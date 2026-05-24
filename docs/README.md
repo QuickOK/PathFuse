@@ -1,6 +1,6 @@
 # PathFuse documentation
 
-PathFuse bonds several unreliable WAN uplinks into one dependable connection — link liveness,
+PathFuse makes one dependable connection out of several unreliable WAN uplinks — link liveness,
 automatic failover, cross-link redundancy, and adaptive forward error correction over a relay.
 (Redundancy + failover + FEC for uptime and low loss — **not** bandwidth aggregation.)
 
