@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# PathFuse pre-push gate. Enable with:  git config core.hooksPath scripts/hooks
+# Blocks a push if tests fail or the sanitization gate finds real IPs / vocab / secrets.
+exec "$(git rev-parse --show-toplevel)/scripts/preflight.sh"

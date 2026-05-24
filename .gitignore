@@ -5,3 +5,5 @@ __pycache__/
 *.tmp
 state.json
 .test-*/
+deploy/values.json
+deploy/out/
