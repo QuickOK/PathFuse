@@ -1,8 +1,8 @@
 # udpspeeder-fec.service — install to /etc/systemd/system/ on the relay.
 # Adaptive FEC controller for the relay->client direction: reads relay sbfd loss,
 # drives the udpspeeder-server FIFO. Runs as root (reads /run/sbfd/state.json,
-# writes the root-owned FIFO dir).
-# Shared key material is in $paths_udpspeeder_etc/key (UDPSPEEDER_KEY=$${UDPSPEEDER_KEY}).
+# writes the root-owned FIFO dir). No UDPspeeder key here — this is the Python
+# controller, not a speederv2 instance.
 [Unit]
 Description=Adaptive FEC controller (relay, drives udpspeeder-server FIFO)
 After=udpspeeder-server.service sbfd.service
