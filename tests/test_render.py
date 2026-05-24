@@ -28,3 +28,10 @@ def test_render_text_strict_missing_placeholder_raises():
 def test_render_text_escaped_dollar_is_literal():
     r = _render()
     assert r.render_text("k=$${UDPSPEEDER_KEY} v=$x", {"x": "7"}) == "k=${UDPSPEEDER_KEY} v=7"
+
+def test_render_check_passes_for_all_roles():
+    res = subprocess.run([sys.executable, str(RENDER), "--check"],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, "render --check failed:\n" + res.stdout + res.stderr
+    assert "client: rendered" in res.stdout.replace("role=", "")
+    assert "relay: rendered" in res.stdout.replace("role=", "")
