@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Adaptive FEC controller for the OVH side (OVH->truck direction).
-Reads OVH sbfd loss, drives the udpspeeder-server FIFO. Loss-driven only."""
+"""Adaptive FEC controller for the relay side (relay->client direction).
+Reads relay sbfd loss, drives the udpspeeder-server FIFO. Loss-driven only."""
 import argparse
 import json
 import logging
@@ -42,8 +42,8 @@ class FecState:
 
 
 def start_fec_http(listen, state, stop_event=None):
-    """Bind GET/POST /fec for the OVH FEC controller. Tailscale-bound via
-    IP_FREEBIND (wins the boot race vs tailscaled, mirrors sbfd.py's /state
+    """Bind GET/POST /fec for the relay FEC controller. the management overlay-bound via
+    IP_FREEBIND (wins the boot race vs the overlay daemon, mirrors sbfd.py's /state
     listener). Returns the bound httpd, or None if listen is falsy / bind fails."""
     if not listen:
         return None
@@ -175,7 +175,7 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="udpspeeder adaptive FEC controller (OVH)")
+    ap = argparse.ArgumentParser(description="udpspeeder adaptive FEC controller (relay)")
     ap.add_argument("-c", "--config", required=True)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()

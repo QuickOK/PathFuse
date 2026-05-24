@@ -20,8 +20,8 @@ import fec_report
 # -- Configuration -----------------------------------------------------------
 
 VALID_MODES = {"full", "master_backup"}
-VALID_POLICIES = {"static_starlink", "dynamic", "static_configured"}
-VALID_EGRESS_MODES = {"warp", "ovh_direct", "local_direct"}
+VALID_POLICIES = {"static_primary", "dynamic", "static_configured"}
+VALID_EGRESS_MODES = {"relay_vpn", "relay_direct", "local_direct"}
 
 
 @dataclass
@@ -32,7 +32,7 @@ class WanCfg:
 
 
 @dataclass
-class OvhCfg:
+class RelayCfg:
     state_url: str
     fetch_interval_s: float = 1.0
     fetch_timeout_s: float = 2.0
@@ -56,13 +56,13 @@ class NftCfg:
 class EgressCfg:
     engarde_table: str = "engarde"
     wg_iface: str = "wg0"
-    default_mode: str = "warp"
+    default_mode: str = "relay_vpn"
 
 
 @dataclass
 class PolicyCfg:
     default_mode: str = "full"
-    default_master_policy: str = "static_starlink"
+    default_master_policy: str = "static_primary"
     default_master_wan: str = "wan2"
     failback_hold_s: int = 30
     dynamic_rtt_margin_ms: float = 25.0
@@ -87,7 +87,7 @@ class FecCfg:
 @dataclass
 class Config:
     wans: dict[str, WanCfg]
-    ovh: OvhCfg
+    relay: RelayCfg
     engarde: EngardeCfg
     nft: NftCfg
     policy: PolicyCfg
@@ -228,7 +228,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
     new_dyn_master = None
     new_dyn_cand = None
     new_dyn_cand_since = None
-    if i.policy == "static_starlink":
+    if i.policy == "static_primary":
         master = cfg.policy.default_master_wan
     elif i.policy == "static_configured":
         master = i.master_wan_cfg
@@ -391,7 +391,7 @@ def read_local_sbfd_state(path: str,
 def fetch_remote_sbfd_state(url: str,
                             timeout_s: float,
                             session_id_to_wan: dict) -> StateSnapshot:
-    """HTTP GET the OVH /state endpoint. Fail-open on any error."""
+    """HTTP GET the relay /state endpoint. Fail-open on any error."""
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:
             body = resp.read()
@@ -614,7 +614,7 @@ def fec_driver_wan(loss, active_wans):
 def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
     """Reconcile decision: POST when desired differs from last-acked (assert until
     acked), on the first tick, or once the heartbeat elapses (defends against an
-    OVH restart that reverted to its default)."""
+    relay restart that reverted to its default)."""
     if desired != last_acked:
         return True
     if last_post_ts is None:
@@ -622,8 +622,8 @@ def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
     return (now - last_post_ts) >= heartbeat_s
 
 
-def ovh_fec_direction(fetch, fetched_at, now, desired, last_acked):
-    """Shape the OVH->truck published direction dict from a fetch_ovh_fec result."""
+def relay_fec_direction(fetch, fetched_at, now, desired, last_acked):
+    """Shape the relay->client published direction dict from a fetch_relay_fec result."""
     fetch = fetch or {}
     data = fetch.get("data") or {}
     return {
@@ -706,11 +706,11 @@ def compute_engarde_table_action(egress_mode: str,
     Returns None | {"op": "replace", "via": str|None, "dev": str, "table": str}.
     Returns None when current state already matches desired (idempotent).
 
-    For warp/ovh_direct: desired = `default dev <wg_iface>` (today's state).
+    For relay_vpn/relay_direct: desired = `default dev <wg_iface>` (today's state).
     For local_direct: desired = `default via <master_gw> dev <master_iface>`.
     Refuses to act on local_direct when master_gw is None (would black-hole).
     """
-    if egress_mode in ("warp", "ovh_direct"):
+    if egress_mode in ("relay_vpn", "relay_direct"):
         desired = {"via": None, "dev": cfg.wg_iface}
     elif egress_mode == "local_direct":
         if master_gw is None or master_iface is None:
@@ -845,7 +845,7 @@ def load_config(path: str) -> Config:
 
         policy = PolicyCfg(
             default_mode=raw["policy"].get("default_mode", "full"),
-            default_master_policy=raw["policy"].get("default_master_policy", "static_starlink"),
+            default_master_policy=raw["policy"].get("default_master_policy", "static_primary"),
             default_master_wan=raw["policy"].get("default_master_wan", "wan2"),
             failback_hold_s=int(raw["policy"].get("failback_hold_s", 30)),
             dynamic_rtt_margin_ms=float(raw["policy"].get("dynamic_rtt_margin_ms", 25.0)),
@@ -854,11 +854,11 @@ def load_config(path: str) -> Config:
             manage_default_route=bool(raw["policy"].get("manage_default_route", False)),
         )
 
-        ovh = OvhCfg(
-            state_url=raw["ovh"]["state_url"],
-            fetch_interval_s=float(raw["ovh"].get("fetch_interval_s", 1.0)),
-            fetch_timeout_s=float(raw["ovh"].get("fetch_timeout_s", 2.0)),
-            fec_url=raw["ovh"].get("fec_url"),
+        relay = RelayCfg(
+            state_url=raw["relay"]["state_url"],
+            fetch_interval_s=float(raw["relay"].get("fetch_interval_s", 1.0)),
+            fetch_timeout_s=float(raw["relay"].get("fetch_timeout_s", 2.0)),
+            fec_url=raw["relay"].get("fec_url"),
         )
         engarde = EngardeCfg(
             server_ip=raw["engarde"]["server_ip"],
@@ -874,7 +874,7 @@ def load_config(path: str) -> Config:
         egress = EgressCfg(
             engarde_table=str(eraw.get("engarde_table", "engarde")),
             wg_iface=str(eraw.get("wg_iface", "wg0")),
-            default_mode=str(eraw.get("default_mode", "warp")),
+            default_mode=str(eraw.get("default_mode", "relay_vpn")),
         )
 
         raw_fec = raw.get("fec")
@@ -894,7 +894,7 @@ def load_config(path: str) -> Config:
 
         cfg = Config(
             wans=wans,
-            ovh=ovh,
+            relay=relay,
             engarde=engarde,
             nft=nft,
             policy=policy,
@@ -917,10 +917,10 @@ def load_config(path: str) -> Config:
         raise ValueError(f"policy.default_master_wan {policy.default_master_wan!r} not in wans={list(wans)}")
     if policy.failback_hold_s < 0:
         raise ValueError(f"policy.failback_hold_s must be >= 0, got {policy.failback_hold_s}")
-    if ovh.fetch_interval_s <= 0:
-        raise ValueError(f"ovh.fetch_interval_s must be > 0, got {ovh.fetch_interval_s}")
-    if ovh.fetch_timeout_s <= 0:
-        raise ValueError(f"ovh.fetch_timeout_s must be > 0, got {ovh.fetch_timeout_s}")
+    if relay.fetch_interval_s <= 0:
+        raise ValueError(f"relay.fetch_interval_s must be > 0, got {relay.fetch_interval_s}")
+    if relay.fetch_timeout_s <= 0:
+        raise ValueError(f"relay.fetch_timeout_s must be > 0, got {relay.fetch_timeout_s}")
     if not 1 <= engarde.server_port <= 65535:
         raise ValueError(f"engarde.server_port must be in 1..65535, got {engarde.server_port}")
     if egress.default_mode not in VALID_EGRESS_MODES:
@@ -1008,8 +1008,8 @@ def effective_fec_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     return True
 
 
-def fetch_ovh_fec(url, timeout_s) -> dict:
-    """Best-effort GET of the OVH /fec endpoint. Returns {ok, data, error};
+def fetch_relay_fec(url, timeout_s) -> dict:
+    """Best-effort GET of the relay /fec endpoint. Returns {ok, data, error};
     never raises (mirrors fetch_remote_sbfd_state's defensive style)."""
     if not url:
         return {"ok": False, "data": None, "error": "no fec_url configured"}
@@ -1023,8 +1023,8 @@ def fetch_ovh_fec(url, timeout_s) -> dict:
         return {"ok": False, "data": None, "error": f"parse: {e}"}
 
 
-def post_ovh_fec(url, enabled, timeout_s) -> bool:
-    """Best-effort POST of desired enabled to OVH /fec. Returns True iff acked 200."""
+def post_relay_fec(url, enabled, timeout_s) -> bool:
+    """Best-effort POST of desired enabled to relay /fec. Returns True iff acked 200."""
     if not url:
         return False
     body = _json.dumps({"enabled": bool(enabled)}).encode()
@@ -1237,7 +1237,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
     recent_switches: deque = deque([last_switch], maxlen=20)
 
     tick = 0.5
-    remote_interval = max(0.5, cfg.ovh.fetch_interval_s)
+    remote_interval = max(0.5, cfg.relay.fetch_interval_s)
 
     fec_rt = fec_control.FecRuntime(current_level=0, up_streak=0, last_change_ts=time.time())
     fec_hyst = (fec_control.FecHysteresis(cfg.fec.ramp_up_ticks, cfg.fec.ramp_down_hold_s)
@@ -1261,10 +1261,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
         fec_reconcile_due = False
         if loop_start - last_remote_at >= remote_interval:
             last_remote = fetch_remote_sbfd_state(
-                cfg.ovh.state_url, cfg.ovh.fetch_timeout_s, sid_to_wan)
+                cfg.relay.state_url, cfg.relay.fetch_timeout_s, sid_to_wan)
             last_remote_at = loop_start
             if cfg.fec:
-                fec_ovh_last = fetch_ovh_fec(cfg.ovh.fec_url, cfg.ovh.fetch_timeout_s)
+                fec_ovh_last = fetch_relay_fec(cfg.relay.fec_url, cfg.relay.fetch_timeout_s)
                 fec_ovh_last_at = loop_start
                 fec_reconcile_due = True
 
@@ -1382,12 +1382,12 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                         fec_ratio_since = loop_start
                         logging.info("fec disabled -> %s (forced off)", _off_ratio)
 
-            # Reconcile desired enable-state to OVH on the remote-fetch cadence
-            # only (best-effort) — rate-limiting to the OVH tick keeps a slow or
-            # unreachable OVH from blocking the 0.5s failover loop on every tick.
+            # Reconcile desired enable-state to relay on the remote-fetch cadence
+            # only (best-effort) — rate-limiting to the relay tick keeps a slow or
+            # unreachable relay from blocking the 0.5s failover loop on every tick.
             if fec_reconcile_due and should_post_fec(
                     fec_desired, fec_ovh_last_acked, fec_ovh_last_post_ts, loop_start):
-                if post_ovh_fec(cfg.ovh.fec_url, fec_desired, cfg.ovh.fetch_timeout_s):
+                if post_relay_fec(cfg.relay.fec_url, fec_desired, cfg.relay.fetch_timeout_s):
                     fec_ovh_last_acked = fec_desired
                 fec_ovh_last_post_ts = loop_start
 
@@ -1407,7 +1407,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             "wan_labels": {w: cfg.wans[w].label for w in cfg.wans},
             "engarde_server": f"{cfg.engarde.server_ip}:{cfg.engarde.server_port}",
             "pi_local": {w: _wan_obj(local, w) for w in cfg.wans},
-            "ovh_remote": {
+            "relay_remote": {
                 "states": {w: _wan_obj(last_remote, w) for w in cfg.wans},
                 "fetched_at": last_remote.fetched_at,
                 "stale_s": loop_start - last_remote_at if last_remote_at else None,
@@ -1457,7 +1457,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 "configured": bool(cfg.fec and cfg.fec.enabled),
                 "desired_enabled": fec_desired,
                 "directions": {
-                    "truck_to_ovh": {
+                    "client_to_relay": {
                         "enabled": fec_desired,
                         "ratio": fec_current_ratio,
                         "level": fec_rt.current_level,
@@ -1467,7 +1467,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                         "actuator_ok": fec_actuator_ok,
                         "wire": (wire_tracker.snapshot(loop_start) if wire_tracker else None),
                     },
-                    "ovh_to_truck": ovh_fec_direction(
+                    "relay_to_client": relay_fec_direction(
                         fec_ovh_last, fec_ovh_last_at, loop_start,
                         fec_desired, fec_ovh_last_acked),
                 },

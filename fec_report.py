@@ -1,5 +1,5 @@
 """Pure parsing + rate tracking for UDPspeeder --report lines, shared by the
-truck (sbfd-ctl) and OVH (udpspeeder_fec) wire-stats tailers. See
+client (sbfd-ctl) and relay (udpspeeder_fec) wire-stats tailers. See
 docs/superpowers/specs/2026-05-24-fec-phase2-report-capture.md for the format."""
 import logging
 import re

@@ -202,19 +202,19 @@ function render(s){
   $("#kpi-active-val").textContent = activeLabels.length ? activeLabels.join(" + ") : "none";
   $("#kpi-active-sub").textContent = masterWan ? `master · ${wanLabel(masterWan)}` : "—";
 
-  /* KPI: OVH sync */
+  /* KPI: relay sync */
   const syncEl  = $("#kpi-sync");
   const syncVal = $("#kpi-sync-val");
   const syncSub = $("#kpi-sync-sub");
-  if (s.ovh_remote && s.ovh_remote.ok) {
+  if (s.relay_remote && s.relay_remote.ok) {
     syncEl.dataset.state = "ok";
-    const stale = s.ovh_remote.stale_s;
+    const stale = s.relay_remote.stale_s;
     syncVal.textContent  = stale != null ? `${stale.toFixed(1)}s` : "fresh";
     syncSub.textContent  = "remote view ok";
   } else {
     syncEl.dataset.state = "degraded";
     syncVal.textContent  = "stale";
-    syncSub.textContent  = (s.ovh_remote && s.ovh_remote.error) ? "pi-local only" : "no remote";
+    syncSub.textContent  = (s.relay_remote && s.relay_remote.error) ? "pi-local only" : "no remote";
   }
 
   /* link sub */
@@ -236,7 +236,7 @@ function render(s){
     const setRadio = (name, val) => $$(`input[name="${name}"]`).forEach(r => r.checked = (r.value === val));
     setRadio("mode", s.mode);
     setRadio("policy", s.master_policy);
-    setRadio("egress_mode", s.egress_mode || "warp");
+    setRadio("egress_mode", s.egress_mode || "relay_vpn");
     if (s.master_wan && sel) sel.value = s.master_wan;
     if (s.fec && s.fec.configured) setRadio("fec_enabled", s.fec.desired_enabled ? "on" : "off");
   }
@@ -263,11 +263,11 @@ function render(s){
     pbrWarn.hidden = !!(et.dev);  // dev present means table is provisioned
   }
 
-  if (s.ovh_remote){
-    const r = s.ovh_remote;
-    $("#ovh-info").textContent = r.ok
-      ? `ovh state · fresh ${r.stale_s != null ? r.stale_s.toFixed(1)+"s ago" : "now"}`
-      : `ovh unavailable · ${r.error || "unknown"}`;
+  if (s.relay_remote){
+    const r = s.relay_remote;
+    $("#relay-info").textContent = r.ok
+      ? `relay state · fresh ${r.stale_s != null ? r.stale_s.toFixed(1)+"s ago" : "now"}`
+      : `relay unavailable · ${r.error || "unknown"}`;
   }
 }
 
@@ -276,7 +276,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
   wrap.innerHTML = "";
   wans.forEach((w) => {
     const local  = s.pi_local[w] || {};
-    const remote = (s.ovh_remote && s.ovh_remote.states && s.ovh_remote.states[w]) || {};
+    const remote = (s.relay_remote && s.relay_remote.states && s.relay_remote.states[w]) || {};
     const eff    = (s.effective || {})[w] || "UNKNOWN";
     const label  = (s.wan_labels && s.wan_labels[w]) || w;
     const rtt    = (local.rtt_ms   != null) ? local.rtt_ms   : remote.rtt_ms;
@@ -295,7 +295,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
       tags.push(`<span class="tag candidate">dyn-candidate</span>`);
     }
 
-    const fecDir = s.fec && s.fec.directions && s.fec.directions.truck_to_ovh;
+    const fecDir = s.fec && s.fec.directions && s.fec.directions.client_to_relay;
     if (fecDir && fecDir.driver_wan === w && s.fec.desired_enabled) {
       tags.push(`<span class="tag candidate">fec driver</span>`);
     }
@@ -305,7 +305,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
     card.innerHTML = `
       <div class="wan-head">
         <div class="wan-name">${escapeHtml(label)}</div>
-        <div class="wan-iface">${escapeHtml(w)} · pi ${escapeHtml(local.state||"?")} · ovh ${escapeHtml(remote.state||"?")}</div>
+        <div class="wan-iface">${escapeHtml(w)} · pi ${escapeHtml(local.state||"?")} · relay ${escapeHtml(remote.state||"?")}</div>
       </div>
       <div class="wan-status">
         <span class="pip ${sCls}"></span>${escapeHtml(eff)}
@@ -377,11 +377,11 @@ function renderSignalDiagram(s, wans, active, masterWan){
   });
 
   // Egress-mode overlay: relabels the engarde node + panel subtitle and dims
-  // the BFD edges when the truck-device flow is bypassing the tunnel entirely.
-  const egressMode = s.egress_mode || "warp";
-  const exit = egressMode === "warp"        ? { tag: "→ CF WARP",  sub: "truck → engarde → CF WARP" }
-             : egressMode === "ovh_direct"  ? { tag: "→ OVH WAN",  sub: "truck → engarde → OVH WAN" }
-             : egressMode === "local_direct"? { tag: "BYPASSED",   sub: "truck → cab WAN (engarde bypassed)" }
+  // the BFD edges when the client-device flow is bypassing the tunnel entirely.
+  const egressMode = s.egress_mode || "relay_vpn";
+  const exit = egressMode === "relay_vpn"        ? { tag: "→ CF relay-VPN",  sub: "client → engarde → CF relay-VPN" }
+             : egressMode === "relay_direct"  ? { tag: "→ relay WAN",  sub: "client → engarde → relay WAN" }
+             : egressMode === "local_direct"? { tag: "BYPASSED",   sub: "client → cab WAN (engarde bypassed)" }
              :                                { tag: "?",          sub: `unknown egress: ${egressMode}` };
   const flowSub = document.getElementById("signal-flow-sub");
   if (flowSub) flowSub.textContent = exit.sub;
@@ -517,17 +517,17 @@ function renderFec(s){
   if (sub) sub.textContent = !fec.configured ? "not configured"
                         : (fec.desired_enabled ? "adaptive" : "disabled — forced 8:0");
 
-  renderFecCard("t2o", dirs.truck_to_ovh, true);
-  renderFecCard("o2t", dirs.ovh_to_truck, false);
+  renderFecCard("c2r", dirs.client_to_relay, true);
+  renderFecCard("r2c", dirs.relay_to_client, false);
 
   const eff = $("#fec-effective");
   if (eff){
     if (!fec.configured){
       eff.textContent = "FEC not configured";
     } else {
-      const o = dirs.ovh_to_truck || {};
-      const ovhTxt = !o.ok ? "OVH sync pending"
-                   : (o.reconcile_pending ? "syncing OVH…" : "OVH synced");
+      const o = dirs.relay_to_client || {};
+      const ovhTxt = !o.ok ? "relay sync pending"
+                   : (o.reconcile_pending ? "syncing relay…" : "relay synced");
       eff.textContent = `effective: ${fec.desired_enabled ? "adaptive" : "disabled"} · ${ovhTxt}`;
     }
   }

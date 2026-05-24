@@ -1,4 +1,4 @@
-"""Pure FEC-ratio decision logic shared by the truck (sbfd-ctl) and OVH
+"""Pure FEC-ratio decision logic shared by the client (sbfd-ctl) and relay
 (udpspeeder_fec) adaptive controllers. No I/O except write_fifo()."""
 from dataclasses import dataclass
 import os

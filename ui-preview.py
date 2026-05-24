@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sbfd_ctl import (
-    Config, EngardeCfg, NftCfg, OvhCfg, PolicyCfg, WanCfg,
+    Config, EngardeCfg, NftCfg, RelayCfg, PolicyCfg, WanCfg,
     load_config, read_local_sbfd_state, fetch_remote_sbfd_state,
     start_ui_server,
 )
@@ -27,7 +27,7 @@ from sbfd_ctl import (
 def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
     local = read_local_sbfd_state(cfg.sbfd_local_state, sid_to_wan)
     try:
-        remote = fetch_remote_sbfd_state(cfg.ovh.state_url, cfg.ovh.fetch_timeout_s, sid_to_wan)
+        remote = fetch_remote_sbfd_state(cfg.relay.state_url, cfg.relay.fetch_timeout_s, sid_to_wan)
     except Exception as e:  # noqa: BLE001
         from sbfd_ctl import StateSnapshot
         remote = StateSnapshot(ok=False, per_wan={}, error=f"preview: {e}")
@@ -54,7 +54,7 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
         "wan_labels": {w: cfg.wans[w].label for w in cfg.wans},
         "engarde_server": f"{cfg.engarde.server_ip}:{cfg.engarde.server_port}",
         "pi_local": {w: wo(local, w) for w in cfg.wans},
-        "ovh_remote": {
+        "relay_remote": {
             "states": {w: wo(remote, w) for w in cfg.wans},
             "fetched_at": remote.fetched_at,
             "stale_s": 0.0,
@@ -78,13 +78,13 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
             "configured": True,
             "desired_enabled": True,
             "directions": {
-                "truck_to_ovh": {
+                "client_to_relay": {
                     "enabled": True, "ratio": "8:4", "level": 2,
                     "driving_loss_pct": 3.1, "driver_wan": cfg.policy.default_master_wan,
                     "since": now - 42, "actuator_ok": True,
                     "wire": {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False},
                 },
-                "ovh_to_truck": {
+                "relay_to_client": {
                     "enabled": True, "ratio": "8:2", "level": 1,
                     "driving_loss_pct": 1.2, "since": now - 133,
                     "ok": True, "stale_s": 0.4, "error": None,

@@ -864,7 +864,7 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 .ctl-block[hidden]   { display: none; }
 
 /* Signal-flow diagram dims its edges when egress_mode === "local_direct" —
-   truck-device traffic is bypassing engarde entirely so the tunnel paths
+   client-device traffic is bypassing engarde entirely so the tunnel paths
    shouldn't visually claim ownership of the egress flow. BFD probes still
    ride those paths, so the edges aren't gone, just muted. */
 #signal-svg.bypass .edge { opacity: 0.2; }

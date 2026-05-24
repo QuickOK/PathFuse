@@ -219,7 +219,7 @@ def fmt(d):
 
 def synthesize_starlink_spike_trace(base_ticks, spike_intervals_s=(300, 400, 500),
                                      spike_duration_s=15.0, spike_rtt_ms=220.0):
-    """Inject brief Starlink RTT spikes into a baseline trace.
+    """Inject brief Satellite RTT spikes into a baseline trace.
 
     spike_intervals_s: list of seconds-from-start at which to inject a spike
     spike_duration_s: how long each spike lasts
@@ -287,7 +287,7 @@ def main():
 
     print()
     spike_ticks = synthesize_starlink_spike_trace(ticks)
-    print(f"{'variant':<48} | + 3 Starlink spikes (15s @ 220ms), starting at wan2")
+    print(f"{'variant':<48} | + 3 Satellite spikes (15s @ 220ms), starting at wan2")
     print('-' * 110)
     for name, fn, margin, dwell in variants:
         sim = Simulator(fn, rtt_margin_ms=margin, dwell_s=dwell)
@@ -297,7 +297,7 @@ def main():
     print()
     long_spike_ticks = synthesize_starlink_spike_trace(
         ticks, spike_intervals_s=(150,), spike_duration_s=120.0, spike_rtt_ms=220.0)
-    print(f"{'variant':<48} | + 1 LONG Starlink spike (120s @ 220ms), starting at wan2")
+    print(f"{'variant':<48} | + 1 LONG Satellite spike (120s @ 220ms), starting at wan2")
     print('-' * 110)
     for name, fn, margin, dwell in variants:
         sim = Simulator(fn, rtt_margin_ms=margin, dwell_s=dwell)

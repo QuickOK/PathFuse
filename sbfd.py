@@ -2,7 +2,7 @@
 """
 sbfd - software BFD-equivalent liveness daemon.
 
-Symmetric: same binary runs on Pi (client) and OVH (server).
+Symmetric: same binary runs on Pi (client) and relay (server).
 One UDP socket per configured session. Each session is a peering
 between (local_iface, peer_addr:port) identified by a session_id.
 
@@ -378,9 +378,9 @@ def start_state_listener(cfg: DaemonConfig):
         logging.error("state_listen port %r is not numeric; HTTP listener disabled", port_str)
         return None
     # IP_FREEBIND lets us bind to an address that doesn't yet exist on any
-    # interface — e.g. Tailscale's 100.x address before tailscaled has finished
+    # interface — e.g. the management overlay's 100.x address before the overlay daemon has finished
     # bringing tailscale0 up at boot. Without this, sbfd loses the boot race
-    # against tailscaled and silently fails to expose /state until restart.
+    # against the overlay daemon and silently fails to expose /state until restart.
     class FreebindHTTPServer(ThreadingHTTPServer):
         def server_bind(self):
             ip_freebind = getattr(socket, "IP_FREEBIND", 15)
