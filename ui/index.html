@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>sbfd · truck failover</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,400..700&family=Geist+Mono:wght@400;500;600&family=Geist:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/wall.css">
+</head>
+<body>
+  <script>
+    /* Pick layout before paint to avoid FOUC. */
+    (function(){
+      try { var v = localStorage.getItem("sbfd_layout");
+            document.body.dataset.layout = (v === "wall" ? "wall" : "ops"); }
+      catch(e){ document.body.dataset.layout = "ops"; }
+    })();
+  </script>
+
+  <div class="app">
+
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M2 7h10"  stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          <path d="M2 12h7"  stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          <path d="M2 17h12" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          <circle cx="19" cy="12" r="3" stroke="currentColor" stroke-width="1.4"/>
+          <circle cx="19" cy="12" r="1.2" fill="currentColor"/>
+        </svg>
+        <span class="brand-name">sbfd</span>
+        <span class="brand-tag">truck failover · controller</span>
+      </div>
+
+      <div class="layout-toggle" role="tablist" aria-label="Layout">
+        <button type="button" data-layout-pick="ops"  role="tab">OPS</button>
+        <button type="button" data-layout-pick="wall" role="tab">WALL</button>
+      </div>
+
+      <div class="topbar-meta">
+        <span class="meta-cell"><span class="lbl">relay</span><span id="station" class="val">—</span></span>
+        <span class="meta-cell"><span class="lbl">time</span><span id="clock" class="val">--:--:--</span></span>
+      </div>
+    </header>
+
+    <section class="kpi-strip" aria-label="System summary">
+      <div class="kpi" id="kpi-system">
+        <div class="kpi-label">System</div>
+        <div class="kpi-value" id="kpi-system-val">—</div>
+        <div class="kpi-sub" id="kpi-system-sub">awaiting state</div>
+      </div>
+      <div class="kpi" id="kpi-mode">
+        <div class="kpi-label">Mode</div>
+        <div class="kpi-value mono" id="kpi-mode-val">—</div>
+        <div class="kpi-sub" id="kpi-mode-sub">—</div>
+      </div>
+      <div class="kpi" id="kpi-active">
+        <div class="kpi-label">Active path</div>
+        <div class="kpi-value mono" id="kpi-active-val">—</div>
+        <div class="kpi-sub" id="kpi-active-sub">—</div>
+      </div>
+      <div class="kpi" id="kpi-sync">
+        <div class="kpi-label">OVH sync</div>
+        <div class="kpi-value mono" id="kpi-sync-val">—</div>
+        <div class="kpi-sub" id="kpi-sync-sub">—</div>
+      </div>
+    </section>
+
+    <main class="grid">
+
+      <section class="panel" aria-label="WAN links">
+        <div class="panel-head">
+          <h2 class="panel-title">WAN links</h2>
+          <span class="panel-title-sub" id="links-sub">—</span>
+        </div>
+        <div id="wan-list" class="wan-list"></div>
+      </section>
+
+      <aside class="panel control" aria-label="Operator controls">
+        <div class="panel-head">
+          <h2 class="panel-title">Control</h2>
+          <span class="panel-title-sub">runtime overlay</span>
+        </div>
+
+        <div class="ctl-block">
+          <div class="ctl-label">Mode</div>
+          <label class="ctl-radio"><input type="radio" name="mode" value="full"><span>Full redundancy</span></label>
+          <label class="ctl-radio"><input type="radio" name="mode" value="master_backup"><span>Master / backup</span></label>
+        </div>
+
+        <div class="ctl-block" id="policy-block">
+          <div class="ctl-label">Master assignment</div>
+          <label class="ctl-radio"><input type="radio" name="policy" value="static_starlink"><span>Starlink master <em>default</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="policy" value="dynamic"><span>Dynamic · best link
+            <span class="tip"
+                  title="Picks master by lower EWMA RTT, with hysteresis to avoid flapping on transient Starlink spikes. Sustained loss outranks RTT for swap decisions.">i</span></span></label>
+          <label class="ctl-radio"><input type="radio" name="policy" value="static_configured"><span>Operator choice
+            <select id="master-wan" class="ctl-select"></select></span></label>
+        </div>
+
+        <div class="ctl-block" id="egress-block">
+          <div class="ctl-label">Egress
+            <span id="egress-warn" class="egress-warn" hidden>master DOWN</span>
+            <span id="engarde-pbr-warn" class="egress-warn" hidden>engarde PBR missing</span>
+          </div>
+          <label class="ctl-radio"><input type="radio" name="egress_mode" value="warp"><span>WARP <em>default</em>
+            <span class="tip" title="truck → engarde tunnel → OVH netns → Cloudflare WARP TUN. Default; works around CGNAT and most ISP quirks.">i</span></span></label>
+          <label class="ctl-radio"><input type="radio" name="egress_mode" value="ovh_direct"><span>OVH Direct
+            <span class="tip" title="truck → engarde tunnel → OVH WAN (no WARP). Use when WARP is broken or blocking destinations.">i</span></span></label>
+          <label class="ctl-radio"><input type="radio" name="egress_mode" value="local_direct"><span>Local Direct
+            <span class="tip" title="truck → master WAN directly (no engarde tunnel, no OVH). Cab IP varies; use when OVH path is broken.">i</span></span></label>
+        </div>
+
+        <div class="ctl-block" id="fec-block">
+          <div class="ctl-label">FEC
+            <span class="tip" title="Adaptive forward error correction over the engarde tunnel. Disabled forces the off tier (8:0) in BOTH directions; the udpspeeder process keeps running.">i</span>
+          </div>
+          <label class="ctl-radio"><input type="radio" name="fec_enabled" value="on"><span>Adaptive <em>default</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="fec_enabled" value="off"><span>Disabled <em>force 8:0</em></span></label>
+          <div class="fec-effective" id="fec-effective">—</div>
+        </div>
+
+        <div class="ctl-actions">
+          <button id="apply" class="btn-apply">Apply</button>
+          <label class="ctl-check"><input type="checkbox" id="persist"><span>Persist across reboot</span></label>
+        </div>
+        <div id="apply-status" class="apply-status"></div>
+
+        <div class="ctl-block dynamic-readout" id="dynamic-readout" hidden>
+          <div class="ctl-label">Dynamic state</div>
+          <div class="dyn-row"><span>master</span><span id="dyn-master">—</span></div>
+          <div class="dyn-row"><span>candidate</span><span id="dyn-candidate">—</span></div>
+          <div class="dyn-row"><span>dwell remaining</span><span id="dyn-dwell">—</span></div>
+        </div>
+
+        <div class="ctl-block" id="failback-block" hidden>
+          <div class="ctl-label">Failback hold</div>
+          <div class="failback-bar"><div id="failback-fill" class="failback-fill"></div></div>
+          <div class="failback-text"><span id="failback-text">—</span></div>
+        </div>
+      </aside>
+
+    </main>
+
+    <section class="panel flow" aria-label="Signal flow">
+      <div class="panel-head">
+        <h2 class="panel-title">Signal flow</h2>
+        <span class="panel-title-sub" id="signal-flow-sub">truck → decide → relay</span>
+      </div>
+      <svg id="signal-svg" viewBox="0 0 600 260" preserveAspectRatio="xMidYMid meet">
+        <g id="node-truck" transform="translate(50,130)">
+          <rect x="-46" y="-26" width="92" height="52" rx="3" class="node-box"/>
+          <text x="0" y="-3" class="node-label center">TRUCK</text>
+          <text x="0" y="14" class="node-sub center">PI · LOCAL</text>
+        </g>
+        <g id="edges"></g>
+        <g id="wan-labels"></g>
+        <g id="node-sbfd" transform="translate(300,130)">
+          <polygon points="0,-30 42,0 0,30 -42,0" class="node-box decision"/>
+          <text x="0" y="-2" class="node-label center">SBFD</text>
+          <text x="0" y="14" class="node-sub center">DECIDE</text>
+        </g>
+        <g id="node-engarde" transform="translate(550,130)">
+          <rect x="-46" y="-26" width="92" height="52" rx="3" class="node-box"/>
+          <text x="0" y="-3" class="node-label center">ENGARDE</text>
+          <text x="0" y="14" class="node-sub center" id="engarde-sub">WG ↻ HUB</text>
+        </g>
+      </svg>
+      <div class="flow-legend">
+        <span><i class="dot up"></i>up</span>
+        <span><i class="dot down"></i>down</span>
+        <span><i class="dot unk"></i>unknown</span>
+        <span><i class="dot master"></i>master</span>
+        <span><i class="dot active"></i>active path</span>
+      </div>
+    </section>
+
+    <section class="panel fec-panel" aria-label="Forward error correction">
+      <div class="panel-head">
+        <h2 class="panel-title">Forward Error Correction</h2>
+        <span class="panel-title-sub" id="fec-sub">—</span>
+      </div>
+      <div class="fec-dirs">
+        <div class="fec-card" id="fec-t2o">
+          <div class="fec-dir-head">truck → OVH</div>
+          <div class="fec-ratio" id="fec-t2o-ratio">—</div>
+          <div class="fec-level" id="fec-t2o-level"></div>
+          <div class="fec-meta" id="fec-t2o-meta">—</div>
+          <div class="fec-since">in ratio for <span id="fec-t2o-dur" data-since="">—</span></div>
+          <div class="fec-badges wan-tags" id="fec-t2o-badges"></div>
+          <div class="fec-wire" id="fec-t2o-wire"></div>
+        </div>
+        <div class="fec-card" id="fec-o2t">
+          <div class="fec-dir-head">OVH → truck</div>
+          <div class="fec-ratio" id="fec-o2t-ratio">—</div>
+          <div class="fec-level" id="fec-o2t-level"></div>
+          <div class="fec-meta" id="fec-o2t-meta">—</div>
+          <div class="fec-since">in ratio for <span id="fec-o2t-dur" data-since="">—</span></div>
+          <div class="fec-badges wan-tags" id="fec-o2t-badges"></div>
+          <div class="fec-wire" id="fec-o2t-wire"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="bottom-row">
+      <div class="panel" aria-label="Switch history">
+        <div class="panel-head">
+          <h2 class="panel-title">Switch history</h2>
+          <span class="panel-title-sub">recent decisions</span>
+        </div>
+        <table class="table">
+          <thead>
+            <tr><th style="width:74px">Time</th><th>From</th><th style="width:18px"></th><th>To</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="board"></tbody>
+        </table>
+        <div id="board-empty" class="empty-row" hidden>No recent switches — all paths nominal</div>
+      </div>
+
+      <div class="panel" aria-label="Engarde sockets">
+        <div class="panel-head">
+          <h2 class="panel-title">Relay sockets</h2>
+          <span class="panel-title-sub" id="consist-sub">engarde server</span>
+        </div>
+        <table class="table">
+          <thead>
+            <tr><th style="width:24px">#</th><th>Remote peer</th><th>Idle</th><th>Status</th></tr>
+          </thead>
+          <tbody id="consist-rows"></tbody>
+        </table>
+        <div id="consist-empty" class="empty-row" hidden>Standby — no sockets bound</div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <div class="footer-left">
+        <span class="pulse" id="pulse"></span>
+        <span id="tick-time">--:--:--.---</span>
+        <span>·</span>
+        <span class="tick-status" id="tick-status">init</span>
+      </div>
+      <div class="footer-right">
+        <span id="ovh-info">—</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
