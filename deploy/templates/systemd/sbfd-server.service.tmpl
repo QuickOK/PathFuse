@@ -1,0 +1,16 @@
+[Unit]
+Description=sbfd software BFD daemon (server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$users_sbfd
+Group=$users_sbfd
+ExecStart=/usr/bin/python3 $paths_sbfd_opt/sbfd.py -c $paths_sbfd_etc/config.json
+RuntimeDirectory=sbfd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+# udpspeeder-client.service — install to /etc/systemd/system/ on the client.
+# FEC client: wg0 sends here; we encode and forward to engarde-client.
+#
+# IMPORTANT: do NOT start this while wg0 still points Endpoint at engarde-client
+# (127.0.0.1:$ports_udpspeeder_in). engarde-client latches its single "wireguard" source to
+# whatever last sent to :$ports_udpspeeder_in (engarde-client main.go:273), so a running
+# udpspeeder-client would hijack the live tunnel's return path. Start it only
+# as part of the cutover, after wg0's Endpoint is moved to :$ports_udpspeeder_client.
+[Unit]
+Description=UDPspeeder FEC client (client, between wg0 and engarde-client)
+After=network-online.target engarde-client.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=udpspeeder
+RuntimeDirectoryMode=0755
+EnvironmentFile=$paths_udpspeeder_etc/key
+ExecStartPre=/bin/sh -c 'test -p /run/udpspeeder/client.fifo || mkfifo -m 0666 /run/udpspeeder/client.fifo'
+ExecStart=$paths_speederv2_bin -c -l 127.0.0.1:$ports_udpspeeder_client -r 127.0.0.1:$ports_udpspeeder_in --mode 0 --mtu 1250 --report 10 --fifo /run/udpspeeder/client.fifo -f 8:4 -k $${UDPSPEEDER_KEY}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

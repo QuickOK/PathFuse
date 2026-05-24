@@ -1,0 +1,29 @@
+[Unit]
+Description=sbfd controller (mode + failover)
+After=network-online.target sbfd.service nftables.service
+Wants=network-online.target
+Requires=sbfd.service
+
+[Service]
+Type=simple
+User=$users_sbfdctl
+Group=$users_sbfdctl
+SupplementaryGroups=sbfd systemd-journal
+ExecStart=$paths_sbfdctl_opt/sbfd_ctl.py -c $paths_sbfdctl_etc/config.json
+ExecStopPost=-/usr/sbin/nft delete table inet sbfd_ctl
+RuntimeDirectory=sbfd-ctl
+StateDirectory=sbfd-ctl
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ReadWritePaths=/run/sbfd-ctl /var/lib/sbfd-ctl /run/udpspeeder
+
+[Install]
+WantedBy=multi-user.target

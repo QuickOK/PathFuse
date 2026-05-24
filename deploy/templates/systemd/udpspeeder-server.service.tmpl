@@ -1,0 +1,19 @@
+# udpspeeder-server.service — install to /etc/systemd/system/ on the relay.
+# FEC server: engarde-server delivers here; we decode/dedup and forward to wg0.
+[Unit]
+Description=UDPspeeder FEC server (relay, between engarde-server and wg0)
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=udpspeeder
+RuntimeDirectoryMode=0755
+EnvironmentFile=$paths_udpspeeder_etc/key
+ExecStartPre=/bin/sh -c 'test -p /run/udpspeeder/server.fifo || mkfifo -m 0666 /run/udpspeeder/server.fifo'
+ExecStart=$paths_speederv2_bin -s -l 127.0.0.1:$ports_udpspeeder_server -r 127.0.0.1:$ports_wg --mode 0 --mtu 1250 --report 10 --fifo /run/udpspeeder/server.fifo -f 8:4 -k $${UDPSPEEDER_KEY}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
