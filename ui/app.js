@@ -379,7 +379,7 @@ function renderSignalDiagram(s, wans, active, masterWan){
   // Egress-mode overlay: relabels the engarde node + panel subtitle and dims
   // the BFD edges when the client-device flow is bypassing the tunnel entirely.
   const egressMode = s.egress_mode || "relay_vpn";
-  const exit = egressMode === "relay_vpn"        ? { tag: "→ CF relay-VPN",  sub: "client → engarde → CF relay-VPN" }
+  const exit = egressMode === "relay_vpn"        ? { tag: "→ egress relay-VPN",  sub: "client → engarde → egress relay-VPN" }
              : egressMode === "relay_direct"  ? { tag: "→ relay WAN",  sub: "client → engarde → relay WAN" }
              : egressMode === "local_direct"? { tag: "BYPASSED",   sub: "client → cab WAN (engarde bypassed)" }
              :                                { tag: "?",          sub: `unknown egress: ${egressMode}` };
