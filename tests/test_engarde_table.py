@@ -6,21 +6,21 @@ def _cfg():
     return M.EgressCfg(engarde_table="engarde", wg_iface="wg0", default_mode="relay_vpn")
 
 
-def test_warp_returns_dev_wg0():
+def test_relay_vpn_returns_dev_wg0():
     out = M.compute_engarde_table_action(
         egress_mode="relay_vpn", master_iface="wan2", master_gw="192.0.2.1",
         current={"via": None, "dev": "wg0"}, cfg=_cfg())
     assert out is None  # already matches
 
 
-def test_warp_replaces_when_table_currently_points_at_wan():
+def test_relay_vpn_replaces_when_table_currently_points_at_wan():
     out = M.compute_engarde_table_action(
         egress_mode="relay_vpn", master_iface="wan2", master_gw="192.0.2.1",
         current={"via": "192.0.2.1", "dev": "wan2"}, cfg=_cfg())
     assert out == {"op": "replace", "via": None, "dev": "wg0", "table": "engarde"}
 
 
-def test_relay_direct_same_as_warp_returns_dev_wg0():
+def test_relay_direct_same_as_relay_vpn_returns_dev_wg0():
     out = M.compute_engarde_table_action(
         egress_mode="relay_direct", master_iface="wan2", master_gw="192.0.2.1",
         current={"via": "192.0.2.1", "dev": "wan2"}, cfg=_cfg())
@@ -44,9 +44,9 @@ def test_local_direct_no_op_when_already_pointed_at_master():
 def test_local_direct_master_change_targets_new_master():
     # Was on wan2, operator switched master to wan1.
     out = M.compute_engarde_table_action(
-        egress_mode="local_direct", master_iface="wan1", master_gw="25.13.210.169",
+        egress_mode="local_direct", master_iface="wan1", master_gw="203.0.113.169",
         current={"via": "192.0.2.1", "dev": "wan2"}, cfg=_cfg())
-    assert out == {"op": "replace", "via": "25.13.210.169", "dev": "wan1", "table": "engarde"}
+    assert out == {"op": "replace", "via": "203.0.113.169", "dev": "wan1", "table": "engarde"}
 
 
 def test_local_direct_with_unknown_gateway_refuses_to_act():

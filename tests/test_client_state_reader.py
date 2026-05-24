@@ -10,8 +10,8 @@ import sbfd_ctl as M
 SBFD_FAKE = {
     "timestamp": 1745889012.34,
     "sessions": {
-        "wan1_tmo":      {"session_id": 1, "state": "UP",   "rtt_ms": 51.2, "loss_pct": 0.0},
-        "wan2_starlink": {"session_id": 2, "state": "DOWN", "rtt_ms": None, "loss_pct": 100.0},
+        "wan1":      {"session_id": 1, "state": "UP",   "rtt_ms": 51.2, "loss_pct": 0.0},
+        "wan2": {"session_id": 2, "state": "DOWN", "rtt_ms": None, "loss_pct": 100.0},
     }
 }
 

@@ -5,7 +5,7 @@ BASE = {
     "wans": {"wan1": {"iface": "wan1", "session_id": 1, "label": "Cellular"},
              "wan2": {"iface": "wan2", "session_id": 2, "label": "Satellite"}},
     "relay": {"state_url": "http://x/state"},
-    "engarde": {"server_ip": "1.2.3.4", "server_port": 59402,
+    "engarde": {"server_ip": "192.0.2.4", "server_port": 59402,
                 "admin_url": "http://127.0.0.1:8080/api/v1/get-list"},
     "nft": {"table": "sbfd_ctl", "family": "inet"},
     "egress": {"engarde_table": "engarde", "wg_iface": "wg0", "default_mode": "relay_vpn"},
@@ -41,14 +41,14 @@ def test_config_with_fec_block_parsed():
     assert cfg.fec.loss_table[-1]["fec"] == "8:8"
 
 
-def test_config_parses_ovh_fec_url():
+def test_config_parses_relay_fec_url():
     d = dict(BASE)
     d["relay"] = dict(BASE["relay"]); d["relay"]["fec_url"] = "http://relay:9276/fec"
     cfg = M.load_config(_write(d))
     assert cfg.relay.fec_url == "http://relay:9276/fec"
 
 
-def test_config_ovh_fec_url_defaults_none():
+def test_config_relay_fec_url_defaults_none():
     cfg = M.load_config(_write(BASE))
     assert cfg.relay.fec_url is None
 

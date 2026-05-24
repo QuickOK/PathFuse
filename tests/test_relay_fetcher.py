@@ -16,8 +16,8 @@ def start_server(handler_factory):
 SBFD_PAYLOAD = {
     "timestamp": 1745889012.34,
     "sessions": {
-        "wan1_tmo":      {"session_id": 1, "state": "UP",   "rtt_ms": 51.2, "loss_pct": 0.0},
-        "wan2_starlink": {"session_id": 2, "state": "UP",   "rtt_ms": 49.9, "loss_pct": 0.0},
+        "wan1":      {"session_id": 1, "state": "UP",   "rtt_ms": 51.2, "loss_pct": 0.0},
+        "wan2": {"session_id": 2, "state": "UP",   "rtt_ms": 49.9, "loss_pct": 0.0},
     }
 }
 

@@ -74,8 +74,8 @@ def test_pick_dynamic_master_currently_down_falls_back_to_configured():
 # -- parse_default_gateway ---------------------------------------------------
 
 def test_parse_gateway_single_route():
-    j = '[{"dst":"default","gateway":"30.224.188.121","dev":"wan1","metric":200,"flags":[]}]'
-    assert M.parse_default_gateway(j) == "30.224.188.121"
+    j = '[{"dst":"default","gateway":"203.0.113.121","dev":"wan1","metric":200,"flags":[]}]'
+    assert M.parse_default_gateway(j) == "203.0.113.121"
 
 
 def test_parse_gateway_skips_routes_without_gateway():
@@ -95,14 +95,14 @@ def test_parse_gateway_empty_returns_none():
 # -- parse_managed_default ---------------------------------------------------
 
 MULTI = '''[
-  {"dst":"default","gateway":"30.224.188.121","dev":"wan1","metric":50,"flags":[]},
-  {"dst":"default","gateway":"30.224.188.121","dev":"wan1","protocol":"dhcp","prefsrc":"30.224.188.122","metric":200,"flags":[]},
+  {"dst":"default","gateway":"203.0.113.121","dev":"wan1","metric":50,"flags":[]},
+  {"dst":"default","gateway":"203.0.113.121","dev":"wan1","protocol":"dhcp","prefsrc":"203.0.113.122","metric":200,"flags":[]},
   {"dst":"default","gateway":"192.0.2.195","dev":"wan2","protocol":"dhcp","prefsrc":"192.0.2.194","metric":100,"flags":[]}
 ]'''
 
 
 def test_parse_managed_finds_metric_50_entry():
-    assert M.parse_managed_default(MULTI, metric=50) == ("wan1", "30.224.188.121")
+    assert M.parse_managed_default(MULTI, metric=50) == ("wan1", "203.0.113.121")
 
 
 def test_parse_managed_returns_none_when_absent():

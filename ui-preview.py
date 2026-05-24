@@ -53,7 +53,7 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
         "effective": eff,
         "wan_labels": {w: cfg.wans[w].label for w in cfg.wans},
         "engarde_server": f"{cfg.engarde.server_ip}:{cfg.engarde.server_port}",
-        "pi_local": {w: wo(local, w) for w in cfg.wans},
+        "client_local": {w: wo(local, w) for w in cfg.wans},
         "relay_remote": {
             "states": {w: wo(remote, w) for w in cfg.wans},
             "fetched_at": remote.fetched_at,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a Pi RTT trace through _dynamic_pick variants and report flap stats.
+"""Replay a client RTT trace through _dynamic_pick variants and report flap stats.
 
 Trace format: JSONL produced by /tmp/pi_trace.py (one row per 200ms poll).
 We thin to the ~1Hz publish cadence of sbfd (the controller's actual tick
@@ -217,7 +217,7 @@ def fmt(d):
             f"final={d['final_master']}")
 
 
-def synthesize_starlink_spike_trace(base_ticks, spike_intervals_s=(300, 400, 500),
+def synthesize_satellite_spike_trace(base_ticks, spike_intervals_s=(300, 400, 500),
                                      spike_duration_s=15.0, spike_rtt_ms=220.0):
     """Inject brief Satellite RTT spikes into a baseline trace.
 
@@ -286,7 +286,7 @@ def main():
         print(f"{name:<48} | {fmt(r)}")
 
     print()
-    spike_ticks = synthesize_starlink_spike_trace(ticks)
+    spike_ticks = synthesize_satellite_spike_trace(ticks)
     print(f"{'variant':<48} | + 3 Satellite spikes (15s @ 220ms), starting at wan2")
     print('-' * 110)
     for name, fn, margin, dwell in variants:
@@ -295,7 +295,7 @@ def main():
         print(f"{name:<48} | {fmt(r)}")
 
     print()
-    long_spike_ticks = synthesize_starlink_spike_trace(
+    long_spike_ticks = synthesize_satellite_spike_trace(
         ticks, spike_intervals_s=(150,), spike_duration_s=120.0, spike_rtt_ms=220.0)
     print(f"{'variant':<48} | + 1 LONG Satellite spike (120s @ 220ms), starting at wan2")
     print('-' * 110)

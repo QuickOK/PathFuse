@@ -6,7 +6,7 @@
   "sessions": [
     {
       "session_id": 1,
-      "name": "wan1_tmo",
+      "name": "wan1",
       "local_iface": "wan1",
       "peer_host": "198.51.100.10",
       "peer_port": 3785,
@@ -15,7 +15,7 @@
     },
     {
       "session_id": 2,
-      "name": "wan2_starlink",
+      "name": "wan2",
       "local_iface": "wan2",
       "peer_host": "198.51.100.10",
       "peer_port": 3786,

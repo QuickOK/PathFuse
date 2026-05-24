@@ -561,7 +561,7 @@ def apply_nft_diff(cfg: Config, actions: list) -> None:
 
 # -- Kernel default-route actuator -------------------------------------------
 # Beats DHCP-installed defaults (typically metric 100/200) by installing our
-# own at metric 50, so system traffic (tailscale, NTP, package mgrs) follows
+# own at metric 50, so system traffic (the management overlay, NTP, package mgrs) follows
 # the WAN sbfd-ctl considers best — not whichever WAN happened to be installed
 # first by the DHCP client.
 
@@ -1048,8 +1048,8 @@ def is_master_wan_down(published_state_path: str, master_wan: str) -> bool:
         snap = _json.loads(Path(published_state_path).read_text())
     except (FileNotFoundError, ValueError, OSError):
         return False
-    pi_local = snap.get("pi_local", {})
-    wan = pi_local.get(master_wan, {})
+    client_local = snap.get("client_local", {})
+    wan = client_local.get(master_wan, {})
     return wan.get("state") == "DOWN"
 
 
@@ -1244,10 +1244,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 if cfg.fec else None)
     fec_current_ratio = None
     fec_ratio_since: Optional[float] = None
-    fec_ovh_last = {"ok": False, "data": None, "error": "not yet fetched"}
-    fec_ovh_last_at = 0.0
-    fec_ovh_last_acked = None
-    fec_ovh_last_post_ts = None
+    fec_relay_last = {"ok": False, "data": None, "error": "not yet fetched"}
+    fec_relay_last_at = 0.0
+    fec_relay_last_acked = None
+    fec_relay_last_post_ts = None
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -1264,8 +1264,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 cfg.relay.state_url, cfg.relay.fetch_timeout_s, sid_to_wan)
             last_remote_at = loop_start
             if cfg.fec:
-                fec_ovh_last = fetch_relay_fec(cfg.relay.fec_url, cfg.relay.fetch_timeout_s)
-                fec_ovh_last_at = loop_start
+                fec_relay_last = fetch_relay_fec(cfg.relay.fec_url, cfg.relay.fetch_timeout_s)
+                fec_relay_last_at = loop_start
                 fec_reconcile_due = True
 
         eff = merge_effective(local, last_remote)
@@ -1386,10 +1386,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             # only (best-effort) — rate-limiting to the relay tick keeps a slow or
             # unreachable relay from blocking the 0.5s failover loop on every tick.
             if fec_reconcile_due and should_post_fec(
-                    fec_desired, fec_ovh_last_acked, fec_ovh_last_post_ts, loop_start):
+                    fec_desired, fec_relay_last_acked, fec_relay_last_post_ts, loop_start):
                 if post_relay_fec(cfg.relay.fec_url, fec_desired, cfg.relay.fetch_timeout_s):
-                    fec_ovh_last_acked = fec_desired
-                fec_ovh_last_post_ts = loop_start
+                    fec_relay_last_acked = fec_desired
+                fec_relay_last_post_ts = loop_start
 
         def _wan_obj(snap: StateSnapshot, w: str) -> dict:
             s = snap.per_wan.get(w) if snap.ok else None
@@ -1406,7 +1406,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             "effective": eff,
             "wan_labels": {w: cfg.wans[w].label for w in cfg.wans},
             "engarde_server": f"{cfg.engarde.server_ip}:{cfg.engarde.server_port}",
-            "pi_local": {w: _wan_obj(local, w) for w in cfg.wans},
+            "client_local": {w: _wan_obj(local, w) for w in cfg.wans},
             "relay_remote": {
                 "states": {w: _wan_obj(last_remote, w) for w in cfg.wans},
                 "fetched_at": last_remote.fetched_at,
@@ -1468,8 +1468,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                         "wire": (wire_tracker.snapshot(loop_start) if wire_tracker else None),
                     },
                     "relay_to_client": relay_fec_direction(
-                        fec_ovh_last, fec_ovh_last_at, loop_start,
-                        fec_desired, fec_ovh_last_acked),
+                        fec_relay_last, fec_relay_last_at, loop_start,
+                        fec_desired, fec_relay_last_acked),
                 },
             },
         }

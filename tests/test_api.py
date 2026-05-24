@@ -148,7 +148,7 @@ def test_validate_runtime_payload_rejects_bad_egress_mode():
 
 def test_post_runtime_accepts_egress_mode_when_master_up(cfg):
     Path(cfg.published_state).write_text(json.dumps({
-        "pi_local": {"wan1": {"state":"UP"}, "wan2": {"state":"UP"}},
+        "client_local": {"wan1": {"state":"UP"}, "wan2": {"state":"UP"}},
     }))
     stop = threading.Event()
     httpd = M.start_ui_server(cfg, stop)
@@ -178,7 +178,7 @@ def test_post_runtime_rejects_local_direct_when_master_down(cfg):
         egress_mode="relay_vpn", set_by="test", set_ts=1.0,
     ))
     Path(cfg.published_state).write_text(json.dumps({
-        "pi_local": {"wan1": {"state":"UP"}, "wan2": {"state":"DOWN"}},
+        "client_local": {"wan1": {"state":"UP"}, "wan2": {"state":"DOWN"}},
     }))
     stop = threading.Event()
     httpd = M.start_ui_server(cfg, stop)
@@ -201,9 +201,9 @@ def test_post_runtime_rejects_local_direct_when_master_down(cfg):
         stop.set(); httpd.shutdown()
 
 
-def test_post_runtime_warp_mode_unaffected_by_master_down(cfg):
+def test_post_runtime_relay_vpn_mode_unaffected_by_master_down(cfg):
     Path(cfg.published_state).write_text(json.dumps({
-        "pi_local": {"wan1": {"state":"UP"}, "wan2": {"state":"DOWN"}},
+        "client_local": {"wan1": {"state":"UP"}, "wan2": {"state":"DOWN"}},
     }))
     stop = threading.Event()
     httpd = M.start_ui_server(cfg, stop)
@@ -286,7 +286,7 @@ def test_get_api_desired_egress_503_when_state_not_published(cfg):
         stop.set(); httpd.shutdown()
 
 
-def test_run_controller_calls_engarde_actuator_with_warp_action(cfg, monkeypatch):
+def test_run_controller_calls_engarde_actuator_with_relay_vpn_action(cfg, monkeypatch):
     """Smoke: one tick of run_controller invokes apply_engarde_table_action with
     the relay_vpn action shape. Stops after a single tick via stop_event."""
     import threading as _t
@@ -295,7 +295,7 @@ def test_run_controller_calls_engarde_actuator_with_warp_action(cfg, monkeypatch
         seen.append(action)
     monkeypatch.setattr(M, "apply_engarde_table_action", fake_apply_engarde)
     monkeypatch.setattr(M, "read_engarde_table_default",
-                        lambda table: {"via": "1.2.3.4", "dev": "wan2"})  # currently wrong → expect a replace
+                        lambda table: {"via": "192.0.2.4", "dev": "wan2"})  # currently wrong → expect a replace
     monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
     monkeypatch.setattr(M, "list_current_drops", lambda c: [])
     monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
@@ -440,7 +440,7 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
     assert o2t["reconcile_pending"] is False
 
 
-def test_run_controller_disabled_and_ovh_unreachable(cfg_with_fec, monkeypatch):
+def test_run_controller_disabled_and_relay_unreachable(cfg_with_fec, monkeypatch):
     import threading as _t
     # Operator has disabled FEC via the runtime overlay.
     M.save_runtime_overlay(cfg_with_fec, M.RuntimeOverlay(fec_enabled=False, set_by="test", set_ts=1.0))
@@ -483,7 +483,7 @@ def test_run_controller_disabled_and_ovh_unreachable(cfg_with_fec, monkeypatch):
     assert o2t["reconcile_pending"] is True
 
 
-def test_run_controller_publishes_truck_wire(cfg_with_fec, monkeypatch):
+def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
     import threading as _t
     monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
     monkeypatch.setattr(M, "list_current_drops", lambda c: set())
@@ -514,7 +514,7 @@ def test_run_controller_publishes_truck_wire(cfg_with_fec, monkeypatch):
         {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False}
 
 
-def test_run_controller_truck_wire_none_without_tracker(cfg_with_fec, monkeypatch):
+def test_run_controller_client_wire_none_without_tracker(cfg_with_fec, monkeypatch):
     import threading as _t
     monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
     monkeypatch.setattr(M, "list_current_drops", lambda c: set())

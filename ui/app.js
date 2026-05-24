@@ -138,7 +138,7 @@ function lossClass(loss){
 
 /* ---------- master render ---------- */
 function render(s){
-  const wans     = Object.keys(s.pi_local || {});
+  const wans     = Object.keys(s.client_local || {});
   const active   = new Set(s.active_wans || []);
   const dyn      = s.dynamic || {};
   const masterWan = (s.mode === "master_backup")
@@ -214,7 +214,7 @@ function render(s){
   } else {
     syncEl.dataset.state = "degraded";
     syncVal.textContent  = "stale";
-    syncSub.textContent  = (s.relay_remote && s.relay_remote.error) ? "pi-local only" : "no remote";
+    syncSub.textContent  = (s.relay_remote && s.relay_remote.error) ? "client-local only" : "no remote";
   }
 
   /* link sub */
@@ -251,7 +251,7 @@ function render(s){
   /* Local-Direct + master-DOWN red badge */
   const warn = $("#egress-warn");
   if (warn) {
-    const masterState = (s.pi_local && s.pi_local[s.master_wan] || {}).state;
+    const masterState = (s.client_local && s.client_local[s.master_wan] || {}).state;
     const inLocalDirect = (s.egress_mode === "local_direct");
     warn.hidden = !(inLocalDirect && masterState === "DOWN");
   }
@@ -275,7 +275,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
   const wrap = $("#wan-list");
   wrap.innerHTML = "";
   wans.forEach((w) => {
-    const local  = s.pi_local[w] || {};
+    const local  = s.client_local[w] || {};
     const remote = (s.relay_remote && s.relay_remote.states && s.relay_remote.states[w]) || {};
     const eff    = (s.effective || {})[w] || "UNKNOWN";
     const label  = (s.wan_labels && s.wan_labels[w]) || w;
@@ -305,7 +305,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
     card.innerHTML = `
       <div class="wan-head">
         <div class="wan-name">${escapeHtml(label)}</div>
-        <div class="wan-iface">${escapeHtml(w)} · pi ${escapeHtml(local.state||"?")} · relay ${escapeHtml(remote.state||"?")}</div>
+        <div class="wan-iface">${escapeHtml(w)} · client ${escapeHtml(local.state||"?")} · relay ${escapeHtml(remote.state||"?")}</div>
       </div>
       <div class="wan-status">
         <span class="pip ${sCls}"></span>${escapeHtml(eff)}
@@ -332,7 +332,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
 function renderSignalDiagram(s, wans, active, masterWan){
   const eff = s.effective || {};
   const W = 600, H = 260;
-  const truckX = 96, sbfdX = 300, engX = 504;
+  const clientX = 96, sbfdX = 300, engX = 504;
   const yMid = H / 2;
   const yStep = wans.length > 1 ? Math.min(80, (H-60)/(wans.length+1)) : 0;
   const yStart = yMid - ((wans.length-1)*yStep)/2;
@@ -350,8 +350,8 @@ function renderSignalDiagram(s, wans, active, masterWan){
     const isActive = active.has(w);
     const extra = (isMaster ? " master" : "") + (!isActive ? " dropped" : "");
 
-    const midX1 = (truckX + sbfdX)/2;
-    const path1 = `M ${truckX} ${yMid} C ${midX1} ${yMid} ${midX1} ${y} ${sbfdX-42} ${y}`;
+    const midX1 = (clientX + sbfdX)/2;
+    const path1 = `M ${clientX} ${yMid} C ${midX1} ${yMid} ${midX1} ${y} ${sbfdX-42} ${y}`;
     const linkOk = state === "UP" && isActive;
     const midX2 = (sbfdX + engX)/2;
     const path2 = `M ${sbfdX+42} ${y} C ${midX2} ${y} ${midX2} ${yMid} ${engX-46} ${yMid}`;
@@ -526,9 +526,9 @@ function renderFec(s){
       eff.textContent = "FEC not configured";
     } else {
       const o = dirs.relay_to_client || {};
-      const ovhTxt = !o.ok ? "relay sync pending"
+      const relayTxt = !o.ok ? "relay sync pending"
                    : (o.reconcile_pending ? "syncing relay…" : "relay synced");
-      eff.textContent = `effective: ${fec.desired_enabled ? "adaptive" : "disabled"} · ${ovhTxt}`;
+      eff.textContent = `effective: ${fec.desired_enabled ? "adaptive" : "disabled"} · ${relayTxt}`;
     }
   }
   $$('input[name="fec_enabled"]').forEach(r => r.disabled = !fec.configured);

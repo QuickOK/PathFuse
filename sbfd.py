@@ -2,7 +2,7 @@
 """
 sbfd - software BFD-equivalent liveness daemon.
 
-Symmetric: same binary runs on Pi (client) and relay (server).
+Symmetric: same binary runs on the client and relay (server).
 One UDP socket per configured session. Each session is a peering
 between (local_iface, peer_addr:port) identified by a session_id.
 
@@ -379,7 +379,7 @@ def start_state_listener(cfg: DaemonConfig):
         return None
     # IP_FREEBIND lets us bind to an address that doesn't yet exist on any
     # interface — e.g. the management overlay's 100.x address before the overlay daemon has finished
-    # bringing tailscale0 up at boot. Without this, sbfd loses the boot race
+    # bringing the overlay interface up at boot. Without this, sbfd loses the boot race
     # against the overlay daemon and silently fails to expose /state until restart.
     class FreebindHTTPServer(ThreadingHTTPServer):
         def server_bind(self):
