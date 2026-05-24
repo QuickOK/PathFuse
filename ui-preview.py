@@ -98,7 +98,7 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-c", "--config", default="sbfd-ctl.config.json")
+    ap.add_argument("-c", "--config", default="config/sbfd-ctl.example.json")
     ap.add_argument("-l", "--listen", default=None,
                     help="override ui_listen, e.g. 0.0.0.0:8181")
     args = ap.parse_args()

@@ -1,0 +1,27 @@
+{
+  "bind_host": "0.0.0.0",
+  "bind_port": 3784,
+  "state_file": "/run/sbfd/state.json",
+  "state_write_interval_s": 1.0,
+  "state_listen": "100.64.0.2:9275",
+  "sessions": [
+    {
+      "session_id": 1,
+      "name": "wan1_tmo",
+      "local_iface": null,
+      "peer_host": "0.0.0.0",
+      "peer_port": 3785,
+      "tx_interval_ms": 500,
+      "detect_mult": 3
+    },
+    {
+      "session_id": 2,
+      "name": "wan2_starlink",
+      "local_iface": null,
+      "peer_host": "0.0.0.0",
+      "peer_port": 3786,
+      "tx_interval_ms": 500,
+      "detect_mult": 3
+    }
+  ]
+}

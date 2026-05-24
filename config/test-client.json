@@ -1,0 +1,17 @@
+{
+  "bind_host": "127.0.0.1",
+  "bind_port": 4884,
+  "state_file": "/tmp/sbfd-test-client-state.json",
+  "state_write_interval_s": 0.5,
+  "sessions": [
+    {
+      "session_id": 1,
+      "name": "loop1",
+      "local_iface": null,
+      "peer_host": "127.0.0.1",
+      "peer_port": 4785,
+      "tx_interval_ms": 200,
+      "detect_mult": 3
+    }
+  ]
+}
