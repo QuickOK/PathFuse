@@ -1,0 +1,33 @@
+{
+  "role": "client",
+  "relay_public_ip": "198.51.100.10",
+  "relay_overlay_ip": "100.64.0.2",
+  "client_overlay_ip": "100.64.0.3",
+  "overlay_iface": "tun-mgmt0",
+  "wg": {
+    "subnet": "10.66.66.0/24",
+    "client_ip": "10.66.66.2",
+    "relay_ip": "10.66.66.1",
+    "listen_port": 51820,
+    "mtu": 1280,
+    "relay_pubkey": "REPLACE_WITH_RELAY_WG_PUBKEY",
+    "client_pubkey": "REPLACE_WITH_CLIENT_WG_PUBKEY"
+  },
+  "wans": {
+    "wan1": { "iface": "eth0", "session_id": 1, "label": "WAN A" },
+    "wan2": { "iface": "eth1", "session_id": 2, "label": "WAN B" }
+  },
+  "ports": {
+    "sbfd_state": 9275, "fec_http": 9276, "ui": 8081,
+    "engarde": 59402, "udpspeeder_in": 59401, "udpspeeder_client": 59411,
+    "udpspeeder_server": 59412, "wg": 51820, "sbfd_base": 3784
+  },
+  "paths": {
+    "sbfd_opt": "/opt/sbfd", "sbfd_etc": "/etc/sbfd",
+    "sbfdctl_opt": "/opt/sbfd-ctl", "sbfdctl_etc": "/etc/sbfd-ctl",
+    "udpspeeder_etc": "/etc/udpspeeder", "udpspeeder_fec_etc": "/etc/udpspeeder-fec",
+    "speederv2_bin": "/usr/local/bin/speederv2"
+  },
+  "users": { "sbfd": "sbfd", "sbfdctl": "sbfd-ctl" },
+  "egress_default": "relay_vpn"
+}

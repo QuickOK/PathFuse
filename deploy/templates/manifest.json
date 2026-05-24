@@ -1,0 +1,16 @@
+[
+  {"template":"systemd/sbfd-server.service.tmpl","roles":["relay"],"dest":"/etc/systemd/system/sbfd.service","mode":"0644"},
+  {"template":"systemd/sbfd-client.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/sbfd.service","mode":"0644"},
+  {"template":"systemd/sbfd-ctl.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/sbfd-ctl.service","mode":"0644"},
+  {"template":"systemd/udpspeeder-client.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/udpspeeder-client.service","mode":"0644"},
+  {"template":"systemd/udpspeeder-server.service.tmpl","roles":["relay"],"dest":"/etc/systemd/system/udpspeeder-server.service","mode":"0644"},
+  {"template":"systemd/udpspeeder-fec.service.tmpl","roles":["relay"],"dest":"/etc/systemd/system/udpspeeder-fec.service","mode":"0644"},
+  {"template":"config/sbfd.client.config.json.tmpl","roles":["client"],"dest":"/etc/sbfd/config.json","mode":"0644"},
+  {"template":"config/sbfd.server.config.json.tmpl","roles":["relay"],"dest":"/etc/sbfd/config.json","mode":"0644"},
+  {"template":"config/sbfd-ctl.config.json.tmpl","roles":["client"],"dest":"/etc/sbfd-ctl/config.json","mode":"0644"},
+  {"template":"config/udpspeeder-fec.config.json.tmpl","roles":["relay"],"dest":"/etc/udpspeeder-fec/config.json","mode":"0644"},
+  {"template":"wireguard/wg0.client.conf.tmpl","roles":["client"],"dest":"/etc/wireguard/wg0.conf","mode":"0600"},
+  {"template":"wireguard/wg0.relay.conf.tmpl","roles":["relay"],"dest":"/etc/wireguard/wg0.conf","mode":"0600"},
+  {"template":"nftables/pathfuse-relay.nft.tmpl","roles":["relay"],"dest":"/etc/nftables.d/pathfuse.nft","mode":"0644"},
+  {"template":"journald/pathfuse-persistent.conf.tmpl","roles":["client"],"dest":"/etc/systemd/journald.conf.d/pathfuse-persistent.conf","mode":"0644"}
+]
