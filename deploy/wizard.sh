@@ -2,6 +2,7 @@
 # PathFuse setup wizard — entry-point chooser. Routes to deploy/scripts/* (never duplicates
 # their mechanics). Works with zero Claude. For agent-driven setup, choose a Claude mode and it
 # points you at the /pathfuse-setup skill. --check prints the plan and changes nothing.
+# (no `-e`: a skipped or failing confirm step should not abort the whole wizard.)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS="$HERE/scripts"
@@ -34,19 +35,31 @@ plan_for(){
 }
 
 run_manual(){
-  local role="$1" tgt="${2:-}" pfx=""
-  [ -n "$tgt" ] && pfx="ssh $tgt "
+  local role="$1" tgt="${2:-}"
   plan_for "$role" "$tgt"
   echo "Each step is confirmed before it runs."
-  for step in \
-    "$SCRIPTS/detect-os.sh" \
-    "$SCRIPTS/fetch-deps.sh --dry-run" \
-    "$SCRIPTS/gen-secrets.sh --dry-run" \
-    "$SCRIPTS/install.sh -c $HERE/values.json --dry-run" \
-    "$SCRIPTS/install.sh -c $HERE/values.json" \
-    "$SCRIPTS/healthcheck.sh -c $HERE/values.json"; do
-    a=$(ask "run: ${pfx}${step}  ? [y/N]")
-    case "$a" in y|Y) eval "${pfx}${step}";; *) echo "skipped";; esac
+  # Fixed internal commands (script paths + fixed flags) — never user free-text.
+  local -a steps=(
+    "$SCRIPTS/detect-os.sh"
+    "$SCRIPTS/fetch-deps.sh --dry-run"
+    "$SCRIPTS/gen-secrets.sh --dry-run"
+    "$SCRIPTS/install.sh -c $HERE/values.json --dry-run"
+    "$SCRIPTS/install.sh -c $HERE/values.json"
+    "$SCRIPTS/healthcheck.sh -c $HERE/values.json"
+  )
+  local step a
+  for step in "${steps[@]}"; do
+    if [ -n "$tgt" ]; then
+      a=$(ask "run on $tgt: $step  ? [y/N]")
+      # $tgt is a single quoted argument to ssh (no local shell injection from the
+      # operator-typed target); $step is the fixed remote command string.
+      case "$a" in y|Y) ssh "$tgt" "$step";; *) echo "skipped";; esac
+    else
+      a=$(ask "run: $step  ? [y/N]")
+      # intentional word-split of $step into argv; contents are fixed, not user input
+      # shellcheck disable=SC2086
+      case "$a" in y|Y) $step;; *) echo "skipped";; esac
+    fi
   done
 }
 
