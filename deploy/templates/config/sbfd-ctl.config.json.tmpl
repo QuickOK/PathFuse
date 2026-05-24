@@ -1,0 +1,53 @@
+{
+  "wans": $wans_json,
+  "relay": {
+    "state_url": "http://$relay_overlay_ip:$ports_sbfd_state/state",
+    "fec_url": "http://$relay_overlay_ip:$ports_fec_http/fec",
+    "fetch_interval_s": 1.0,
+    "fetch_timeout_s": 2.0
+  },
+  "engarde": {
+    "server_ip": "$relay_public_ip",
+    "server_port": 59402,
+    "admin_url": "http://127.0.0.1:8080/api/v1/get-list"
+  },
+  "nft": {
+    "table": "sbfd_ctl",
+    "family": "inet"
+  },
+  "egress": {
+    "engarde_table": "engarde",
+    "wg_iface": "wg0",
+    "default_mode": "$egress_default"
+  },
+  "policy": {
+    "default_mode": "full",
+    "default_master_policy": "static_primary",
+    "default_master_wan": "wan2",
+    "failback_hold_s": 30,
+    "manage_default_route": true
+  },
+  "ui": {
+    "listen": "0.0.0.0:$ports_ui"
+  },
+  "sbfd_local_state": "/run/sbfd/state.json",
+  "runtime_state": "/run/sbfd-ctl/runtime.json",
+  "persist_state": "/var/lib/sbfd-ctl/runtime.json",
+  "published_state": "/run/sbfd-ctl/state.json",
+  "fec": {
+    "enabled": true,
+    "fifo": "/run/udpspeeder/client.fifo",
+    "loss_table": [
+      {"max_loss_pct": 0.5,  "fec": "8:0"},
+      {"max_loss_pct": 2.0,  "fec": "8:2"},
+      {"max_loss_pct": 5.0,  "fec": "8:4"},
+      {"max_loss_pct": 10.0, "fec": "8:6"},
+      {"max_loss_pct": 100.0,"fec": "8:8"}
+    ],
+    "ramp_up_ticks": 2,
+    "ramp_down_hold_s": 20,
+    "full_mode_backoff_fec": "8:0",
+    "full_min_up_wans": 2,
+    "wire_unit": "udpspeeder-client"
+  }
+}

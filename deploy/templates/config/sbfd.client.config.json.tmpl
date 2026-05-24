@@ -1,0 +1,26 @@
+{
+  "bind_host": "0.0.0.0",
+  "bind_port": $ports_sbfd_base,
+  "state_file": "/run/sbfd/state.json",
+  "state_write_interval_s": 1.0,
+  "sessions": [
+    {
+      "session_id": 1,
+      "name": "wan1",
+      "local_iface": "wan1",
+      "peer_host": "$relay_public_ip",
+      "peer_port": 3785,
+      "tx_interval_ms": 500,
+      "detect_mult": 3
+    },
+    {
+      "session_id": 2,
+      "name": "wan2",
+      "local_iface": "wan2",
+      "peer_host": "$relay_public_ip",
+      "peer_port": 3786,
+      "tx_interval_ms": 500,
+      "detect_mult": 3
+    }
+  ]
+}
