@@ -1,0 +1,11 @@
+[Interface]
+Address = $wg_client_ip/24
+MTU = $wg_mtu
+PostUp = wg set %i private-key /etc/wireguard/wg0.key
+
+[Peer]
+# relay peer
+PublicKey = $wg_relay_pubkey
+Endpoint = 127.0.0.1:$ports_udpspeeder_client
+AllowedIPs = $wg_relay_ip/32
+PersistentKeepalive = 25

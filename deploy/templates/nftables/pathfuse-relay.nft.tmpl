@@ -1,0 +1,6 @@
+# PathFuse relay — allow management-overlay control ports + data ports.
+# Loaded as a drop-in; install.sh MERGES these into the existing inet filter input
+# chain (it does not flush the ruleset).
+add rule inet filter input iifname "$overlay_iface" tcp dport $ports_sbfd_state accept
+add rule inet filter input iifname "$overlay_iface" tcp dport $ports_fec_http accept
+add rule inet filter input udp dport $ports_engarde accept
