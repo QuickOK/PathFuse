@@ -93,10 +93,10 @@
 
         <div class="ctl-block" id="policy-block">
           <div class="ctl-label">Master assignment</div>
-          <label class="ctl-radio"><input type="radio" name="policy" value="static_primary"><span>Satellite master <em>default</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="policy" value="static_primary"><span>Primary uplink <em>default</em></span></label>
           <label class="ctl-radio"><input type="radio" name="policy" value="dynamic"><span>Dynamic · best link
             <span class="tip"
-                  title="Picks master by lower EWMA RTT, with hysteresis to avoid flapping on transient Satellite spikes. Sustained loss outranks RTT for swap decisions.">i</span></span></label>
+                  title="Picks master by lower EWMA RTT, with hysteresis to avoid flapping on transient latency spikes. Sustained loss outranks RTT for swap decisions.">i</span></span></label>
           <label class="ctl-radio"><input type="radio" name="policy" value="static_configured"><span>Operator choice
             <select id="master-wan" class="ctl-select"></select></span></label>
         </div>

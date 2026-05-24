@@ -42,9 +42,9 @@ class FecState:
 
 
 def start_fec_http(listen, state, stop_event=None):
-    """Bind GET/POST /fec for the relay FEC controller. the management overlay-bound via
-    IP_FREEBIND (wins the boot race vs the overlay daemon, mirrors sbfd.py's /state
-    listener). Returns the bound httpd, or None if listen is falsy / bind fails."""
+    """Bind GET/POST /fec for the relay FEC controller. Bound to the management-overlay
+    address via IP_FREEBIND (wins the boot race vs the overlay daemon, mirrors sbfd.py's
+    /state listener). Returns the bound httpd, or None if listen is falsy / bind fails."""
     if not listen:
         return None
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
