@@ -35,3 +35,29 @@ def test_render_check_passes_for_all_roles():
     assert res.returncode == 0, "render --check failed:\n" + res.stdout + res.stderr
     assert "client: rendered" in res.stdout.replace("role=", "")
     assert "relay: rendered" in res.stdout.replace("role=", "")
+
+
+def test_sbfd_sessions_client_uses_iface_and_relay_ip():
+    r = _render()
+    v = {"role": "client", "relay_public_ip": "198.51.100.10", "ports": {"sbfd_base": 3784},
+         "wans": {"wan1": {"iface": "eth0", "session_id": 1}, "fiveg": {"iface": "wwan0", "session_id": 2}}}
+    s = r.sbfd_sessions(v, "client")
+    assert {x["name"]: x["local_iface"] for x in s} == {"wan1": "eth0", "fiveg": "wwan0"}
+    assert all(x["peer_host"] == "198.51.100.10" for x in s)
+    assert {x["session_id"]: x["peer_port"] for x in s} == {1: 3785, 2: 3786}
+
+
+def test_sbfd_sessions_server_null_iface_any_peer():
+    r = _render()
+    v = {"role": "relay", "relay_public_ip": "198.51.100.10", "ports": {"sbfd_base": 3784},
+         "wans": {"wan1": {"iface": "eth0", "session_id": 1}}}
+    s = r.sbfd_sessions(v, "relay")
+    assert s[0]["local_iface"] is None and s[0]["peer_host"] == "0.0.0.0"
+
+
+def test_sbfd_sessions_count_agnostic_three_wans():
+    r = _render()
+    v = {"role": "client", "relay_public_ip": "198.51.100.10", "ports": {"sbfd_base": 3784},
+         "wans": {"a": {"iface": "e0", "session_id": 1}, "b": {"iface": "e1", "session_id": 2},
+                  "c": {"iface": "e2", "session_id": 3}}}
+    assert len(r.sbfd_sessions(v, "client")) == 3

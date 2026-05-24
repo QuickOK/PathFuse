@@ -38,11 +38,34 @@ def render_text(text, tvars):
 def manifest():
     return json.loads((HERE / "templates" / "manifest.json").read_text())
 
+def sbfd_sessions(values, role):
+    """Build the sbfd daemon's per-WAN sessions from values['wans'] so the daemon
+    config tracks ANY number of links with their real interfaces (not a fixed pair).
+    Client sessions bind to the WAN iface (SO_BINDTODEVICE) and target the relay's
+    public IP; relay sessions bind to any iface and accept from any peer. The per-
+    session port is bind_base + session_id (symmetric peer_port)."""
+    base = int(values["ports"]["sbfd_base"])
+    out = []
+    for name, w in values["wans"].items():
+        sid = int(w["session_id"])
+        out.append({
+            "session_id": sid,
+            "name": name,
+            "local_iface": (w["iface"] if role == "client" else None),
+            "peer_host": (values["relay_public_ip"] if role == "client" else "0.0.0.0"),
+            "peer_port": base + sid,
+            "tx_interval_ms": 500,
+            "detect_mult": 3,
+        })
+    return out
+
 def render_all(values, out_dir):
     """Render every manifest template whose roles include values['role'] into out_dir
     (mirroring each entry's dest path under out_dir). Returns list of (entry, out_path)."""
     role = values["role"]
     tvars = template_vars(values)
+    # Role-aware computed blocks (the sbfd daemon's sessions are generated from wans).
+    tvars["sbfd_sessions_json"] = json.dumps(sbfd_sessions(values, role))
     results = []
     for entry in manifest():
         if role not in entry["roles"]:

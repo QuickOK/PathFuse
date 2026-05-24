@@ -1,11 +1,10 @@
 # udpspeeder-client.service — install to /etc/systemd/system/ on the client.
 # FEC client: wg0 sends here; we encode and forward to engarde-client.
 #
-# IMPORTANT: do NOT start this while wg0 still points Endpoint at engarde-client
-# (127.0.0.1:$ports_udpspeeder_in). engarde-client latches its single "wireguard" source to
-# whatever last sent to :$ports_udpspeeder_in (engarde-client main.go:273), so a running
-# udpspeeder-client would hijack the live tunnel's return path. Start it only
-# as part of the cutover, after wg0's Endpoint is moved to :$ports_udpspeeder_client.
+# ORDERING: start this only AFTER engarde-client is up. engarde-client latches its single
+# "wireguard" return-path source to whatever last sent to its input port
+# (127.0.0.1:$ports_udpspeeder_in), so udpspeeder-client must come up after engarde-client,
+# never before. (wg0's Endpoint is 127.0.0.1:$ports_udpspeeder_client from the start in this kit.)
 [Unit]
 Description=UDPspeeder FEC client (client, between wg0 and engarde-client)
 After=network-online.target engarde-client.service

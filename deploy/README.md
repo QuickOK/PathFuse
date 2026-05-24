@@ -11,7 +11,11 @@ coordination and an agent-driven setup come in the wizard (separate); this is th
 deploy/scripts/detect-os.sh        # needs: systemd, python3, nft, wg
 deploy/scripts/fetch-deps.sh       # wireguard-tools + build speederv2 + engarde (see notes it prints)
 ```
-You must separately provide two operator-chosen pieces (PathFuse only integrates with them):
+You must separately provide three operator-managed pieces (PathFuse integrates with them but
+does not ship or manage them):
+- **engarde** — the multipath relay tunnel. `fetch-deps.sh` builds the `engarde-client` /
+  `engarde-server` binaries, but you install + configure engarde yourself per engarde's own
+  docs (its `engarde.yml` and its service). This kit does **not** ship engarde unit files.
 - a **management overlay** (any VPN/mesh, e.g. a WireGuard mesh) giving the relay a stable
   address the client can reach for the `/state` (9275) and `/fec` (9276) control endpoints;
 - an **egress VPN/overlay at the relay** if you want `relay_vpn` egress mode (otherwise use
@@ -56,18 +60,22 @@ does **not** auto-start services (the client has a cutover ordering constraint �
 
 **Relay:**
 ```bash
-sudo systemctl enable --now wg-quick@wg0 engarde-server udpspeeder-server udpspeeder-fec sbfd
+sudo systemctl enable --now wg-quick@wg0
+# bring up YOUR engarde-server (operator-managed; see step 0), then the PathFuse units:
+sudo systemctl enable --now udpspeeder-server udpspeeder-fec sbfd
 sudo nft -f /etc/nftables.d/pathfuse.nft     # merge the control-port allows into your ruleset
 ```
 
-**Client (the cutover):**
+**Client (start order):**
 ```bash
-sudo systemctl enable --now wg-quick@wg0 engarde-client
-# wg0's Endpoint already points at the local udpspeeder-client (127.0.0.1:59411) per the
-# rendered config; start the FEC client AFTER engarde-client is up:
+sudo systemctl enable --now wg-quick@wg0
+# bring up YOUR engarde-client (operator-managed; see step 0) FIRST, then the FEC client:
 sudo systemctl enable --now udpspeeder-client
 sudo systemctl enable --now sbfd sbfd-ctl
 ```
+> wg0's Endpoint is the local udpspeeder-client (`127.0.0.1:59411`) from the start in this kit.
+> Start `udpspeeder-client` only **after** engarde-client is up — engarde-client latches its
+> single return path to whatever last sent to its input port, so order matters.
 > Why the order: engarde-client latches its single return path to whatever last sent to its
 > input port, so `udpspeeder-client` must start after `engarde-client`, never before.
 
