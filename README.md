@@ -26,7 +26,8 @@ existing multipath relay tunnel (engarde), WireGuard, and UDPspeeder:
 1. **Run / read the code (this repo).** Quickstart below.
 2. **Deploy it** — run `deploy/wizard.sh` (manual, no Claude needed), or open this repo in Claude
    Code and run `/pathfuse-setup` for guided / SSH-assisted setup. Details in `deploy/README.md`.
-3. **Understand the architecture** — see `docs/`. *(Coming in a later release.)*
+3. **Understand the architecture** — see [`docs/architecture.md`](docs/architecture.md) and
+   [`docs/design-notes.md`](docs/design-notes.md).
 
 ## Quickstart
 
