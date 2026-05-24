@@ -381,7 +381,7 @@ function renderSignalDiagram(s, wans, active, masterWan){
   const egressMode = s.egress_mode || "relay_vpn";
   const exit = egressMode === "relay_vpn"        ? { tag: "→ egress relay-VPN",  sub: "client → engarde → egress relay-VPN" }
              : egressMode === "relay_direct"  ? { tag: "→ relay WAN",  sub: "client → engarde → relay WAN" }
-             : egressMode === "local_direct"? { tag: "BYPASSED",   sub: "client → cab WAN (engarde bypassed)" }
+             : egressMode === "local_direct"? { tag: "BYPASSED",   sub: "client → local WAN (engarde bypassed)" }
              :                                { tag: "?",          sub: `unknown egress: ${egressMode}` };
   const flowSub = document.getElementById("signal-flow-sub");
   if (flowSub) flowSub.textContent = exit.sub;
