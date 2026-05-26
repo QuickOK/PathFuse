@@ -116,10 +116,13 @@
 
         <div class="ctl-block" id="fec-block">
           <div class="ctl-label">FEC
-            <span class="tip" title="Adaptive forward error correction over the engarde tunnel. Disabled forces the off tier (8:0) in BOTH directions; the udpspeeder process keeps running.">i</span>
+            <span class="tip" title="Forward error correction over the engarde tunnel. Off forces 8:0 in both directions; Fixed holds the selected ratio; Adaptive scales to measured loss; Floor + adaptive keeps a 20:1 (~5%) floor and ramps up under loss.">i</span>
           </div>
-          <label class="ctl-radio"><input type="radio" name="fec_enabled" value="on"><span>Adaptive <em>default</em></span></label>
-          <label class="ctl-radio"><input type="radio" name="fec_enabled" value="off"><span>Disabled <em>force 8:0</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="fec_mode" value="min_adaptive"><span>Floor + adaptive <em>default</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="fec_mode" value="adaptive"><span>Adaptive</span></label>
+          <label class="ctl-radio"><input type="radio" name="fec_mode" value="fixed"><span>Fixed
+            <select id="fec-fixed-ratio" class="ctl-select" disabled></select></span></label>
+          <label class="ctl-radio"><input type="radio" name="fec_mode" value="off"><span>Off <em>force 8:0</em></span></label>
           <div class="fec-effective" id="fec-effective">—</div>
         </div>
 

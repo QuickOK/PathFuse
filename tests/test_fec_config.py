@@ -68,3 +68,44 @@ def test_fec_wire_unit_override():
     cfg = M.load_config(_write(d))
     assert cfg.fec.wire_unit == "udpspeeder-client@client"
     assert cfg.fec.wire_stale_after_s == 45.0
+
+
+# ---------- FEC mode schema ----------
+import fec_control as F
+
+
+def test_fec_mode_defaults_to_min_adaptive_when_absent():
+    # New configs (no `mode`, no legacy `enabled`) get the new default.
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo"}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.mode == F.MODE_MIN_ADAPTIVE
+    assert cfg.fec.fixed_ratio == F.DEFAULT_FIXED_RATIO
+    assert cfg.fec.floor_ratio == F.DEFAULT_FLOOR_RATIO
+
+
+def test_fec_mode_explicit_wins():
+    d = dict(BASE)
+    d["fec"] = {"enabled": True, "fifo": "/run/udpspeeder/client.fifo",
+                "mode": "adaptive", "fixed_ratio": "8:2", "floor_ratio": "8:1"}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.mode == "adaptive"
+    assert cfg.fec.fixed_ratio == "8:2"
+    assert cfg.fec.floor_ratio == "8:1"
+
+
+def test_fec_legacy_enabled_true_maps_to_adaptive():
+    # An older config with enabled=true and no mode field preserves the explicit
+    # choice as adaptive rather than silently lifting it to the new min_adaptive
+    # default.
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "enabled": True}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.mode == F.MODE_ADAPTIVE
+
+
+def test_fec_legacy_enabled_false_maps_to_off():
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "enabled": False}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.mode == F.MODE_OFF

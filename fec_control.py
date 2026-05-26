@@ -16,6 +16,23 @@ DEFAULT_LOSS_TABLE = [
     {"max_loss_pct": 100.0, "fec": "8:8"},
 ]
 
+# Operator-selectable FEC modes.
+#   off          - force the off tier (8:0), independent of loss
+#   fixed        - hold a single operator-chosen ratio
+#   adaptive     - scale ratio to measured loss via the loss table (idle = 8:0)
+#   min_adaptive - same as adaptive but the idle/backoff tier is replaced with
+#                  a small always-on floor (default 20:1 = ~5% overhead)
+MODE_OFF = "off"
+MODE_FIXED = "fixed"
+MODE_ADAPTIVE = "adaptive"
+MODE_MIN_ADAPTIVE = "min_adaptive"
+ALL_MODES = (MODE_OFF, MODE_FIXED, MODE_ADAPTIVE, MODE_MIN_ADAPTIVE)
+DEFAULT_MODE = MODE_MIN_ADAPTIVE
+DEFAULT_FLOOR_RATIO = "20:1"
+DEFAULT_FIXED_RATIO = "20:1"
+OFF_RATIO = "8:0"
+FIXED_RATIO_PRESETS = ("20:1", "8:1", "8:2", "8:4", "8:6", "8:8")
+
 
 def parse_ratio(s):
     a, b = s.split(":")
@@ -86,6 +103,30 @@ def step_level(target_level, rt, hyst, now):
             return FecRuntime(target_level, 0, now), True
         return FecRuntime(cur, 0, rt.last_change_ts), False
     return FecRuntime(cur, 0, rt.last_change_ts), False
+
+
+def apply_mode(mode, adaptive_ratio, fixed_ratio=DEFAULT_FIXED_RATIO,
+               floor_ratio=DEFAULT_FLOOR_RATIO):
+    """Map (mode, adaptive_ratio) → the ratio actually sent to UDPspeeder.
+
+    adaptive_ratio is whatever the loss-driven logic chose (e.g. level_to_ratio
+    over the loss table). For 'off' and 'fixed' it is ignored; for
+    'min_adaptive' it's lifted to floor_ratio when it would be 8:0.
+    """
+    if mode == MODE_OFF:
+        return OFF_RATIO
+    if mode == MODE_FIXED:
+        return fixed_ratio
+    if mode == MODE_MIN_ADAPTIVE and adaptive_ratio == OFF_RATIO:
+        return floor_ratio
+    return adaptive_ratio
+
+
+def normalize_mode(value):
+    """Coerce arbitrary input to a valid mode string, falling back to DEFAULT_MODE."""
+    if isinstance(value, str) and value in ALL_MODES:
+        return value
+    return DEFAULT_MODE
 
 
 def fifo_command(ratio):

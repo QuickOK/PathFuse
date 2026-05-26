@@ -39,6 +39,9 @@
   "published_state": "/run/sbfd-ctl/state.json",
   "fec": {
     "enabled": true,
+    "mode": "min_adaptive",
+    "fixed_ratio": "20:1",
+    "floor_ratio": "20:1",
     "fifo": "/run/udpspeeder/client.fifo",
     "loss_table": [
       {"max_loss_pct": 0.5,  "fec": "8:0"},

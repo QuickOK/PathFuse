@@ -16,21 +16,58 @@ import fec_report
 
 class FecState:
     """Thread-safe holder shared between the control loop and the HTTP server.
-    The loop sets the published snapshot; POST /fec sets desired_enabled."""
+    The loop sets the published snapshot; POST /fec sets desired mode/ratio."""
 
-    def __init__(self, enabled=True):
+    def __init__(self, mode=None, fixed_ratio=None, enabled=True):
+        # Back-compat: an explicit enabled=False starts the relay in MODE_OFF
+        # so callers that only know the legacy boolean still get sensible
+        # behavior.
         self._lock = threading.Lock()
-        self._enabled = bool(enabled)
-        self._snapshot = {"enabled": bool(enabled), "ratio": None, "level": 0,
-                          "driving_loss_pct": None, "since": None, "wire": None}
+        if mode is None:
+            mode = (fec_control.MODE_ADAPTIVE if enabled
+                    else fec_control.MODE_OFF)
+        self._mode = fec_control.normalize_mode(mode)
+        self._fixed_ratio = fixed_ratio or fec_control.DEFAULT_FIXED_RATIO
+        self._snapshot = {
+            "enabled": self._mode != fec_control.MODE_OFF,
+            "mode": self._mode,
+            "fixed_ratio": self._fixed_ratio,
+            "ratio": None,
+            "level": 0,
+            "driving_loss_pct": None,
+            "since": None,
+            "wire": None,
+        }
 
     def get_enabled(self):
         with self._lock:
-            return self._enabled
+            return self._mode != fec_control.MODE_OFF
 
     def set_enabled(self, value):
         with self._lock:
-            self._enabled = bool(value)
+            self._mode = (fec_control.MODE_ADAPTIVE if bool(value)
+                          else fec_control.MODE_OFF)
+
+    def get_mode(self):
+        with self._lock:
+            return self._mode
+
+    def set_mode(self, mode):
+        with self._lock:
+            self._mode = fec_control.normalize_mode(mode)
+
+    def get_fixed_ratio(self):
+        with self._lock:
+            return self._fixed_ratio
+
+    def set_fixed_ratio(self, ratio):
+        with self._lock:
+            self._fixed_ratio = ratio
+
+    def get_desired(self):
+        """Return (mode, fixed_ratio) atomically."""
+        with self._lock:
+            return self._mode, self._fixed_ratio
 
     def publish(self, **fields):
         with self._lock:
@@ -77,10 +114,36 @@ def start_fec_http(listen, state, stop_event=None):
                 payload = json.loads(self.rfile.read(length) or b"{}")
             except ValueError:
                 self._json(400, {"error": "invalid JSON"}); return
-            if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+            if not isinstance(payload, dict):
+                self._json(400, {"error": "payload must be an object"}); return
+            mode_in = payload.get("mode")
+            enabled_in = payload.get("enabled")
+            fixed_in = payload.get("fixed_ratio")
+            if mode_in is None and enabled_in is None:
+                self._json(400, {"error": "mode or enabled required"}); return
+            if mode_in is not None and mode_in not in fec_control.ALL_MODES:
+                self._json(400, {"error": f"mode must be one of "
+                                          f"{sorted(fec_control.ALL_MODES)}"}); return
+            if enabled_in is not None and not isinstance(enabled_in, bool):
                 self._json(400, {"error": "enabled must be true or false"}); return
-            state.set_enabled(payload["enabled"])
-            self._json(200, {"ok": True, "enabled": payload["enabled"]})
+            if fixed_in is not None:
+                if not isinstance(fixed_in, str):
+                    self._json(400, {"error": "fixed_ratio must be a string"}); return
+                try:
+                    a, b = fec_control.parse_ratio(fixed_in)
+                except (ValueError, AttributeError):
+                    self._json(400, {"error": "fixed_ratio must be 'x:y'"}); return
+                if not fec_control.validate_ratio(a, b):
+                    self._json(400, {"error": "fixed_ratio out of bounds"}); return
+                state.set_fixed_ratio(fixed_in)
+            if mode_in is not None:
+                state.set_mode(mode_in)
+            elif enabled_in is not None:
+                state.set_enabled(enabled_in)
+            mode_now, fixed_now = state.get_desired()
+            self._json(200, {"ok": True, "mode": mode_now,
+                             "fixed_ratio": fixed_now,
+                             "enabled": mode_now != fec_control.MODE_OFF})
 
     host_str, port_str = listen.rsplit(":", 1)
     host = host_str.strip("[]")
@@ -126,28 +189,40 @@ def read_worst_loss(state_path):
     return (max(losses) if losses else 0.0), up
 
 
-def run_once(cfg, rt, current_ratio, enabled=True):
+def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None):
     """One control tick. Returns (new_runtime, ratio_now_or_current).
-    When enabled is False, force the off tier (8:0) immediately and freeze
-    (never stop the udpspeeder process — that would black-hole the tunnel)."""
+    The adaptive engine always advances so the loss-tracked level stays fresh;
+    apply_mode then maps it through the operator-chosen mode."""
     table = cfg["loss_table"]
-    if not enabled:
-        off_ratio = fec_control.level_to_ratio(0, table)
-        if current_ratio != off_ratio:
-            if fec_control.write_fifo(cfg["fifo"], off_ratio, logging):
-                logging.info("fec disabled -> %s (forced off)", off_ratio)
-                return fec_control.FecRuntime(0, 0, time.time()), off_ratio
-        return rt, current_ratio
+    floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
+    if mode is None:
+        mode = fec_control.MODE_ADAPTIVE if enabled else fec_control.MODE_OFF
+    if fixed_ratio is None:
+        fixed_ratio = fec_control.DEFAULT_FIXED_RATIO
+
     hyst = fec_control.FecHysteresis(cfg["ramp_up_ticks"], cfg["ramp_down_hold_s"])
     worst, up = read_worst_loss(cfg["sbfd_state"])
     if worst is None:
+        # No fresh loss sample: still honor explicit off/fixed overrides so the
+        # operator can drive the relay without depending on sbfd state.
+        if mode in (fec_control.MODE_OFF, fec_control.MODE_FIXED):
+            forced = fec_control.OFF_RATIO if mode == fec_control.MODE_OFF else fixed_ratio
+            if current_ratio != forced:
+                if fec_control.write_fifo(cfg["fifo"], forced, logging):
+                    logging.info("fec ratio -> %s (mode=%s, no loss sample)",
+                                 forced, mode)
+                    return rt, forced
         return rt, current_ratio
     target = fec_control.loss_to_level(worst, table)
-    rt, changed = fec_control.step_level(target, rt, hyst, time.time())
-    ratio = fec_control.level_to_ratio(rt.current_level, table)
-    if changed or current_ratio is None:
+    rt, _changed = fec_control.step_level(target, rt, hyst, time.time())
+    adaptive_ratio = fec_control.level_to_ratio(rt.current_level, table)
+    ratio = fec_control.apply_mode(mode, adaptive_ratio,
+                                   fixed_ratio=fixed_ratio,
+                                   floor_ratio=floor_ratio)
+    if ratio != current_ratio:
         if fec_control.write_fifo(cfg["fifo"], ratio, logging):
-            logging.info("fec ratio -> %s (worst_loss=%.1f%% up=%d)", ratio, worst, up)
+            logging.info("fec ratio -> %s (mode=%s worst_loss=%.1f%% up=%d)",
+                         ratio, mode, worst, up)
             return rt, ratio
     return rt, current_ratio
 
@@ -156,19 +231,22 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     if stop_event is None:
         stop_event = threading.Event()
     if state is None:
-        state = FecState(enabled=True)
+        state = FecState(mode=fec_control.DEFAULT_MODE)
     rt = fec_control.FecRuntime(0, 0, time.time())
     current_ratio = None
     since = None
     while not stop_event.is_set():
-        enabled = state.get_enabled()
+        mode, fixed_ratio = state.get_desired()
         prev = current_ratio
-        rt, current_ratio = run_once(cfg, rt, current_ratio, enabled=enabled)
+        rt, current_ratio = run_once(cfg, rt, current_ratio,
+                                     mode=mode, fixed_ratio=fixed_ratio)
         if current_ratio != prev:
             since = time.time()
         worst, _up = read_worst_loss(cfg["sbfd_state"])
         now = time.time()
-        state.publish(enabled=enabled, ratio=current_ratio,
+        state.publish(enabled=mode != fec_control.MODE_OFF,
+                      mode=mode, fixed_ratio=fixed_ratio,
+                      ratio=current_ratio,
                       level=rt.current_level, driving_loss_pct=worst, since=since,
                       wire=(wire_tracker.snapshot(now) if wire_tracker else None))
         stop_event.wait(cfg["poll_interval_s"])
@@ -183,7 +261,9 @@ def main():
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = json.loads(Path(args.config).read_text())
     stop = threading.Event()
-    state = FecState(enabled=True)
+    initial_mode = fec_control.normalize_mode(cfg.get("mode"))
+    initial_fixed = cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO)
+    state = FecState(mode=initial_mode, fixed_ratio=initial_fixed)
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     start_fec_http(cfg.get("http_listen"), state, stop)

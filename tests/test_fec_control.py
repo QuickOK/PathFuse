@@ -108,3 +108,42 @@ def test_write_fifo_returns_false_with_no_reader():
 
 def test_write_fifo_returns_false_when_path_missing():
     assert F.write_fifo("/nonexistent/dir/f.fifo", "1:0") is False
+
+
+# ---------- tri/quad-state FEC mode ----------
+
+def test_modes_exposed():
+    assert F.ALL_MODES == (F.MODE_OFF, F.MODE_FIXED, F.MODE_ADAPTIVE, F.MODE_MIN_ADAPTIVE)
+    assert F.DEFAULT_MODE == F.MODE_MIN_ADAPTIVE
+
+
+def test_apply_mode_off_forces_off_ratio():
+    assert F.apply_mode(F.MODE_OFF, "8:6", fixed_ratio="20:1") == "8:0"
+
+
+def test_apply_mode_fixed_returns_fixed_ratio():
+    assert F.apply_mode(F.MODE_FIXED, "8:4", fixed_ratio="20:1") == "20:1"
+    assert F.apply_mode(F.MODE_FIXED, "8:0", fixed_ratio="8:2") == "8:2"
+
+
+def test_apply_mode_adaptive_passes_through():
+    assert F.apply_mode(F.MODE_ADAPTIVE, "8:0") == "8:0"
+    assert F.apply_mode(F.MODE_ADAPTIVE, "8:4") == "8:4"
+
+
+def test_apply_mode_min_adaptive_lifts_idle_to_floor():
+    assert F.apply_mode(F.MODE_MIN_ADAPTIVE, "8:0", floor_ratio="20:1") == "20:1"
+    # Above idle, min_adaptive behaves like adaptive.
+    assert F.apply_mode(F.MODE_MIN_ADAPTIVE, "8:4", floor_ratio="20:1") == "8:4"
+
+
+def test_apply_mode_unknown_passes_through_adaptive():
+    # Defensive: an unknown mode shouldn't accidentally force off.
+    assert F.apply_mode("nonsense", "8:2") == "8:2"
+
+
+def test_normalize_mode_accepts_valid_and_falls_back():
+    assert F.normalize_mode(F.MODE_OFF) == F.MODE_OFF
+    assert F.normalize_mode(F.MODE_FIXED) == F.MODE_FIXED
+    assert F.normalize_mode("garbage") == F.DEFAULT_MODE
+    assert F.normalize_mode(None) == F.DEFAULT_MODE

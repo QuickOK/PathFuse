@@ -27,7 +27,7 @@ def test_fetch_relay_fec_transport_error(monkeypatch):
 
 
 def test_post_relay_fec_no_url():
-    assert M.post_relay_fec("", True, 1.0) is False
+    assert M.post_relay_fec("", "adaptive", "20:1", 1.0) is False
 
 
 def test_post_relay_fec_success(monkeypatch):
@@ -36,14 +36,33 @@ def test_post_relay_fec_success(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
     monkeypatch.setattr(M.urllib.request, "urlopen", lambda req, timeout=None: FakeResp())
-    assert M.post_relay_fec("http://relay/fec", False, 1.0) is True
+    assert M.post_relay_fec("http://relay/fec", "off", "20:1", 1.0) is True
 
 
 def test_post_relay_fec_transport_error_returns_false(monkeypatch):
     def boom(req, timeout=None):
         raise M.urllib.error.URLError("down")
     monkeypatch.setattr(M.urllib.request, "urlopen", boom)
-    assert M.post_relay_fec("http://relay/fec", True, 1.0) is False
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", 1.0) is False
+
+
+def test_post_relay_fec_body_includes_mode_and_legacy_enabled(monkeypatch):
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    assert M.post_relay_fec("http://relay/fec", "fixed", "20:1", 1.0) is True
+    assert seen["body"]["mode"] == "fixed"
+    assert seen["body"]["fixed_ratio"] == "20:1"
+    assert seen["body"]["enabled"] is True   # legacy field for older relays
+    seen.clear()
+    assert M.post_relay_fec("http://relay/fec", "off", "20:1", 1.0) is True
+    assert seen["body"]["enabled"] is False
 
 
 def test_fec_driver_wan_picks_max_loss():

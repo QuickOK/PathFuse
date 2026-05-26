@@ -30,7 +30,29 @@ let lastEngarde = null;
 function isFormFocused(){
   const a = document.activeElement;
   if (!a) return false;
-  return a.matches('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_enabled"], #master-wan, #persist');
+  return a.matches('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #master-wan, #persist');
+}
+
+const FEC_FIXED_FALLBACK_PRESETS = ["20:1", "8:1", "8:2", "8:4", "8:6", "8:8"];
+let fecFixedPresetsRendered = "";
+
+function syncFecFixedDropdown(presets, desired){
+  const sel = $("#fec-fixed-ratio");
+  if (!sel) return;
+  const list = Array.isArray(presets) && presets.length ? presets : FEC_FIXED_FALLBACK_PRESETS;
+  const key = list.join("|");
+  if (key !== fecFixedPresetsRendered){
+    sel.innerHTML = "";
+    list.forEach(r => {
+      const o = document.createElement("option");
+      o.value = r; o.textContent = r;
+      sel.appendChild(o);
+    });
+    fecFixedPresetsRendered = key;
+  }
+  if (desired && Array.from(sel.options).some(o => o.value === desired)){
+    if (sel.value !== desired) sel.value = desired;
+  }
 }
 
 function pad(n, w=2){ return String(n).padStart(w, "0"); }
@@ -238,7 +260,12 @@ function render(s){
     setRadio("policy", s.master_policy);
     setRadio("egress_mode", s.egress_mode || "relay_vpn");
     if (s.master_wan && sel) sel.value = s.master_wan;
-    if (s.fec && s.fec.configured) setRadio("fec_enabled", s.fec.desired_enabled ? "on" : "off");
+    if (s.fec && s.fec.configured){
+      const desiredMode = s.fec.desired_mode
+        || (s.fec.desired_enabled ? "adaptive" : "off");
+      setRadio("fec_mode", desiredMode);
+      syncFecFixedDropdown(s.fec.fixed_ratio_presets, s.fec.desired_fixed_ratio);
+    }
   }
 
   renderWanList(s, wans, active, masterWan, dyn);
@@ -510,12 +537,23 @@ function renderConsist(e){
 }
 
 /* ---------- FEC ---------- */
+const FEC_MODE_LABELS = {
+  off: "off — forced 8:0",
+  fixed: "fixed",
+  adaptive: "adaptive",
+  min_adaptive: "floor + adaptive",
+};
+
 function renderFec(s){
   const fec  = s.fec || {};
   const dirs = fec.directions || {};
   const sub  = $("#fec-sub");
+  const desiredMode = fec.desired_mode || (fec.desired_enabled ? "adaptive" : "off");
+  const modeLabel   = FEC_MODE_LABELS[desiredMode] || desiredMode;
   if (sub) sub.textContent = !fec.configured ? "not configured"
-                        : (fec.desired_enabled ? "adaptive" : "disabled — forced 8:0");
+                        : (desiredMode === "fixed"
+                            ? `fixed ${fec.desired_fixed_ratio || ""}`.trim()
+                            : modeLabel);
 
   renderFecCard("c2r", dirs.client_to_relay, true);
   renderFecCard("r2c", dirs.relay_to_client, false);
@@ -528,10 +566,18 @@ function renderFec(s){
       const o = dirs.relay_to_client || {};
       const relayTxt = !o.ok ? "relay sync pending"
                    : (o.reconcile_pending ? "syncing relay…" : "relay synced");
-      eff.textContent = `effective: ${fec.desired_enabled ? "adaptive" : "disabled"} · ${relayTxt}`;
+      const effDesc = desiredMode === "fixed"
+        ? `fixed ${fec.desired_fixed_ratio || ""}`.trim()
+        : modeLabel;
+      eff.textContent = `effective: ${effDesc} · ${relayTxt}`;
     }
   }
-  $$('input[name="fec_enabled"]').forEach(r => r.disabled = !fec.configured);
+  // Radios & dropdown availability follow whether FEC is configured at all,
+  // plus the dropdown is only meaningful while Fixed mode is selected.
+  $$('input[name="fec_mode"]').forEach(r => r.disabled = !fec.configured);
+  const fixedSel = $("#fec-fixed-ratio");
+  const fixedChecked = document.querySelector('input[name="fec_mode"]:checked')?.value === "fixed";
+  if (fixedSel) fixedSel.disabled = !fec.configured || !fixedChecked;
 }
 
 function renderFecCard(id, d, local){
@@ -596,7 +642,8 @@ async function apply(){
   const masterWan = $("#master-wan").value;
   const egressMode = document.querySelector('input[name="egress_mode"]:checked')?.value;
   const persist   = $("#persist").checked;
-  const fecOn = document.querySelector('input[name="fec_enabled"]:checked')?.value;
+  const fecMode = document.querySelector('input[name="fec_mode"]:checked')?.value;
+  const fecFixed = $("#fec-fixed-ratio")?.value;
   const status    = $("#apply-status");
   if (!mode || !policy || !egressMode){
     status.textContent = "select mode, policy, and egress first";
@@ -605,12 +652,15 @@ async function apply(){
   $("#apply").disabled = true;
   status.textContent = "applying…"; status.className = "apply-status";
   try {
+    const fecPayload = {};
+    if (fecMode) fecPayload.fec_mode = fecMode;
+    if (fecMode === "fixed" && fecFixed) fecPayload.fec_fixed_ratio = fecFixed;
     const r = await fetch("/api/runtime", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(Object.assign(
         {mode, master_policy: policy, master_wan: masterWan, egress_mode: egressMode, persist},
-        (fecOn ? {fec_enabled: fecOn === "on"} : {})))
+        fecPayload))
     });
     if (r.status === 409){
       const j = await r.json().catch(() => ({}));
@@ -644,8 +694,14 @@ function escapeHtml(s){
 
 /* ---------- wire ---------- */
 $("#apply").addEventListener("click", apply);
-$$('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_enabled"], #master-wan, #persist').forEach(el => {
-  el.addEventListener("change", () => { userDirty = true; });
+$$('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #master-wan, #persist').forEach(el => {
+  el.addEventListener("change", () => {
+    userDirty = true;
+    if (el.name === "fec_mode"){
+      const fixedSel = $("#fec-fixed-ratio");
+      if (fixedSel) fixedSel.disabled = el.value !== "fixed";
+    }
+  });
   el.addEventListener("input",  () => { userDirty = true; });
 });
 

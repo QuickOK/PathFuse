@@ -72,7 +72,43 @@ def test_run_once_disabled_forces_off_tier(tmp_path):
         rt, ratio = U.run_once(cfg, rt, current_ratio="8:8", enabled=False)
         assert ratio == "8:0"
         assert os.read(rfd, 64).decode() == "fec 8:0\n"
-        assert rt.current_level == 0
+    finally:
+        os.close(rfd)
+
+
+def test_run_once_fixed_mode_writes_fixed_ratio(tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"sessions": {"a": {"session_id": 1, "state": "UP", "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state), "poll_interval_s": 0.01,
+           "loss_table": fec_control.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1, "ramp_down_hold_s": 0}
+    try:
+        rt = fec_control.FecRuntime(0, 0, 0.0)
+        rt, ratio = U.run_once(cfg, rt, current_ratio=None,
+                               mode=fec_control.MODE_FIXED, fixed_ratio="20:1")
+        assert ratio == "20:1"
+        assert os.read(rfd, 64).decode() == "fec 20:1\n"
+    finally:
+        os.close(rfd)
+
+
+def test_run_once_min_adaptive_lifts_idle_to_floor(tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"sessions": {"a": {"session_id": 1, "state": "UP", "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state), "poll_interval_s": 0.01,
+           "loss_table": fec_control.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1,
+           "ramp_down_hold_s": 0, "floor_ratio": "20:1"}
+    try:
+        rt = fec_control.FecRuntime(0, 0, 0.0)
+        rt, ratio = U.run_once(cfg, rt, current_ratio=None,
+                               mode=fec_control.MODE_MIN_ADAPTIVE)
+        assert ratio == "20:1"     # idle 8:0 lifted to the floor
+        assert os.read(rfd, 64).decode() == "fec 20:1\n"
     finally:
         os.close(rfd)
 

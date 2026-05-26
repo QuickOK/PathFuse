@@ -370,6 +370,77 @@ def test_effective_fec_enabled_defaults_true_when_configured(cfg_with_fec):
     assert M.effective_fec_enabled(cfg_with_fec, M.RuntimeOverlay()) is True
 
 
+def test_validate_runtime_payload_accepts_fec_mode():
+    ok, err = M.validate_runtime_payload({"fec_mode": "min_adaptive"},
+                                         wan_names={"wan1", "wan2"})
+    assert ok and err is None
+
+
+def test_validate_runtime_payload_rejects_bad_fec_mode():
+    ok, err = M.validate_runtime_payload({"fec_mode": "magic"},
+                                         wan_names={"wan1", "wan2"})
+    assert not ok and "fec_mode" in err
+
+
+def test_validate_runtime_payload_accepts_fec_fixed_ratio():
+    ok, err = M.validate_runtime_payload({"fec_fixed_ratio": "20:1"},
+                                         wan_names={"wan1", "wan2"})
+    assert ok and err is None
+
+
+def test_validate_runtime_payload_rejects_bad_fec_fixed_ratio():
+    ok, err = M.validate_runtime_payload({"fec_fixed_ratio": "garbage"},
+                                         wan_names={"wan1", "wan2"})
+    assert not ok and "fec_fixed_ratio" in err
+
+
+def test_effective_fec_mode_defaults_to_cfg_default(cfg_with_fec):
+    assert M.effective_fec_mode(cfg_with_fec, M.RuntimeOverlay()) == "min_adaptive"
+
+
+def test_effective_fec_mode_overlay_wins(cfg_with_fec):
+    ov = M.RuntimeOverlay(fec_mode="fixed", fec_fixed_ratio="8:2")
+    assert M.effective_fec_mode(cfg_with_fec, ov) == "fixed"
+    assert M.effective_fec_fixed_ratio(cfg_with_fec, ov) == "8:2"
+
+
+def test_effective_fec_mode_off_when_unconfigured(cfg):
+    assert M.effective_fec_mode(cfg, M.RuntimeOverlay(fec_mode="adaptive")) == "off"
+
+
+def test_effective_fec_mode_legacy_overlay_enabled_maps_to_adaptive(cfg_with_fec):
+    assert M.effective_fec_mode(
+        cfg_with_fec, M.RuntimeOverlay(fec_enabled=True)) == "adaptive"
+    assert M.effective_fec_mode(
+        cfg_with_fec, M.RuntimeOverlay(fec_enabled=False)) == "off"
+
+
+def test_post_runtime_applies_fec_mode_and_fixed_ratio(cfg):
+    from pathlib import Path
+    Path(cfg.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        body = json.dumps({
+            "mode": "full", "master_policy": "static_primary", "master_wan": "wan2",
+            "egress_mode": "relay_vpn", "fec_mode": "fixed",
+            "fec_fixed_ratio": "8:2", "persist": False,
+        }).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/runtime",
+            data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            assert r.status == 200
+        ov = M.load_runtime_overlay(cfg)
+        assert ov.fec_mode == "fixed"
+        assert ov.fec_fixed_ratio == "8:2"
+        # Legacy flag kept in sync so a downgrade still sees the off/on intent.
+        assert ov.fec_enabled is True
+    finally:
+        stop.set(); httpd.shutdown()
+
+
 def test_effective_fec_enabled_overlay_false_wins(cfg_with_fec):
     assert M.effective_fec_enabled(cfg_with_fec, M.RuntimeOverlay(fec_enabled=False)) is False
 
@@ -416,7 +487,7 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
         lambda url, t: {"ok": True, "error": None,
                         "data": {"enabled": True, "ratio": "8:2", "level": 1,
                                  "driving_loss_pct": 1.2, "since": 5.0}})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, en, t: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
@@ -457,7 +528,7 @@ def test_run_controller_disabled_and_relay_unreachable(cfg_with_fec, monkeypatch
         lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec",
         lambda url, t: {"ok": False, "data": None, "error": "transport: unreachable"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, en, t: False)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: False)
     captured = []
     monkeypatch.setattr(M.fec_control, "write_fifo",
         lambda path, ratio, logger=None: (captured.append(ratio), True)[1])
@@ -496,7 +567,7 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
             "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state", lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec", lambda url, t: {"ok": False, "data": None, "error": "x"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, en, t: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
     class FakeTracker:
@@ -526,7 +597,7 @@ def test_run_controller_client_wire_none_without_tracker(cfg_with_fec, monkeypat
                                                         "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state", lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec", lambda url, t: {"ok": False, "data": None, "error": "x"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, en, t: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg_with_fec.sbfd_local_state).write_text("{}")

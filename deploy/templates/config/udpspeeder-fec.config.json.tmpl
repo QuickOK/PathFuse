@@ -4,6 +4,9 @@
   "http_listen": "$relay_overlay_ip:$ports_fec_http",
   "wire_unit": "udpspeeder-server",
   "poll_interval_s": 1.0,
+  "mode": "min_adaptive",
+  "fixed_ratio": "20:1",
+  "floor_ratio": "20:1",
   "loss_table": [
     {"max_loss_pct": 0.5,  "fec": "8:0"},
     {"max_loss_pct": 2.0,  "fec": "8:2"},

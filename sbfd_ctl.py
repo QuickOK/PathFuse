@@ -82,6 +82,9 @@ class FecCfg:
     full_min_up_wans: int
     wire_unit: str = "udpspeeder-client"
     wire_stale_after_s: float = 30.0
+    mode: str = fec_control.DEFAULT_MODE
+    fixed_ratio: str = fec_control.DEFAULT_FIXED_RATIO
+    floor_ratio: str = fec_control.DEFAULT_FLOOR_RATIO
 
 
 @dataclass
@@ -592,8 +595,9 @@ def pick_default_wan(eff_state: dict, desired_active: set,
 
 
 def compute_fec_target(fec_cfg, mode, eff, loss, active_wans):
-    """Pure: map mode/effective-state/loss to a FEC table level.
-    Loss = worst among the WANs actually carrying traffic."""
+    """Pure: map mode/effective-state/loss to a FEC table level (the
+    pre-fec-mode-override adaptive choice). Loss = worst among the WANs
+    actually carrying traffic."""
     up_count = sum(1 for w, st in eff.items() if st == "UP")
     active = active_wans or set(loss.keys())
     active_loss = max((loss.get(w, 0.0) for w in active), default=0.0)
@@ -623,11 +627,18 @@ def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
 
 
 def relay_fec_direction(fetch, fetched_at, now, desired, last_acked):
-    """Shape the relay->client published direction dict from a fetch_relay_fec result."""
+    """Shape the relay->client published direction dict from a fetch_relay_fec result.
+
+    `desired` / `last_acked` are either the legacy enabled-boolean (during the
+    pre-tri-state transition) or a (mode, fixed_ratio) tuple. We just compare
+    them for equality to drive reconcile_pending — the relay echoes back what
+    it actually applied."""
     fetch = fetch or {}
     data = fetch.get("data") or {}
     return {
         "enabled": data.get("enabled"),
+        "mode": data.get("mode"),
+        "fixed_ratio": data.get("fixed_ratio"),
         "ratio": data.get("ratio"),
         "level": data.get("level"),
         "driving_loss_pct": data.get("driving_loss_pct"),
@@ -880,6 +891,16 @@ def load_config(path: str) -> Config:
         raw_fec = raw.get("fec")
         fec_cfg = None
         if raw_fec is not None:
+            # Legacy fallback: if `mode` is absent and the deprecated `enabled`
+            # boolean is present, map true→adaptive (preserve their explicit
+            # choice), false→off. Otherwise default = min_adaptive.
+            if "mode" in raw_fec:
+                cfg_mode = fec_control.normalize_mode(raw_fec.get("mode"))
+            elif "enabled" in raw_fec:
+                cfg_mode = (fec_control.MODE_ADAPTIVE if bool(raw_fec["enabled"])
+                            else fec_control.MODE_OFF)
+            else:
+                cfg_mode = fec_control.DEFAULT_MODE
             fec_cfg = FecCfg(
                 enabled=bool(raw_fec.get("enabled", True)),
                 fifo=raw_fec["fifo"],
@@ -890,6 +911,9 @@ def load_config(path: str) -> Config:
                 full_min_up_wans=int(raw_fec.get("full_min_up_wans", 2)),
                 wire_unit=raw_fec.get("wire_unit", "udpspeeder-client"),
                 wire_stale_after_s=float(raw_fec.get("wire_stale_after_s", 30.0)),
+                mode=cfg_mode,
+                fixed_ratio=raw_fec.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
+                floor_ratio=raw_fec.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO),
             )
 
         cfg = Config(
@@ -942,7 +966,11 @@ class RuntimeOverlay:
     set_by: str = "boot-default"
     set_ts: float = 0.0
     egress_mode: Optional[str] = None
-    fec_enabled: Optional[bool] = None
+    # FEC tri/quad-state override. Legacy fec_enabled boolean is still accepted
+    # on load and on the HTTP API, mapped into fec_mode.
+    fec_enabled: Optional[bool] = None  # deprecated; kept for backward-compat reads
+    fec_mode: Optional[str] = None
+    fec_fixed_ratio: Optional[str] = None
 
 
 def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
@@ -951,6 +979,13 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
         try:
             with open(path) as f:
                 raw = _json.load(f)
+            # Legacy fec_enabled bool migrates into fec_mode at load time so
+            # operators who set "disabled" pre-tri-state stay disabled.
+            legacy_enabled = raw.get("fec_enabled")
+            loaded_fec_mode = raw.get("fec_mode")
+            if loaded_fec_mode is None and isinstance(legacy_enabled, bool):
+                loaded_fec_mode = (fec_control.MODE_ADAPTIVE if legacy_enabled
+                                   else fec_control.MODE_OFF)
             return RuntimeOverlay(
                 mode=raw.get("mode"),
                 master_policy=raw.get("master_policy"),
@@ -959,7 +994,9 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 set_by=raw.get("set_by", src),
                 set_ts=float(raw.get("set_ts", 0.0)),
                 egress_mode=raw.get("egress_mode"),
-                fec_enabled=raw.get("fec_enabled"),
+                fec_enabled=legacy_enabled,
+                fec_mode=loaded_fec_mode,
+                fec_fixed_ratio=raw.get("fec_fixed_ratio"),
             )
         except (FileNotFoundError, ValueError, OSError):
             continue
@@ -976,6 +1013,8 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
         "set_ts": ov.set_ts,
         "egress_mode": ov.egress_mode,
         "fec_enabled": ov.fec_enabled,
+        "fec_mode": ov.fec_mode,
+        "fec_fixed_ratio": ov.fec_fixed_ratio,
     }
     body = _json.dumps(payload, indent=2)
     Path(cfg.runtime_state).parent.mkdir(parents=True, exist_ok=True)
@@ -999,13 +1038,33 @@ def effective_policy(cfg: Config, ov: RuntimeOverlay) -> tuple:
 
 
 def effective_fec_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
-    """Operator override if set, else the config default. Always False when FEC
-    is unconfigured (cfg.fec absent or cfg.fec.enabled false)."""
+    """True when FEC is configured AND the effective mode is not 'off'.
+    Retained for backward compatibility with callers and the published state."""
     if not (cfg.fec and cfg.fec.enabled):
         return False
+    return effective_fec_mode(cfg, ov) != fec_control.MODE_OFF
+
+
+def effective_fec_mode(cfg: Config, ov: RuntimeOverlay) -> str:
+    """Operator override if set, else the config default. Returns MODE_OFF when
+    FEC is unconfigured. Honors legacy ov.fec_enabled when ov.fec_mode is unset."""
+    if not (cfg.fec and cfg.fec.enabled):
+        return fec_control.MODE_OFF
+    if ov.fec_mode in fec_control.ALL_MODES:
+        return ov.fec_mode
     if ov.fec_enabled is not None:
-        return ov.fec_enabled
-    return True
+        return (fec_control.MODE_ADAPTIVE if ov.fec_enabled
+                else fec_control.MODE_OFF)
+    return cfg.fec.mode
+
+
+def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
+    """The ratio used by MODE_FIXED — operator override wins, else cfg default."""
+    if ov.fec_fixed_ratio:
+        return ov.fec_fixed_ratio
+    if cfg.fec:
+        return cfg.fec.fixed_ratio
+    return fec_control.DEFAULT_FIXED_RATIO
 
 
 def fetch_relay_fec(url, timeout_s) -> dict:
@@ -1023,11 +1082,18 @@ def fetch_relay_fec(url, timeout_s) -> dict:
         return {"ok": False, "data": None, "error": f"parse: {e}"}
 
 
-def post_relay_fec(url, enabled, timeout_s) -> bool:
-    """Best-effort POST of desired enabled to relay /fec. Returns True iff acked 200."""
+def post_relay_fec(url, mode, fixed_ratio, timeout_s) -> bool:
+    """Best-effort POST of desired (mode, fixed_ratio) to relay /fec.
+
+    Also sends the legacy `enabled` boolean so an older relay binary still
+    honors the off/on intent during a rolling upgrade. Returns True iff 200."""
     if not url:
         return False
-    body = _json.dumps({"enabled": bool(enabled)}).encode()
+    body = _json.dumps({
+        "mode": mode,
+        "fixed_ratio": fixed_ratio,
+        "enabled": mode != fec_control.MODE_OFF,
+    }).encode()
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
@@ -1078,6 +1144,18 @@ def validate_runtime_payload(payload: dict, wan_names: set):
         return False, f"egress_mode must be one of {sorted(VALID_EGRESS_MODES)}"
     if "fec_enabled" in payload and not isinstance(payload["fec_enabled"], bool):
         return False, "fec_enabled must be true or false"
+    if "fec_mode" in payload and payload["fec_mode"] not in fec_control.ALL_MODES:
+        return False, f"fec_mode must be one of {sorted(fec_control.ALL_MODES)}"
+    if "fec_fixed_ratio" in payload:
+        r = payload["fec_fixed_ratio"]
+        if not isinstance(r, str):
+            return False, "fec_fixed_ratio must be a string like 'x:y'"
+        try:
+            a, b = fec_control.parse_ratio(r)
+        except (ValueError, AttributeError):
+            return False, "fec_fixed_ratio must be 'x:y' with integers"
+        if not fec_control.validate_ratio(a, b):
+            return False, "fec_fixed_ratio out of bounds (a>=1, b>=0, a+b<=254)"
     return True, None
 
 
@@ -1204,6 +1282,16 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
             ov.egress_mode = payload.get("egress_mode", ov.egress_mode) or cfg.egress.default_mode
             if "fec_enabled" in payload:
                 ov.fec_enabled = payload["fec_enabled"]
+                # Legacy clients use this; map into the new tri-state so the
+                # rest of the controller sees a single source of truth.
+                ov.fec_mode = (fec_control.MODE_ADAPTIVE if payload["fec_enabled"]
+                               else fec_control.MODE_OFF)
+            if "fec_mode" in payload:
+                ov.fec_mode = payload["fec_mode"]
+                # Keep the legacy flag in sync for downgrade safety.
+                ov.fec_enabled = (payload["fec_mode"] != fec_control.MODE_OFF)
+            if "fec_fixed_ratio" in payload:
+                ov.fec_fixed_ratio = payload["fec_fixed_ratio"]
             ov.set_by = "ui"
             ov.set_ts = time.time()
             save_runtime_overlay(cfg, ov)
@@ -1356,39 +1444,47 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
 
         last_decision_reason = out.reason
 
-        fec_desired = effective_fec_enabled(cfg, ov)
+        fec_mode_eff = effective_fec_mode(cfg, ov)
+        fec_fixed_ratio_eff = effective_fec_fixed_ratio(cfg, ov)
+        fec_desired = fec_mode_eff != fec_control.MODE_OFF
         fec_driver = None
         fec_actuator_ok = True
+        relay_desired = (fec_mode_eff, fec_fixed_ratio_eff)
         if cfg.fec:
-            if fec_desired:
-                _fec_target = compute_fec_target(cfg.fec, mode, eff, loss, currently_active)
-                fec_rt, _fec_changed = fec_control.step_level(_fec_target, fec_rt, fec_hyst, loop_start)
-                _fec_ratio = fec_control.level_to_ratio(fec_rt.current_level, cfg.fec.loss_table)
+            # The adaptive engine always runs so the loss-tracked level stays
+            # fresh; apply_mode then maps it to the actual ratio per mode.
+            _fec_target = compute_fec_target(cfg.fec, mode, eff, loss, currently_active)
+            fec_rt, _fec_changed = fec_control.step_level(
+                _fec_target, fec_rt, fec_hyst, loop_start)
+            _adaptive_ratio = fec_control.level_to_ratio(
+                fec_rt.current_level, cfg.fec.loss_table)
+            _fec_ratio = fec_control.apply_mode(
+                fec_mode_eff, _adaptive_ratio,
+                fixed_ratio=fec_fixed_ratio_eff,
+                floor_ratio=cfg.fec.floor_ratio)
+            if fec_mode_eff in (fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE):
                 fec_driver = fec_driver_wan(loss, currently_active)
-                if _fec_changed or fec_current_ratio is None:
-                    fec_actuator_ok = fec_control.write_fifo(cfg.fec.fifo, _fec_ratio, logging)
-                    if fec_actuator_ok:
-                        fec_current_ratio = _fec_ratio
-                        fec_ratio_since = loop_start
-                        logging.info("fec ratio -> %s (mode=%s active=%s)",
-                                     _fec_ratio, mode, sorted(currently_active))
-            else:
-                _off_ratio = fec_control.level_to_ratio(0, cfg.fec.loss_table)
-                if fec_current_ratio != _off_ratio:
-                    fec_actuator_ok = fec_control.write_fifo(cfg.fec.fifo, _off_ratio, logging)
-                    if fec_actuator_ok:
-                        fec_rt = fec_control.FecRuntime(0, 0, loop_start)
-                        fec_current_ratio = _off_ratio
-                        fec_ratio_since = loop_start
-                        logging.info("fec disabled -> %s (forced off)", _off_ratio)
+            if _fec_ratio != fec_current_ratio:
+                fec_actuator_ok = fec_control.write_fifo(
+                    cfg.fec.fifo, _fec_ratio, logging)
+                if fec_actuator_ok:
+                    fec_current_ratio = _fec_ratio
+                    fec_ratio_since = loop_start
+                    logging.info("fec ratio -> %s (fec_mode=%s mode=%s active=%s)",
+                                 _fec_ratio, fec_mode_eff, mode,
+                                 sorted(currently_active))
 
-            # Reconcile desired enable-state to relay on the remote-fetch cadence
-            # only (best-effort) — rate-limiting to the relay tick keeps a slow or
-            # unreachable relay from blocking the 0.5s failover loop on every tick.
+            # Reconcile desired mode/ratio to relay on the remote-fetch cadence
+            # only (best-effort) — rate-limiting to the relay tick keeps a slow
+            # or unreachable relay from blocking the 0.5s failover loop on
+            # every tick.
             if fec_reconcile_due and should_post_fec(
-                    fec_desired, fec_relay_last_acked, fec_relay_last_post_ts, loop_start):
-                if post_relay_fec(cfg.relay.fec_url, fec_desired, cfg.relay.fetch_timeout_s):
-                    fec_relay_last_acked = fec_desired
+                    relay_desired, fec_relay_last_acked,
+                    fec_relay_last_post_ts, loop_start):
+                if post_relay_fec(cfg.relay.fec_url, fec_mode_eff,
+                                  fec_fixed_ratio_eff,
+                                  cfg.relay.fetch_timeout_s):
+                    fec_relay_last_acked = relay_desired
                 fec_relay_last_post_ts = loop_start
 
         def _wan_obj(snap: StateSnapshot, w: str) -> dict:
@@ -1456,9 +1552,15 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             "fec": {
                 "configured": bool(cfg.fec and cfg.fec.enabled),
                 "desired_enabled": fec_desired,
+                "desired_mode": fec_mode_eff,
+                "desired_fixed_ratio": fec_fixed_ratio_eff,
+                "floor_ratio": (cfg.fec.floor_ratio if cfg.fec else None),
+                "fixed_ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
                 "directions": {
                     "client_to_relay": {
                         "enabled": fec_desired,
+                        "mode": fec_mode_eff,
+                        "fixed_ratio": fec_fixed_ratio_eff,
                         "ratio": fec_current_ratio,
                         "level": fec_rt.current_level,
                         "driving_loss_pct": (loss.get(fec_driver) if fec_driver else None),
@@ -1469,7 +1571,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                     },
                     "relay_to_client": relay_fec_direction(
                         fec_relay_last, fec_relay_last_at, loop_start,
-                        fec_desired, fec_relay_last_acked),
+                        relay_desired, fec_relay_last_acked),
                 },
             },
         }
