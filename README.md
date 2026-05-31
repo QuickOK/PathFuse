@@ -75,7 +75,7 @@ bypassing the relay).
 - The data-plane components it integrates with — **engarde**, **WireGuard**, and
   **UDPspeeder/speederv2** — are separate projects you install yourself. PathFuse
   invokes them as external programs (subprocess / sockets / FIFO); it does not bundle
-  them. (The forthcoming deploy kit includes a helper to fetch/build them.)
+  them. (The deploy kit includes a helper to fetch/build them.)
 
 ## Security / secrets
 

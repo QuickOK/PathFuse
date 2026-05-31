@@ -2,7 +2,7 @@
 # PathFuse — verify a deployed node. Usage: healthcheck.sh -c values.json
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"; VALUES="$HERE/values.example.json"
-while [ $# -gt 0 ]; do case "$1" in -c) VALUES="$2"; shift;; esac; shift; done
+while [ $# -gt 0 ]; do case "$1" in -c) VALUES="${2:?-c requires a values.json path}"; shift;; esac; shift; done
 ROLE=$(python3 -c "import json;print(json.load(open('$VALUES'))['role'])")
 UI=$(python3 -c "import json;print(json.load(open('$VALUES'))['ports']['ui'])")
 fail=0
@@ -18,5 +18,5 @@ else
   chk "udpspeeder-server"  "systemctl is-active --quiet udpspeeder-server"
   chk "udpspeeder-fec"     "systemctl is-active --quiet udpspeeder-fec"
 fi
-chk "wg0 has a peer"       "wg show wg0 peers"
+chk "wg0 has a peer"       "[ -n \"\$(wg show wg0 peers)\" ]"
 [ "$fail" = 0 ] && echo "ALL CHECKS PASSED" || { echo "SOME CHECKS FAILED"; exit 1; }

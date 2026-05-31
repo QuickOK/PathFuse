@@ -226,8 +226,11 @@ def test_run_publishes_wire_from_tracker(tmp_path):
     th = _t.Thread(target=lambda: U.run(cfg, stop, st, wire_tracker=FakeTracker()), daemon=True)
     th.start()
     _time.sleep(0.2)
-    stop.set(); th.join(timeout=2)
-    os.close(rfd)
+    try:
+        stop.set()
+        th.join(timeout=2)
+    finally:
+        os.close(rfd)
     assert st.snapshot()["wire"] == {"tx_mbps": 3.8, "overhead_pct": 9.0, "sample_age_s": 4.0, "stale": False}
 
 

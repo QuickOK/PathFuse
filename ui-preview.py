@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -106,7 +108,7 @@ def main():
     cfg = load_config(args.config)
     if args.listen:
         cfg.ui_listen = args.listen
-    cfg.published_state = "/tmp/sbfd-ui-preview-state.json"
+    cfg.published_state = str(Path(tempfile.gettempdir()) / f"sbfd-ui-preview-state-{os.getuid()}.json")
 
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 

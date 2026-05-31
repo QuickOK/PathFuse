@@ -6,6 +6,9 @@
 [Unit]
 Description=Adaptive FEC controller (relay, drives udpspeeder-server FIFO)
 After=udpspeeder-server.service sbfd.service
+# Soft dep (Wants, not Requires) is intentional: write_fifo() tolerates a missing
+# reader (logs a warning and continues), so the controller survives udpspeeder-server
+# restarts instead of being torn down with it.
 Wants=udpspeeder-server.service
 
 [Service]

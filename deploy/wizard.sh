@@ -37,6 +37,15 @@ plan_for(){
 run_manual(){
   local role="$1" tgt="${2:-}"
   plan_for "$role" "$tgt"
+  # Remote steps send LOCAL absolute paths ($SCRIPTS/$HERE) verbatim over ssh, so the
+  # remote must have this repo checked out at the same path with values.json present.
+  # Validate that precondition up front instead of failing opaquely mid-run.
+  if [ -n "$tgt" ] && ! ssh "$tgt" "test -d '$SCRIPTS' && test -f '$HERE/values.json'"; then
+    echo "ERROR: remote '$tgt' must have this repo checked out at the same path:" >&2
+    echo "         $HERE   (with values.json present)." >&2
+    echo "       The wizard sends local paths verbatim over ssh; aborting remote steps." >&2
+    return 1
+  fi
   echo "Each step is confirmed before it runs."
   # Fixed internal commands (script paths + fixed flags) — never user free-text.
   local -a steps=(

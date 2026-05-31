@@ -74,10 +74,9 @@ sudo systemctl enable --now udpspeeder-client
 sudo systemctl enable --now sbfd sbfd-ctl
 ```
 > wg0's Endpoint is the local udpspeeder-client (`127.0.0.1:59411`) from the start in this kit.
-> Start `udpspeeder-client` only **after** engarde-client is up — engarde-client latches its
-> single return path to whatever last sent to its input port, so order matters.
-> Why the order: engarde-client latches its single return path to whatever last sent to its
-> input port, so `udpspeeder-client` must start after `engarde-client`, never before.
+> Start `udpspeeder-client` only **after** engarde-client is up: engarde-client latches its
+> single return path to whatever last sent to its input port, so `udpspeeder-client` must
+> start after engarde-client, never before.
 
 ## 6. Verify
 ```bash

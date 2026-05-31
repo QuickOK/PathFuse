@@ -3,7 +3,7 @@
 # break tests, fail to render, or LEAK real infrastructure identifiers / secrets.
 # Used directly (`scripts/preflight.sh`) and by the pre-push hook (scripts/hooks/pre-push).
 set -uo pipefail
-cd "$(cd "$(dirname "$0")/.." && pwd)"   # repo root
+cd "$(cd "$(dirname "$0")/.." && pwd)" || exit 1   # repo root
 PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 fail=0
 

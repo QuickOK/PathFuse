@@ -2,12 +2,14 @@
 Address = $wg_relay_ip/24
 ListenPort = $wg_listen_port
 MTU = $wg_mtu
-PreUp = sysctl -w net.ipv4.ip_forward=1
+PreUp = sysctl -n net.ipv4.ip_forward > /run/pathfuse-wg0.ip_forward.prev; sysctl -w net.ipv4.ip_forward=1
 PostUp = wg set %i private-key /etc/wireguard/wg0.key
+PostUp = nft 'add table inet filter; add chain inet filter forward { type filter hook forward priority 0; policy accept; }'
 PostUp = nft insert rule inet filter forward oifname "wg0" tcp flags syn / syn,rst tcp option maxseg size set rt mtu comment "wg0-mss-clamp-out"
 PostUp = nft insert rule inet filter forward iifname "wg0" tcp flags syn / syn,rst tcp option maxseg size set rt mtu comment "wg0-mss-clamp-in"
 PreDown = nft -a list chain inet filter forward | awk '/comment "wg0-mss-clamp-out"/ {h=$$NF; system("nft delete rule inet filter forward handle " h)}'
 PreDown = nft -a list chain inet filter forward | awk '/comment "wg0-mss-clamp-in"/ {h=$$NF; system("nft delete rule inet filter forward handle " h)}'
+PreDown = sysctl -w net.ipv4.ip_forward=$$(cat /run/pathfuse-wg0.ip_forward.prev 2>/dev/null || echo 0)
 
 [Peer]
 # client peer — PublicKey filled from values (gen-secrets/wizard)

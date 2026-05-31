@@ -84,13 +84,15 @@ def check(values_path):
     base = load_values(values_path)
     ok = True
     for role in ("client", "relay"):
-        v = dict(base); v["role"] = role
+        v = dict(base)
+        v["role"] = role
         with tempfile.TemporaryDirectory() as td:
             try:
                 n = render_all(v, td)
                 print(f"role={role}: rendered {len(n)} files OK")
             except KeyError as e:
-                print(f"role={role}: MISSING placeholder {e}"); ok = False
+                print(f"role={role}: MISSING placeholder {e}")
+                ok = False
     return ok
 
 def main():

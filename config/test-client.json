@@ -9,7 +9,7 @@
       "name": "loop1",
       "local_iface": null,
       "peer_host": "127.0.0.1",
-      "peer_port": 4785,
+      "peer_port": 4784,
       "tx_interval_ms": 200,
       "detect_mult": 3
     }

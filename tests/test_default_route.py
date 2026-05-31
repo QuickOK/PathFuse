@@ -28,11 +28,8 @@ def test_pick_master_backup_singleton_active_up_uses_it():
 
 
 def test_pick_master_backup_singleton_but_down_falls_back():
-    # Engarde decided wan2, but wan2 is now DOWN — pick something UP.
-    assert P({"wan1": "UP", "wan2": "DOWN"}, desired_active=("wan2",)) == "wan2" \
-        or True
-    # Actually: spec says return None / fallback? We say: skip the singleton
-    # if it's DOWN and pick from all UP.
+    # Engarde decided wan2, but wan2 is now DOWN — skip the DOWN singleton
+    # and pick something UP.
     out = P({"wan1": "UP", "wan2": "DOWN"}, desired_active=("wan2",))
     assert out == "wan1"
 

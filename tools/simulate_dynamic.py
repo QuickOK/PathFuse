@@ -259,6 +259,9 @@ def synthesize_loss_event(base_ticks, start_s=200.0, duration_s=30.0,
 def main():
     trace_path = sys.argv[1] if len(sys.argv) > 1 else '/tmp/pi_trace.jsonl'
     ticks = load_trace(trace_path)
+    if not ticks:
+        print(f"No valid ticks in {trace_path}")
+        sys.exit(1)
     print(f"loaded {len(ticks)} ticks ({ticks[-1][0] - ticks[0][0]:.1f}s span)")
     print()
 

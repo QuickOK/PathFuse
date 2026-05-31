@@ -22,14 +22,14 @@ else
   run "sudo chmod 0600 $WG_KEY"
 fi
 echo "This host's WireGuard PUBLIC key (give this to the other end):"
-if [ "$DRY" = 1 ]; then echo "  DRY: sudo wg pubkey < $WG_KEY"; else sudo wg pubkey < "$WG_KEY"; fi
+if [ "$DRY" = 1 ]; then echo "  DRY: sudo cat $WG_KEY | wg pubkey"; else sudo cat "$WG_KEY" | wg pubkey; fi
 
 if [ -s "$UDP_KEY" ] && [ "$ROTATE" = 0 ]; then
   echo "UDPspeeder key exists ($UDP_KEY); use --rotate to replace."
 else
   [ -s "$UDP_KEY" ] && run "sudo cp -a $UDP_KEY $UDP_KEY.bak.$ts"
   run "sudo install -d -m 0755 $UDP_KEY_DIR"
-  run "printf 'UDPSPEEDER_KEY=%s\n' \"\$(head -c 32 /dev/urandom | base64)\" | sudo tee $UDP_KEY >/dev/null"
+  run "printf 'UDPSPEEDER_KEY=%s\n' \"\$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')\" | sudo tee $UDP_KEY >/dev/null"
   run "sudo chmod 0600 $UDP_KEY"
 fi
 echo "NOTE: the UDPspeeder key must MATCH on both ends — copy $UDP_KEY to the other host (or let the wizard do it)."
