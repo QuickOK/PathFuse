@@ -29,5 +29,6 @@
     "speederv2_bin": "/usr/local/bin/speederv2"
   },
   "users": { "sbfd": "sbfd", "sbfdctl": "sbfd-ctl" },
-  "egress_default": "relay_vpn"
+  "egress_default": "relay_vpn",
+  "gps": { "host": "100.64.0.4", "port": 2947 }
 }

@@ -32,6 +32,7 @@ sudo install -D -m0755 udpspeeder_fec.py  /opt/sbfd/udpspeeder_fec.py     # rela
 sudo install -D -m0755 sbfd_ctl.py        /opt/sbfd-ctl/sbfd_ctl.py
 sudo install -D -m0644 fec_control.py     /opt/sbfd-ctl/fec_control.py
 sudo install -D -m0644 fec_report.py      /opt/sbfd-ctl/fec_report.py
+sudo install -D -m0755 environ_ctl.py     /opt/sbfd-ctl/environ_ctl.py   # optional: environmental redundancy (precip+smoke), needs gpsd reachable
 sudo install -d /opt/sbfd-ctl/ui && sudo install -m0644 ui/* /opt/sbfd-ctl/ui/
 ```
 
