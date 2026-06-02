@@ -7,3 +7,4 @@ state.json
 .test-*/
 deploy/values.json
 deploy/out/
+docs/superpowers/

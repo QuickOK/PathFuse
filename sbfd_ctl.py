@@ -88,6 +88,13 @@ class FecCfg:
 
 
 @dataclass
+class EnvironmentalCfg:
+    enabled: bool
+    auto_override_path: str
+    auto_override_ttl_s: float = 180.0
+
+
+@dataclass
 class Config:
     wans: dict[str, WanCfg]
     relay: RelayCfg
@@ -101,6 +108,7 @@ class Config:
     published_state: str
     egress: EgressCfg = field(default_factory=EgressCfg)
     fec: Optional[FecCfg] = None
+    environmental: Optional[EnvironmentalCfg] = None
 
 
 # -- Decision logic ----------------------------------------------------------
@@ -916,6 +924,16 @@ def load_config(path: str) -> Config:
                 floor_ratio=raw_fec.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO),
             )
 
+        raw_env = raw.get("environmental")
+        env_cfg = None
+        if raw_env is not None:
+            ao = raw_env.get("auto_override", {})
+            env_cfg = EnvironmentalCfg(
+                enabled=bool(raw_env.get("enabled", True)),
+                auto_override_path=ao["path"],
+                auto_override_ttl_s=float(ao.get("ttl_s", 180.0)),
+            )
+
         cfg = Config(
             wans=wans,
             relay=relay,
@@ -929,6 +947,7 @@ def load_config(path: str) -> Config:
             published_state=raw["published_state"],
             egress=egress,
             fec=fec_cfg,
+            environmental=env_cfg,
         )
     except KeyError as e:
         raise ValueError(f"{path}: missing required key {e}") from e
@@ -951,6 +970,9 @@ def load_config(path: str) -> Config:
         raise ValueError(
             f"egress.default_mode must be one of {sorted(VALID_EGRESS_MODES)}, "
             f"got {egress.default_mode!r}")
+    if env_cfg is not None and env_cfg.auto_override_ttl_s <= 0:
+        raise ValueError(
+            f"environmental.auto_override.ttl_s must be > 0, got {env_cfg.auto_override_ttl_s}")
 
     return cfg
 
@@ -971,6 +993,7 @@ class RuntimeOverlay:
     fec_enabled: Optional[bool] = None  # deprecated; kept for backward-compat reads
     fec_mode: Optional[str] = None
     fec_fixed_ratio: Optional[str] = None
+    environmental_enabled: Optional[bool] = None
 
 
 def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
@@ -997,6 +1020,7 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_enabled=legacy_enabled,
                 fec_mode=loaded_fec_mode,
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
+                environmental_enabled=raw.get("environmental_enabled"),
             )
         except (FileNotFoundError, ValueError, OSError):
             continue
@@ -1015,6 +1039,7 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
         "fec_enabled": ov.fec_enabled,
         "fec_mode": ov.fec_mode,
         "fec_fixed_ratio": ov.fec_fixed_ratio,
+        "environmental_enabled": ov.environmental_enabled,
     }
     body = _json.dumps(payload, indent=2)
     Path(cfg.runtime_state).parent.mkdir(parents=True, exist_ok=True)
@@ -1027,6 +1052,36 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
             Path(cfg.persist_state).unlink()
         except OSError:
             pass
+
+
+@dataclass
+class AutoOverride:
+    force_full: bool
+    source: str
+    reason: str
+    set_ts: float
+
+
+def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
+    """Read the environmental auto-override file. Returns None when the feature
+    is unconfigured, or the file is missing / malformed / stale. Best-effort and
+    fail-open — a bad file is ignored, never raised (mirrors fetch_relay_fec)."""
+    env = cfg.environmental
+    if env is None:
+        return None
+    try:
+        raw = _json.loads(Path(env.auto_override_path).read_text())
+        set_ts = float(raw["set_ts"])
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+        return None
+    if now - set_ts > env.auto_override_ttl_s:
+        return None
+    return AutoOverride(
+        force_full=bool(raw.get("force_full", False)),
+        source=str(raw.get("source", "")),
+        reason=str(raw.get("reason", "")),
+        set_ts=set_ts,
+    )
 
 
 def effective_policy(cfg: Config, ov: RuntimeOverlay) -> tuple:
@@ -1065,6 +1120,51 @@ def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     if cfg.fec:
         return cfg.fec.fixed_ratio
     return fec_control.DEFAULT_FIXED_RATIO
+
+
+def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
+    """Resolve the environmental master toggle.
+
+    Unlike effective_fec_enabled (where cfg.fec.enabled is a hard kill-switch),
+    cfg.environmental.enabled is only the boot-time DEFAULT: the operator's
+    runtime override (ov.environmental_enabled) wins in either direction. The
+    feature is hard-off only when unconfigured (cfg.environmental is None)."""
+    if cfg.environmental is None:
+        return False
+    if ov.environmental_enabled is not None:
+        return ov.environmental_enabled
+    return bool(cfg.environmental.enabled)
+
+
+def apply_auto_override(mode: str, env_enabled: bool,
+                        auto: Optional[AutoOverride]) -> tuple:
+    """Fold the environmental auto-override into the effective mode.
+
+    Precedence: when the environmental toggle is on AND a fresh override requests
+    force_full, raise to 'full'. Otherwise pass the operator/default mode through.
+    Auto can only raise to full; it never forces master_backup. Returns
+    (effective_mode, active_override_or_None)."""
+    active = bool(env_enabled and auto is not None and auto.force_full)
+    if active:
+        return "full", auto
+    return mode, None
+
+
+def environmental_snapshot(configured: bool, env_enabled: bool,
+                           active: Optional[AutoOverride],
+                           auto: Optional[AutoOverride], now: float) -> dict:
+    """Build the /api/state 'environmental' block. `active` is the override that
+    actually forced full (or None); `auto` is the loaded override regardless of
+    whether it was honored, used for the status readout."""
+    return {
+        "configured": configured,
+        "enabled": env_enabled,
+        "active": active is not None,
+        "force_full": bool(auto.force_full) if auto else False,
+        "source": auto.source if auto else None,
+        "reason": auto.reason if auto else None,
+        "age_s": (now - auto.set_ts) if auto else None,
+    }
 
 
 def fetch_relay_fec(url, timeout_s) -> dict:
@@ -1156,6 +1256,8 @@ def validate_runtime_payload(payload: dict, wan_names: set):
             return False, "fec_fixed_ratio must be 'x:y' with integers"
         if not fec_control.validate_ratio(a, b):
             return False, "fec_fixed_ratio out of bounds (a>=1, b>=0, a+b<=254)"
+    if "environmental_enabled" in payload and not isinstance(payload["environmental_enabled"], bool):
+        return False, "environmental_enabled must be true or false"
     return True, None
 
 
@@ -1292,6 +1394,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                 ov.fec_enabled = (payload["fec_mode"] != fec_control.MODE_OFF)
             if "fec_fixed_ratio" in payload:
                 ov.fec_fixed_ratio = payload["fec_fixed_ratio"]
+            if "environmental_enabled" in payload:
+                ov.environmental_enabled = payload["environmental_enabled"]
             ov.set_by = "ui"
             ov.set_ts = time.time()
             save_runtime_overlay(cfg, ov)
@@ -1344,6 +1448,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
         loop_start = time.time()
         ov = load_runtime_overlay(cfg)
         mode, policy, master_wan, egress_mode = effective_policy(cfg, ov)
+        env_auto = load_auto_override(cfg, loop_start)
+        env_enabled = effective_environmental_enabled(cfg, ov)
+        mode, env_active = apply_auto_override(mode, env_enabled, env_auto)
 
         local = read_local_sbfd_state(cfg.sbfd_local_state, sid_to_wan)
         fec_reconcile_due = False
@@ -1574,6 +1681,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                         relay_desired, fec_relay_last_acked),
                 },
             },
+            "environmental": environmental_snapshot(
+                configured=cfg.environmental is not None,
+                env_enabled=env_enabled, active=env_active,
+                auto=env_auto, now=loop_start),
         }
         publish_state(cfg, snapshot)
 

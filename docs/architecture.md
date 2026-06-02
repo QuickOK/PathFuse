@@ -65,6 +65,14 @@ The client's `sbfd-ctl` is the brain:
 The management overlay is any stable network (e.g. a small WireGuard mesh) you provide so the client
 can reach the relay's control endpoints; it is separate from the data plane.
 
+### Environmental auto-override (optional)
+
+An optional policy source (`environ_ctl`) can ask `sbfd-ctl` to raise the link to
+full redundancy ahead of an on-route hazard (precipitation, wildfire smoke). It
+writes a TTL'd `auto_override.json`; `sbfd-ctl` reads it each loop and, when the
+operator's environmental toggle is on, raises the mode to `full` (raise-only —
+never forces master/backup). See [`environmental.md`](environmental.md).
+
 ## Failover
 
 - **Modes:** `full` (redundancy — all UP links) · `master_backup` (one master, fail over).

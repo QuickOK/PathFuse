@@ -21,6 +21,12 @@ existing multipath relay tunnel (engarde), WireGuard, and UDPspeeder:
 | `fec_report.py` | Parses UDPspeeder `--report` output into live throughput/overhead stats |
 | `ui/` | The `:8081` operator status page |
 
+**Optional: environmental redundancy.** `environ_ctl.py` is an opt-in policy
+source that forces full redundancy when on-route precipitation or wildfire smoke
+is detected (GPS + Open-Meteo), with a master on/off toggle on the `:8081` UI.
+See [`docs/environmental.md`](docs/environmental.md). It is not part of the core
+data plane.
+
 ## Three ways to use this repo
 
 1. **Run / read the code (this repo).** Quickstart below.

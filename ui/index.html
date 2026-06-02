@@ -114,6 +114,15 @@
             <span class="tip" title="client → master WAN directly (no engarde tunnel, no relay). Local IP varies; use when relay path is broken.">i</span></span></label>
         </div>
 
+        <div class="ctl-block" id="environment-block">
+          <div class="ctl-label">Environment
+            <span class="tip" title="Auto-redundancy driven by environ_ctl. When on, a fresh hazard report (rain/smoke) forces full-redundancy mode until the override expires.">i</span>
+          </div>
+          <label class="ctl-radio"><input type="radio" name="environmental_enabled" value="on"><span>Auto <em>rain/smoke → full</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="environmental_enabled" value="off"><span>Off</span></label>
+          <div class="fec-effective" id="environment-effective">—</div>
+        </div>
+
         <div class="ctl-block" id="fec-block">
           <div class="ctl-label">FEC
             <span class="tip" title="Forward error correction over the engarde tunnel. Off forces 8:0 in both directions; Fixed holds the selected ratio; Adaptive scales to measured loss; Floor + adaptive keeps a 20:1 (~5%) floor and ramps up under loss.">i</span>
