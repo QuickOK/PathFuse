@@ -10,8 +10,8 @@
       "enabled": true,
       "url": "https://api.open-meteo.com/v1/forecast",
       "current_field": "precipitation",
-      "on_thresh": 0.5,
-      "off_thresh": 0.1,
+      "on_thresh": 2.5,
+      "off_thresh": 1.0,
       "wet_confirm": 1,
       "dry_confirm": 2,
       "reason": "precip ahead"
