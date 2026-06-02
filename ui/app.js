@@ -30,7 +30,7 @@ let lastEngarde = null;
 function isFormFocused(){
   const a = document.activeElement;
   if (!a) return false;
-  return a.matches('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #master-wan, #persist');
+  return a.matches('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, input[name="environmental_enabled"], #master-wan, #persist');
 }
 
 const FEC_FIXED_FALLBACK_PRESETS = ["20:1", "8:1", "8:2", "8:4", "8:6", "8:8"];
@@ -266,6 +266,8 @@ function render(s){
       setRadio("fec_mode", desiredMode);
       syncFecFixedDropdown(s.fec.fixed_ratio_presets, s.fec.desired_fixed_ratio);
     }
+    const env = s.environmental || {};
+    if (env.configured) setRadio("environmental_enabled", env.enabled ? "on" : "off");
   }
 
   renderWanList(s, wans, active, masterWan, dyn);
@@ -274,6 +276,7 @@ function render(s){
   renderDynamic(s);
   renderFailback(s);
   renderFec(s);
+  renderEnvironmental(s);
 
   /* Local-Direct + master-DOWN red badge */
   const warn = $("#egress-warn");
@@ -635,6 +638,26 @@ function renderFecCard(id, d, local){
   }
 }
 
+/* ---------- environmental ---------- */
+function renderEnvironmental(s){
+  const env = s.environmental || {};
+  const envEl = document.getElementById('environment-effective');
+  if (envEl) {
+    if (!env.configured) {
+      envEl.textContent = 'not configured';
+    } else if (!env.enabled) {
+      envEl.textContent = 'off';
+    } else if (env.active) {
+      envEl.textContent = 'forcing full · ' + (env.reason || 'hazard');
+    } else {
+      envEl.textContent = env.force_full
+        ? 'hazard reported (age ' + Math.round(env.age_s || 0) + 's)'
+        : 'clear';
+    }
+  }
+  $$('input[name="environmental_enabled"]').forEach(r => r.disabled = !env.configured);
+}
+
 /* ---------- apply ---------- */
 async function apply(){
   const mode      = document.querySelector('input[name="mode"]:checked')?.value;
@@ -644,6 +667,7 @@ async function apply(){
   const persist   = $("#persist").checked;
   const fecMode = document.querySelector('input[name="fec_mode"]:checked')?.value;
   const fecFixed = $("#fec-fixed-ratio")?.value;
+  const envSel = document.querySelector('input[name="environmental_enabled"]:checked')?.value;
   const status    = $("#apply-status");
   if (!mode || !policy || !egressMode){
     status.textContent = "select mode, policy, and egress first";
@@ -660,7 +684,8 @@ async function apply(){
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify(Object.assign(
         {mode, master_policy: policy, master_wan: masterWan, egress_mode: egressMode, persist},
-        fecPayload))
+        fecPayload,
+        (envSel ? {environmental_enabled: envSel === "on"} : {})))
     });
     if (r.status === 409){
       const j = await r.json().catch(() => ({}));
@@ -694,7 +719,7 @@ function escapeHtml(s){
 
 /* ---------- wire ---------- */
 $("#apply").addEventListener("click", apply);
-$$('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #master-wan, #persist').forEach(el => {
+$$('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, input[name="environmental_enabled"], #master-wan, #persist').forEach(el => {
   el.addEventListener("change", () => {
     userDirty = true;
     if (el.name === "fec_mode"){

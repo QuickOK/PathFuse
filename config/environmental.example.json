@@ -1,0 +1,30 @@
+{
+  "poll_interval_s": 60,
+  "lookahead_s": 300,
+  "min_speed_ms": 2.0,
+  "max_stale_s": 600,
+  "gpsd": { "host": "127.0.0.1", "port": 2947 },
+  "auto_override": { "path": "/run/sbfd-ctl/auto_override.json" },
+  "signals": {
+    "precip": {
+      "enabled": true,
+      "url": "https://api.open-meteo.com/v1/forecast",
+      "current_field": "precipitation",
+      "on_thresh": 0.5,
+      "off_thresh": 0.1,
+      "wet_confirm": 1,
+      "dry_confirm": 2,
+      "reason": "precip ahead"
+    },
+    "smoke": {
+      "enabled": true,
+      "url": "https://air-quality-api.open-meteo.com/v1/air-quality",
+      "current_field": "pm2_5",
+      "on_thresh": 55.0,
+      "off_thresh": 35.0,
+      "wet_confirm": 1,
+      "dry_confirm": 2,
+      "reason": "smoke"
+    }
+  }
+}
