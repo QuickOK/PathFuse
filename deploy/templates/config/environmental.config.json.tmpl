@@ -16,6 +16,17 @@
       "dry_confirm": 2,
       "reason": "precip ahead"
     },
+    "weather": {
+      "enabled": true,
+      "url": "https://api.open-meteo.com/v1/forecast",
+      "current_field": "weather_code",
+      "hazard_codes": [80, 81, 82, 95, 96, 99],
+      "on_thresh": 1.0,
+      "off_thresh": 0.0,
+      "wet_confirm": 1,
+      "dry_confirm": 3,
+      "reason": "storm/showers ahead"
+    },
     "smoke": {
       "enabled": true,
       "url": "https://air-quality-api.open-meteo.com/v1/air-quality",

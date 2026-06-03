@@ -104,6 +104,35 @@ def test_signal_controller_band_while_hazard_holds_on():
     assert sc.hazard is True
 
 
+def test_classify_codes_hazard_and_clear():
+    codes = {80, 81, 82, 95, 96, 99}
+    assert M.classify_codes([95.0], codes) == [1.0]      # thunderstorm
+    assert M.classify_codes([81.0], codes) == [1.0]      # moderate rain showers
+    assert M.classify_codes([45.0], codes) == [0.0]      # fog: not a hazard
+    assert M.classify_codes([0.0], codes) == [0.0]       # clear sky
+
+
+def test_classify_codes_max_picks_hazard_across_points():
+    codes = {95, 96, 99}
+    # current point clear (3 = overcast), look-ahead point a thunderstorm (95)
+    vals = M.classify_codes([3.0, 95.0], codes)
+    assert max(vals) == 1.0
+
+
+def test_classify_codes_junk_value_is_clear():
+    assert M.classify_codes([None, "x"], {95}) == [0.0, 0.0]
+
+
+def test_weather_code_signal_thresholds_fire_on_first_storm():
+    # how the "weather" signal is wired: binary classifier + on=1.0/off=0.0
+    sc = M.SignalController("weather", on_thresh=1.0, off_thresh=0.0,
+                            wet_confirm=1, dry_confirm=3, reason="thunderstorm ahead")
+    assert sc.update(1.0) is True       # storm code -> hazard immediately
+    assert sc.update(0.0) is True       # one clear poll: dry_confirm=3 holds it
+    assert sc.update(0.0) is True
+    assert sc.update(0.0) is False      # third clear poll clears it
+
+
 def test_parse_open_meteo_single_object():
     data = {"current": {"precipitation": 0.7}}
     assert M.parse_open_meteo(data, "precipitation") == [0.7]
@@ -151,6 +180,74 @@ def test_load_env_config_parses_signals(tmp_path):
     assert names == ["precip"]
     assert cfg.signals[0].url == "http://fc"
     assert cfg.signals[0].current_field == "precipitation"
+
+
+def test_load_env_config_parses_hazard_codes(tmp_path):
+    raw = {
+        "poll_interval_s": 60, "lookahead_s": 300, "min_speed_ms": 2.0, "max_stale_s": 600,
+        "gpsd": {"host": "127.0.0.1", "port": 2947},
+        "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        "signals": {
+            "precip": {"enabled": True, "url": "http://fc", "current_field": "precipitation",
+                       "on_thresh": 0.5, "off_thresh": 0.1, "reason": "precip ahead"},
+            "weather": {"enabled": True, "url": "http://fc", "current_field": "weather_code",
+                        "hazard_codes": [80, 95, 96, 99], "on_thresh": 1.0, "off_thresh": 0.0,
+                        "reason": "thunderstorm ahead"},
+        },
+    }
+    p = tmp_path / "env.json"
+    p.write_text(_json.dumps(raw))
+    cfg = M.load_env_config(str(p))
+    by_name = {s.controller.name: s for s in cfg.signals}
+    assert by_name["precip"].hazard_codes is None
+    assert by_name["weather"].hazard_codes == {80, 95, 96, 99}
+    assert by_name["weather"].current_field == "weather_code"
+
+
+def test_poll_once_weather_code_storm_triggers_full(tmp_path, monkeypatch):
+    raw = {
+        "poll_interval_s": 60, "lookahead_s": 0, "min_speed_ms": 2.0, "max_stale_s": 600,
+        "gpsd": {"host": "127.0.0.1", "port": 2947},
+        "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        "signals": {
+            "weather": {"enabled": True, "url": "http://fc", "current_field": "weather_code",
+                        "hazard_codes": [80, 81, 82, 95, 96, 99], "on_thresh": 1.0,
+                        "off_thresh": 0.0, "wet_confirm": 1, "dry_confirm": 3,
+                        "reason": "thunderstorm ahead"},
+        },
+    }
+    p = tmp_path / "env.json"
+    p.write_text(_json.dumps(raw))
+    cfg = M.load_env_config(str(p))
+    monkeypatch.setattr(M, "get_fix", lambda h, port, **k: (10.0, 20.0, 0.0, None))
+    monkeypatch.setattr(M, "fetch_open_meteo", lambda pts, url, field, **k: [95.0])
+    M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
+    rec = _json.loads(Path(cfg.auto_override_path).read_text())
+    assert rec["force_full"] is True
+    assert rec["reason"] == "thunderstorm ahead"
+
+
+def test_poll_once_weather_code_fog_does_not_trigger(tmp_path, monkeypatch):
+    # regression guard: a high non-storm code (fog=45) must not be read as a hazard
+    raw = {
+        "poll_interval_s": 60, "lookahead_s": 0, "min_speed_ms": 2.0, "max_stale_s": 600,
+        "gpsd": {"host": "127.0.0.1", "port": 2947},
+        "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        "signals": {
+            "weather": {"enabled": True, "url": "http://fc", "current_field": "weather_code",
+                        "hazard_codes": [80, 81, 82, 95, 96, 99], "on_thresh": 1.0,
+                        "off_thresh": 0.0, "wet_confirm": 1, "dry_confirm": 3,
+                        "reason": "thunderstorm ahead"},
+        },
+    }
+    p = tmp_path / "env.json"
+    p.write_text(_json.dumps(raw))
+    cfg = M.load_env_config(str(p))
+    monkeypatch.setattr(M, "get_fix", lambda h, port, **k: (10.0, 20.0, 0.0, None))
+    monkeypatch.setattr(M, "fetch_open_meteo", lambda pts, url, field, **k: [45.0])
+    M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
+    rec = _json.loads(Path(cfg.auto_override_path).read_text())
+    assert rec["force_full"] is False
 
 
 def test_poll_once_writes_override_on_success(tmp_path, monkeypatch):

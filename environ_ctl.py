@@ -100,6 +100,22 @@ class SignalController:
         return self.hazard
 
 
+def classify_codes(vals, hazard_codes):
+    """Map raw categorical codes (e.g. WMO weather_code) to a binary hazard score:
+    1.0 when the code is in hazard_codes, else 0.0. This lets a categorical signal
+    feed the numeric SignalController unchanged — run it with on_thresh=1.0,
+    off_thresh=0.0 so the result never lands in the hysteresis band and debounce
+    (wet_confirm/dry_confirm) still governs flap protection. Non-integer / junk
+    values map to 0.0 (clear) rather than raising."""
+    out = []
+    for v in vals:
+        try:
+            out.append(1.0 if int(v) in hazard_codes else 0.0)
+        except (TypeError, ValueError):
+            out.append(0.0)
+    return out
+
+
 def combine_hazard(controllers):
     """OR the signal controllers. Returns (force_full, reason) where reason names
     the signals currently in hazard, joined by '; '."""
@@ -211,6 +227,7 @@ class SignalSpec:
     controller: SignalController
     url: str
     current_field: str
+    hazard_codes: object = None  # optional set[int]; categorical (code-membership) signal
 
 
 @dataclass
@@ -232,6 +249,7 @@ def load_env_config(path) -> EnvConfig:
     for name, s in raw.get("signals", {}).items():
         if not s.get("enabled", True):
             continue
+        hc = s.get("hazard_codes")
         signals.append(SignalSpec(
             controller=SignalController(
                 name=name,
@@ -243,6 +261,7 @@ def load_env_config(path) -> EnvConfig:
             ),
             url=s["url"],
             current_field=s["current_field"],
+            hazard_codes=set(int(c) for c in hc) if hc is not None else None,
         ))
     g = raw.get("gpsd", {})
     return EnvConfig(
@@ -280,6 +299,8 @@ def poll_once(cfg: EnvConfig, last_good_mono: float, now_mono: float) -> float:
         for spec in cfg.signals:
             try:
                 vals = fetch_open_meteo(points, spec.url, spec.current_field)
+                if spec.hazard_codes is not None:
+                    vals = classify_codes(vals, spec.hazard_codes)
                 spec.controller.update(max(vals) if vals else 0.0)
                 evaluated = True
             except Exception as e:  # noqa: BLE001 - hold this signal's last state

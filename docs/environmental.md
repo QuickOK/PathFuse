@@ -34,16 +34,17 @@ The toggle is on the `:8081` UI next to the Egress selector.
 
 ## Signals
 
-Both signals use keyless Open-Meteo HTTP APIs and only stdlib Python.
+All signals use keyless Open-Meteo HTTP APIs and only stdlib Python.
 
-| Signal | Source | Field | Units |
+| Signal | Source | Field | Units / values |
 |---|---|---|---|
 | `precip` | Open-Meteo Forecast | `current.precipitation` | mm |
+| `weather` | Open-Meteo Forecast | `current.weather_code` | WMO code (categorical) |
 | `smoke` | Open-Meteo Air Quality | `current.pm2_5` | µg/m³ |
 
 Each poll queries both the client's current GPS position and a course-projected
 look-ahead point. The look-ahead direction comes from the client's gpsd
-course-over-ground value; smoke uses the travel heading (not wind direction).
+course-over-ground value; every signal uses the travel heading (not wind direction).
 
 Each signal has its own **hysteresis band** (`on_thresh` > `off_thresh`) and a
 **debounce count** (`wet_confirm` to activate, `dry_confirm` to deactivate). The daemon
@@ -53,6 +54,24 @@ which signals triggered.
 The thresholds in `config/environmental.example.json` are starting guesses — tune
 `precip` against the precipitation rate at which your rain-sensitive link (e.g. a
 satellite uplink) degrades, and `smoke` against the PM2.5 level you want to react to.
+
+### Categorical signals (`hazard_codes`)
+
+`precip` and `smoke` are magnitude signals: the controller compares a numeric value
+against `on_thresh`/`off_thresh`. `weather` is **categorical** — `weather_code` is a WMO
+enum, not a magnitude (fog `45` is not "more hazardous" than overcast `3`). A signal that
+sets `hazard_codes` is evaluated by **set membership** instead: each polled code maps to
+`1.0` if it is in `hazard_codes`, else `0.0`, before the controller sees it. Run such a
+signal with `on_thresh: 1.0` / `off_thresh: 0.0` so the binary result never lands in the
+hysteresis band — debounce (`wet_confirm`/`dry_confirm`) still governs flap protection.
+
+The default `weather` codes are `[80, 81, 82, 95, 96, 99]`: rain showers (80–82) and
+thunderstorms with/without hail (95/96/99). This targets convective cells, which carry
+high cloud liquid water and can degrade a Ku/Ka satellite uplink **even with no rain at
+the dish** — see [`cloud-coverage.md`](../cloud-coverage.md). `dry_confirm: 3` holds the
+override as a cell drifts across the slant path rather than dropping it the moment the
+code clears. To also react to non-convective thunderstorm-adjacent codes, add them to the
+list; to react only to thunderstorms, drop the shower codes (80–82).
 
 ## Fail-safe
 
