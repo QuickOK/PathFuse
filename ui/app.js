@@ -650,9 +650,9 @@ function renderEnvironmental(s){
     } else if (env.active) {
       envEl.textContent = 'forcing full · ' + (env.reason || 'hazard');
     } else {
-      envEl.textContent = env.force_full
-        ? 'hazard reported (age ' + Math.round(env.age_s || 0) + 's)'
-        : 'clear';
+      // enabled + not active ⇒ no honored override ⇒ clear. (A fresh force_full
+      // override while enabled would set env.active, handled above.)
+      envEl.textContent = 'clear';
     }
   }
   $$('input[name="environmental_enabled"]').forEach(r => r.disabled = !env.configured);

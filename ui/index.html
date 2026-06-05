@@ -120,7 +120,10 @@
           </div>
           <label class="ctl-radio"><input type="radio" name="environmental_enabled" value="on"><span>Auto <em>rain/smoke → full</em></span></label>
           <label class="ctl-radio"><input type="radio" name="environmental_enabled" value="off"><span>Off</span></label>
-          <div class="fec-effective" id="environment-effective">—</div>
+          <div class="fec-effective">
+            <span id="environment-effective">—</span>
+            <span class="tip" title="Status of the auto-redundancy check, evaluated at the client's current gpsd position and a course-projected look-ahead point. clear: no rain/smoke hazard there — conserve. forcing full · reason: a fresh hazard report raised both WANs to full redundancy. off: toggle disabled. not configured: environ_ctl not set up.">i</span>
+          </div>
         </div>
 
         <div class="ctl-block" id="fec-block">
