@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""relay-egress-watchdog: reference relay-side egress actuator.
+
+Vendor-neutral reference implementation of the component that *enacts* a client's
+desired egress mode on the relay. The client (sbfd-ctl) only *publishes* the
+desired mode at `:8081/api/desired_egress`; this watchdog decides where the
+client's decrypted traffic actually exits.
+
+Fired as a Type=oneshot by a 10s timer. Each tick it:
+  1. Probes the upstream-VPN egress for health.
+  2. Polls the client's control URL for the desired egress mode.
+  3. Adds/withdraws the metric-100 *upstream-VPN* default in the egress PBR
+     table so the client subnet exits via either the upstream VPN (`relay_vpn`)
+     or the relay's own WAN (`relay_direct` / `local_direct`, which leave a
+     lower-priority WAN default in place to fall through to).
+
+Reads config from an EnvironmentFile; hardcodes no real infrastructure
+addresses (defaults are RFC-5737/6598 reserved examples).
+
+See deploy/relay/egress/README.md for the egress-mode vocabulary contract — the
+single most important thing to keep in sync with the client.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+
+# Canonical client egress vocabulary, exactly as published by sbfd-ctl's
+# /api/desired_egress. This MUST match the client; see MODE_ALIASES below.
+VALID_DESIRED_MODES = {"relay_vpn", "relay_direct", "local_direct"}
+
+# Only these modes keep the upstream-VPN default route in place. Any other valid
+# mode withdraws it, so traffic falls through to the relay's own WAN default.
+UPSTREAM_MODES = {"relay_vpn"}
+
+# Translate alternate/legacy egress names onto the canonical vocabulary. An
+# actuator whose internal names drift from what the client publishes will reject
+# every poll as "invalid mode", fall back to the default, and silently never
+# honor the requested mode. Keeping this mapping correct is what prevents that.
+# Unknown/None passes through unchanged so the VALID check still rejects it.
+MODE_ALIASES = {
+    "upstream_vpn": "relay_vpn",
+    "relay_wan": "relay_direct",
+    "local": "local_direct",
+}
+
+
+def normalize_mode(mode):
+    """Map an alternate egress name onto the canonical client vocabulary."""
+    return MODE_ALIASES.get(mode, mode)
+
+
+def probe_upstream(url: str, timeout_s: float) -> tuple[bool, str]:
+    """Health-probe the upstream-VPN egress. ok=True on a 2xx response."""
+    import urllib.request, urllib.error, socket
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as r:
+            code = r.getcode()
+            return (200 <= code < 300, str(code))
+    except urllib.error.HTTPError as e:
+        return (False, f"http {e.code}")
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
+        return (False, "timeout" if isinstance(e, (socket.timeout, TimeoutError)) else f"transport: {e}")
+
+
+def fetch_desired_mode(url: str, timeout_s: float) -> tuple[str | None, str | None, str | None]:
+    """GET the client's /api/desired_egress and return (mode, master_wan, err).
+
+    Success: (mode, master_wan, None) — mode is normalized to VALID_DESIRED_MODES.
+    Failure: (None, None, "<reason>") — caller decides last-known vs. default.
+    """
+    import urllib.request, urllib.error, json as _j, socket
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        return (None, None, f"http {e.code}")
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
+        return (None, None, "timeout" if isinstance(e, (socket.timeout, TimeoutError)) else f"transport: {e}")
+    try:
+        payload = _j.loads(body.decode())
+    except (ValueError, UnicodeDecodeError) as e:
+        return (None, None, f"parse: {e}")
+    mode = normalize_mode(payload.get("mode"))
+    if mode not in VALID_DESIRED_MODES:
+        return (None, None, f"invalid mode: {mode!r}")
+    return (mode, payload.get("master_wan"), None)
+
+
+def choose_fetch_timeout(last_known: Optional[str], bootstrap_s: float, regular_s: float) -> float:
+    """Cold-start (no last-known) gets the longer bootstrap timeout; else the snappy regular one."""
+    return bootstrap_s if last_known is None else regular_s
+
+
+def effective_mode_for(desired_mode: str, age_s: float, grace_s: float, default_mode: str) -> str:
+    """Resolve which mode to use this tick: desired if within grace, else default."""
+    return desired_mode if age_s <= grace_s else default_mode
+
+
+def apply_post_fetch_state_update(state: dict, fetched_mode: Optional[str],
+                                  default_mode: str, now: float) -> dict:
+    """Pure state update applied after attempting fetch_desired_mode().
+
+    - On success: store mode, refresh fetched_at, reset fail counter.
+    - On failure with last-known present: keep last-known, increment counter, do NOT
+      refresh fetched_at (so the grace window keeps ticking).
+    - On failure with NO last-known (cold-start): synthesize default_mode immediately
+      and refresh fetched_at — avoids assuming None for a whole grace window.
+    """
+    s = dict(state)
+    if fetched_mode is not None:
+        s["desired_mode"] = fetched_mode
+        s["desired_mode_fetched_at"] = now
+        s["desired_mode_fetch_fail"] = 0
+    else:
+        s["desired_mode_fetch_fail"] = s.get("desired_mode_fetch_fail", 0) + 1
+        if s.get("desired_mode") is None:
+            s["desired_mode"] = default_mode
+            s["desired_mode_fetched_at"] = now
+    return s
+
+
+_DEFAULT_STATE = {
+    "consecutive_pass": 0,
+    "consecutive_fail": 0,
+    "healthy": False,
+    "first_pass_seen": False,
+    "last_check": 0.0,
+    "last_change": 0.0,
+    "last_probe_value": "",
+    "desired_mode": None,
+    "desired_mode_fetched_at": 0.0,
+    "desired_mode_fetch_fail": 0,
+}
+
+
+def load_state(path: Path) -> dict:
+    if not Path(path).exists():
+        return dict(_DEFAULT_STATE)
+    return json.loads(Path(path).read_text())
+
+
+def save_state(path: Path, state: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def advance(state: dict, *, ok: bool, probe_value: str, now: float,
+            fail_threshold: int, pass_threshold: int,
+            add_route, remove_route,
+            desired_mode: str = "relay_vpn",
+            desired_age_s: float = 0.0,
+            grace_s: float = 60.0,
+            default_mode: str = "relay_vpn") -> dict:
+    """Advance the state machine by one tick.
+
+    The upstream-VPN route is present only when BOTH upstream-healthy AND the
+    effective mode is an upstream mode. effective_mode = desired within grace_s,
+    else default_mode.
+    """
+    s = dict(state)
+    s["last_check"] = now
+    s["last_probe_value"] = probe_value
+
+    effective_mode = effective_mode_for(desired_mode, desired_age_s, grace_s, default_mode)
+    want_upstream = effective_mode in UPSTREAM_MODES
+
+    if ok:
+        s["consecutive_pass"] = s["consecutive_pass"] + 1
+        s["consecutive_fail"] = 0
+
+        should_add = False
+        if not s["healthy"]:
+            if not s["first_pass_seen"]:
+                should_add = True            # first successful probe — fast boot
+            elif s["consecutive_pass"] >= pass_threshold:
+                should_add = True            # recovery after a failure window
+
+        if should_add and want_upstream:
+            add_route()
+            s["healthy"] = True
+            s["last_change"] = now
+
+        s["first_pass_seen"] = True
+    else:
+        s["consecutive_fail"] = s["consecutive_fail"] + 1
+        s["consecutive_pass"] = 0
+
+        if s["healthy"] and s["consecutive_fail"] >= fail_threshold:
+            remove_route()
+            s["healthy"] = False
+            s["last_change"] = now
+
+    # Mode-driven removal: route present but the effective mode isn't an upstream mode.
+    if s["healthy"] and not want_upstream:
+        remove_route()
+        s["healthy"] = False
+        s["last_change"] = now
+
+    return s
+
+
+def add_route(table: str, via_ip: str, dev: str) -> None:
+    """Install the metric-100 upstream-VPN default. Idempotent via `ip route replace`."""
+    subprocess.run(
+        ["ip", "route", "replace", "default", "via", via_ip, "dev", dev,
+         "metric", "100", "table", table],
+        check=False, capture_output=True,
+    )
+
+
+def remove_route(table: str, via_ip: str, dev: str) -> None:
+    """Remove the metric-100 upstream-VPN default. Idempotent (ignore 'not found')."""
+    subprocess.run(
+        ["ip", "route", "del", "default", "via", via_ip, "dev", dev,
+         "metric", "100", "table", table],
+        check=False, capture_output=True,
+    )
+
+
+def main() -> int:
+    table       = os.environ.get("EGRESS_TABLE", "egress")
+    up_gw       = os.environ.get("EGRESS_UPSTREAM_GW", "192.0.2.2")
+    up_dev      = os.environ.get("EGRESS_UPSTREAM_DEV", "vpn0")
+    probe_url   = os.environ.get("EGRESS_PROBE_URL", "http://198.51.100.1/healthz")
+    probe_t     = float(os.environ.get("EGRESS_PROBE_TIMEOUT_S", "5"))
+    fail_t      = int(os.environ.get("EGRESS_FAIL_THRESHOLD", "3"))
+    pass_t      = int(os.environ.get("EGRESS_PASS_THRESHOLD", "2"))
+    state_p     = Path(os.environ.get("EGRESS_STATE_PATH", "/run/relay-egress-watchdog/state.json"))
+    control_url = os.environ.get("EGRESS_CLIENT_CONTROL_URL", "")
+    grace_s     = float(os.environ.get("EGRESS_DESIRED_MODE_GRACE_S", "60"))
+    default_m   = os.environ.get("EGRESS_DESIRED_MODE_DEFAULT", "relay_vpn")
+    fetch_t     = float(os.environ.get("EGRESS_FETCH_TIMEOUT_S", "1"))
+    boot_t      = float(os.environ.get("EGRESS_BOOTSTRAP_TIMEOUT_S", "5"))
+
+    ok, value = probe_upstream(probe_url, probe_t)
+
+    state = load_state(state_p)
+    for k, v in _DEFAULT_STATE.items():
+        state.setdefault(k, v)
+
+    now = time.time()
+    fetch_err = None
+    if control_url:
+        eff_timeout = choose_fetch_timeout(state.get("desired_mode"), boot_t, fetch_t)
+        fetched_mode, _master, fetch_err = fetch_desired_mode(control_url, eff_timeout)
+        state = apply_post_fetch_state_update(state, fetched_mode, default_m, now)
+    else:
+        fetch_err = "disabled"
+
+    desired_age_s = (now - state.get("desired_mode_fetched_at", 0.0)) if state.get("desired_mode_fetched_at") else 0.0
+    desired_for_advance = state.get("desired_mode") or default_m
+
+    new = advance(
+        state, ok=ok, probe_value=value, now=now,
+        fail_threshold=fail_t, pass_threshold=pass_t,
+        add_route=lambda: add_route(table, up_gw, up_dev),
+        remove_route=lambda: remove_route(table, up_gw, up_dev),
+        desired_mode=desired_for_advance,
+        desired_age_s=desired_age_s,
+        grace_s=grace_s,
+        default_mode=default_m,
+    )
+    save_state(state_p, new)
+
+    # Reconcile route to match state every tick.
+    effective_mode = effective_mode_for(desired_for_advance, desired_age_s, grace_s, default_m)
+    if new["healthy"] and effective_mode in UPSTREAM_MODES:
+        add_route(table, up_gw, up_dev)
+    else:
+        remove_route(table, up_gw, up_dev)
+
+    print(f"probe={'ok' if ok else 'fail'} value={value} healthy={new['healthy']} "
+          f"mode={desired_for_advance} eff={effective_mode} fetch_err={fetch_err or '-'} "
+          f"pass={new['consecutive_pass']} fail={new['consecutive_fail']}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
