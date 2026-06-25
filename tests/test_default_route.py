@@ -144,11 +144,15 @@ def test_action_replace_when_gateway_differs_dhcp_renewal():
     assert out == ("replace", "wan1", "10.0.0.99")
 
 
-def test_action_delete_when_no_desired_but_have_current():
+def test_action_preserves_route_when_no_desired_wan():
+    # Parked route-delete outage: when no WAN is pickable (all DOWN/UNKNOWN ->
+    # egress_master None), the controller must PRESERVE the last-good managed
+    # default route, not delete it (deleting risks total outage). Clean-shutdown
+    # withdrawal is a separate path (withdraw_managed_default).
     out = M.compute_route_action(
         desired_iface=None, desired_gateway=None,
         current=("wan1", "10.0.0.1"))
-    assert out == ("delete", "wan1", "10.0.0.1")
+    assert out is None
 
 
 def test_action_none_when_no_desired_and_no_current():

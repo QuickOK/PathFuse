@@ -727,13 +727,17 @@ def compute_route_action(desired_iface: Optional[str],
                          current: Optional[tuple]) -> Optional[tuple]:
     """Reconcile current managed default toward desired.
 
-    Returns None | ('replace', iface, gw) | ('delete', iface, gw).
+    Returns None | ('replace', iface, gw).
     Safety: if desired_iface is set but desired_gateway is None (couldn't
     read it), returns None — refuse to act on incomplete info.
+
+    No-WAN-pickable (desired_iface None, e.g. all WANs DOWN/UNKNOWN ->
+    egress_master None) PRESERVES the last-good managed default route rather
+    than deleting it: deleting our sole default during a transient both-down
+    blip caused episodic total outages. Clean-shutdown removal is handled
+    separately by withdraw_managed_default().
     """
     if desired_iface is None:
-        if current is not None:
-            return ("delete", current[0], current[1])
         return None
     if desired_gateway is None:
         return None
@@ -1564,6 +1568,12 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             chosen_iface = cfg.wans[chosen].iface if chosen else None
             chosen_gw = read_wan_gateway(chosen_iface) if chosen_iface else None
             current_managed = read_managed_default()
+            if chosen is None and current_managed is not None:
+                # No WAN pickable (all DOWN/UNKNOWN): preserve the last-good
+                # default route rather than delete it (deleting our sole default
+                # during a transient both-down blip caused episodic outages).
+                logging.warning("no WAN pickable; preserving managed default %s",
+                                current_managed)
             action = compute_route_action(chosen_iface, chosen_gw, current_managed)
             if action is not None:
                 try:
