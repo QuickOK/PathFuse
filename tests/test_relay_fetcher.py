@@ -116,3 +116,38 @@ def test_merge_effective_both_unavailable_returns_empty():
     L = M.StateSnapshot(ok=False, per_wan={}, error="missing")
     R = M.StateSnapshot(ok=False, per_wan={}, error="conn refused")
     assert M.merge_effective(L, R) == {}
+
+
+def test_merge_effective_stale_local_down_does_not_suppress_fresh_remote_up():
+    # CR #13: a stale local snapshot (sbfd daemon frozen) must not let its
+    # last-seen DOWN dominate fresh remote data, or a recovered WAN stays
+    # suppressed forever.
+    L = M.StateSnapshot(ok=True, stale=True,
+                        per_wan={"wan1": M.WanSample("UP", 50.0, 0.0),
+                                 "wan2": M.WanSample("DOWN", None, 100.0)})
+    R = M.StateSnapshot(ok=True, stale=False,
+                        per_wan={"wan1": M.WanSample("UP", 50.0, 0.0),
+                                 "wan2": M.WanSample("UP", 50.0, 0.0)})
+    assert M.merge_effective(L, R) == {"wan1": "UP", "wan2": "UP"}
+
+
+def test_merge_effective_both_stale_keeps_last_known():
+    # When NEITHER side is fresh (total blindness), keep last-known states
+    # rather than nuking everything to UNKNOWN -- doing the latter would route
+    # into the "both DOWN safety fallback" path. With both stale, DOWN still
+    # dominates the last-known data (conservative; no new fallback trigger).
+    L = M.StateSnapshot(ok=True, stale=True,
+                        per_wan={"wan1": M.WanSample("DOWN", None, 100.0)})
+    R = M.StateSnapshot(ok=True, stale=True,
+                        per_wan={"wan1": M.WanSample("UP", 50.0, 0.0)})
+    assert M.merge_effective(L, R) == {"wan1": "DOWN"}
+
+
+def test_merge_effective_stale_only_source_kept_when_nothing_fresher():
+    # A stale local with no fresh counterpart is still our best info: keep it
+    # rather than going blind.
+    L = M.StateSnapshot(ok=True, stale=True,
+                        per_wan={"wan1": M.WanSample("UP", 50.0, 0.0),
+                                 "wan2": M.WanSample("DOWN", None, 100.0)})
+    R = M.StateSnapshot(ok=False, per_wan={}, error="conn refused")
+    assert M.merge_effective(L, R) == {"wan1": "UP", "wan2": "DOWN"}

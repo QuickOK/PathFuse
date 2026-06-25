@@ -25,6 +25,27 @@ def cfg(tmp_path: Path):
     )
 
 
+def test_save_runtime_overlay_is_atomic_against_interrupted_write(cfg, monkeypatch):
+    # CR #15 / Greptile P2: the 0.5s controller loop reads runtime.json while
+    # the API writes it. A non-atomic truncate-then-write can be observed as a
+    # partial/empty file. An interrupted save must leave the previous COMPLETE
+    # overlay intact, never a truncated one.
+    c = cfg
+    M.save_runtime_overlay(c, M.RuntimeOverlay(mode="master_backup", set_by="A", set_ts=1.0))
+
+    def boom(*a, **k):
+        raise RuntimeError("crash mid-publish")
+
+    monkeypatch.setattr(M.os, "replace", boom)
+    try:
+        M.save_runtime_overlay(c, M.RuntimeOverlay(mode="full", set_by="B", set_ts=2.0))
+    except RuntimeError:
+        pass  # atomic impl raises here; the point is what survives on disk
+
+    loaded = M.load_runtime_overlay(c)
+    assert loaded.mode == "master_backup"  # old complete state, never partial
+
+
 def test_validate_runtime_payload_accepts_valid():
     ok, err = M.validate_runtime_payload({
         "mode": "master_backup",

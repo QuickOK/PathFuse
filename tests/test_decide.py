@@ -45,6 +45,35 @@ def test_full_mode_returns_both_always():
     assert "full redundancy" in out.reason.lower() or "both" in out.reason.lower()
 
 
+# -- effective_master: the policy-resolved master, exposed so the default-route
+#    picker and the local_direct egress anchor stop re-deriving it from static
+#    config (CR #11 / CR #14). ---------------------------------------------------
+
+def test_effective_master_static_primary_is_config_default():
+    out = D(policy="static_primary", master_wan="wan1")  # overlay ignored by policy
+    assert out.effective_master == "wan2"  # cfg default_master_wan
+
+
+def test_effective_master_static_configured_follows_overlay():
+    out = D(policy="static_configured", master_wan="wan1")
+    assert out.effective_master == "wan1"
+
+
+def test_effective_master_dynamic_follows_picker():
+    # wan1 clearly better (lower rtt) and held past dwell -> picker selects wan1.
+    out = D(policy="dynamic", eff={"wan1":"UP","wan2":"UP"},
+            rtt={"wan1":20.0,"wan2":200.0}, loss={"wan1":0.0,"wan2":0.0},
+            dyn_master="wan2", dyn_cand="wan1", dyn_cand_since=0.0, now=10_000.0)
+    assert out.effective_master == "wan1"
+    assert out.dynamic_master_current == "wan1"
+
+
+def test_effective_master_full_mode_follows_operator_master():
+    out = D(mode="full", policy="static_configured", master_wan="wan1",
+            eff={"wan1":"UP","wan2":"UP"})
+    assert out.effective_master == "wan1"
+
+
 def test_master_backup_steady_state_on_master():
     out = D(eff={"wan1":"UP","wan2":"UP"}, currently_active=("wan2",))
     assert out.desired_active == {"wan2"}

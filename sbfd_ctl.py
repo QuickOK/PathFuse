@@ -137,6 +137,9 @@ class DecideOutput:
     dynamic_master_current: Optional[str] = None
     dynamic_candidate: Optional[str] = None
     dynamic_candidate_since: Optional[float] = None
+    # Policy-resolved master. Callers use this for the kernel default route and
+    # the local_direct egress anchor instead of re-deriving from static config.
+    effective_master: Optional[str] = None
 
 
 def _best_link(eff_state: dict, rtt_ms: dict, loss_pct: dict, configured_master: str) -> str:
@@ -234,6 +237,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
             desired_active=set(cfg.wans.keys()),
             reason="full redundancy mode: both WANs active",
             master_up_since=None,
+            effective_master=i.master_wan_cfg,
         )
 
     new_dyn_master = None
@@ -260,7 +264,8 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
                             master_up_since=i.master_up_since,
                             dynamic_master_current=new_dyn_master,
                             dynamic_candidate=new_dyn_cand,
-                            dynamic_candidate_since=new_dyn_cand_since)
+                            dynamic_candidate_since=new_dyn_cand_since,
+                            effective_master=master)
     backup = others[0]
 
     master_up = i.eff_state.get(master) == "UP"
@@ -281,6 +286,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
             dynamic_master_current=new_dyn_master,
             dynamic_candidate=new_dyn_cand,
             dynamic_candidate_since=new_dyn_cand_since,
+            effective_master=master,
         )
 
     if not master_up and backup_up:
@@ -291,6 +297,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
             dynamic_master_current=new_dyn_master,
             dynamic_candidate=new_dyn_cand,
             dynamic_candidate_since=new_dyn_cand_since,
+            effective_master=master,
         )
 
     if master_up and i.currently_active == {backup} and i.policy != "dynamic":
@@ -303,6 +310,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
                 dynamic_master_current=new_dyn_master,
                 dynamic_candidate=new_dyn_cand,
                 dynamic_candidate_since=new_dyn_cand_since,
+                effective_master=master,
             )
         else:
             remaining = cfg.policy.failback_hold_s - elapsed
@@ -313,6 +321,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
                 dynamic_master_current=new_dyn_master,
                 dynamic_candidate=new_dyn_cand,
                 dynamic_candidate_since=new_dyn_cand_since,
+                effective_master=master,
             )
 
     return DecideOutput(
@@ -322,6 +331,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
         dynamic_master_current=new_dyn_master,
         dynamic_candidate=new_dyn_cand,
         dynamic_candidate_since=new_dyn_cand_since,
+        effective_master=master,
     )
 
 
@@ -441,13 +451,24 @@ def fetch_remote_sbfd_state(url: str,
 
 
 def merge_effective(local: StateSnapshot, remote: StateSnapshot) -> dict:
-    """DOWN dominates: a WAN is DOWN if either side reports DOWN."""
+    """DOWN dominates: a WAN is DOWN if a contributing side reports DOWN.
+
+    Freshness gating (CR #13): a fresh source always overrides a stale one, so a
+    stale DOWN can never suppress a WAN that a fresh source reports UP. A stale
+    source still contributes when the other side has nothing fresher — losing
+    last-known state entirely would route total blindness into the "both DOWN"
+    safety fallback. So a stale snapshot is used only if the other side is not
+    fresh; if both are stale, last-known data (DOWN-dominant) is kept."""
     eff = {}
+    local_fresh = local.ok and not local.stale
+    remote_fresh = remote.ok and not remote.stale
+    use_local = local.ok and (local_fresh or not remote_fresh)
+    use_remote = remote.ok and (remote_fresh or not local_fresh)
     wans = set((local.per_wan if local.ok else {}).keys()) | \
            set((remote.per_wan if remote.ok else {}).keys())
     for w in wans:
-        l = local.per_wan.get(w) if local.ok else None
-        r = remote.per_wan.get(w) if remote.ok else None
+        l = local.per_wan.get(w) if use_local else None
+        r = remote.per_wan.get(w) if use_remote else None
         states = []
         if l: states.append(l.state)
         if r: states.append(r.state)
@@ -567,6 +588,13 @@ def apply_nft_diff(cfg: Config, actions: list) -> None:
                 r3 = subprocess.run(fallback, capture_output=True, text=True)
                 if r3.returncode == 0:
                     continue
+            else:
+                # Rule is already absent (nft flush, restart, or external
+                # change). The desired end-state — drop rule gone — already
+                # holds, so this delete is a no-op. Treating it as an error
+                # would keep desired != current and re-fire every tick.
+                logging.debug("nft delete: drop rule for %s already absent; converged", wan)
+                continue
         raise RuntimeError(f"nft action {line!r} failed: {r2.stderr.strip()}")
 
 
@@ -910,7 +938,11 @@ def load_config(path: str) -> Config:
             else:
                 cfg_mode = fec_control.DEFAULT_MODE
             fec_cfg = FecCfg(
-                enabled=bool(raw_fec.get("enabled", True)),
+                # Derive `enabled` from the resolved mode so an explicit `mode`
+                # always wins over the deprecated `enabled` bool. Leaving a
+                # stale `enabled:false` next to `mode:"adaptive"` must NOT keep
+                # FEC silently off (and vice-versa).
+                enabled=(cfg_mode != fec_control.MODE_OFF),
                 fifo=raw_fec["fifo"],
                 loss_table=raw_fec.get("loss_table", fec_control.DEFAULT_LOSS_TABLE),
                 ramp_up_ticks=int(raw_fec.get("ramp_up_ticks", 2)),
@@ -1027,6 +1059,15 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
     return RuntimeOverlay()
 
 
+def _atomic_write_text(path: str, body: str) -> None:
+    """Write via a temp file + os.replace so a concurrent reader never sees a
+    truncated/partial file. os.replace is atomic within a filesystem."""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(body)
+    os.replace(tmp, p)
+
+
 def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
     payload = {
         "mode": ov.mode,
@@ -1043,10 +1084,10 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
     }
     body = _json.dumps(payload, indent=2)
     Path(cfg.runtime_state).parent.mkdir(parents=True, exist_ok=True)
-    Path(cfg.runtime_state).write_text(body)
+    _atomic_write_text(cfg.runtime_state, body)
     if ov.persist:
         Path(cfg.persist_state).parent.mkdir(parents=True, exist_ok=True)
-        Path(cfg.persist_state).write_text(body)
+        _atomic_write_text(cfg.persist_state, body)
     elif Path(cfg.persist_state).exists():
         try:
             Path(cfg.persist_state).unlink()
@@ -1491,6 +1532,14 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             dynamic_candidate = None
             dynamic_candidate_since = None
 
+        # Single source of truth for "which WAN does box-originated traffic
+        # egress" — shared by the kernel default route and the local_direct
+        # engarde anchor. Follows the policy-resolved master and the actually
+        # active WAN after failover, not static config (CR #11 / CR #14).
+        # None when all WANs are DOWN (callers no-op rather than black-hole).
+        egress_master = pick_default_wan(eff, out.desired_active,
+                                         out.effective_master, dynamic_master_current)
+
         if out.desired_active != currently_active:
             current_drops = list_current_drops(cfg)
             actions = compute_nft_diff(cfg, out.desired_active, current_drops)
@@ -1511,9 +1560,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
 
         managed_default = None
         if cfg.policy.manage_default_route:
-            chosen = pick_default_wan(eff, out.desired_active,
-                                      cfg.policy.default_master_wan,
-                                      dynamic_master_current)
+            chosen = egress_master
             chosen_iface = cfg.wans[chosen].iface if chosen else None
             chosen_gw = read_wan_gateway(chosen_iface) if chosen_iface else None
             current_managed = read_managed_default()
@@ -1528,8 +1575,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             # Re-read post-apply for honest publishing.
             managed_default = read_managed_default()
 
-        # Engarde-table reconciliation (egress_mode actuator).
-        engarde_master_iface = cfg.wans[master_wan].iface if (egress_mode == "local_direct" and master_wan in cfg.wans) else None
+        # Engarde-table reconciliation (egress_mode actuator). local_direct
+        # anchors on the active egress WAN, not the static configured master,
+        # so it never pins traffic to a failed-over (DOWN) WAN (CR #14).
+        engarde_master_iface = cfg.wans[egress_master].iface if (egress_mode == "local_direct" and egress_master in cfg.wans) else None
         engarde_master_gw = read_wan_gateway(engarde_master_iface) if engarde_master_iface else None
         engarde_current = read_engarde_table_default(cfg.egress.engarde_table)
         engarde_action = compute_engarde_table_action(

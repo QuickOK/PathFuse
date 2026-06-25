@@ -52,3 +52,55 @@ def test_diff_master_only_failover_swaps_drop():
 def test_diff_idempotent_on_steady_state():
     actions = M.compute_nft_diff(cfg(), desired_active={"wan2"}, current_drops={"wan1"})
     assert actions == []
+
+
+class _FakeProc:
+    def __init__(self, returncode, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def test_apply_nft_diff_delete_of_absent_rule_is_noop(monkeypatch):
+    # Greptile P1: when unblocking a WAN whose drop rule is already gone
+    # (nft flush / restart / external change), reconciliation must converge,
+    # not raise a RuntimeError every 500ms tick.
+    line = ("delete rule inet sbfd_ctl egress_filter oifname wan1 "
+            "ip daddr 198.51.100.10 udp dport 59402 drop")
+
+    def fake_run(argv, **kwargs):
+        # batch `nft -f -` fails (rule absent), per-line delete also fails.
+        return _FakeProc(1, stderr="Error: No such file or directory; no such rule")
+
+    monkeypatch.setattr(M.subprocess, "run", fake_run)
+    # rule genuinely absent -> handle lookup finds nothing
+    monkeypatch.setattr(M, "_find_drop_handle", lambda cfg, wan: None)
+
+    # Must NOT raise: the desired end-state (rule gone) is already achieved.
+    M.apply_nft_diff(cfg(), [line])
+
+
+def test_apply_nft_diff_failing_add_still_raises(monkeypatch):
+    # The no-op convergence must only cover absent deletes; a genuinely
+    # failing add (e.g. bad syntax / table missing) must still surface.
+    line = ("add rule inet sbfd_ctl egress_filter oifname wan1 "
+            "ip daddr 198.51.100.10 udp dport 59402 drop")
+
+    monkeypatch.setattr(M.subprocess, "run",
+                        lambda argv, **kw: _FakeProc(1, stderr="could not process rule"))
+    import pytest
+    with pytest.raises(RuntimeError):
+        M.apply_nft_diff(cfg(), [line])
+
+
+def test_apply_nft_diff_delete_with_present_handle_failing_raises(monkeypatch):
+    # If the rule IS present (handle found) but delete-by-handle still fails,
+    # that's a real error, not convergence.
+    line = ("delete rule inet sbfd_ctl egress_filter oifname wan1 "
+            "ip daddr 198.51.100.10 udp dport 59402 drop")
+
+    monkeypatch.setattr(M.subprocess, "run",
+                        lambda argv, **kw: _FakeProc(1, stderr="no such rule"))
+    monkeypatch.setattr(M, "_find_drop_handle", lambda cfg, wan: 7)
+    import pytest
+    with pytest.raises(RuntimeError):
+        M.apply_nft_diff(cfg(), [line])

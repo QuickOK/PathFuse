@@ -1,0 +1,24 @@
+{
+  "strictness": 1,
+  "commentTypes": ["logic", "syntax", "style"],
+  "triggerOnUpdates": true,
+  "triggerOnDrafts": false,
+  "statusCheck": true,
+  "shouldUpdateDescription": false,
+  "ignorePatterns": "**/*.md\n**/*.lock\n**/dist/**\n**/build/**\n**/node_modules/**\n**/*.snap\n**/__snapshots__/**",
+  "ignoreKeywords": "release\nbump version\nformatting\nprettier\nlint",
+  "summarySection": { "included": true, "collapsible": true, "defaultOpen": true },
+  "issuesTableSection": { "included": true, "collapsible": true, "defaultOpen": true },
+  "confidenceScoreSection": { "included": true, "collapsible": true, "defaultOpen": false },
+  "sequenceDiagramSection": { "included": true, "collapsible": true, "defaultOpen": false },
+  "customContext": {
+    "rules": [
+      {
+        "scope": ["**/*"],
+        "rule": "Flag changes that break callers elsewhere in the codebase — check every call site of any modified function signature, exported symbol, or shared type."
+      }
+    ],
+    "files": [],
+    "other": []
+  }
+}

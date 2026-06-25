@@ -109,3 +109,27 @@ def test_fec_legacy_enabled_false_maps_to_off():
     d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "enabled": False}
     cfg = M.load_config(_write(d))
     assert cfg.fec.mode == F.MODE_OFF
+
+
+def test_fec_explicit_mode_overrides_deprecated_enabled_false():
+    # Greptile P2: migrating to mode:"adaptive" while leaving the deprecated
+    # enabled:false behind must NOT silently keep FEC off. An explicit mode
+    # wins; `enabled` must not act as a hidden kill-switch.
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo",
+                "mode": "adaptive", "enabled": False}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.mode == F.MODE_ADAPTIVE
+    # effective_fec_mode must reflect the resolved mode, not the stale bool.
+    assert M.effective_fec_mode(cfg, M.RuntimeOverlay()) == F.MODE_ADAPTIVE
+    assert M.effective_fec_enabled(cfg, M.RuntimeOverlay()) is True
+
+
+def test_fec_explicit_mode_off_overrides_enabled_true():
+    # Symmetric: mode:"off" wins even if a stale enabled:true lingers.
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo",
+                "mode": "off", "enabled": True}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.mode == F.MODE_OFF
+    assert M.effective_fec_mode(cfg, M.RuntimeOverlay()) == F.MODE_OFF
