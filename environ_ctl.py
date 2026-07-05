@@ -346,7 +346,7 @@ def load_env_config(path) -> EnvConfig:
     stations = None
     if st and st.get("enabled", True):
         stations = {
-            "path": st.get("path", "/var/lib/environ-ctl/stations.json"),
+            "path": st.get("path", "/var/lib/sbfd-ctl/stations.json"),
             "radius_m": float(st.get("radius_m", 150)),
             "dwell_speed_ms": float(st.get("dwell_speed_ms", 1.0)),
             "dwell_min_s": float(st.get("dwell_min_s", 600)),
