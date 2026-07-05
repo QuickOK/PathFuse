@@ -109,6 +109,7 @@ class Config:
     egress: EgressCfg = field(default_factory=EgressCfg)
     fec: Optional[FecCfg] = None
     environmental: Optional[EnvironmentalCfg] = None
+    map: object = None                 # raw `map` config section (dict | None)
 
 
 # -- Decision logic ----------------------------------------------------------
@@ -338,6 +339,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
 # -- State sensing -----------------------------------------------------------
 
 import os
+import re
 import time
 import json as _json
 import urllib.request
@@ -1067,6 +1069,7 @@ def load_config(path: str) -> Config:
             egress=egress,
             fec=fec_cfg,
             environmental=env_cfg,
+            map=raw.get("map"),
         )
     except KeyError as e:
         raise ValueError(f"{path}: missing required key {e}") from e
@@ -1389,6 +1392,214 @@ def validate_runtime_payload(payload: dict, wan_names: set):
     return True, None
 
 
+# -- map UI helpers ------------------------------------------------------------
+
+_MAP_DEFAULTS = {
+    "stations_path": "/var/lib/sbfd-ctl/stations.json",
+    "labels_path": "/var/lib/sbfd-ctl/station_labels.json",
+    "environ_points_path": "/run/sbfd-ctl/environ_points.json",
+    "gpsd": {"host": "127.0.0.1", "port": 2947},
+    "tile_cache": {"path": "/var/lib/sbfd-ctl/tilecache",
+                   "max_mb": 512, "max_zoom": 17},
+}
+
+_SID_RE = re.compile(r"^s[0-9]+$")
+
+
+def resolve_map_cfg(raw) -> dict:
+    """Merge the optional config `map` section over deployment defaults
+    (one level deep — the nested gpsd/tile_cache dicts merge key-wise)."""
+    out = {k: (dict(v) if isinstance(v, dict) else v)
+           for k, v in _MAP_DEFAULTS.items()}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k].update(v)
+            else:
+                out[k] = v
+    return out
+
+
+def validate_label(payload) -> tuple:
+    """(ok, sid, label, err). Empty label means delete. Labels are stored
+    verbatim (minus control chars) and must only ever be rendered as text."""
+    if not isinstance(payload, dict):
+        return (False, None, None, "payload must be an object")
+    sid = payload.get("id")
+    if not isinstance(sid, str) or not _SID_RE.match(sid):
+        return (False, None, None, "invalid station id")
+    label = payload.get("label", "")
+    if not isinstance(label, str):
+        return (False, None, None, "label must be a string")
+    label = "".join(ch for ch in label if ch.isprintable())[:48]
+    return (True, sid, label, None)
+
+
+def predict_from_stations(data: dict, n: int = 2) -> list:
+    """Top-n predicted next station ids from a stations.json dict — the same
+    ordering rule as StationTracker.predict_points (count desc, then the
+    destination's last_visit desc), reimplemented read-only so the failover
+    daemon does not import the tracker."""
+    origin = data.get("last_station")
+    if not origin:
+        return []
+    stations = data.get("stations", {})
+    row = data.get("transitions", {}).get(origin, {})
+    ranked = sorted(
+        row.items(),
+        key=lambda kv: (-kv[1], -stations.get(kv[0], {}).get("last_visit", 0.0)))
+    return [sid for sid, _c in ranked[:n] if sid in stations]
+
+
+def _read_json_file(path):
+    try:
+        return _json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
+    """Set (or delete, when label is empty) one label; atomic write; returns
+    the resulting mapping. Labels live apart from stations.json on purpose —
+    the tracker rewrites that file periodically and would race us."""
+    labels = _read_json_file(labels_path)
+    if not isinstance(labels, dict):
+        labels = {}
+    if label:
+        labels[sid] = label
+    else:
+        labels.pop(sid, None)
+    p = Path(labels_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(labels))
+    tmp.replace(p)
+    return labels
+
+
+def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
+    """Aggregate every map data source; each degrades independently to
+    null/empty — a broken source must never 500 the endpoint."""
+    st = _read_json_file(map_cfg["stations_path"]) or {}
+    labels = _read_json_file(map_cfg["labels_path"])
+    labels = labels if isinstance(labels, dict) else {}
+    stations = []
+    for sid, s in (st.get("stations") or {}).items():
+        stations.append({"id": sid, "lat": s.get("lat"), "lon": s.get("lon"),
+                         "visits": s.get("visits", 0),
+                         "last_visit": s.get("last_visit"),
+                         "label": labels.get(sid)})
+    snap = _read_json_file(published_state_path) or {}
+    out_fix = None
+    if fix is not None:
+        lat, lon, speed, track = fix[0], fix[1], fix[2], fix[3]
+        fix_ts = fix[4] if len(fix) > 4 else None
+        age = round(now - fix_ts, 1) if fix_ts else None
+        out_fix = {"lat": lat, "lon": lon, "speed": speed,
+                   "track": track, "age_s": age}
+    return {"ts": now,
+            "fix": out_fix,
+            "stations": stations,
+            "predictions": predict_from_stations(st),
+            "environ": _read_json_file(map_cfg["environ_points_path"]),
+            "mode": snap.get("mode"),
+            "active": snap.get("active")}
+
+
+_GPS_MEMO = {"ts": 0.0, "fix": None}
+
+
+def get_map_fix(host, port):
+    """Fresh gpsd fix for the map, memoized 2s. Lazy import: the failover
+    daemon has no hard dependency on the environ module."""
+    now = time.time()
+    if now - _GPS_MEMO["ts"] < 2.0:
+        return _GPS_MEMO["fix"]
+    fix = None
+    try:
+        import environ_ctl
+        fix = environ_ctl.get_fix(host, port, timeout=1.5)
+    except Exception as e:  # noqa: BLE001 - map shows "no gps" instead
+        logging.debug("map gpsd read failed: %s", e)
+    _GPS_MEMO["ts"] = now
+    _GPS_MEMO["fix"] = fix
+    return fix
+
+
+_VENDOR_ASSETS = {
+    "vendor/leaflet.js": "application/javascript",
+    "vendor/leaflet.css": "text/css; charset=utf-8",
+    "vendor/images/marker-icon.png": "image/png",
+    "vendor/images/marker-icon-2x.png": "image/png",
+    "vendor/images/marker-shadow.png": "image/png",
+    "vendor/images/layers.png": "image/png",
+    "vendor/images/layers-2x.png": "image/png",
+}
+
+_TILE_RE = re.compile(r"^/tiles/([0-9]{1,2})/([0-9]+)/([0-9]+)\.png$")
+_TILE_UA = "PathFuse-map/1.0 (+https://github.com/QuickOK/PathFuse)"
+_tile_store_count = 0
+
+
+def tile_valid(z: int, x: int, y: int, max_zoom: int) -> bool:
+    return 0 <= z <= max_zoom and 0 <= x < 2 ** z and 0 <= y < 2 ** z
+
+
+def tile_cache_file(cache_dir: str, z: int, x: int, y: int) -> Path:
+    return Path(cache_dir) / str(z) / str(x) / f"{y}.png"
+
+
+def fetch_tile(z: int, x: int, y: int, timeout: float = 4.0):
+    """One OSM tile, or None on any failure (offline -> cache-only mode)."""
+    url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    req = urllib.request.Request(url, headers={"User-Agent": _TILE_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as e:  # noqa: BLE001 - offline is a supported state
+        logging.debug("tile fetch %s/%s/%s failed: %s", z, x, y, e)
+        return None
+
+
+def evict_tiles(cache_dir: str, max_mb: int) -> int:
+    """Delete oldest-mtime tiles until the cache fits max_mb. Returns count."""
+    # st_mtime_ns: float st_mtime loses sub-microsecond ordering, which can
+    # evict the newest tile on rapid writes (ties break by directory order)
+    files = sorted(Path(cache_dir).rglob("*.png"),
+                   key=lambda f: f.stat().st_mtime_ns)
+    total = sum(f.stat().st_size for f in files)
+    budget = max_mb * 1024 * 1024
+    removed = 0
+    for f in files:
+        if total <= budget:
+            break
+        size = f.stat().st_size
+        try:
+            f.unlink()
+            total -= size
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def store_tile(cache_dir, z, x, y, data, max_mb) -> None:
+    """Atomic write; every ~200 stores, amortized LRU eviction."""
+    global _tile_store_count
+    p = tile_cache_file(cache_dir, z, x, y)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(p)
+    except OSError as e:
+        logging.debug("tile store failed: %s", e)
+        return
+    _tile_store_count += 1
+    if _tile_store_count % 200 == 0:
+        evict_tiles(cache_dir, max_mb)
+
+
 def start_ui_server(cfg: Config, stop_event: threading.Event):
     """Bind the UI HTTP server (returns the bound httpd; caller doesn't need it)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1399,6 +1610,7 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
         ui_dir = deployed_ui_dir
 
     wan_names = set(cfg.wans.keys())
+    map_cfg = resolve_map_cfg(cfg.map)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -1427,6 +1639,28 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
             self.end_headers()
             self.wfile.write(data)
 
+        def _serve_tile(self, z: int, x: int, y: int):
+            tc = map_cfg["tile_cache"]
+            if not tile_valid(z, x, y, tc["max_zoom"]):
+                self.send_error(404)
+                return
+            p = tile_cache_file(tc["path"], z, x, y)
+            if p.exists():
+                data = p.read_bytes()
+            else:
+                data = fetch_tile(z, x, y)
+                if data is not None:
+                    store_tile(tc["path"], z, x, y, data, tc["max_mb"])
+            if data is None:
+                self.send_error(502, "tile unavailable (offline, not cached)")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 self._send_static("index.html", "text/html; charset=utf-8")
@@ -1434,6 +1668,13 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                 self._send_static("app.js", "application/javascript")
             elif self.path == "/wall.css":
                 self._send_static("wall.css", "text/css; charset=utf-8")
+            elif self.path in ("/map", "/map.html"):
+                self._send_static("map.html", "text/html; charset=utf-8")
+            elif self.path == "/map.js":
+                self._send_static("map.js", "application/javascript")
+            elif self.path.lstrip("/") in _VENDOR_ASSETS:
+                name = self.path.lstrip("/")
+                self._send_static(name, _VENDOR_ASSETS[name])
             elif self.path == "/api/state":
                 try:
                     data = Path(cfg.published_state).read_text()
@@ -1470,10 +1711,34 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                     "master_wan": snap.get("master_wan"),
                     "ts": snap.get("ts"),
                 })
+            elif self.path == "/api/map":
+                g = map_cfg["gpsd"]
+                fix = get_map_fix(g["host"], g["port"])
+                self._send_json(200, assemble_map_payload(
+                    map_cfg, cfg.published_state, fix, time.time()))
+            elif (m := _TILE_RE.match(self.path)):
+                self._serve_tile(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             else:
                 self.send_error(404)
 
         def do_POST(self):
+            if self.path == "/api/station-label":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length > 4096:
+                    self.send_error(413, "payload too large"); return
+                try:
+                    payload = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    self._send_json(400, {"error": "invalid JSON"}); return
+                ok, sid, label, err = validate_label(payload)
+                if not ok:
+                    self._send_json(400, {"error": err}); return
+                try:
+                    labels = apply_station_label(map_cfg["labels_path"], sid, label)
+                except OSError as e:
+                    self._send_json(500, {"error": f"persist failed: {e}"}); return
+                self._send_json(200, {"ok": True, "labels": labels})
+                return
             if self.path != "/api/runtime":
                 self.send_error(404); return
             length = int(self.headers.get("Content-Length", "0") or "0")

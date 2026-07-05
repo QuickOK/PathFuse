@@ -16,7 +16,7 @@ echo "== deploy render --check =="
 echo "== gate: no deployment vocabulary =="
 # Scan TRACKED files only (skips .pytest_cache/.venv/out and other local cruft). Exclude the
 # gate's own files, which legitimately contain the term list / workflow docs.
-if git ls-files | grep -vE '^(scripts/preflight\.sh|MAINTAINING\.md)$' \
+if git ls-files | grep -vE '^(scripts/preflight\.sh|MAINTAINING\.md|ui/vendor/)' \
      | xargs grep -nIE "truck|[^a-z]ovh|starlink|t-?mobile|\btmo\b|tailscale|warp|cloudflare|raspberr|\bpi\b|\bcab\b" 2>/dev/null \
      | grep -viE "pip |pipe|pid |mapping"; then
   echo "!! deployment vocabulary found (above) — generalize it before pushing"; fail=1
@@ -25,7 +25,7 @@ else
 fi
 
 echo "== gate: every IP is RFC-reserved (examples only) =="
-bad=$(git ls-files -z | xargs -0 grep -hoIE "([0-9]{1,3}\.){3}[0-9]{1,3}" 2>/dev/null | sort -u \
+bad=$(git ls-files -z | grep -zvE '^ui/vendor/' | xargs -0 grep -hoIE "([0-9]{1,3}\.){3}[0-9]{1,3}" 2>/dev/null | sort -u \
       | grep -vE "^(0\.0\.0\.0|127\.|10\.|100\.64\.|169\.254\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|224\.|255\.)" || true)
 if [ -n "$bad" ]; then
   echo "!! non-reserved IP literal(s) found — replace with RFC-5737/6598 examples:"; echo "$bad"; fail=1

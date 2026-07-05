@@ -497,3 +497,35 @@ def test_poll_once_fresh_fix_still_evaluates(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "fetch_signal", lambda pts, spec, **k: [0.2])
     out = M.poll_once(cfg, last_good_mono=100.0, now_mono=200.0)
     assert out == 200.0                                   # evaluated -> last_good updated
+
+
+def test_build_points_record_shape():
+    rec = M.build_points_record(
+        points=[(35.0, -97.0), (35.1, -97.0)],
+        per_signal_vals={"precip": [0.4, 3.2], "smoke": [1.0, 2.0]},
+        force_full=True, reason="precip ahead", ts=123.0)
+    assert rec["ts"] == 123.0 and rec["force_full"] is True
+    assert rec["reason"] == "precip ahead"
+    assert rec["points"] == [
+        {"lat": 35.0, "lon": -97.0, "values": {"precip": 0.4, "smoke": 1.0}},
+        {"lat": 35.1, "lon": -97.0, "values": {"precip": 3.2, "smoke": 2.0}},
+    ]
+
+
+def test_build_points_record_tolerates_short_value_lists():
+    rec = M.build_points_record([(1.0, 2.0), (3.0, 4.0)], {"precip": [0.5]},
+                                False, "", 1.0)
+    assert rec["points"][1]["values"] == {}
+
+
+def test_poll_once_publishes_points_file(tmp_path, monkeypatch):
+    import time as _time
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    cfg.points_path = str(tmp_path / "pts.json")
+    monkeypatch.setattr(M, "get_fix",
+                        lambda h, p, **k: (10.0, 20.0, 0.0, None, _time.time()))
+    monkeypatch.setattr(M, "fetch_signal", lambda pts, spec, **k: [0.9])
+    M.poll_once(cfg, last_good_mono=100.0, now_mono=200.0)
+    rec = _json.loads(Path(cfg.points_path).read_text())
+    assert rec["points"][0]["lat"] == 10.0
+    assert rec["points"][0]["values"]["precip"] == 0.9

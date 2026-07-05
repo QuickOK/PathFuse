@@ -228,6 +228,18 @@ def write_override(path, record):
     os.replace(tmp, path)
 
 
+def build_points_record(points, per_signal_vals, force_full, reason, ts):
+    """Map-friendly record of this poll's sample points and each signal's
+    per-point hazard value (index-aligned; missing indices are skipped)."""
+    out_points = []
+    for i, (lat, lon) in enumerate(points):
+        values = {name: vals[i] for name, vals in per_signal_vals.items()
+                  if i < len(vals)}
+        out_points.append({"lat": lat, "lon": lon, "values": values})
+    return {"ts": ts, "force_full": force_full, "reason": reason,
+            "points": out_points}
+
+
 # -- GPS ---------------------------------------------------------------------
 
 def tpv_epoch(iso):
@@ -315,6 +327,7 @@ class EnvConfig:
     signals: list
     max_fix_age_s: float = 30.0
     stations: object = None            # dict | None
+    points_path: str = "/run/sbfd-ctl/environ_points.json"
 
 
 def load_env_config(path) -> EnvConfig:
@@ -368,6 +381,7 @@ def load_env_config(path) -> EnvConfig:
         signals=signals,
         max_fix_age_s=float(g.get("max_fix_age_s", 30)),
         stations=stations,
+        points_path=raw.get("points_path", "/run/sbfd-ctl/environ_points.json"),
     )
 
 
@@ -432,10 +446,12 @@ def poll_once(cfg: EnvConfig, last_good_mono: float, now_mono: float,
 
     points = assemble_points(cfg, tracker, fix, fresh, now_wall)
     evaluated = False
+    per_signal_vals = {}
     if points:
         for spec in cfg.signals:
             try:
                 vals = fetch_signal(points, spec)
+                per_signal_vals[spec.controller.name] = vals
                 spec.controller.update(max(vals) if vals else 0.0)
                 evaluated = True
             except Exception as e:  # noqa: BLE001 - hold this signal's last state
@@ -450,6 +466,12 @@ def poll_once(cfg: EnvConfig, last_good_mono: float, now_mono: float,
                        build_override_record(force_full, reason, time.time()))
         log.info("override force_full=%s reason=%r points=%d",
                  force_full, reason, len(points))
+        try:
+            write_override(cfg.points_path,
+                           build_points_record(points, per_signal_vals,
+                                               force_full, reason, time.time()))
+        except OSError as e:
+            log.warning("points publish failed: %s", e)
     elif now_mono - last_good_mono > cfg.max_stale_s:
         write_override(cfg.auto_override_path,
                        build_override_record(False, "stale: no data", time.time()))
