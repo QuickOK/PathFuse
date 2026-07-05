@@ -18,6 +18,7 @@ never dies on a transient error; it degrades to the fail-safe path.
 """
 
 import argparse
+import datetime
 import json
 import logging
 import math
@@ -51,8 +52,8 @@ def project(lat, lon, bearing_deg, dist_m):
 
 def build_points(fix, lookahead_s, min_speed_ms):
     """[current] plus a course-projected look-ahead point when moving fast enough
-    to trust gpsd's track. fix = (lat, lon, speed_ms, track_deg)."""
-    lat, lon, speed, track = fix
+    to trust gpsd's track. fix = (lat, lon, speed_ms, track_deg[, fix_epoch])."""
+    lat, lon, speed, track = fix[:4]
     points = [(lat, lon)]
     if lookahead_s > 0 and track is not None and speed >= min_speed_ms:
         points.append(project(lat, lon, track, speed * lookahead_s))
@@ -173,9 +174,20 @@ def write_override(path, record):
 
 # -- GPS ---------------------------------------------------------------------
 
+def tpv_epoch(iso):
+    """gpsd TPV `time` (ISO8601, Z suffix) -> epoch seconds, or None on junk."""
+    if not iso:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(iso)).timestamp()
+    except ValueError:
+        return None
+
+
 def get_fix(host, port, timeout=5.0):
-    """Return (lat, lon, speed_ms, track_deg) from gpsd, or None on no fix.
-    Opens a fresh gpsd connection each call (stateless; robust at minute cadence).
+    """Return (lat, lon, speed_ms, track_deg, fix_epoch_or_None) from gpsd, or
+    None on no fix. Opens a fresh gpsd connection each call (stateless; robust
+    at minute cadence).
     """
     try:
         s = socket.create_connection((host, port), timeout=timeout)
@@ -211,7 +223,7 @@ def get_fix(host, port, timeout=5.0):
                     continue
                 speed = obj.get("speed", 0.0) or 0.0
                 track = obj.get("track")
-                return (lat, lon, float(speed), track)
+                return (lat, lon, float(speed), track, tpv_epoch(obj.get("time")))
         return None
     finally:
         try:
@@ -228,6 +240,9 @@ class SignalSpec:
     url: str
     current_field: str
     hazard_codes: object = None  # optional set[int]; categorical (code-membership) signal
+    forecast_variable: object = None   # str | None; minutely_15 variable to fetch
+    forecast_steps: int = 0            # 15-min steps in the look-ahead window
+    forecast_scale: float = 4.0        # 3600 / 900: mm-per-15-min -> mm/h equivalent
 
 
 @dataclass
@@ -240,6 +255,8 @@ class EnvConfig:
     gpsd_port: int
     auto_override_path: str
     signals: list
+    max_fix_age_s: float = 30.0
+    stations: object = None            # dict | None
 
 
 def load_env_config(path) -> EnvConfig:
@@ -250,6 +267,9 @@ def load_env_config(path) -> EnvConfig:
         if not s.get("enabled", True):
             continue
         hc = s.get("hazard_codes")
+        fc = s.get("forecast") or {}
+        fvar = fc.get("variable")
+        fsteps = math.ceil(float(fc.get("window_s", 1800)) / 900.0) if fvar else 0
         signals.append(SignalSpec(
             controller=SignalController(
                 name=name,
@@ -262,8 +282,23 @@ def load_env_config(path) -> EnvConfig:
             url=s["url"],
             current_field=s["current_field"],
             hazard_codes=set(int(c) for c in hc) if hc is not None else None,
+            forecast_variable=fvar,
+            forecast_steps=fsteps,
         ))
     g = raw.get("gpsd", {})
+    st = raw.get("stations")
+    stations = None
+    if st and st.get("enabled", True):
+        stations = {
+            "path": st.get("path", "/var/lib/environ-ctl/stations.json"),
+            "radius_m": float(st.get("radius_m", 150)),
+            "dwell_speed_ms": float(st.get("dwell_speed_ms", 1.0)),
+            "dwell_min_s": float(st.get("dwell_min_s", 600)),
+            "hold_s": float(st.get("hold_s", 900)),
+            "max_stations": int(st.get("max_stations", 16)),
+            "predict_n": int(st.get("predict_n", 2)),
+            "persist_min_interval_s": float(st.get("persist_min_interval_s", 300)),
+        }
     return EnvConfig(
         poll_interval_s=float(raw.get("poll_interval_s", 60)),
         lookahead_s=float(raw.get("lookahead_s", 300)),
@@ -273,6 +308,8 @@ def load_env_config(path) -> EnvConfig:
         gpsd_port=int(g.get("port", 2947)),
         auto_override_path=raw["auto_override"]["path"],
         signals=signals,
+        max_fix_age_s=float(g.get("max_fix_age_s", 30)),
+        stations=stations,
     )
 
 

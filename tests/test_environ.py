@@ -318,3 +318,55 @@ def test_parse_args_accepts_dash_c():
 def test_parse_args_accepts_long_flag():
     ns = M._parse_args(["--config", "/x.json"])
     assert ns.config == "/x.json"
+
+
+def test_tpv_epoch_parses_zulu():
+    import datetime
+    e = M.tpv_epoch("2026-07-05T11:31:54.000Z")
+    expect = datetime.datetime(2026, 7, 5, 11, 31, 54,
+                               tzinfo=datetime.timezone.utc).timestamp()
+    assert e == expect
+
+
+def test_tpv_epoch_junk_is_none():
+    assert M.tpv_epoch(None) is None
+    assert M.tpv_epoch("not-a-time") is None
+
+
+def test_build_points_accepts_five_tuple():
+    pts = M.build_points((10.0, 20.0, 10.0, 90.0, 12345.0),
+                         lookahead_s=300, min_speed_ms=2.0)
+    assert len(pts) == 2
+
+
+def test_config_forecast_and_stations_parsing(tmp_path):
+    raw = {
+        "poll_interval_s": 60, "lookahead_s": 300, "min_speed_ms": 2.0,
+        "max_stale_s": 600,
+        "gpsd": {"host": "127.0.0.1", "port": 2947, "max_fix_age_s": 45},
+        "auto_override": {"path": str(tmp_path / "ao.json")},
+        "stations": {"enabled": True, "path": str(tmp_path / "st.json"),
+                     "radius_m": 100, "predict_n": 3},
+        "signals": {"precip": {"url": "http://fc", "current_field": "precipitation",
+                               "on_thresh": 2.5, "off_thresh": 1.0,
+                               "forecast": {"variable": "precipitation",
+                                            "window_s": 1800}}},
+    }
+    p = tmp_path / "env2.json"
+    p.write_text(_json.dumps(raw))
+    cfg = M.load_env_config(str(p))
+    assert cfg.max_fix_age_s == 45.0
+    assert cfg.stations["radius_m"] == 100.0
+    assert cfg.stations["predict_n"] == 3
+    assert cfg.stations["dwell_min_s"] == 600.0          # default filled
+    spec = cfg.signals[0]
+    assert spec.forecast_variable == "precipitation"
+    assert spec.forecast_steps == 2                       # ceil(1800/900)
+    assert spec.forecast_scale == 4.0                     # 3600/900
+
+
+def test_config_without_new_keys_backcompat(tmp_path):
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    assert cfg.max_fix_age_s == 30.0
+    assert cfg.stations is None
+    assert cfg.signals[0].forecast_variable is None
