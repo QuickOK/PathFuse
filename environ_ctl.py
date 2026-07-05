@@ -31,6 +31,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+from station_tracker import StationTracker, haversine_m
+
 log = logging.getLogger("environ_ctl")
 
 
@@ -377,34 +379,75 @@ def _stop(signum, frame):
     _running = False
 
 
-def poll_once(cfg: EnvConfig, last_good_mono: float, now_mono: float) -> float:
+def dedup_points(points, min_sep_m=1000.0):
+    """Drop points within min_sep_m of an already-kept point (weather cells are
+    km-scale; duplicate points waste API width)."""
+    out = []
+    for p in points:
+        if all(haversine_m(p[0], p[1], q[0], q[1]) >= min_sep_m for q in out):
+            out.append(p)
+    return out
+
+
+def assemble_points(cfg, tracker, fix, fresh, now_wall):
+    """Weather sample points for this poll: immediate position (snapped/held),
+    course projection while moving, predicted next stations."""
+    points = []
+    if fix is not None and fresh:
+        lat, lon, speed, track = fix[:4]
+        pos = tracker.snap(lat, lon) if tracker else (lat, lon)
+        points.append(pos)
+        if cfg.lookahead_s > 0 and track is not None and speed >= cfg.min_speed_ms:
+            points.append(project(lat, lon, track, speed * cfg.lookahead_s))
+    elif tracker is not None:
+        held = tracker.held_position(now_wall)
+        if held:
+            points.append(held)
+    if tracker is not None:
+        points.extend(tracker.predict_points())
+    return dedup_points(points)
+
+
+def poll_once(cfg: EnvConfig, last_good_mono: float, now_mono: float,
+              tracker=None) -> float:
     """One poll cycle. Updates signal controllers and writes the override.
-    Returns the (possibly updated) last_good_mono. Fail-safe: if no signal can be
-    evaluated for longer than max_stale_s, write force_full=false. The only
+    Returns the (possibly updated) last_good_mono. Fail-safe: if no signal can
+    be evaluated for longer than max_stale_s, write force_full=false. The only
     exception it may propagate is OSError from write_override, which main()
     catches; transient fetch/GPS errors are handled internally."""
     fix = get_fix(cfg.gpsd_host, cfg.gpsd_port)
-    evaluated = False
+    now_wall = time.time()
+    fresh = False
     if fix is not None:
-        points = build_points(fix, cfg.lookahead_s, cfg.min_speed_ms)
+        fix_time = fix[4] if len(fix) > 4 else None
+        fresh = fix_time is None or abs(now_wall - fix_time) <= cfg.max_fix_age_s
+        if not fresh:
+            log.warning("GPS fix is %.0fs old (> %.0fs), treating as no fix",
+                        abs(now_wall - fix_time), cfg.max_fix_age_s)
+    if tracker is not None:
+        tracker.update((fix[0], fix[1], fix[2]) if (fix is not None and fresh)
+                       else None, now_wall)
+
+    points = assemble_points(cfg, tracker, fix, fresh, now_wall)
+    evaluated = False
+    if points:
         for spec in cfg.signals:
             try:
-                vals = fetch_open_meteo(points, spec.url, spec.current_field)
-                if spec.hazard_codes is not None:
-                    vals = classify_codes(vals, spec.hazard_codes)
+                vals = fetch_signal(points, spec)
                 spec.controller.update(max(vals) if vals else 0.0)
                 evaluated = True
             except Exception as e:  # noqa: BLE001 - hold this signal's last state
                 log.warning("fetch %s failed: %s", spec.controller.name, e)
     else:
-        log.warning("no GPS fix")
+        log.warning("no usable position (no fresh fix, no held station)")
 
     if evaluated:
         last_good_mono = now_mono
         force_full, reason = combine_hazard([s.controller for s in cfg.signals])
         write_override(cfg.auto_override_path,
                        build_override_record(force_full, reason, time.time()))
-        log.info("override force_full=%s reason=%r", force_full, reason)
+        log.info("override force_full=%s reason=%r points=%d",
+                 force_full, reason, len(points))
     elif now_mono - last_good_mono > cfg.max_stale_s:
         write_override(cfg.auto_override_path,
                        build_override_record(False, "stale: no data", time.time()))
@@ -427,16 +470,38 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     args = _parse_args(sys.argv[1:])
     cfg = load_env_config(args.config)
+    tracker = None
+    last_persist = 0.0
+    if cfg.stations:
+        sc = cfg.stations
+        tracker = StationTracker.load(
+            sc["path"], radius_m=sc["radius_m"],
+            dwell_speed_ms=sc["dwell_speed_ms"], dwell_min_s=sc["dwell_min_s"],
+            hold_s=sc["hold_s"], max_stations=sc["max_stations"],
+            predict_n=sc["predict_n"])
+        log.info("station tracker: %d stations loaded", len(tracker.stations))
     last_good = time.monotonic()
     while _running:
         cycle_start = time.monotonic()
         try:
-            last_good = poll_once(cfg, last_good, cycle_start)
+            last_good = poll_once(cfg, last_good, cycle_start, tracker=tracker)
+            if tracker is not None and \
+                    time.time() - last_persist >= cfg.stations["persist_min_interval_s"]:
+                try:
+                    tracker.save(cfg.stations["path"])
+                    last_persist = time.time()
+                except OSError as e:
+                    log.warning("station persist failed: %s", e)
         except Exception as e:  # noqa: BLE001 - keep the daemon alive
             log.error("poll error: %s", e)
         end = time.monotonic() + max(5.0, cfg.poll_interval_s - (time.monotonic() - cycle_start))
         while _running and time.monotonic() < end:
             time.sleep(min(1.0, end - time.monotonic()))
+    if tracker is not None:
+        try:
+            tracker.save(cfg.stations["path"])
+        except OSError as e:
+            log.warning("station persist on shutdown failed: %s", e)
     log.info("shutting down")
     return 0
 

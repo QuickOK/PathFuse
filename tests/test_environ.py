@@ -220,7 +220,8 @@ def test_poll_once_weather_code_storm_triggers_full(tmp_path, monkeypatch):
     p.write_text(_json.dumps(raw))
     cfg = M.load_env_config(str(p))
     monkeypatch.setattr(M, "get_fix", lambda h, port, **k: (10.0, 20.0, 0.0, None))
-    monkeypatch.setattr(M, "fetch_open_meteo", lambda pts, url, field, **k: [95.0])
+    monkeypatch.setattr(M, "fetch_signal", lambda pts, spec, **k:
+                        M.parse_signal({"current": {"weather_code": 95.0}}, spec))
     M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
     rec = _json.loads(Path(cfg.auto_override_path).read_text())
     assert rec["force_full"] is True
@@ -244,7 +245,8 @@ def test_poll_once_weather_code_fog_does_not_trigger(tmp_path, monkeypatch):
     p.write_text(_json.dumps(raw))
     cfg = M.load_env_config(str(p))
     monkeypatch.setattr(M, "get_fix", lambda h, port, **k: (10.0, 20.0, 0.0, None))
-    monkeypatch.setattr(M, "fetch_open_meteo", lambda pts, url, field, **k: [45.0])
+    monkeypatch.setattr(M, "fetch_signal", lambda pts, spec, **k:
+                        M.parse_signal({"current": {"weather_code": 45.0}}, spec))
     M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
     rec = _json.loads(Path(cfg.auto_override_path).read_text())
     assert rec["force_full"] is False
@@ -253,7 +255,7 @@ def test_poll_once_weather_code_fog_does_not_trigger(tmp_path, monkeypatch):
 def test_poll_once_writes_override_on_success(tmp_path, monkeypatch):
     cfg = M.load_env_config(_make_cfg(tmp_path))
     monkeypatch.setattr(M, "get_fix", lambda h, p, **k: (10.0, 20.0, 10.0, 90.0))
-    monkeypatch.setattr(M, "fetch_open_meteo", lambda pts, url, field, **k: [0.9])
+    monkeypatch.setattr(M, "fetch_signal", lambda pts, spec, **k: [0.9])
     M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
     rec = _json.loads(Path(cfg.auto_override_path).read_text())
     assert rec["force_full"] is True
@@ -297,11 +299,11 @@ def test_poll_once_partial_fetch_failure_holds_and_writes(tmp_path, monkeypatch)
 
     monkeypatch.setattr(M, "get_fix", lambda h, port, **k: (10.0, 20.0, 0.0, None))
 
-    def flaky_fetch(points, url, field, **k):
-        if url == "http://aq":
+    def flaky_fetch(points, spec, **k):
+        if spec.url == "http://aq":
             raise RuntimeError("smoke endpoint down")
         return [0.9]  # precip wet
-    monkeypatch.setattr(M, "fetch_open_meteo", flaky_fetch)
+    monkeypatch.setattr(M, "fetch_signal", flaky_fetch)
 
     M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
     rec = _json.loads(Path(cfg.auto_override_path).read_text())
@@ -425,3 +427,73 @@ def test_parse_signal_missing_forecast_falls_back_to_current():
     spec = _fspec()
     data = {"current": {"precipitation": 1.5}}
     assert M.parse_signal(data, spec) == [1.5]
+
+
+import station_tracker as ST
+
+
+def _tracker_with_two_stations():
+    t = ST.StationTracker(radius_m=150.0, dwell_speed_ms=1.0, dwell_min_s=60.0,
+                          hold_s=900.0, max_stations=16, predict_n=2)
+    now = 1000.0
+    for i in range(3):
+        t.update((35.0, -97.0, 0.0), now + i * 40.0)     # station A
+    t.update((35.05, -97.0, 15.0), now + 200.0)          # drive
+    for i in range(3):
+        t.update((35.1, -97.0, 0.0), now + 300.0 + i * 40.0)  # station B (A->B)
+    return t
+
+
+def test_assemble_points_parked_snaps_and_predicts(tmp_path):
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    t = _tracker_with_two_stations()
+    # drive back to A and dwell so current station = A, prediction = B
+    t.update((35.05, -97.0, 15.0), 2000.0)
+    for i in range(3):
+        t.update((35.0, -97.0, 0.0), 2100.0 + i * 40.0)
+    fix = (35.0002, -97.0002, 0.0, None, 2200.0)
+    pts = M.assemble_points(cfg, t, fix, True, 2200.0)
+    assert len(pts) == 2                                  # snapped A + predicted B
+    assert abs(pts[0][0] - 35.0) < 0.01
+    assert abs(pts[1][0] - 35.1) < 0.001
+
+
+def test_assemble_points_no_fix_uses_held_station(tmp_path):
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    t = _tracker_with_two_stations()
+    pts = M.assemble_points(cfg, t, None, False, 1500.0)  # fix lost right after B
+    assert len(pts) >= 1
+    assert abs(pts[0][0] - 35.1) < 0.001                  # held at B
+
+
+def test_assemble_points_without_tracker_matches_old_behavior(tmp_path):
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    fix = (10.0, 20.0, 10.0, 90.0, 111.0)
+    pts = M.assemble_points(cfg, None, fix, True, 111.0)
+    assert len(pts) == 2                                  # current + projection
+
+
+def test_dedup_points_merges_near_duplicates():
+    pts = M.dedup_points([(35.0, -97.0), (35.0001, -97.0001), (35.1, -97.0)])
+    assert len(pts) == 2
+
+
+def test_poll_once_rejects_stale_fix(tmp_path, monkeypatch):
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    calls = []
+    monkeypatch.setattr(M, "get_fix",
+                        lambda h, p, **k: (10.0, 20.0, 0.0, None, 100.0))  # ancient
+    monkeypatch.setattr(M, "fetch_signal",
+                        lambda pts, spec, **k: calls.append(pts) or [0.0])
+    M.poll_once(cfg, last_good_mono=100.0, now_mono=100.0)
+    assert calls == []                                    # no points -> no fetch
+
+
+def test_poll_once_fresh_fix_still_evaluates(tmp_path, monkeypatch):
+    import time as _time
+    cfg = M.load_env_config(_make_cfg(tmp_path))
+    monkeypatch.setattr(M, "get_fix",
+                        lambda h, p, **k: (10.0, 20.0, 0.0, None, _time.time()))
+    monkeypatch.setattr(M, "fetch_signal", lambda pts, spec, **k: [0.2])
+    out = M.poll_once(cfg, last_good_mono=100.0, now_mono=200.0)
+    assert out == 200.0                                   # evaluated -> last_good updated
