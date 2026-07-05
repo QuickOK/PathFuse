@@ -1451,6 +1451,70 @@ def predict_from_stations(data: dict, n: int = 2) -> list:
     return [sid for sid, _c in ranked[:n] if sid in stations]
 
 
+_TILE_RE = re.compile(r"^/tiles/([0-9]{1,2})/([0-9]+)/([0-9]+)\.png$")
+_TILE_UA = "PathFuse-map/1.0 (+https://github.com/QuickOK/PathFuse)"
+_tile_store_count = 0
+
+
+def tile_valid(z: int, x: int, y: int, max_zoom: int) -> bool:
+    return 0 <= z <= max_zoom and 0 <= x < 2 ** z and 0 <= y < 2 ** z
+
+
+def tile_cache_file(cache_dir: str, z: int, x: int, y: int) -> Path:
+    return Path(cache_dir) / str(z) / str(x) / f"{y}.png"
+
+
+def fetch_tile(z: int, x: int, y: int, timeout: float = 4.0):
+    """One OSM tile, or None on any failure (offline -> cache-only mode)."""
+    url = f"https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    req = urllib.request.Request(url, headers={"User-Agent": _TILE_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as e:  # noqa: BLE001 - offline is a supported state
+        logging.debug("tile fetch %s/%s/%s failed: %s", z, x, y, e)
+        return None
+
+
+def evict_tiles(cache_dir: str, max_mb: int) -> int:
+    """Delete oldest-mtime tiles until the cache fits max_mb. Returns count."""
+    # st_mtime_ns: float st_mtime loses sub-microsecond ordering, which can
+    # evict the newest tile on rapid writes (ties break by directory order)
+    files = sorted(Path(cache_dir).rglob("*.png"),
+                   key=lambda f: f.stat().st_mtime_ns)
+    total = sum(f.stat().st_size for f in files)
+    budget = max_mb * 1024 * 1024
+    removed = 0
+    for f in files:
+        if total <= budget:
+            break
+        size = f.stat().st_size
+        try:
+            f.unlink()
+            total -= size
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def store_tile(cache_dir, z, x, y, data, max_mb) -> None:
+    """Atomic write; every ~200 stores, amortized LRU eviction."""
+    global _tile_store_count
+    p = tile_cache_file(cache_dir, z, x, y)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    try:
+        tmp.write_bytes(data)
+        tmp.replace(p)
+    except OSError as e:
+        logging.debug("tile store failed: %s", e)
+        return
+    _tile_store_count += 1
+    if _tile_store_count % 200 == 0:
+        evict_tiles(cache_dir, max_mb)
+
+
 def start_ui_server(cfg: Config, stop_event: threading.Event):
     """Bind the UI HTTP server (returns the bound httpd; caller doesn't need it)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1461,6 +1525,7 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
         ui_dir = deployed_ui_dir
 
     wan_names = set(cfg.wans.keys())
+    map_cfg = resolve_map_cfg(cfg.map)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -1486,6 +1551,28 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _serve_tile(self, z: int, x: int, y: int):
+            tc = map_cfg["tile_cache"]
+            if not tile_valid(z, x, y, tc["max_zoom"]):
+                self.send_error(404)
+                return
+            p = tile_cache_file(tc["path"], z, x, y)
+            if p.exists():
+                data = p.read_bytes()
+            else:
+                data = fetch_tile(z, x, y)
+                if data is not None:
+                    store_tile(tc["path"], z, x, y, data, tc["max_mb"])
+            if data is None:
+                self.send_error(502, "tile unavailable (offline, not cached)")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
             self.end_headers()
             self.wfile.write(data)
 
@@ -1532,6 +1619,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                     "master_wan": snap.get("master_wan"),
                     "ts": snap.get("ts"),
                 })
+            elif (m := _TILE_RE.match(self.path)):
+                self._serve_tile(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             else:
                 self.send_error(404)
 
