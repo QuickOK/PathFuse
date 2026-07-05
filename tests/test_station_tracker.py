@@ -102,3 +102,73 @@ def test_same_station_revisit_records_no_self_transition():
     now = drive(t, 35.002, -97.0, now)            # short hop, comes right back
     dwell(t, 35.0, -97.0, now + 120.0)
     assert t.transitions == {}
+
+
+def test_snap_returns_centroid_within_radius():
+    t = make()
+    dwell(t, 35.0, -97.0, 1000.0)
+    st = list(t.stations.values())[0]
+    lat, lon = t.snap(35.0004, -97.0)             # ~44 m away
+    assert (lat, lon) == (st["lat"], st["lon"])
+    assert t.snap(36.0, -98.0) == (36.0, -98.0)   # far: unchanged
+
+
+def test_held_position_within_hold_window():
+    t = make()
+    t.update((35.0, -97.0, 0.0), 1000.0)
+    t.update((35.0, -97.0, 0.0), 1601.0)          # arrival; last fix ts=1601
+    t.update(None, 1700.0)                        # GPS lost (indoors)
+    assert t.held_position(1601.0 + 899.0) is not None
+    assert t.held_position(1601.0 + 901.0) is None   # hold expired
+
+
+def test_held_position_none_when_last_fix_off_station():
+    t = make()
+    t.update((40.0, -100.0, 15.0), 1000.0)        # driving, nowhere near a station
+    assert t.held_position(1010.0) is None
+
+
+def test_eviction_of_least_recent_station():
+    t = make(max_stations=2, dwell_min_s=60.0)
+    now = dwell(t, 35.0, -97.0, 1000.0, dur=120.0)          # s1
+    now = drive(t, 35.05, -97.0, now)
+    now = dwell(t, 35.1, -97.0, now + 60.0, dur=120.0)      # s2
+    now = drive(t, 35.15, -97.0, now)
+    now = dwell(t, 35.2, -97.0, now + 60.0, dur=120.0)      # s3 -> evict s1
+    assert len(t.stations) == 2
+    assert all(abs(st["lat"] - 35.0) > 0.01 for st in t.stations.values())
+    # transition rows referencing the evicted station are gone
+    for row in t.transitions.values():
+        assert "s1" not in row
+
+
+def test_persistence_roundtrip(tmp_path):
+    t = make()
+    now = dwell(t, 35.0, -97.0, 1000.0)
+    now = drive(t, 35.05, -97.0, now)
+    dwell(t, 35.1, -97.0, now + 600.0)
+    p = str(tmp_path / "stations.json")
+    t.save(p)
+    u = ST.StationTracker.load(p, radius_m=150.0, dwell_speed_ms=1.0,
+                               dwell_min_s=600.0, hold_s=900.0,
+                               max_stations=16, predict_n=2)
+    assert u.stations.keys() == t.stations.keys()
+    assert u.transitions == t.transitions
+    assert u.last_station == t.last_station
+    assert u.next_id == t.next_id
+
+
+def test_load_corrupt_file_starts_empty(tmp_path):
+    p = tmp_path / "stations.json"
+    p.write_text("{not json")
+    u = ST.StationTracker.load(str(p), radius_m=150.0, dwell_speed_ms=1.0,
+                               dwell_min_s=600.0, hold_s=900.0,
+                               max_stations=16, predict_n=2)
+    assert u.stations == {}
+
+
+def test_load_missing_file_starts_empty(tmp_path):
+    u = ST.StationTracker.load(str(tmp_path / "absent.json"), radius_m=150.0,
+                               dwell_speed_ms=1.0, dwell_min_s=600.0,
+                               hold_s=900.0, max_stations=16, predict_n=2)
+    assert u.stations == {}

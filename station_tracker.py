@@ -147,3 +147,62 @@ class StationTracker:
             if st:
                 out.append((st["lat"], st["lon"]))
         return out
+
+    # -- position services -----------------------------------------------------
+
+    def snap(self, lat, lon):
+        """Station centroid when the point is inside a station, else unchanged."""
+        sid = self._match(lat, lon)
+        if sid is None:
+            return (lat, lon)
+        st = self.stations[sid]
+        return (st["lat"], st["lon"])
+
+    def held_position(self, now):
+        """When the fix is lost (indoor bay): centroid of the station the last
+        good fix was inside, for up to hold_s after that fix. Else None."""
+        if self._last_fix is None:
+            return None
+        lat, lon, ts = self._last_fix
+        if now - ts > self.hold_s:
+            return None
+        sid = self._match(lat, lon)
+        if sid is None:
+            return None
+        st = self.stations[sid]
+        return (st["lat"], st["lon"])
+
+    # -- persistence -------------------------------------------------------------
+
+    def to_dict(self):
+        return {"stations": self.stations, "transitions": self.transitions,
+                "next_id": self.next_id, "last_station": self.last_station}
+
+    @classmethod
+    def from_dict(cls, d, **cfg_kwargs):
+        t = cls(**cfg_kwargs)
+        t.stations = {str(k): dict(v) for k, v in d.get("stations", {}).items()}
+        t.transitions = {str(k): {str(k2): int(v2) for k2, v2 in row.items()}
+                         for k, row in d.get("transitions", {}).items()}
+        t.next_id = int(d.get("next_id", 1))
+        t.last_station = d.get("last_station")
+        return t
+
+    def save(self, path):
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.to_dict(), f)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path, **cfg_kwargs):
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            return cls.from_dict(d, **cfg_kwargs)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            log.warning("station file %s unusable (%s); starting empty", path, e)
+            return cls(**cfg_kwargs)
