@@ -109,6 +109,7 @@ class Config:
     egress: EgressCfg = field(default_factory=EgressCfg)
     fec: Optional[FecCfg] = None
     environmental: Optional[EnvironmentalCfg] = None
+    map: object = None                 # raw `map` config section (dict | None)
 
 
 # -- Decision logic ----------------------------------------------------------
@@ -338,6 +339,7 @@ def decide(cfg: Config, i: DecideInput) -> DecideOutput:
 # -- State sensing -----------------------------------------------------------
 
 import os
+import re
 import time
 import json as _json
 import urllib.request
@@ -1067,6 +1069,7 @@ def load_config(path: str) -> Config:
             egress=egress,
             fec=fec_cfg,
             environmental=env_cfg,
+            map=raw.get("map"),
         )
     except KeyError as e:
         raise ValueError(f"{path}: missing required key {e}") from e
@@ -1387,6 +1390,65 @@ def validate_runtime_payload(payload: dict, wan_names: set):
     if "environmental_enabled" in payload and not isinstance(payload["environmental_enabled"], bool):
         return False, "environmental_enabled must be true or false"
     return True, None
+
+
+# -- map UI helpers ------------------------------------------------------------
+
+_MAP_DEFAULTS = {
+    "stations_path": "/var/lib/sbfd-ctl/stations.json",
+    "labels_path": "/var/lib/sbfd-ctl/station_labels.json",
+    "environ_points_path": "/run/sbfd-ctl/environ_points.json",
+    "gpsd": {"host": "127.0.0.1", "port": 2947},
+    "tile_cache": {"path": "/var/lib/sbfd-ctl/tilecache",
+                   "max_mb": 512, "max_zoom": 17},
+}
+
+_SID_RE = re.compile(r"^s[0-9]+$")
+
+
+def resolve_map_cfg(raw) -> dict:
+    """Merge the optional config `map` section over deployment defaults
+    (one level deep — the nested gpsd/tile_cache dicts merge key-wise)."""
+    out = {k: (dict(v) if isinstance(v, dict) else v)
+           for k, v in _MAP_DEFAULTS.items()}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k].update(v)
+            else:
+                out[k] = v
+    return out
+
+
+def validate_label(payload) -> tuple:
+    """(ok, sid, label, err). Empty label means delete. Labels are stored
+    verbatim (minus control chars) and must only ever be rendered as text."""
+    if not isinstance(payload, dict):
+        return (False, None, None, "payload must be an object")
+    sid = payload.get("id")
+    if not isinstance(sid, str) or not _SID_RE.match(sid):
+        return (False, None, None, "invalid station id")
+    label = payload.get("label", "")
+    if not isinstance(label, str):
+        return (False, None, None, "label must be a string")
+    label = "".join(ch for ch in label if ch.isprintable())[:48]
+    return (True, sid, label, None)
+
+
+def predict_from_stations(data: dict, n: int = 2) -> list:
+    """Top-n predicted next station ids from a stations.json dict — the same
+    ordering rule as StationTracker.predict_points (count desc, then the
+    destination's last_visit desc), reimplemented read-only so the failover
+    daemon does not import the tracker."""
+    origin = data.get("last_station")
+    if not origin:
+        return []
+    stations = data.get("stations", {})
+    row = data.get("transitions", {}).get(origin, {})
+    ranked = sorted(
+        row.items(),
+        key=lambda kv: (-kv[1], -stations.get(kv[0], {}).get("last_visit", 0.0)))
+    return [sid for sid, _c in ranked[:n] if sid in stations]
 
 
 def start_ui_server(cfg: Config, stop_event: threading.Event):
