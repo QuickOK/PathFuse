@@ -3,8 +3,14 @@
   "lookahead_s": 300,
   "min_speed_ms": 2.0,
   "max_stale_s": 600,
-  "gpsd": { "host": "127.0.0.1", "port": 2947 },
-  "auto_override": { "path": "/run/sbfd-ctl/auto_override.json" },
+  "gpsd": {
+    "host": "127.0.0.1",
+    "port": 2947,
+    "max_fix_age_s": 30
+  },
+  "auto_override": {
+    "path": "/run/sbfd-ctl/auto_override.json"
+  },
   "signals": {
     "precip": {
       "enabled": true,
@@ -14,18 +20,33 @@
       "off_thresh": 1.0,
       "wet_confirm": 1,
       "dry_confirm": 2,
-      "reason": "precip ahead"
+      "reason": "precip ahead",
+      "forecast": {
+        "variable": "precipitation",
+        "window_s": 1800
+      }
     },
     "weather": {
       "enabled": true,
       "url": "https://api.open-meteo.com/v1/forecast",
       "current_field": "weather_code",
-      "hazard_codes": [80, 81, 82, 95, 96, 99],
+      "hazard_codes": [
+        80,
+        81,
+        82,
+        95,
+        96,
+        99
+      ],
       "on_thresh": 1.0,
       "off_thresh": 0.0,
       "wet_confirm": 1,
       "dry_confirm": 3,
-      "reason": "storm/showers ahead"
+      "reason": "storm/showers ahead",
+      "forecast": {
+        "variable": "weather_code",
+        "window_s": 1800
+      }
     },
     "smoke": {
       "enabled": true,
@@ -37,5 +58,16 @@
       "dry_confirm": 2,
       "reason": "smoke"
     }
+  },
+  "stations": {
+    "enabled": true,
+    "path": "/var/lib/environ-ctl/stations.json",
+    "radius_m": 150,
+    "dwell_speed_ms": 1.0,
+    "dwell_min_s": 600,
+    "hold_s": 900,
+    "max_stations": 16,
+    "predict_n": 2,
+    "persist_min_interval_s": 300
   }
 }
