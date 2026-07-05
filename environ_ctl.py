@@ -235,7 +235,9 @@ def tpv_epoch(iso):
     if not iso:
         return None
     try:
-        return datetime.datetime.fromisoformat(str(iso)).timestamp()
+        # normalize trailing Z for Python <= 3.10 (3.11+ accepts it natively)
+        return datetime.datetime.fromisoformat(
+            str(iso).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
 
