@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #111; }
+  #map { height: 100%; }
+  #banner { position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+    z-index: 1000; background: rgba(17,17,17,.85); color: #eee;
+    font: 14px/1.4 system-ui, sans-serif; padding: 6px 14px;
+    border-radius: 0 0 8px 8px; white-space: nowrap; }
+  #banner.alert { background: rgba(160,30,30,.9); }
+  #ctl { position: absolute; bottom: 14px; left: 14px; z-index: 1000; }
+  #ctl button { background: #222; color: #eee; border: 1px solid #555;
+    border-radius: 6px; padding: 8px 12px; margin-right: 6px;
+    font: 13px system-ui, sans-serif; }
+  #ctl button.on { border-color: #7c7; color: #cfc; }
+  .veh-icon { color: #4af; font-size: 26px; text-shadow: 0 0 4px #000; }
+  .stn-tip { font: 12px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="banner">loading&hellip;</div>
+<div id="ctl">
+  <button id="follow" class="on">Follow</button>
+  <button id="radar" class="on">Radar</button>
+</div>
+<script src="/vendor/leaflet.js"></script>
+<script src="/map.js"></script>
+</body>
+</html>

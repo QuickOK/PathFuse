@@ -50,3 +50,11 @@ If your live nodes still run pre-PathFuse configs, migrate them once onto this r
 generic vocabulary + the deploy kit (real values in a gitignored `deploy/values.json`). After that,
 all future updates are just the "Deploying a change" loop above. (Do it carefully on the relay first,
 with backups + healthcheck + rollback ready, since it's the live failover system.)
+
+## Vendored third-party assets (`ui/vendor/`)
+
+`ui/vendor/` contains unmodified upstream files (currently Leaflet 1.9.4,
+BSD-2-Clause) served by the UI for offline capability. The directory is
+excluded from preflight's vocabulary and IP gates (minified libraries contain
+`Math.PI`, arbitrary dotted numbers, etc.). Only verbatim upstream releases may
+live here — never project code, never anything edited.

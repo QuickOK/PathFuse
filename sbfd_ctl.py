@@ -1526,6 +1526,16 @@ def get_map_fix(host, port):
     return fix
 
 
+_VENDOR_ASSETS = {
+    "vendor/leaflet.js": "application/javascript",
+    "vendor/leaflet.css": "text/css; charset=utf-8",
+    "vendor/images/marker-icon.png": "image/png",
+    "vendor/images/marker-icon-2x.png": "image/png",
+    "vendor/images/marker-shadow.png": "image/png",
+    "vendor/images/layers.png": "image/png",
+    "vendor/images/layers-2x.png": "image/png",
+}
+
 _TILE_RE = re.compile(r"^/tiles/([0-9]{1,2})/([0-9]+)/([0-9]+)\.png$")
 _TILE_UA = "PathFuse-map/1.0 (+https://github.com/QuickOK/PathFuse)"
 _tile_store_count = 0
@@ -1658,6 +1668,13 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                 self._send_static("app.js", "application/javascript")
             elif self.path == "/wall.css":
                 self._send_static("wall.css", "text/css; charset=utf-8")
+            elif self.path in ("/map", "/map.html"):
+                self._send_static("map.html", "text/html; charset=utf-8")
+            elif self.path == "/map.js":
+                self._send_static("map.js", "application/javascript")
+            elif self.path.lstrip("/") in _VENDOR_ASSETS:
+                name = self.path.lstrip("/")
+                self._send_static(name, _VENDOR_ASSETS[name])
             elif self.path == "/api/state":
                 try:
                     data = Path(cfg.published_state).read_text()
