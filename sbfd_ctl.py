@@ -1503,7 +1503,7 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
             "predictions": predict_from_stations(st),
             "environ": _read_json_file(map_cfg["environ_points_path"]),
             "mode": snap.get("mode"),
-            "active": snap.get("active")}
+            "active": snap.get("active_wans")}
 
 
 _GPS_MEMO = {"ts": 0.0, "fix": None}

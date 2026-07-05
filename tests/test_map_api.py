@@ -113,7 +113,7 @@ def test_assemble_map_payload_all_sources(tmp_path):
         {"ts": 9.0, "force_full": True, "reason": "precip ahead",
          "points": [{"lat": 35.0, "lon": -97.0, "values": {"precip": 3.0}}]}))
     st = tmp_path / "state.json"
-    st.write_text(_json.dumps({"mode": "master_backup", "active": ["wan2"]}))
+    st.write_text(_json.dumps({"mode": "master_backup", "active_wans": ["wan2"]}))
     fix = (35.05, -97.01, 4.2, 90.0, 100.0)
     out = M.assemble_map_payload(m, str(st), fix, now=101.5)
     assert out["fix"] == {"lat": 35.05, "lon": -97.01, "speed": 4.2,
