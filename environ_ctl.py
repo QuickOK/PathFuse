@@ -161,6 +161,60 @@ def fetch_open_meteo(points, url, current_field, timeout=HTTP_TIMEOUT):
     return parse_open_meteo(data, current_field)
 
 
+def signal_value_per_point(cur, fvals, spec):
+    """Collapse a point's current value + forecast-window steps into one hazard
+    scalar. Numeric signals: forecast steps (mm per 15 min) scale by
+    forecast_scale to the mm/h-equivalent the thresholds are tuned for.
+    Categorical (hazard_codes) signals: hazard if current OR any window code is
+    in the set."""
+    if spec.hazard_codes is not None:
+        window = [cur] + list(fvals or []) if spec.forecast_variable else [cur]
+        return max(classify_codes(window, spec.hazard_codes))
+    v = float(cur or 0.0)
+    if spec.forecast_variable and fvals:
+        fs = [float(x) for x in fvals if x is not None]
+        if fs:
+            v = max(v, max(fs) * spec.forecast_scale)
+    return v
+
+
+def parse_signal(data, spec):
+    """Per-point hazard values from an Open-Meteo response (object or array),
+    combining `current.<field>` with the `minutely_15.<variable>` window."""
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for d in data:
+        cur = d.get("current", {}).get(spec.current_field, 0.0)
+        fvals = []
+        if spec.forecast_variable:
+            fvals = (d.get("minutely_15") or {}).get(spec.forecast_variable) or []
+        out.append(signal_value_per_point(cur, fvals, spec))
+    return out
+
+
+def fetch_signal(points, spec, timeout=HTTP_TIMEOUT):
+    """Query a signal's endpoint for all points (current + optional forecast
+    window). May raise; callers hold the signal's last state."""
+    params = {
+        "latitude": ",".join(f"{p[0]:.4f}" for p in points),
+        "longitude": ",".join(f"{p[1]:.4f}" for p in points),
+        "current": spec.current_field, "timezone": "UTC",
+    }
+    if spec.forecast_variable:
+        params["minutely_15"] = spec.forecast_variable
+        params["forecast_minutely_15"] = spec.forecast_steps
+    req = urllib.request.Request(f"{spec.url}?{urllib.parse.urlencode(params)}",
+                                 headers={"User-Agent": "environ-ctl/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+    dl = data if isinstance(data, list) else [data]
+    if spec.forecast_variable and not any("minutely_15" in d for d in dl):
+        log.warning("signal %s: forecast fields missing in response; "
+                    "using current conditions only", spec.controller.name)
+    return parse_signal(data, spec)
+
+
 def write_override(path, record):
     """Atomically write the auto-override record (tmp + os.replace)."""
     d = os.path.dirname(path)

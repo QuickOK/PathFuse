@@ -370,3 +370,58 @@ def test_config_without_new_keys_backcompat(tmp_path):
     assert cfg.max_fix_age_s == 30.0
     assert cfg.stations is None
     assert cfg.signals[0].forecast_variable is None
+
+
+def _fspec(**kw):
+    ctl = M.SignalController("precip", 2.5, 1.0, 1, 2, "precip ahead")
+    args = dict(controller=ctl, url="http://fc", current_field="precipitation",
+                forecast_variable="precipitation", forecast_steps=2)
+    args.update(kw)
+    return M.SignalSpec(**args)
+
+
+def test_signal_value_forecast_scales_to_hourly_rate():
+    spec = _fspec()
+    # 0.8 mm in a 15-min step = 3.2 mm/h equivalent > current 0.1
+    assert M.signal_value_per_point(0.1, [0.0, 0.8], spec) == 3.2
+
+
+def test_signal_value_current_dominates_when_larger():
+    spec = _fspec()
+    assert M.signal_value_per_point(5.0, [0.2], spec) == 5.0
+
+
+def test_signal_value_ignores_none_steps():
+    spec = _fspec()
+    assert M.signal_value_per_point(0.0, [None, 0.5, None], spec) == 2.0
+
+
+def test_signal_value_no_forecast_config():
+    spec = _fspec(forecast_variable=None, forecast_steps=0)
+    assert M.signal_value_per_point(0.7, [9.9], spec) == 0.7   # forecast ignored
+
+
+def test_signal_value_categorical_codes_check_window_too():
+    ctl = M.SignalController("wx", 1.0, 0.0, 1, 2, "storm")
+    spec = M.SignalSpec(controller=ctl, url="u", current_field="weather_code",
+                        hazard_codes={95, 96}, forecast_variable="weather_code",
+                        forecast_steps=2)
+    assert M.signal_value_per_point(1.0, [95], spec) == 1.0    # code in window
+    assert M.signal_value_per_point(1.0, [45], spec) == 0.0    # benign everywhere
+
+
+def test_parse_signal_multi_point_with_forecast():
+    spec = _fspec()
+    data = [
+        {"current": {"precipitation": 0.0},
+         "minutely_15": {"precipitation": [0.0, 0.9]}},
+        {"current": {"precipitation": 3.0},
+         "minutely_15": {"precipitation": [0.0, 0.0]}},
+    ]
+    assert M.parse_signal(data, spec) == [3.6, 3.0]
+
+
+def test_parse_signal_missing_forecast_falls_back_to_current():
+    spec = _fspec()
+    data = {"current": {"precipitation": 1.5}}
+    assert M.parse_signal(data, spec) == [1.5]
