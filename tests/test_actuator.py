@@ -104,3 +104,116 @@ def test_apply_nft_diff_delete_with_present_handle_failing_raises(monkeypatch):
     import pytest
     with pytest.raises(RuntimeError):
         M.apply_nft_diff(cfg(), [line])
+
+
+def test_apply_nft_diff_batches_deletes_by_handle(monkeypatch):
+    # nft's `delete rule` only accepts a handle; the spec form makes every
+    # batched un-drop fail into the per-line fallback (warning noise each
+    # switch). Deletes must be resolved to handle form BEFORE batching.
+    line = ("delete rule inet sbfd_ctl egress_filter oifname wan1 "
+            "ip daddr 198.51.100.10 udp dport 59402 drop")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs.get("input", "")))
+        return _FakeProc(0)
+
+    monkeypatch.setattr(M.subprocess, "run", fake_run)
+    monkeypatch.setattr(M, "_find_drop_handle", lambda cfg, wan: 42)
+    M.apply_nft_diff(cfg(), [line])
+    assert len(calls) == 1                       # batch succeeded first try
+    argv, script = calls[0]
+    assert argv[:2] == ["nft", "-f"]
+    assert "delete rule inet sbfd_ctl egress_filter handle 42" in script
+    assert "oifname" not in script               # no spec-form delete remains
+
+
+def test_apply_nft_diff_mixed_batch_keeps_adds_verbatim(monkeypatch):
+    add = ("add rule inet sbfd_ctl egress_filter oifname wan2 "
+           "ip daddr 198.51.100.10 udp dport 59402 drop")
+    dele = ("delete rule inet sbfd_ctl egress_filter oifname wan1 "
+            "ip daddr 198.51.100.10 udp dport 59402 drop")
+    scripts = []
+
+    def fake_run(argv, **kwargs):
+        scripts.append(kwargs.get("input", ""))
+        return _FakeProc(0)
+
+    monkeypatch.setattr(M.subprocess, "run", fake_run)
+    monkeypatch.setattr(M, "_find_drop_handle", lambda cfg, wan: 7)
+    M.apply_nft_diff(cfg(), [add, dele])
+    assert add in scripts[0]
+    assert "handle 7" in scripts[0]
+
+
+# -- engarde exclusion sync ---------------------------------------------------
+
+GET_LIST = """{"type":"client","interfaces":[
+  {"name":"lo","status":"excluded"},
+  {"name":"eth0","status":"excluded"},
+  {"name":"wan1","status":"idle"},
+  {"name":"wan2","status":"active"}]}"""
+
+
+def test_parse_engarde_exclusions():
+    assert M.parse_engarde_exclusions(GET_LIST) == {"lo", "eth0"}
+    assert M.parse_engarde_exclusions("junk") is None
+    assert M.parse_engarde_exclusions("{}") is None
+
+
+def test_compute_exclusion_diff_blocks_inactive_wan():
+    to_exc, to_inc = M.compute_exclusion_diff(
+        {"wan1", "wan2"}, {"wan2"}, {"lo", "eth0"})
+    assert to_exc == ["wan1"]
+    assert to_inc == []
+
+
+def test_compute_exclusion_diff_restores_on_full_redundancy():
+    to_exc, to_inc = M.compute_exclusion_diff(
+        {"wan1", "wan2"}, {"wan1", "wan2"}, {"lo", "eth0", "wan1"})
+    assert to_exc == []
+    assert to_inc == ["wan1"]
+
+
+def test_compute_exclusion_diff_never_touches_unmanaged_ifaces():
+    to_exc, to_inc = M.compute_exclusion_diff(
+        {"wan1", "wan2"}, {"wan1", "wan2"}, {"lo", "eth0", "wg0"})
+    assert to_exc == [] and to_inc == []
+
+
+def test_sync_engarde_exclusions_posts_exclude(monkeypatch):
+    c = cfg()
+    c.engarde.admin_url = "http://127.0.0.1:8080/api/v1/get-list"
+    posts = []
+
+    class FakeResp:
+        def __init__(self, body):
+            self.body = body.encode()
+
+        def read(self):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        if isinstance(req, str):
+            return FakeResp(GET_LIST)
+        posts.append((req.full_url, req.data.decode()))
+        return FakeResp("{}")
+
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    M.sync_engarde_exclusions(c, {"wan2"})
+    assert posts == [("http://127.0.0.1:8080/api/v1/exclude",
+                      '{"interface": "wan1"}')]
+
+
+def test_sync_engarde_exclusions_noop_without_admin_url(monkeypatch):
+    c = cfg()
+    c.engarde.admin_url = None
+    monkeypatch.setattr(M.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no HTTP expected")))
+    M.sync_engarde_exclusions(c, {"wan2"})

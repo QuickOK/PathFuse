@@ -560,7 +560,30 @@ def apply_nft_init(cfg: Config) -> None:
         raise RuntimeError(f"nft init failed: {r.stderr.strip()}")
 
 
+def _resolve_delete_lines(cfg: Config, actions: list) -> list:
+    """nft's `delete rule` only accepts a handle, never a match spec — a
+    spec-form delete fails the whole `nft -f` batch (per-switch warning noise).
+    Rewrite delete lines to handle form up front; a delete whose rule is
+    already absent is dropped (the desired end-state already holds)."""
+    out = []
+    for line in actions:
+        if not line.startswith("delete rule"):
+            out.append(line)
+            continue
+        wan = _wan_from_rule_line(line)
+        handle = _find_drop_handle(cfg, wan) if wan else None
+        if handle is None:
+            logging.debug("nft delete: drop rule for %s already absent; converged", wan)
+            continue
+        out.append(f"delete rule {cfg.nft.family} {cfg.nft.table} "
+                   f"egress_filter handle {handle}")
+    return out
+
+
 def apply_nft_diff(cfg: Config, actions: list) -> None:
+    if not actions:
+        return
+    actions = _resolve_delete_lines(cfg, actions)
     if not actions:
         return
     script = "\n".join(actions) + "\n"
@@ -579,7 +602,7 @@ def apply_nft_diff(cfg: Config, actions: list) -> None:
                             capture_output=True, text=True)
         if r2.returncode == 0:
             continue
-        if line.startswith("delete rule"):
+        if line.startswith("delete rule") and " handle " not in line:
             wan = _wan_from_rule_line(line)
             handle = _find_drop_handle(cfg, wan) if wan else None
             if handle is not None:
@@ -881,6 +904,66 @@ def _find_drop_handle(cfg: Config, wan: str) -> Optional[int]:
             except (ValueError, IndexError):
                 continue
     return None
+
+
+# -- engarde exclusion sync ----------------------------------------------------
+# The nft egress_filter silently eats engarde's packets on blocked WANs, so
+# engarde-client retries the send every second and logs a write error each
+# time. Its web API supports runtime interface exclusion; keeping engarde's
+# exclusion set converged to the blocked set silences that loop at the source.
+# Runtime exclusions are lost when engarde-client restarts, hence reconcile
+# every tick. nft remains the enforcement backstop.
+
+def parse_engarde_exclusions(raw: str) -> Optional[set]:
+    """Interface names engarde currently excludes, from get-list JSON.
+    None when the payload is junk (callers skip the sync this tick)."""
+    try:
+        d = json.loads(raw)
+        return {i["name"] for i in d["interfaces"] if i.get("status") == "excluded"}
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return None
+
+
+def compute_exclusion_diff(wan_ifaces: set, desired_active_ifaces: set,
+                           currently_excluded: set) -> tuple:
+    """Pure: (to_exclude, to_include), limited to managed WAN ifaces — the
+    config's own excludedInterfaces (lo, LAN, tunnels) are never touched."""
+    desired_excluded = wan_ifaces - desired_active_ifaces
+    to_exclude = desired_excluded - currently_excluded
+    to_include = (currently_excluded & wan_ifaces) - desired_excluded
+    return sorted(to_exclude), sorted(to_include)
+
+
+def sync_engarde_exclusions(cfg: Config, desired_active: set) -> None:
+    """Best-effort convergence of engarde's runtime exclusions; never raises."""
+    url = cfg.engarde.admin_url
+    if not url or "/get-list" not in url:
+        return
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            current = parse_engarde_exclusions(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 - engarde may be restarting
+        logging.debug("engarde get-list failed: %s", e)
+        return
+    if current is None:
+        return
+    wan_ifaces = {w.iface for w in cfg.wans.values()}
+    active_ifaces = {cfg.wans[k].iface for k in desired_active if k in cfg.wans}
+    to_exclude, to_include = compute_exclusion_diff(wan_ifaces, active_ifaces, current)
+    base = url.rsplit("/get-list", 1)[0]
+    for action, ifaces in (("exclude", to_exclude), ("include", to_include)):
+        for iface in ifaces:
+            try:
+                req = urllib.request.Request(
+                    f"{base}/{action}", method="POST",
+                    data=json.dumps({"interface": iface}).encode(),
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    resp.read()
+            except Exception as e:  # noqa: BLE001 - best effort; nft backstops
+                logging.debug("engarde %s %s failed: %s", action, iface, e)
+    if to_exclude or to_include:
+        logging.info("engarde exclusions: +%s -%s", to_exclude, to_include)
 
 
 def load_config(path: str) -> Config:
@@ -1561,6 +1644,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 currently_active = set(out.desired_active)
             except RuntimeError as e:
                 logging.error("nft apply failed: %s", e)
+
+        # Keep engarde's runtime exclusions matched to the blocked WAN set
+        # every tick (engarde restarts forget them; see sync_engarde_exclusions).
+        sync_engarde_exclusions(cfg, out.desired_active)
 
         managed_default = None
         if cfg.policy.manage_default_route:
