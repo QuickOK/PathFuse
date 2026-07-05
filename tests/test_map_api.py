@@ -88,3 +88,59 @@ def test_evict_tiles_noop_under_budget(tmp_path):
     cache = str(tmp_path / "tiles")
     M.store_tile(cache, 5, 1, 1, b"tiny", max_mb=512)
     assert M.evict_tiles(cache, max_mb=512) == 0
+
+
+def _mcfg(tmp_path, **over):
+    m = M.resolve_map_cfg({
+        "stations_path": str(tmp_path / "stations.json"),
+        "labels_path": str(tmp_path / "labels.json"),
+        "environ_points_path": str(tmp_path / "points.json"),
+    })
+    m.update(over)
+    return m
+
+
+def test_assemble_map_payload_all_sources(tmp_path):
+    m = _mcfg(tmp_path)
+    Path(m["stations_path"]).write_text(_json.dumps({
+        "stations": {"s1": {"lat": 35.0, "lon": -97.0, "n_fixes": 4,
+                             "visits": 2, "last_visit": 50.0},
+                     "s2": {"lat": 35.1, "lon": -97.0, "n_fixes": 1,
+                             "visits": 1, "last_visit": 60.0}},
+        "transitions": {"s1": {"s2": 2}}, "last_station": "s1"}))
+    Path(m["labels_path"]).write_text(_json.dumps({"s1": "Depot"}))
+    Path(m["environ_points_path"]).write_text(_json.dumps(
+        {"ts": 9.0, "force_full": True, "reason": "precip ahead",
+         "points": [{"lat": 35.0, "lon": -97.0, "values": {"precip": 3.0}}]}))
+    st = tmp_path / "state.json"
+    st.write_text(_json.dumps({"mode": "master_backup", "active": ["wan2"]}))
+    fix = (35.05, -97.01, 4.2, 90.0, 100.0)
+    out = M.assemble_map_payload(m, str(st), fix, now=101.5)
+    assert out["fix"] == {"lat": 35.05, "lon": -97.01, "speed": 4.2,
+                          "track": 90.0, "age_s": 1.5}
+    s1 = [s for s in out["stations"] if s["id"] == "s1"][0]
+    assert s1["label"] == "Depot"
+    s2 = [s for s in out["stations"] if s["id"] == "s2"][0]
+    assert s2["label"] is None
+    assert out["predictions"] == ["s2"]
+    assert out["environ"]["force_full"] is True
+    assert out["mode"] == "master_backup" and out["active"] == ["wan2"]
+
+
+def test_assemble_map_payload_degrades_when_everything_missing(tmp_path):
+    m = _mcfg(tmp_path)
+    out = M.assemble_map_payload(m, str(tmp_path / "absent.json"), None, now=1.0)
+    assert out["fix"] is None and out["stations"] == []
+    assert out["predictions"] == [] and out["environ"] is None
+    assert out["mode"] is None and out["active"] is None
+
+
+def test_apply_station_label_set_and_delete(tmp_path):
+    lp = str(tmp_path / "labels.json")
+    out = M.apply_station_label(lp, "s1", "Depot")
+    assert out == {"s1": "Depot"}
+    out = M.apply_station_label(lp, "s2", "Yard")
+    assert out == {"s1": "Depot", "s2": "Yard"}
+    out = M.apply_station_label(lp, "s1", "")
+    assert out == {"s2": "Yard"}
+    assert _json.loads(Path(lp).read_text()) == {"s2": "Yard"}

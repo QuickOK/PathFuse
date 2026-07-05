@@ -1451,6 +1451,81 @@ def predict_from_stations(data: dict, n: int = 2) -> list:
     return [sid for sid, _c in ranked[:n] if sid in stations]
 
 
+def _read_json_file(path):
+    try:
+        return _json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
+    """Set (or delete, when label is empty) one label; atomic write; returns
+    the resulting mapping. Labels live apart from stations.json on purpose —
+    the tracker rewrites that file periodically and would race us."""
+    labels = _read_json_file(labels_path)
+    if not isinstance(labels, dict):
+        labels = {}
+    if label:
+        labels[sid] = label
+    else:
+        labels.pop(sid, None)
+    p = Path(labels_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(labels))
+    tmp.replace(p)
+    return labels
+
+
+def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
+    """Aggregate every map data source; each degrades independently to
+    null/empty — a broken source must never 500 the endpoint."""
+    st = _read_json_file(map_cfg["stations_path"]) or {}
+    labels = _read_json_file(map_cfg["labels_path"])
+    labels = labels if isinstance(labels, dict) else {}
+    stations = []
+    for sid, s in (st.get("stations") or {}).items():
+        stations.append({"id": sid, "lat": s.get("lat"), "lon": s.get("lon"),
+                         "visits": s.get("visits", 0),
+                         "last_visit": s.get("last_visit"),
+                         "label": labels.get(sid)})
+    snap = _read_json_file(published_state_path) or {}
+    out_fix = None
+    if fix is not None:
+        lat, lon, speed, track = fix[0], fix[1], fix[2], fix[3]
+        fix_ts = fix[4] if len(fix) > 4 else None
+        age = round(now - fix_ts, 1) if fix_ts else None
+        out_fix = {"lat": lat, "lon": lon, "speed": speed,
+                   "track": track, "age_s": age}
+    return {"ts": now,
+            "fix": out_fix,
+            "stations": stations,
+            "predictions": predict_from_stations(st),
+            "environ": _read_json_file(map_cfg["environ_points_path"]),
+            "mode": snap.get("mode"),
+            "active": snap.get("active")}
+
+
+_GPS_MEMO = {"ts": 0.0, "fix": None}
+
+
+def get_map_fix(host, port):
+    """Fresh gpsd fix for the map, memoized 2s. Lazy import: the failover
+    daemon has no hard dependency on the environ module."""
+    now = time.time()
+    if now - _GPS_MEMO["ts"] < 2.0:
+        return _GPS_MEMO["fix"]
+    fix = None
+    try:
+        import environ_ctl
+        fix = environ_ctl.get_fix(host, port, timeout=1.5)
+    except Exception as e:  # noqa: BLE001 - map shows "no gps" instead
+        logging.debug("map gpsd read failed: %s", e)
+    _GPS_MEMO["ts"] = now
+    _GPS_MEMO["fix"] = fix
+    return fix
+
+
 _TILE_RE = re.compile(r"^/tiles/([0-9]{1,2})/([0-9]+)/([0-9]+)\.png$")
 _TILE_UA = "PathFuse-map/1.0 (+https://github.com/QuickOK/PathFuse)"
 _tile_store_count = 0
@@ -1619,12 +1694,34 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                     "master_wan": snap.get("master_wan"),
                     "ts": snap.get("ts"),
                 })
+            elif self.path == "/api/map":
+                g = map_cfg["gpsd"]
+                fix = get_map_fix(g["host"], g["port"])
+                self._send_json(200, assemble_map_payload(
+                    map_cfg, cfg.published_state, fix, time.time()))
             elif (m := _TILE_RE.match(self.path)):
                 self._serve_tile(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             else:
                 self.send_error(404)
 
         def do_POST(self):
+            if self.path == "/api/station-label":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length > 4096:
+                    self.send_error(413, "payload too large"); return
+                try:
+                    payload = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    self._send_json(400, {"error": "invalid JSON"}); return
+                ok, sid, label, err = validate_label(payload)
+                if not ok:
+                    self._send_json(400, {"error": err}); return
+                try:
+                    labels = apply_station_label(map_cfg["labels_path"], sid, label)
+                except OSError as e:
+                    self._send_json(500, {"error": f"persist failed: {e}"}); return
+                self._send_json(200, {"ok": True, "labels": labels})
+                return
             if self.path != "/api/runtime":
                 self.send_error(404); return
             length = int(self.headers.get("Content-Length", "0") or "0")
