@@ -1,7 +1,15 @@
 {
   "wans": {
-    "wan1": { "iface": "wan1", "session_id": 1, "label": "Cellular" },
-    "wan2": { "iface": "wan2", "session_id": 2, "label": "Satellite" }
+    "wan1": {
+      "iface": "wan1",
+      "session_id": 1,
+      "label": "Cellular"
+    },
+    "wan2": {
+      "iface": "wan2",
+      "session_id": 2,
+      "label": "Satellite"
+    }
   },
   "relay": {
     "state_url": "http://100.64.0.2:9275/state",
@@ -44,11 +52,26 @@
     "floor_ratio": "20:1",
     "fifo": "/run/udpspeeder/client.fifo",
     "loss_table": [
-      {"max_loss_pct": 0.5,  "fec": "8:0"},
-      {"max_loss_pct": 2.0,  "fec": "8:2"},
-      {"max_loss_pct": 5.0,  "fec": "8:4"},
-      {"max_loss_pct": 10.0, "fec": "8:6"},
-      {"max_loss_pct": 100.0,"fec": "8:8"}
+      {
+        "max_loss_pct": 0.5,
+        "fec": "8:0"
+      },
+      {
+        "max_loss_pct": 2.0,
+        "fec": "8:2"
+      },
+      {
+        "max_loss_pct": 5.0,
+        "fec": "8:4"
+      },
+      {
+        "max_loss_pct": 10.0,
+        "fec": "8:6"
+      },
+      {
+        "max_loss_pct": 100.0,
+        "fec": "8:8"
+      }
     ],
     "ramp_up_ticks": 2,
     "ramp_down_hold_s": 20,
@@ -58,6 +81,20 @@
   },
   "environmental": {
     "enabled": true,
-    "auto_override": { "path": "/run/sbfd-ctl/auto_override.json", "ttl_s": 180 }
+    "auto_override": {
+      "path": "/run/sbfd-ctl/auto_override.json",
+      "ttl_s": 180
+    }
+  },
+  "map": {
+    "gpsd": {
+      "host": "192.0.2.10",
+      "port": 2947
+    },
+    "tile_cache": {
+      "path": "/var/lib/sbfd-ctl/tilecache",
+      "max_mb": 512,
+      "max_zoom": 17
+    }
   }
 }
