@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""ntfy notifications for sbfd-ctl, delivered via the spool-notify helper.
+
+Three units:
+  RateLimiter   -- per-event-kind coalescing (pure logic, injectable clock)
+  Notifier      -- bounded buffer + daemon thread that shells out to spool-notify
+  EventDetector -- edge-triggered event derivation from per-tick observations
+
+Design notes: the control loop only ever calls Notifier.notify(), which
+appends to an in-memory deque and returns; all subprocess work happens on the
+worker thread. Delivery reliability (spool + redeliver when the uplink is
+down) is spool-notify's job, not ours.
+"""
+import logging
+import os
+import subprocess
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
+
+DEFAULT_COMMAND = "/usr/local/sbin/spool-notify"
+
+
+@dataclass
+class NotifyCfg:
+    topic: str
+    min_interval_s: float = 30.0
+    command: str = DEFAULT_COMMAND
+
+
+@dataclass
+class Event:
+    kind: str          # rate-limit bucket, e.g. "wan_switch"
+    title: str         # ntfy Title (emoji leads; spool-notify prefixes hostname)
+    message: str       # body
+    priority: str      # ntfy named priority: min|low|default|high|max
+
+
+class RateLimiter:
+    """Per-kind coalescing: the first event of a kind sends immediately;
+    further events of the same kind within min_interval_s are held and folded
+    into one summary released when the window expires. Kinds are independent,
+    so e.g. a flapping WAN never delays an all-WANs-down alert."""
+
+    def __init__(self, min_interval_s: float, clock=time.monotonic):
+        self.min_interval_s = float(min_interval_s)
+        self._clock = clock
+        self._last_sent = {}   # kind -> clock time of last real send
+        self._held = {}        # kind -> [Event, ...] awaiting summary
+
+    def admit(self, ev: Event) -> Optional[Event]:
+        now = self._clock()
+        last = self._last_sent.get(ev.kind)
+        in_window = last is not None and (now - last) < self.min_interval_s
+        if ev.kind in self._held or in_window:
+            self._held.setdefault(ev.kind, []).append(ev)
+            return None
+        self._last_sent[ev.kind] = now
+        return ev
+
+    def next_deadline(self) -> Optional[float]:
+        if not self._held:
+            return None
+        return min(self._last_sent[k] for k in self._held) + self.min_interval_s
+
+    def flush_due(self) -> list:
+        now = self._clock()
+        out = []
+        for kind in list(self._held):
+            if now - self._last_sent[kind] < self.min_interval_s:
+                continue
+            out.append(self._summarize(kind, now))
+        return out
+
+    def flush_all(self) -> list:
+        """Summarize and release ALL held events regardless of deadline.
+
+        For shutdown: events still inside an open coalescing window must not
+        be silently discarded."""
+        now = self._clock()
+        return [self._summarize(kind, now) for kind in list(self._held)]
+
+    def _summarize(self, kind: str, now: float) -> Event:
+        held = self._held.pop(kind)
+        last = held[-1]
+        if len(held) == 1:
+            summary = last
+        else:
+            summary = Event(
+                kind=kind,
+                title=f"{last.title} (×{len(held)} in "
+                      f"{int(self.min_interval_s)}s)",
+                message=last.message,
+                priority=last.priority,
+            )
+        # Window restarts from the actual flush time, not the theoretical
+        # deadline: a late flush extends the quiet period rather than
+        # immediately re-admitting the next event of this kind.
+        self._last_sent[kind] = now
+        return summary
+
+
+class Notifier:
+    """Bounded buffer drained by a daemon thread that invokes spool-notify.
+
+    notify() never blocks and never raises: at 50 buffered entries the oldest
+    is dropped (with a warning). The worker applies the RateLimiter, then
+    runs `spool-notify <title> <priority> <message>` with NOTIFY_TOPIC set.
+    A nonzero exit is logged and the message dropped — spool-notify itself
+    spools on delivery failure, so nonzero means something *local* is wrong,
+    and notifications must never affect failover behavior."""
+
+    BUFFER_MAX = 50
+    SUBPROCESS_TIMEOUT_S = 30.0
+
+    def __init__(self, topic: str, min_interval_s: float = 30.0,
+                 command: str = DEFAULT_COMMAND, clock=time.monotonic):
+        self._topic = topic
+        self._command = command
+        self._clock = clock
+        self._limiter = RateLimiter(min_interval_s, clock=clock)
+        self._buf = deque()
+        self._cond = threading.Condition()
+        self._stopping = False
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="notify",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0):
+        with self._cond:
+            self._stopping = True
+            self._cond.notify()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def notify(self, ev: Event):
+        with self._cond:
+            if len(self._buf) >= self.BUFFER_MAX:
+                dropped = self._buf.popleft()
+                logging.warning("notify buffer full; dropped oldest (%s)",
+                                dropped.kind)
+            self._buf.append(ev)
+            self._cond.notify()
+
+    # -- worker thread --------------------------------------------------
+
+    def _run(self):
+        while True:
+            with self._cond:
+                deadline = self._limiter.next_deadline()
+                if not self._buf and not self._stopping:
+                    timeout = (None if deadline is None
+                               else max(0.0, deadline - self._clock()))
+                    self._cond.wait(timeout=timeout)
+                stopping = self._stopping and not self._buf
+                if not stopping:
+                    batch = list(self._buf)
+                    self._buf.clear()
+            if stopping:
+                # Don't discard events still held in an open coalescing
+                # window: summarize and send them before exiting.
+                try:
+                    for summary in self._limiter.flush_all():
+                        self._send(summary)
+                except Exception:
+                    logging.exception("notify worker error during shutdown")
+                return
+            try:
+                for ev in batch:
+                    sendable = self._limiter.admit(ev)
+                    if sendable is not None:
+                        self._send(sendable)
+                for summary in self._limiter.flush_due():
+                    self._send(summary)
+            except Exception:
+                logging.exception("notify worker error (continuing)")
+
+    def _send(self, ev: Event):
+        env = dict(os.environ, NOTIFY_TOPIC=self._topic)
+        try:
+            res = subprocess.run(
+                [self._command, ev.title, ev.priority, ev.message],
+                env=env, capture_output=True,
+                timeout=self.SUBPROCESS_TIMEOUT_S)
+            if res.returncode != 0:
+                logging.warning(
+                    "spool-notify exited %d for %s: %s", res.returncode, ev.kind,
+                    res.stderr.decode(errors="replace").strip())
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logging.warning("spool-notify invocation failed for %s: %s",
+                            ev.kind, e)
+
+
+@dataclass
+class Observation:
+    """One control-loop tick's worth of state, as seen by sbfd-ctl."""
+    wan_states: dict     # wan -> "UP"|"DOWN"|"UNKNOWN" (merged effective)
+    wan_labels: dict     # wan -> human label
+    mode: str            # effective mode AFTER env override
+    env_active: bool
+    env_reason: str
+    fec_engaged: bool
+    fec_at_max: bool
+    relay_polled: bool
+    relay_ok: bool
+    switch: Optional[tuple]   # (from_list, to_list, reason) or None
+
+
+class EventDetector:
+    """Turns per-tick observations into edge-triggered Events. The first
+    observation seeds comparison state silently, so a controller restart
+    never replays the current status as a notification storm."""
+
+    def __init__(self, relay_fail_threshold: int = 10):
+        self.relay_fail_threshold = max(1, int(relay_fail_threshold))
+        self._seeded = False
+        self._wan_states = {}
+        self._mode = None
+        self._env_active = False
+        self._fec_engaged = False
+        self._fec_at_max = False
+        self._all_down = False
+        self._relay_fails = 0
+        self._relay_alerted = False
+
+    def observe(self, obs: Observation) -> list:
+        evs = []
+        if self._seeded:
+            evs.extend(self._wan_events(obs))
+            evs.extend(self._switch_events(obs))
+            evs.extend(self._mode_events(obs))
+            evs.extend(self._env_events(obs))
+            evs.extend(self._fec_events(obs))
+            evs.extend(self._relay_events(obs))
+        else:
+            if obs.relay_polled and not obs.relay_ok:
+                self._relay_fails = 1
+            self._seeded = True
+        self._wan_states = dict(obs.wan_states)
+        self._mode = obs.mode
+        self._env_active = obs.env_active
+        self._fec_engaged = obs.fec_engaged
+        self._fec_at_max = obs.fec_at_max
+        self._all_down = not any(s == "UP" for s in obs.wan_states.values())
+        return evs
+
+    # -- per-category edges ----------------------------------------------
+
+    def _wan_events(self, obs):
+        evs = []
+        for wan, state in obs.wan_states.items():
+            prev = self._wan_states.get(wan)
+            label = obs.wan_labels.get(wan, wan)
+            if prev == "UP" and state != "UP":
+                evs.append(Event("wan_down", f"⚠️ {label} down",
+                                 f"{wan} {prev} → {state}", "high"))
+            elif prev is not None and prev != "UP" and state == "UP":
+                evs.append(Event("wan_up", f"✅ {label} up",
+                                 f"{wan} {prev} → {state}", "default"))
+        all_down = not any(s == "UP" for s in obs.wan_states.values())
+        if all_down and not self._all_down:
+            detail = ", ".join(f"{w}={s}" for w, s in
+                               sorted(obs.wan_states.items()))
+            evs.append(Event("all_wans_down", "🚨 All WANs down",
+                             detail, "max"))
+        return evs
+
+    def _switch_events(self, obs):
+        if obs.switch is None:
+            return []
+        frm, to, reason = obs.switch
+        return [Event("wan_switch",
+                      f"🔀 WAN switch → {','.join(to)}",
+                      f"active {','.join(frm)} → {','.join(to)}\n"
+                      f"reason: {reason}", "high")]
+
+    def _mode_events(self, obs):
+        if self._mode == obs.mode:
+            return []
+        was_full = self._mode == "full"
+        is_full = obs.mode == "full"
+        if not (was_full or is_full):
+            return []
+        cause = (f"environmental override: {obs.env_reason}"
+                 if obs.env_active else "operator/policy")
+        return [Event("redundancy",
+                      f"🛡 Mode {self._mode} → {obs.mode}",
+                      cause, "default")]
+
+    def _env_events(self, obs):
+        if obs.env_active and not self._env_active:
+            return [Event("env_override",
+                          "🌩 Environmental override: full redundancy",
+                          obs.env_reason or "(no reason given)", "high")]
+        if self._env_active and not obs.env_active:
+            return [Event("env_override",
+                          "🌩 Environmental override cleared",
+                          "back to operator/policy mode", "high")]
+        return []
+
+    def _fec_events(self, obs):
+        evs = []
+        if obs.fec_engaged and not self._fec_engaged:
+            evs.append(Event("fec", "📶 FEC engaged",
+                             "packet loss detected; parity streams on",
+                             "default"))
+        elif self._fec_engaged and not obs.fec_engaged:
+            evs.append(Event("fec", "📶 FEC disengaged",
+                             "loss cleared; parity streams off", "default"))
+        if obs.fec_at_max and not self._fec_at_max:
+            evs.append(Event("fec", "📶 FEC at max level",
+                             "loss beyond the top of the table", "default"))
+        return evs
+
+    def _relay_events(self, obs):
+        if not obs.relay_polled:
+            return []
+        if obs.relay_ok:
+            self._relay_fails = 0
+            if self._relay_alerted:
+                self._relay_alerted = False
+                return [Event("relay", "🔌 Relay restored",
+                              "relay /state reachable again", "high")]
+            return []
+        self._relay_fails += 1
+        if (self._relay_fails >= self.relay_fail_threshold
+                and not self._relay_alerted):
+            self._relay_alerted = True
+            return [Event("relay", "🔌 Relay unreachable",
+                          f"{self._relay_fails} consecutive failed polls",
+                          "high")]
+        return []

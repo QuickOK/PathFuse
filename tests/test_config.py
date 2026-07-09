@@ -164,3 +164,59 @@ def test_load_config_egress_rejects_bad_default_mode(tmp_path: Path):
     p.write_text(json.dumps(cfg_raw))
     with pytest.raises(ValueError, match="default_mode"):
         sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_no_notifications_section(tmp_path: Path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(SAMPLE))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.notifications is None
+
+
+def test_load_config_notifications_minimal(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse"}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.notifications.topic == "pathfuse"
+    assert cfg.notifications.min_interval_s == 30.0
+    assert cfg.notifications.command == "/usr/local/sbin/spool-notify"
+
+
+def test_load_config_notifications_full(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse", "min_interval_s": 60,
+                            "command": "/tmp/fake-spool-notify"}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.notifications.min_interval_s == 60.0
+    assert cfg.notifications.command == "/tmp/fake-spool-notify"
+
+
+def test_load_config_notifications_missing_topic_raises(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"min_interval_s": 60}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="missing required key"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_notifications_empty_topic_raises(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": ""}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="topic"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_notifications_negative_interval_raises(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse", "min_interval_s": -5}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="min_interval_s"):
+        sbfd_ctl.load_config(str(p))

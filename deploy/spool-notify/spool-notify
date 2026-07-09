@@ -1,0 +1,112 @@
+#!/bin/bash
+# Generic ntfy notification helper. The topic comes from NOTIFY_TOPIC or, when
+# unset, from a shared JSON config (key .ntfy_topic) so several services on one
+# box can stay on a common topic.
+# Auth lives in /etc/spool-notify.auth (mode 600).
+#
+# Usage: spool-notify <title> [<priority>] [<message>]
+#        message defaults to stdin if omitted.
+#
+# Reliability: a single bounded send attempt; if it fails — early boot before
+# DNS/uplink is up, or the ntfy endpoint is unreachable — the message is
+# SPOOLED to $SPOOL_DIR and spool-notify-drain.timer redelivers it later. A
+# fire-and-forget helper drops exactly the alerts that matter most (a reboot
+# storm, an uplink outage) because the notify path itself is down.
+# spool-notify returns 0 on a spool: delivery is deferred, not failed, so
+# callers don't log a false failure.
+#
+# Env overrides (tests): NOTIFY_CONFIG, NOTIFY_AUTH, NOTIFY_SPOOL,
+#   CURL_BIN, NOTIFY_TIMEOUT, NOTIFY_TRIES.
+# NOTIFY_TOPIC overrides the config topic (lets other services — e.g.
+# sbfd-ctl — publish to their own topic without touching the shared one).
+# The override is recorded in spool files (TOPIC=) so spool-notify-drain
+# redelivers to the right topic.
+set -uo pipefail
+
+CONFIG="${NOTIFY_CONFIG:-/etc/spool-notify/config.json}"
+AUTH="${NOTIFY_AUTH:-/etc/spool-notify.auth}"
+SPOOL_DIR="${NOTIFY_SPOOL:-/var/spool/spool-notify}"
+CURL_BIN="${CURL_BIN:-curl}"
+SEND_TIMEOUT="${NOTIFY_TIMEOUT:-8}"
+SEND_TRIES="${NOTIFY_TRIES:-1}"
+
+log() { logger -t spool-notify -- "$*"; }
+
+# Capture title/priority/message FIRST so we can always spool, even if config
+# or auth turn out to be unreadable.
+TITLE="${1:?title required}"
+PRIORITY="${2:-default}"
+if [ $# -ge 3 ]; then
+    MSG="$3"
+else
+    MSG=$(cat)
+fi
+
+# Prefix the host so alerts from multiple boxes sharing one ntfy topic stay
+# attributable. Applied ONCE here, before spool/send, so the spooled title
+# already carries the tag and spool-notify-drain replays it without re-tagging.
+# `${VAR-...}` (no colon): UNSET auto-detects the hostname; an EXPLICIT empty
+# value (NOTIFY_HOSTTAG=) is a clean opt-out — no tag at all.
+HOSTTAG="${NOTIFY_HOSTTAG-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
+[ -n "$HOSTTAG" ] && TITLE="${HOSTTAG}: ${TITLE}"
+
+spool() {
+    local reason="$1"
+    mkdir -p "$SPOOL_DIR" 2>/dev/null
+    # 770 (not 700): group members must be able to spool too — sbfd-ctl runs
+    # as an unprivileged user and reaches this dir via the spool-notify group.
+    # On boxes without that group the dir is root:root, so this is 700-equivalent.
+    chmod 770 "$SPOOL_DIR" 2>/dev/null
+    local f="${SPOOL_DIR}/$(date +%s)-$$-${RANDOM}.msg"
+    if { printf 'TS=%s\n' "$(date +%s)"
+         printf 'PRIORITY=%s\n' "$PRIORITY"
+         printf 'TITLE=%s\n' "$TITLE"
+         [ -z "${NOTIFY_TOPIC:-}" ] || printf 'TOPIC=%s\n' "$NOTIFY_TOPIC"
+         printf -- '---\n'
+         printf '%s' "$MSG"; } > "${f}.tmp" 2>/dev/null && mv -f "${f}.tmp" "$f" 2>/dev/null; then
+        log "spooled (${reason}): ${f##*/} title=[$TITLE]"
+    else
+        rm -f "${f}.tmp" 2>/dev/null
+        log "ERROR: could not spool message title=[$TITLE]"
+    fi
+}
+
+if [ -z "${NOTIFY_TOPIC:-}" ]; then
+    [ -r "$CONFIG" ] || { log "config $CONFIG missing/unreadable"; spool no-config; exit 0; }
+fi
+[ -r "$AUTH" ]   || { log "auth $AUTH missing/unreadable";   spool no-auth;   exit 0; }
+
+if [ -n "${NOTIFY_TOPIC:-}" ]; then
+    TOPIC="$NOTIFY_TOPIC"
+else
+    TOPIC=$(jq -r '.ntfy_topic // empty' "$CONFIG" 2>/dev/null)
+    [ -n "$TOPIC" ] || { log "no ntfy_topic in $CONFIG"; spool no-topic; exit 0; }
+fi
+
+# shellcheck disable=SC1090
+. "$AUTH"
+if [ -z "${NTFY_USER:-}" ] || [ -z "${NTFY_PASS:-}" ] || [ -z "${NTFY_BASE:-}" ]; then
+    log "auth vars missing in $AUTH"; spool no-auth-vars; exit 0
+fi
+
+send() {
+    "$CURL_BIN" -fsS --max-time "$SEND_TIMEOUT" \
+        -u "$NTFY_USER:$NTFY_PASS" \
+        -H "Title: $TITLE" \
+        -H "Priority: $PRIORITY" \
+        --data-binary "$MSG" \
+        "$NTFY_BASE/$TOPIC" >/dev/null 2>&1
+}
+
+i=0
+while [ "$i" -lt "$SEND_TRIES" ]; do
+    if send; then
+        exit 0
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "$SEND_TRIES" ] && sleep 1
+done
+
+log "send failed after ${SEND_TRIES} attempt(s); spooling"
+spool send-failed
+exit 0

@@ -1,0 +1,113 @@
+#!/bin/bash
+# Redeliver spooled spool-notify messages (written by spool-notify when the live send
+# failed — early boot before DNS/uplink is up, or the ntfy endpoint down).
+# Driven by spool-notify-drain.timer (shortly after boot + every ~60s).
+#
+# Behaviour:
+#   - oldest-first (filenames are epoch-prefixed, lexically sortable)
+#   - delete each file on successful redelivery
+#   - on the FIRST connectivity failure, stop (the rest would fail too) and
+#     retry the whole batch next cycle
+#   - drop messages older than MAX_AGE (stale alerts are noise)
+#   - prepend a "[delayed Nm ...]" line when a message is materially late so a
+#     belated alert isn't confusing (suppressed for sub-DELAY_MARK_MIN delays)
+#   - enforce a hard MAX_SPOOL cap (drop oldest beyond it)
+#
+# Env overrides (tests): NOTIFY_CONFIG, NOTIFY_AUTH, NOTIFY_SPOOL,
+#   CURL_BIN, NOTIFY_TIMEOUT, NOTIFY_MAX_AGE, NOTIFY_MAX_SPOOL,
+#   NOTIFY_DELAY_MARK.
+# Spool files may carry a TOPIC= header (written by spool-notify when
+# NOTIFY_TOPIC was set); those redeliver to that topic, others to the
+# config topic as before.
+set -uo pipefail
+
+CONFIG="${NOTIFY_CONFIG:-/etc/spool-notify/config.json}"
+AUTH="${NOTIFY_AUTH:-/etc/spool-notify.auth}"
+SPOOL_DIR="${NOTIFY_SPOOL:-/var/spool/spool-notify}"
+CURL_BIN="${CURL_BIN:-curl}"
+SEND_TIMEOUT="${NOTIFY_TIMEOUT:-8}"
+MAX_AGE="${NOTIFY_MAX_AGE:-86400}"      # drop alerts older than 24h
+MAX_SPOOL="${NOTIFY_MAX_SPOOL:-500}"    # hard cap on spool files
+DELAY_MARK="${NOTIFY_DELAY_MARK:-120}"  # only mark "delayed" if age >= this
+
+log() { logger -t spool-notify-drain -- "$*"; }
+
+[ -d "$SPOOL_DIR" ] || exit 0
+shopt -s nullglob
+files=( "$SPOOL_DIR"/*.msg )
+[ "${#files[@]}" -eq 0 ] && exit 0
+
+# Config/auth: if unreadable we can't send — leave the spool intact for later.
+[ -r "$CONFIG" ] || { log "config unreadable; deferring ${#files[@]} msg(s)"; exit 0; }
+[ -r "$AUTH" ]   || { log "auth unreadable; deferring ${#files[@]} msg(s)"; exit 0; }
+TOPIC=$(jq -r '.ntfy_topic // empty' "$CONFIG" 2>/dev/null)
+[ -n "$TOPIC" ] || { log "no ntfy_topic; deferring ${#files[@]} msg(s)"; exit 0; }
+# shellcheck disable=SC1090
+. "$AUTH"
+if [ -z "${NTFY_USER:-}" ] || [ -z "${NTFY_PASS:-}" ] || [ -z "${NTFY_BASE:-}" ]; then
+    log "auth vars missing; deferring ${#files[@]} msg(s)"; exit 0
+fi
+
+# Oldest-first, and enforce the hard cap by dropping the oldest excess.
+mapfile -t sorted < <(printf '%s\n' "${files[@]}" | sort)
+if [ "${#sorted[@]}" -gt "$MAX_SPOOL" ]; then
+    drop=$(( ${#sorted[@]} - MAX_SPOOL ))
+    for f in "${sorted[@]:0:$drop}"; do rm -f "$f"; log "spool over cap (${MAX_SPOOL}); dropped ${f##*/}"; done
+    sorted=( "${sorted[@]:$drop}" )
+fi
+
+now=$(date +%s)
+sent=0
+for f in "${sorted[@]}"; do
+    [ -f "$f" ] || continue
+
+    ts=""; prio="default"; title=""; ftopic=""; body=""; body_started=0
+    # `|| [ -n "$line" ]` so the final line is processed even when the file has
+    # no trailing newline (spool-notify writes the body with `printf '%s'`, so the
+    # last body line — often the diagnostic footer — has no newline).
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ "$body_started" -eq 1 ]; then
+            if [ -z "$body" ]; then body="$line"; else body="$body"$'\n'"$line"; fi
+            continue
+        fi
+        case "$line" in
+            TS=*)       ts="${line#TS=}" ;;
+            PRIORITY=*) prio="${line#PRIORITY=}" ;;
+            TITLE=*)    title="${line#TITLE=}" ;;
+            TOPIC=*)    ftopic="${line#TOPIC=}" ;;
+            ---)        body_started=1 ;;
+        esac
+    done < "$f"
+
+    if [ -z "$title" ]; then
+        log "malformed spool file ${f##*/} (no title); discarding"; rm -f "$f"; continue
+    fi
+
+    if [ -n "$ts" ] && [ "$ts" -gt 0 ] 2>/dev/null && [ $(( now - ts )) -gt "$MAX_AGE" ]; then
+        log "dropping stale (>${MAX_AGE}s) ${f##*/} title=[$title]"; rm -f "$f"; continue
+    fi
+
+    sendbody="$body"
+    if [ -n "$ts" ] && [ "$ts" -gt 0 ] 2>/dev/null; then
+        age=$(( now - ts ))
+        if [ "$age" -ge "$DELAY_MARK" ]; then
+            orig=$(date -d "@$ts" '+%H:%M' 2>/dev/null || echo "$ts")
+            sendbody="[delayed $(( age / 60 ))m — originally sent $orig]"$'\n'"$body"
+        fi
+    fi
+
+    if "$CURL_BIN" -fsS --max-time "$SEND_TIMEOUT" \
+            -u "$NTFY_USER:$NTFY_PASS" \
+            -H "Title: $title" \
+            -H "Priority: $prio" \
+            --data-binary "$sendbody" \
+            "$NTFY_BASE/${ftopic:-$TOPIC}" >/dev/null 2>&1; then
+        rm -f "$f"; sent=$(( sent + 1 ))
+    else
+        log "redeliver failed (connectivity?) at ${f##*/}; retrying whole batch next cycle"
+        break
+    fi
+done
+
+[ "$sent" -gt 0 ] && log "redelivered ${sent} spooled message(s)"
+exit 0

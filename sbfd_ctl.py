@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 import fec_control
 import fec_report
+import notify
 
 # -- Configuration -----------------------------------------------------------
 
@@ -109,6 +110,7 @@ class Config:
     egress: EgressCfg = field(default_factory=EgressCfg)
     fec: Optional[FecCfg] = None
     environmental: Optional[EnvironmentalCfg] = None
+    notifications: Optional["notify.NotifyCfg"] = None
     map: object = None                 # raw `map` config section (dict | None)
 
 
@@ -1055,6 +1057,16 @@ def load_config(path: str) -> Config:
                 auto_override_ttl_s=float(ao.get("ttl_s", 180.0)),
             )
 
+        raw_notif = raw.get("notifications")
+        notif_cfg = None
+        if raw_notif is not None:
+            notif_cfg = notify.NotifyCfg(
+                topic=raw_notif["topic"],
+                min_interval_s=float(raw_notif.get("min_interval_s", 30.0)),
+                command=str(raw_notif.get("command",
+                                          notify.DEFAULT_COMMAND)),
+            )
+
         cfg = Config(
             wans=wans,
             relay=relay,
@@ -1069,6 +1081,7 @@ def load_config(path: str) -> Config:
             egress=egress,
             fec=fec_cfg,
             environmental=env_cfg,
+            notifications=notif_cfg,
             map=raw.get("map"),
         )
     except KeyError as e:
@@ -1095,6 +1108,13 @@ def load_config(path: str) -> Config:
     if env_cfg is not None and env_cfg.auto_override_ttl_s <= 0:
         raise ValueError(
             f"environmental.auto_override.ttl_s must be > 0, got {env_cfg.auto_override_ttl_s}")
+    if cfg.notifications is not None:
+        if not cfg.notifications.topic:
+            raise ValueError("notifications.topic must be a non-empty string")
+        if cfg.notifications.min_interval_s < 0:
+            raise ValueError(
+                f"notifications.min_interval_s must be >= 0, "
+                f"got {cfg.notifications.min_interval_s}")
 
     return cfg
 
@@ -1834,11 +1854,27 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
     fec_relay_last_acked = None
     fec_relay_last_post_ts = None
 
+    notifier = None
+    detector = None
+    if cfg.notifications is not None:
+        notifier = notify.Notifier(cfg.notifications.topic,
+                                   min_interval_s=cfg.notifications.min_interval_s,
+                                   command=cfg.notifications.command)
+        notifier.start()
+        notifier.notify(notify.Event(
+            "started", "▶️ sbfd-ctl started",
+            f"wans: {', '.join(cfg.wans)}", "low"))
+        # ~10s of failed relay polls before alerting, at the actual poll cadence.
+        detector = notify.EventDetector(
+            relay_fail_threshold=max(1, round(10.0 / remote_interval)))
+
     if stop_event is None:
         stop_event = threading.Event()
 
     while not stop_event.is_set():
         loop_start = time.time()
+        relay_polled = False
+        switch_event = None
         ov = load_runtime_overlay(cfg)
         mode, policy, master_wan, egress_mode = effective_policy(cfg, ov)
         env_auto = load_auto_override(cfg, loop_start)
@@ -1855,6 +1891,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 fec_relay_last = fetch_relay_fec(cfg.relay.fec_url, cfg.relay.fetch_timeout_s)
                 fec_relay_last_at = loop_start
                 fec_reconcile_due = True
+            relay_polled = True
 
         eff = merge_effective(local, last_remote)
 
@@ -1904,6 +1941,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                     "reason": out.reason,
                 }
                 recent_switches.append(last_switch)
+                switch_event = (last_switch["from"], last_switch["to"],
+                                last_switch["reason"])
                 logging.info("switch: %s -> %s (%s)",
                              sorted(currently_active), sorted(out.desired_active), out.reason)
                 currently_active = set(out.desired_active)
@@ -2097,10 +2136,37 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 env_enabled=env_enabled, active=env_active,
                 auto=env_auto, now=loop_start),
         }
+        if detector is not None:
+            fec_engaged = False
+            fec_at_max = False
+            if cfg.fec and fec_current_ratio:
+                try:
+                    _fa, _fb = fec_control.parse_ratio(fec_current_ratio)
+                    fec_engaged = _fb > 0
+                except ValueError:
+                    pass
+                if fec_mode_eff in (fec_control.MODE_ADAPTIVE,
+                                    fec_control.MODE_MIN_ADAPTIVE):
+                    fec_at_max = fec_rt.current_level >= len(cfg.fec.loss_table) - 1
+            for _ev in detector.observe(notify.Observation(
+                    wan_states={w: eff.get(w, "UNKNOWN") for w in cfg.wans},
+                    wan_labels={w: cfg.wans[w].label for w in cfg.wans},
+                    mode=mode,
+                    env_active=env_active is not None,
+                    env_reason=(env_active.reason if env_active else ""),
+                    fec_engaged=fec_engaged,
+                    fec_at_max=fec_at_max,
+                    relay_polled=relay_polled,
+                    relay_ok=last_remote.ok,
+                    switch=switch_event)):
+                notifier.notify(_ev)
         publish_state(cfg, snapshot)
 
         elapsed = time.time() - loop_start
         stop_event.wait(max(0.0, tick - elapsed))
+
+    if notifier is not None:
+        notifier.stop()
 
 
 def withdraw_managed_default(cfg: Config):

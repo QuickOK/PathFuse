@@ -96,5 +96,9 @@
       "max_mb": 512,
       "max_zoom": 17
     }
+  },
+  "notifications": {
+    "topic": "pathfuse",
+    "min_interval_s": 30
   }
 }
