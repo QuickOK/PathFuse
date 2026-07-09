@@ -127,3 +127,95 @@ def test_relay_fec_direction_wire_none_when_absent():
     fetch = {"ok": True, "error": None, "data": {"ratio": "8:0"}}
     d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True, last_acked=True)
     assert d["wire"] is None
+
+
+# ---------------------------------------------------------------------------
+# Direction-correct loss sourcing (2026-07-08): sbfd loss_pct is RX-side, so
+# the loss that the client->relay FEC leg repairs is measured at the RELAY.
+# The client must drive its TX leg from the relay-fetched snapshot and push
+# its own (relay->client direction) measurement to the relay.
+# ---------------------------------------------------------------------------
+
+def _snap(ok, per_wan):
+    return M.StateSnapshot(ok=ok, per_wan={
+        w: M.WanSample(state="UP", rtt_ms=10.0, loss_pct=l)
+        for w, l in per_wan.items()})
+
+
+def test_fec_loss_map_prefers_fresh_remote():
+    local = _snap(True, {"wan1": 5.0, "wan2": 1.5})   # relay->client loss (not ours to fix)
+    remote = _snap(True, {"wan1": 0.0, "wan2": 0.3})  # client->relay loss (what our TX leg repairs)
+    loss, source = M.fec_loss_map(local, remote, remote_fresh=True, wans=["wan1", "wan2"])
+    assert loss == {"wan1": 0.0, "wan2": 0.3}
+    assert source == "relay"
+
+
+def test_fec_loss_map_falls_back_when_remote_stale():
+    local = _snap(True, {"wan1": 2.0})
+    remote = _snap(True, {"wan1": 9.0})
+    loss, source = M.fec_loss_map(local, remote, remote_fresh=False, wans=["wan1"])
+    assert loss == {"wan1": 2.0}
+    assert source == "local"
+
+
+def test_fec_loss_map_falls_back_when_remote_not_ok():
+    local = _snap(True, {"wan1": 2.0})
+    remote = M.StateSnapshot(ok=False, per_wan={})
+    loss, source = M.fec_loss_map(local, remote, remote_fresh=True, wans=["wan1"])
+    assert loss == {"wan1": 2.0}
+    assert source == "local"
+
+
+def test_fec_loss_map_missing_sample_is_zero():
+    local = _snap(True, {})
+    remote = _snap(True, {"wan1": 1.0})
+    loss, source = M.fec_loss_map(local, remote, remote_fresh=True, wans=["wan1", "wan2"])
+    assert loss == {"wan1": 1.0, "wan2": 0.0}
+    assert source == "relay"
+
+
+def test_worst_active_loss_max_over_active():
+    assert M.worst_active_loss({"wan1": 1.0, "wan2": 4.0}, {"wan2"}) == 4.0
+
+
+def test_worst_active_loss_falls_back_to_all_wans():
+    assert M.worst_active_loss({"wan1": 1.0, "wan2": 4.0}, set()) == 4.0
+
+
+def test_worst_active_loss_empty():
+    assert M.worst_active_loss({}, set()) == 0.0
+
+
+def test_post_relay_fec_includes_client_loss_pct(monkeypatch):
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", 1.0,
+                            client_loss_pct=1.47) is True
+    assert seen["body"]["client_loss_pct"] == 1.47
+
+
+def test_post_relay_fec_omits_client_loss_when_none(monkeypatch):
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", 1.0) is True
+    assert "client_loss_pct" not in seen["body"]
+
+
+def test_relay_fec_direction_passes_through_loss_source():
+    fetch = {"ok": True, "error": None, "data": {"ratio": "8:2", "loss_source": "client_push"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True, last_acked=True)
+    assert d["loss_source"] == "client_push"

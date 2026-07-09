@@ -498,17 +498,26 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
     monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
     monkeypatch.setattr(M, "apply_engarde_table_action", lambda a: None)
     monkeypatch.setattr(M, "read_engarde_table_default", lambda table: {"via": None, "dev": "wg0"})
+    # Local sbfd measures relay->client loss (1.5% on wan1) — that is pushed
+    # to the relay, not used for our own leg. The relay-fetched snapshot
+    # (client->relay direction: 4% on wan1) is what drives our TX ratio.
     monkeypatch.setattr(M, "read_local_sbfd_state",
         lambda p, m: M.StateSnapshot(ok=True, per_wan={
-            "wan1": M.WanSample("UP", 10.0, 4.0, 100.0),
+            "wan1": M.WanSample("UP", 10.0, 1.5, 100.0),
             "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state",
-        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
+        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 4.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_relay_fec",
         lambda url, t: {"ok": True, "error": None,
                         "data": {"enabled": True, "ratio": "8:2", "level": 1,
                                  "driving_loss_pct": 1.2, "since": 5.0}})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: True)
+    pushed = []
+    def fake_post(url, mode, fixed_ratio, t, client_loss_pct=None):
+        pushed.append(client_loss_pct)
+        return True
+    monkeypatch.setattr(M, "post_relay_fec", fake_post)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
@@ -523,9 +532,11 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
     assert fec["configured"] is True
     assert fec["desired_enabled"] is True
     t2o = fec["directions"]["client_to_relay"]
-    assert t2o["ratio"] == "8:4"          # wan1 4% loss -> level 2 -> 8:4
+    assert t2o["ratio"] == "8:4"          # relay-measured wan1 4% -> level 2 -> 8:4
     assert t2o["driver_wan"] == "wan1"    # higher-loss WAN drives the ratio
+    assert t2o["loss_source"] == "relay"  # driven by relay-measured loss, not local
     assert t2o["actuator_ok"] is True
+    assert pushed and pushed[0] == 1.5    # our relay->client measurement got pushed
     o2t = fec["directions"]["relay_to_client"]
     assert o2t["ratio"] == "8:2"
     assert o2t["ok"] is True
@@ -549,7 +560,7 @@ def test_run_controller_disabled_and_relay_unreachable(cfg_with_fec, monkeypatch
         lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec",
         lambda url, t: {"ok": False, "data": None, "error": "transport: unreachable"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: False)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t, client_loss_pct=None: False)
     captured = []
     monkeypatch.setattr(M.fec_control, "write_fifo",
         lambda path, ratio, logger=None: (captured.append(ratio), True)[1])
@@ -588,7 +599,7 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
             "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state", lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec", lambda url, t: {"ok": False, "data": None, "error": "x"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t, client_loss_pct=None: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
     class FakeTracker:
@@ -618,7 +629,7 @@ def test_run_controller_client_wire_none_without_tracker(cfg_with_fec, monkeypat
                                                         "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state", lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec", lambda url, t: {"ok": False, "data": None, "error": "x"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, t, client_loss_pct=None: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg_with_fec.sbfd_local_state).write_text("{}")

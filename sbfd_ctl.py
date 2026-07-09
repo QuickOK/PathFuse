@@ -657,13 +657,35 @@ def pick_default_wan(eff_state: dict, desired_active: set,
     return sorted(ups)[0]
 
 
+def worst_active_loss(loss, active_wans):
+    """Worst loss among the WANs actually carrying traffic (all WANs when
+    the active set is empty — mirrors fec_driver_wan's fallback)."""
+    active = active_wans or set(loss.keys())
+    return max((loss.get(w, 0.0) for w in active), default=0.0)
+
+
+def fec_loss_map(local, remote, remote_fresh, wans):
+    """Per-WAN loss driving the client->relay FEC leg, plus its source.
+
+    sbfd loss_pct is RX-side, so the loss this leg's parity repairs
+    (client->relay direction) is measured at the RELAY. Prefer the fetched
+    relay snapshot; the locally measured loss (relay->client direction) is
+    only a correlation proxy, used when the relay view is missing or stale."""
+    use_remote = remote.ok and remote_fresh
+    src, source = (remote, "relay") if use_remote else (local, "local")
+    loss = {}
+    for w in wans:
+        s = src.per_wan.get(w) if src.ok else None
+        loss[w] = s.loss_pct if (s and s.loss_pct is not None) else 0.0
+    return loss, source
+
+
 def compute_fec_target(fec_cfg, mode, eff, loss, active_wans):
     """Pure: map mode/effective-state/loss to a FEC table level (the
     pre-fec-mode-override adaptive choice). Loss = worst among the WANs
     actually carrying traffic."""
     up_count = sum(1 for w, st in eff.items() if st == "UP")
-    active = active_wans or set(loss.keys())
-    active_loss = max((loss.get(w, 0.0) for w in active), default=0.0)
+    active_loss = worst_active_loss(loss, active_wans)
     return fec_control.mode_aware_level(
         mode, up_count, active_loss, fec_cfg.loss_table,
         fec_cfg.full_min_up_wans, fec_cfg.full_mode_backoff_fec)
@@ -705,6 +727,7 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked):
         "ratio": data.get("ratio"),
         "level": data.get("level"),
         "driving_loss_pct": data.get("driving_loss_pct"),
+        "loss_source": data.get("loss_source"),
         "since": data.get("since"),
         "ok": bool(fetch.get("ok")),
         "stale_s": (now - fetched_at) if fetched_at else None,
@@ -1333,18 +1356,24 @@ def fetch_relay_fec(url, timeout_s) -> dict:
         return {"ok": False, "data": None, "error": f"parse: {e}"}
 
 
-def post_relay_fec(url, mode, fixed_ratio, timeout_s) -> bool:
+def post_relay_fec(url, mode, fixed_ratio, timeout_s, client_loss_pct=None) -> bool:
     """Best-effort POST of desired (mode, fixed_ratio) to relay /fec.
 
-    Also sends the legacy `enabled` boolean so an older relay binary still
-    honors the off/on intent during a rolling upgrade. Returns True iff 200."""
+    client_loss_pct carries our locally measured relay->client loss — the
+    direction the relay's TX leg repairs but cannot see (sbfd loss is
+    RX-side). Older relays ignore the extra field. Also sends the legacy
+    `enabled` boolean so an older relay binary still honors the off/on intent
+    during a rolling upgrade. Returns True iff 200."""
     if not url:
         return False
-    body = _json.dumps({
+    payload = {
         "mode": mode,
         "fixed_ratio": fixed_ratio,
         "enabled": mode != fec_control.MODE_OFF,
-    }).encode()
+    }
+    if client_loss_pct is not None:
+        payload["client_loss_pct"] = round(client_loss_pct, 2)
+    body = _json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
@@ -2006,11 +2035,20 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
         fec_desired = fec_mode_eff != fec_control.MODE_OFF
         fec_driver = None
         fec_actuator_ok = True
+        fec_loss = loss
+        fec_loss_source = "local"
         relay_desired = (fec_mode_eff, fec_fixed_ratio_eff)
         if cfg.fec:
+            # Our TX leg repairs client->relay loss, which only the relay can
+            # measure — drive it from the fetched relay snapshot (local loss,
+            # the opposite direction, is the stale-relay fallback).
+            remote_fresh = bool(last_remote_at) and (
+                loop_start - last_remote_at) <= max(3 * remote_interval, 10.0)
+            fec_loss, fec_loss_source = fec_loss_map(
+                local, last_remote, remote_fresh, cfg.wans)
             # The adaptive engine always runs so the loss-tracked level stays
             # fresh; apply_mode then maps it to the actual ratio per mode.
-            _fec_target = compute_fec_target(cfg.fec, mode, eff, loss, currently_active)
+            _fec_target = compute_fec_target(cfg.fec, mode, eff, fec_loss, currently_active)
             fec_rt, _fec_changed = fec_control.step_level(
                 _fec_target, fec_rt, fec_hyst, loop_start)
             _adaptive_ratio = fec_control.level_to_ratio(
@@ -2019,8 +2057,16 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 fec_mode_eff, _adaptive_ratio,
                 fixed_ratio=fec_fixed_ratio_eff,
                 floor_ratio=cfg.fec.floor_ratio)
+            # Push our locally measured (relay->client) loss so the relay can
+            # drive ITS leg on the direction it actually repairs. Quantized to
+            # a table level in relay_desired so posts fire on level changes,
+            # not every EWMA wiggle.
+            client_push_loss = worst_active_loss(loss, currently_active)
+            relay_desired = (fec_mode_eff, fec_fixed_ratio_eff,
+                             fec_control.loss_to_level(client_push_loss,
+                                                       cfg.fec.loss_table))
             if fec_mode_eff in (fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE):
-                fec_driver = fec_driver_wan(loss, currently_active)
+                fec_driver = fec_driver_wan(fec_loss, currently_active)
             if _fec_ratio != fec_current_ratio:
                 fec_actuator_ok = fec_control.write_fifo(
                     cfg.fec.fifo, _fec_ratio, logging)
@@ -2040,7 +2086,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                     fec_relay_last_post_ts, loop_start):
                 if post_relay_fec(cfg.relay.fec_url, fec_mode_eff,
                                   fec_fixed_ratio_eff,
-                                  cfg.relay.fetch_timeout_s):
+                                  cfg.relay.fetch_timeout_s,
+                                  client_loss_pct=client_push_loss):
                     fec_relay_last_acked = relay_desired
                 fec_relay_last_post_ts = loop_start
 
@@ -2120,8 +2167,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                         "fixed_ratio": fec_fixed_ratio_eff,
                         "ratio": fec_current_ratio,
                         "level": fec_rt.current_level,
-                        "driving_loss_pct": (loss.get(fec_driver) if fec_driver else None),
+                        "driving_loss_pct": (fec_loss.get(fec_driver) if fec_driver else None),
                         "driver_wan": fec_driver,
+                        "loss_source": fec_loss_source,
                         "since": fec_ratio_since,
                         "actuator_ok": fec_actuator_ok,
                         "wire": (wire_tracker.snapshot(loop_start) if wire_tracker else None),

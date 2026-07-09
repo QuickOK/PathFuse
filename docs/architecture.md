@@ -100,6 +100,10 @@ Redundancy ramps with measured loss and backs off when links are clean:
 - **Two directions, independent:** client→relay is driven by `sbfd-ctl`; relay→client by
   `udpspeeder-fec`. A single operator switch can force both to `8:0` (disabled) without stopping the
   tunnel.
+- **Receiver-measured loss:** sbfd loss is RX-side, so each leg is driven by the loss the *far end*
+  measures — the client leg by the relay-fetched `/state` snapshot, the relay leg by
+  `client_loss_pct` pushed in the client's `POST /fec` (fallback: own-side loss when the far-end
+  view is stale, e.g. during a rolling upgrade).
 - **Wire stats:** parsed from UDPspeeder `--report` — throughput and parity overhead per direction
   (recovery counts are not emitted by the report and are not shown).
 

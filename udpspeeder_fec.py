@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Adaptive FEC controller for the relay side (relay->client direction).
-Reads relay sbfd loss, drives the udpspeeder-server FIFO. Loss-driven only."""
+
+Drives the udpspeeder-server FIFO from the loss the CLIENT measures
+(relay->client is the direction this leg's parity repairs, and sbfd loss_pct
+is RX-side, so only the client can see it). The client pushes that sample in
+its POST /fec body (`client_loss_pct`). Relay-local sbfd loss measures the
+opposite (client->relay) direction and is kept only as a correlation-proxy
+fallback for older clients that don't push."""
 import argparse
 import json
 import logging
@@ -28,6 +34,8 @@ class FecState:
                     else fec_control.MODE_OFF)
         self._mode = fec_control.normalize_mode(mode)
         self._fixed_ratio = fixed_ratio or fec_control.DEFAULT_FIXED_RATIO
+        self._pushed_loss = None
+        self._pushed_loss_ts = 0.0
         self._snapshot = {
             "enabled": self._mode != fec_control.MODE_OFF,
             "mode": self._mode,
@@ -35,6 +43,7 @@ class FecState:
             "ratio": None,
             "level": 0,
             "driving_loss_pct": None,
+            "loss_source": None,
             "since": None,
             "wire": None,
         }
@@ -68,6 +77,20 @@ class FecState:
         """Return (mode, fixed_ratio) atomically."""
         with self._lock:
             return self._mode, self._fixed_ratio
+
+    def set_pushed_loss(self, value, ts):
+        with self._lock:
+            self._pushed_loss = float(value)
+            self._pushed_loss_ts = ts
+
+    def get_pushed_loss(self, now, stale_after_s):
+        """Client-pushed relay->client loss sample, or None if absent/stale."""
+        with self._lock:
+            if self._pushed_loss is None:
+                return None
+            if (now - self._pushed_loss_ts) > stale_after_s:
+                return None
+            return self._pushed_loss
 
     def publish(self, **fields):
         with self._lock:
@@ -119,8 +142,9 @@ def start_fec_http(listen, state, stop_event=None):
             mode_in = payload.get("mode")
             enabled_in = payload.get("enabled")
             fixed_in = payload.get("fixed_ratio")
-            if mode_in is None and enabled_in is None:
-                self._json(400, {"error": "mode or enabled required"}); return
+            loss_in = payload.get("client_loss_pct")
+            if mode_in is None and enabled_in is None and loss_in is None:
+                self._json(400, {"error": "mode, enabled or client_loss_pct required"}); return
             if mode_in is not None and mode_in not in fec_control.ALL_MODES:
                 self._json(400, {"error": f"mode must be one of "
                                           f"{sorted(fec_control.ALL_MODES)}"}); return
@@ -136,6 +160,11 @@ def start_fec_http(listen, state, stop_event=None):
                 if not fec_control.validate_ratio(a, b):
                     self._json(400, {"error": "fixed_ratio out of bounds"}); return
                 state.set_fixed_ratio(fixed_in)
+            if loss_in is not None:
+                if (isinstance(loss_in, bool) or not isinstance(loss_in, (int, float))
+                        or not (0.0 <= loss_in <= 100.0)):
+                    self._json(400, {"error": "client_loss_pct must be a number 0..100"}); return
+                state.set_pushed_loss(loss_in, time.time())
             if mode_in is not None:
                 state.set_mode(mode_in)
             elif enabled_in is not None:
@@ -189,10 +218,15 @@ def read_worst_loss(state_path):
     return (max(losses) if losses else 0.0), up
 
 
-def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None):
+def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
+             pushed_loss=None):
     """One control tick. Returns (new_runtime, ratio_now_or_current).
     The adaptive engine always advances so the loss-tracked level stays fresh;
-    apply_mode then maps it through the operator-chosen mode."""
+    apply_mode then maps it through the operator-chosen mode.
+
+    pushed_loss is the fresh client-measured relay->client loss (the direction
+    this leg repairs); when present it drives the level. Relay-local sbfd loss
+    (opposite direction) is only the fallback for clients that don't push."""
     table = cfg["loss_table"]
     floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
     if mode is None:
@@ -201,7 +235,8 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None):
         fixed_ratio = fec_control.DEFAULT_FIXED_RATIO
 
     hyst = fec_control.FecHysteresis(cfg["ramp_up_ticks"], cfg["ramp_down_hold_s"])
-    worst, up = read_worst_loss(cfg["sbfd_state"])
+    local_worst, up = read_worst_loss(cfg["sbfd_state"])
+    worst = pushed_loss if pushed_loss is not None else local_worst
     if worst is None:
         # No fresh loss sample: still honor explicit off/fixed overrides so the
         # operator can drive the relay without depending on sbfd state.
@@ -235,19 +270,27 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     rt = fec_control.FecRuntime(0, 0, time.time())
     current_ratio = None
     since = None
+    pushed_stale_after = float(cfg.get("pushed_loss_stale_after_s", 90.0))
     while not stop_event.is_set():
         mode, fixed_ratio = state.get_desired()
+        pushed = state.get_pushed_loss(time.time(), pushed_stale_after)
         prev = current_ratio
         rt, current_ratio = run_once(cfg, rt, current_ratio,
-                                     mode=mode, fixed_ratio=fixed_ratio)
+                                     mode=mode, fixed_ratio=fixed_ratio,
+                                     pushed_loss=pushed)
         if current_ratio != prev:
             since = time.time()
-        worst, _up = read_worst_loss(cfg["sbfd_state"])
+        driving = pushed
+        if driving is None:
+            driving, _up = read_worst_loss(cfg["sbfd_state"])
         now = time.time()
         state.publish(enabled=mode != fec_control.MODE_OFF,
                       mode=mode, fixed_ratio=fixed_ratio,
                       ratio=current_ratio,
-                      level=rt.current_level, driving_loss_pct=worst, since=since,
+                      level=rt.current_level, driving_loss_pct=driving,
+                      loss_source=("client_push" if pushed is not None
+                                   else "local_sbfd"),
+                      since=since,
                       wire=(wire_tracker.snapshot(now) if wire_tracker else None))
         stop_event.wait(cfg["poll_interval_s"])
 
