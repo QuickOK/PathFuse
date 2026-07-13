@@ -486,8 +486,9 @@ def test_unknown_carrier_still_allows_reboot():
 
 
 class _StubClient:
-    def __init__(self, login_ok=True, reboot_ok=True, model={"x": 1}):
-        self.login_ok, self.reboot_ok, self.model = login_ok, reboot_ok, model
+    def __init__(self, login_ok=True, reboot_ok=True, model=None):
+        self.login_ok, self.reboot_ok = login_ok, reboot_ok
+        self.model = model if model is not None else {"x": 1}
         self.rebooted = False
 
     def fetch_model(self):
@@ -577,3 +578,42 @@ def test_scheduled_reboot_reports_login_failure(tmp_path, monkeypatch):
     assert issued is False
     assert "login" in reason
     assert c.rebooted is False
+
+
+def test_scheduled_reboot_skips_when_peer_state_stale(tmp_path, monkeypatch):
+    # peer state UNKNOWN (stale sbfd file) must SKIP: "peer_up is not True"
+    # has to catch None as well as False, or a stale file reads as a
+    # definite DOWN and takes out the last standing WAN.
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient()
+    stale_now = 1000.0 + cfg.state_max_age_s + 1
+    issued, reason = W.scheduled_reboot(cfg, c, now=stale_now)
+    assert issued is False
+    assert "not UP" in reason and "None" in reason
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_skips_when_state_file_missing(tmp_path, monkeypatch):
+    # peer state UNKNOWN (no sbfd file at all) must also SKIP: read_bfd_states
+    # returns (None, None) on OSError, same "unknown, don't touch it" case.
+    cfg = sched_cfg(tmp_path)
+    Path(cfg.sbfd_state_path).unlink()
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient()
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is False
+    assert "not UP" in reason and "None" in reason
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_issues_when_carrier_unknown(tmp_path, monkeypatch):
+    # carrier UNKNOWN (None) must PROCEED: only a definite False (no link)
+    # may suppress the reboot, so "read_carrier(...) is False" must stay a
+    # strict equality check and never become "is not True".
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: None)
+    c = _StubClient()
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is True
+    assert c.rebooted is True

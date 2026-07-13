@@ -16,7 +16,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import notify as notify_mod
 
@@ -524,7 +524,7 @@ def _scheduled_reboot_verbose(cfg: WdConfig, client, now: float):
     return True, "reboot issued", False
 
 
-def scheduled_reboot(cfg: WdConfig, client, now: float) -> tuple:
+def scheduled_reboot(cfg: WdConfig, client, now: float) -> Tuple[bool, str]:
     """One-shot, guarded reboot for the daily maintenance window.
 
     Deliberately does NOT read or write the daemon's policy state: a scheduled
@@ -587,6 +587,11 @@ def main():
         return 0 if ok else 1
     if args.scheduled_reboot:
         # Separate session jar: the daemon may be mid-login with the shared one.
+        # /run/hotspot-watchdog/ is normally provided by systemd's
+        # RuntimeDirectory=, which systemd removes once the daemon stops --
+        # create it here so a one-shot run with the daemon down still has
+        # somewhere for curl -c to persist the login cookie.
+        Path("/run/hotspot-watchdog").mkdir(parents=True, exist_ok=True)
         sc = NetgearClient(cfg.admin_url, cfg.iface,
                            "/run/hotspot-watchdog/cookies-scheduled.txt")
         issued, reason, guard_skipped = _scheduled_reboot_verbose(
