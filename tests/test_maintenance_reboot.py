@@ -366,6 +366,77 @@ def test_update_staged_rejects_bool_seconds(tmp_path):
     assert d.update_staged() is False
 
 
+# float() accepts "nan"/"inf"/"-inf"/"Infinity" and only raises ValueError on
+# genuinely non-numeric strings, so these quoted forms parse successfully and
+# must be caught by an explicit finiteness check, not by the string-to-float
+# conversion itself.
+NON_FINITE_STRINGS = ("nan", "inf", "-inf", "Infinity")
+
+# json.dumps emits bareword NaN/Infinity/-Infinity (no quotes) for these
+# Python floats by default, and json.loads parses that bareword form back
+# into the same non-finite floats, so a device could in principle send this
+# shape too; _as_number must reject it exactly like the quoted-string form.
+NON_FINITE_FLOATS = (float("nan"), float("inf"), float("-inf"))
+
+
+def _status_with_non_finite(value):
+    return _json.dumps({"dishGetStatus": {
+        "deviceInfo": {"bootcount": value},
+        "deviceState": {"uptimeS": value},
+        "softwareUpdateState": "IDLE",
+        "secondsUntilSwupdateRebootPossible": value,
+    }})
+
+
+def test_bootcount_none_on_non_finite_strings(tmp_path):
+    # CONFIRMED bug: float("nan")/float("inf") succeed, so bootcount()'s
+    # int(n) used to raise ValueError (NaN) or OverflowError (inf); this pins
+    # that bootcount() instead returns None and never raises
+    for s in NON_FINITE_STRINGS:
+        d, _ = dish(tmp_path, [(0, _status_with_non_finite(s))])
+        assert d.bootcount() is None
+
+
+def test_bootcount_none_on_non_finite_float_values(tmp_path):
+    # same guard, but for the bareword-float form (json.loads("NaN")) rather
+    # than the quoted-string form
+    for v in NON_FINITE_FLOATS:
+        d, _ = dish(tmp_path, [(0, _status_with_non_finite(v))])
+        assert d.bootcount() is None
+
+
+def test_uptime_s_none_on_non_finite_strings(tmp_path):
+    # CONFIRMED bug: a NaN uptime silently bypassed the min-uptime "just
+    # rebooted" guard, since nan < x and nan >= x are both False; this pins
+    # that uptime_s() returns None (never nan) so the guard cannot be skipped
+    for s in NON_FINITE_STRINGS:
+        d, _ = dish(tmp_path, [(0, _status_with_non_finite(s))])
+        assert d.uptime_s() is None
+
+
+def test_uptime_s_none_on_non_finite_float_values(tmp_path):
+    # same guard, but for the bareword-float form
+    for v in NON_FINITE_FLOATS:
+        d, _ = dish(tmp_path, [(0, _status_with_non_finite(v))])
+        assert d.uptime_s() is None
+
+
+def test_update_staged_false_on_non_finite_seconds_strings(tmp_path):
+    # CONFIRMED bug: secondsUntilSwupdateRebootPossible "inf" >= 0 is True in
+    # Python, so update_staged() used to wrongly report a staged update; this
+    # pins that a non-finite seconds value must never be treated as staged
+    for s in NON_FINITE_STRINGS:
+        d, _ = dish(tmp_path, [(0, _status_with_non_finite(s))])
+        assert d.update_staged() is False
+
+
+def test_update_staged_false_on_non_finite_seconds_float_values(tmp_path):
+    # same guard, but for the bareword-float form
+    for v in NON_FINITE_FLOATS:
+        d, _ = dish(tmp_path, [(0, _status_with_non_finite(v))])
+        assert d.update_staged() is False
+
+
 def test_status_none_on_non_dict_json_bodies(tmp_path):
     # grpcurl printing valid JSON that isn't an object ([]/"x"/3/null) must
     # yield None, not raise

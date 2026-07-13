@@ -14,6 +14,7 @@ WAN fails to come back."""
 import argparse
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -172,16 +173,25 @@ def _as_number(v):
     drops them. Accept a numeric string too. Reject bools explicitly —
     isinstance(True, int) is True in Python, and a bool must never be
     mistaken for a device-reported count. Anything else (None, list, dict,
-    a non-numeric string) returns None."""
+    a non-numeric string) returns None.
+
+    float() also accepts "nan"/"inf"/"-inf"/"Infinity" and only raises on
+    genuinely non-numeric strings, so a string that parses must still be
+    checked for finiteness: a non-finite value is not a number this module
+    can trust, and callers (bootcount's int(n), uptime_s's threshold
+    comparisons) must never see one."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
+        if isinstance(v, float) and not math.isfinite(v):
+            return None
         return v
     if isinstance(v, str):
         try:
-            return float(v)
+            n = float(v)
         except ValueError:
             return None
+        return n if math.isfinite(n) else None
     return None
 
 
