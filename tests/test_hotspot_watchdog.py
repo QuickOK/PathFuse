@@ -188,6 +188,13 @@ def test_parse_bfd_states_by_iface():
     assert W.parse_bfd_states(missing, "wan1", "wan2", now=5010.0, max_age_s=30) == (None, None)
 
 
+def test_parse_bfd_states_rejects_non_dict_sessions():
+    # host-only type guard: a malformed "sessions" (e.g. a list, not a dict of
+    # sessions) must return (None, None) rather than raising on .values().
+    bad_shape = _json.dumps({"timestamp": 5000.0, "sessions": ["oops"]})
+    assert W.parse_bfd_states(bad_shape, "wan1", "wan2", now=5010.0, max_age_s=30) == (None, None)
+
+
 FIXTURE = (Path(__file__).parent / "fixtures" / "m6_model.json").read_text()
 
 
@@ -275,6 +282,16 @@ def test_load_config_rejects_bad_values(tmp_path):
         W.load_config(write_cfg(tmp_path, dwell_s=0))
 
 
+def test_load_config_requires_admin_url(tmp_path):
+    # admin_url is a required key (no default): a config missing it must fail
+    # loudly at load time, not fall back to a hardcoded hotspot address.
+    import pytest
+    p = tmp_path / "wd.json"
+    p.write_text(_json.dumps({"secret_path": str(tmp_path / "secret")}))
+    with pytest.raises(KeyError):
+        W.load_config(str(p))
+
+
 class SpyNotify:
     def __init__(self):
         self.sent = []
@@ -283,7 +300,8 @@ class SpyNotify:
         self.sent.append((title, priority, message))
 
 
-def make_executor(tmp_path, dry_run, login_ok=True, reboot_ok=True):
+def make_executor(tmp_path, dry_run, login_ok=True, reboot_ok=True,
+                  fetch_model_ok=True):
     cfg = W.load_config(write_cfg(tmp_path, dry_run=dry_run))
     (tmp_path / "secret").write_text("pw123\n")
 
@@ -292,6 +310,8 @@ def make_executor(tmp_path, dry_run, login_ok=True, reboot_ok=True):
             self.rebooted = 0
 
         def fetch_model(self):
+            if not fetch_model_ok:
+                return None
             return {"wwan": {"connection": "Disconnected"}}
 
         def login(self, pw):
@@ -327,6 +347,39 @@ def test_executor_notifies_on_login_failure(tmp_path):
     ex.execute([W.Action("reboot")])
     assert client.rebooted == 0
     assert spy.sent[0][0] == "hotspot reboot API error"
+
+
+def test_reboot_alerts_when_admin_ui_unreachable(tmp_path):
+    # _do_reboot's first guard: fetch_model() returning None means the admin
+    # UI never answered at all — must alert distinctly and never reboot.
+    ex, client, spy = make_executor(tmp_path, dry_run=False,
+                                     fetch_model_ok=False)
+    ex.execute([W.Action("reboot")])
+    assert client.rebooted == 0
+    assert spy.sent[0][0] == "hotspot reboot API error"
+    assert "unreachable" in spy.sent[0][2]
+
+
+def test_reboot_alerts_when_secret_unreadable(tmp_path):
+    # _do_reboot's second guard: the admin UI answered fine, but the secret
+    # file is gone/unreadable — must alert distinctly and never reboot.
+    ex, client, spy = make_executor(tmp_path, dry_run=False)
+    (tmp_path / "secret").unlink()
+    ex.execute([W.Action("reboot")])
+    assert client.rebooted == 0
+    assert spy.sent[0][0] == "hotspot reboot API error"
+    assert "secret" in spy.sent[0][2]
+
+
+def test_reboot_alerts_when_post_fails(tmp_path):
+    # _do_reboot's final guard: login succeeds but client.reboot() itself
+    # returns False (the reboot POST failed) — distinct alert, budget still
+    # spent (the POST really was attempted).
+    ex, client, spy = make_executor(tmp_path, dry_run=False, reboot_ok=False)
+    ex.execute([W.Action("reboot")])
+    assert client.rebooted == 1
+    assert spy.sent[0][0] == "hotspot reboot API error"
+    assert "reboot POST failed" in spy.sent[0][2]
 
 
 def test_executor_passes_through_notify_actions(tmp_path):
