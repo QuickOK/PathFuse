@@ -23,15 +23,25 @@ const $$ = (s) => document.querySelectorAll(s);
 })();
 
 let lastApplyAt = 0;
-let userDirty = false;
+const dirtyFields = new Set();
 let lastState = null;
 let lastEngarde = null;
 
-function isFormFocused(){
+const FORM_SELECTOR = 'input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, input[name="environmental_enabled"], #master-wan, #persist';
+
+/* A control's identity for dirty/focus tracking: radios share a name, the
+   rest are unique ids. */
+function fieldKey(el){ return el.name || el.id; }
+
+function focusedField(){
   const a = document.activeElement;
-  if (!a) return false;
-  return a.matches('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, input[name="environmental_enabled"], #master-wan, #persist');
+  return (a && a.matches(FORM_SELECTOR)) ? fieldKey(a) : null;
 }
+
+/* Freeze only the control the operator is actually working on. Everything
+   else keeps tracking live state, so a page left open across a controller
+   restart can't re-post a stale value as deliberate intent. */
+function isFrozen(key){ return dirtyFields.has(key) || focusedField() === key; }
 
 const FEC_FIXED_FALLBACK_PRESETS = ["20:1", "8:1", "8:2", "8:4", "8:6", "8:8"];
 let fecFixedPresetsRendered = "";
@@ -253,21 +263,33 @@ function render(s){
     }
   }
 
-  /* form sync — focus-protected so we don't clobber operator typing */
-  if (Date.now() - lastApplyAt > 5000 && !userDirty && !isFormFocused()){
-    const setRadio = (name, val) => $$(`input[name="${name}"]`).forEach(r => r.checked = (r.value === val));
+  /* form sync — per-field dirty/focus protection so we don't clobber operator
+     edits, while untouched controls keep tracking live state. Apply() posts
+     the whole panel, so a control left showing a stale value would otherwise
+     be re-applied as though the operator had chosen it. */
+  if (Date.now() - lastApplyAt > 5000){
+    const setRadio = (name, val) => {
+      if (isFrozen(name)) return;
+      $$(`input[name="${name}"]`).forEach(r => r.checked = (r.value === val));
+    };
     setRadio("mode", s.mode);
     setRadio("policy", s.master_policy);
     setRadio("egress_mode", s.egress_mode || "relay_vpn");
-    if (s.master_wan && sel) sel.value = s.master_wan;
+    if (s.master_wan && sel && !isFrozen("master-wan")) sel.value = s.master_wan;
     if (s.fec && s.fec.configured){
       const desiredMode = s.fec.desired_mode
         || (s.fec.desired_enabled ? "adaptive" : "off");
       setRadio("fec_mode", desiredMode);
-      syncFecFixedDropdown(s.fec.fixed_ratio_presets, s.fec.desired_fixed_ratio);
+      // Presets always render; the selected value holds while frozen.
+      syncFecFixedDropdown(s.fec.fixed_ratio_presets,
+        isFrozen("fec-fixed-ratio") ? null : s.fec.desired_fixed_ratio);
     }
     const env = s.environmental || {};
     if (env.configured) setRadio("environmental_enabled", env.enabled ? "on" : "off");
+    const persistBox = $("#persist");
+    if (persistBox && typeof s.persist === "boolean" && !isFrozen("persist")){
+      persistBox.checked = s.persist;
+    }
   }
 
   renderWanList(s, wans, active, masterWan, dyn);
@@ -698,7 +720,7 @@ async function apply(){
       throw new Error(j.error || r.statusText);
     }
     lastApplyAt = Date.now();
-    userDirty = false;
+    dirtyFields.clear();
     status.textContent = "applied";
     status.className = "apply-status ok";
   } catch (e){
@@ -719,15 +741,15 @@ function escapeHtml(s){
 
 /* ---------- wire ---------- */
 $("#apply").addEventListener("click", apply);
-$$('input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, input[name="environmental_enabled"], #master-wan, #persist').forEach(el => {
+$$(FORM_SELECTOR).forEach(el => {
   el.addEventListener("change", () => {
-    userDirty = true;
+    dirtyFields.add(fieldKey(el));
     if (el.name === "fec_mode"){
       const fixedSel = $("#fec-fixed-ratio");
       if (fixedSel) fixedSel.disabled = el.value !== "fixed";
     }
   });
-  el.addEventListener("input",  () => { userDirty = true; });
+  el.addEventListener("input",  () => { dirtyFields.add(fieldKey(el)); });
 });
 
 fetchState();

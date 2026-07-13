@@ -28,6 +28,8 @@ class NotifyCfg:
     topic: str
     min_interval_s: float = 30.0
     command: str = DEFAULT_COMMAND
+    wan_down_hold_s: float = 10.0
+    fec_alerts: bool = False
 
 
 @dataclass
@@ -214,17 +216,31 @@ class Observation:
 class EventDetector:
     """Turns per-tick observations into edge-triggered Events. The first
     observation seeds comparison state silently, so a controller restart
-    never replays the current status as a notification storm."""
+    never replays the current status as a notification storm.
 
-    def __init__(self, relay_fail_threshold: int = 10):
+    A WAN must be continuously not-UP for wan_down_hold_s before it alerts;
+    the same hold gates the all-WANs-down alert. Anything shorter is a blip
+    and stays invisible — including the recovery, since alerting "✅ up" for
+    an outage that was never announced would be noise on its own."""
+
+    def __init__(self, relay_fail_threshold: int = 10,
+                 wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
+                 clock=time.monotonic):
         self.relay_fail_threshold = max(1, int(relay_fail_threshold))
+        self.wan_down_hold_s = max(0.0, float(wan_down_hold_s))
+        self.fec_alerts = bool(fec_alerts)
+        self._clock = clock
         self._seeded = False
         self._wan_states = {}
+        self._down_since = {}      # wan -> clock time it stopped being UP
+        self._down_from = {}       # wan -> last UP-or-seeded state before that
+        self._down_alerted = set()  # wans whose outage has been announced
+        self._all_down_since = None
+        self._all_down_alerted = False
         self._mode = None
         self._env_active = False
         self._fec_engaged = False
         self._fec_at_max = False
-        self._all_down = False
         self._relay_fails = 0
         self._relay_alerted = False
 
@@ -235,40 +251,81 @@ class EventDetector:
             evs.extend(self._switch_events(obs))
             evs.extend(self._mode_events(obs))
             evs.extend(self._env_events(obs))
-            evs.extend(self._fec_events(obs))
+            if self.fec_alerts:
+                evs.extend(self._fec_events(obs))
             evs.extend(self._relay_events(obs))
         else:
-            if obs.relay_polled and not obs.relay_ok:
-                self._relay_fails = 1
-            self._seeded = True
+            self._seed(obs)
         self._wan_states = dict(obs.wan_states)
         self._mode = obs.mode
         self._env_active = obs.env_active
         self._fec_engaged = obs.fec_engaged
         self._fec_at_max = obs.fec_at_max
-        self._all_down = not any(s == "UP" for s in obs.wan_states.values())
         return evs
+
+    def _seed(self, obs):
+        # Whatever is already broken at startup is treated as announced: no
+        # alert now, and none once the hold expires either. A later recovery
+        # still reports, which is the useful half of the edge.
+        for wan, state in obs.wan_states.items():
+            if state != "UP":
+                self._down_alerted.add(wan)
+        if obs.wan_states and not any(s == "UP"
+                                      for s in obs.wan_states.values()):
+            self._all_down_since = self._clock()
+            self._all_down_alerted = True
+        if obs.relay_polled and not obs.relay_ok:
+            self._relay_fails = 1
+        self._seeded = True
 
     # -- per-category edges ----------------------------------------------
 
     def _wan_events(self, obs):
+        now = self._clock()
         evs = []
         for wan, state in obs.wan_states.items():
-            prev = self._wan_states.get(wan)
             label = obs.wan_labels.get(wan, wan)
-            if prev == "UP" and state != "UP":
-                evs.append(Event("wan_down", f"⚠️ {label} down",
-                                 f"{wan} {prev} → {state}", "high"))
-            elif prev is not None and prev != "UP" and state == "UP":
-                evs.append(Event("wan_up", f"✅ {label} up",
-                                 f"{wan} {prev} → {state}", "default"))
-        all_down = not any(s == "UP" for s in obs.wan_states.values())
-        if all_down and not self._all_down:
-            detail = ", ".join(f"{w}={s}" for w, s in
-                               sorted(obs.wan_states.items()))
-            evs.append(Event("all_wans_down", "🚨 All WANs down",
-                             detail, "max"))
+            if state == "UP":
+                self._down_since.pop(wan, None)
+                self._down_from.pop(wan, None)
+                if wan in self._down_alerted:
+                    self._down_alerted.discard(wan)
+                    prev = self._wan_states.get(wan, "DOWN")
+                    evs.append(Event("wan_up", f"✅ {label} up",
+                                     f"{wan} {prev} → {state}", "default"))
+                continue
+            if wan in self._down_alerted:
+                continue
+            if wan not in self._down_since:
+                self._down_since[wan] = now
+                self._down_from[wan] = self._wan_states.get(wan, "UP")
+            held = now - self._down_since[wan]
+            if held >= self.wan_down_hold_s:
+                self._down_alerted.add(wan)
+                evs.append(Event(
+                    "wan_down", f"⚠️ {label} down",
+                    f"{wan} {self._down_from.get(wan, 'UP')} → {state} "
+                    f"(down {int(held)}s)", "high"))
+        evs.extend(self._all_down_events(obs, now))
         return evs
+
+    def _all_down_events(self, obs, now):
+        if not obs.wan_states:
+            return []
+        if any(s == "UP" for s in obs.wan_states.values()):
+            self._all_down_since = None
+            self._all_down_alerted = False
+            return []
+        if self._all_down_alerted:
+            return []
+        if self._all_down_since is None:
+            self._all_down_since = now
+        if now - self._all_down_since < self.wan_down_hold_s:
+            return []
+        self._all_down_alerted = True
+        detail = ", ".join(f"{w}={s}" for w, s in
+                           sorted(obs.wan_states.items()))
+        return [Event("all_wans_down", "🚨 All WANs down", detail, "max")]
 
     def _switch_events(self, obs):
         if obs.switch is None:

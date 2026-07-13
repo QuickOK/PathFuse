@@ -99,6 +99,8 @@
   },
   "notifications": {
     "topic": "pathfuse",
-    "min_interval_s": 30
+    "min_interval_s": 30,
+    "wan_down_hold_s": 10,
+    "fec_alerts": false
   }
 }

@@ -228,8 +228,9 @@ def obs(**kw):
     return notify.Observation(**base)
 
 
-def seeded(**kw):
-    d = notify.EventDetector(relay_fail_threshold=3)
+def seeded(clk=None, **kw):
+    d = notify.EventDetector(relay_fail_threshold=3, clock=clk or FakeClock(),
+                             **kw)
     assert d.observe(obs()) == []          # first observation seeds silently
     return d
 
@@ -246,33 +247,110 @@ def test_seed_is_silent_even_with_bad_state():
 
 
 def test_wan_down_and_up_edges():
-    d = seeded()
-    evs = d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"}))
+    clk = FakeClock()
+    d = seeded(clk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"})
+    assert d.observe(down) == []           # held: not down long enough yet
+    clk.advance(10)
+    evs = d.observe(down)
     assert kinds(evs) == ["wan_down"]
     assert "Satellite" in evs[0].title and evs[0].priority == "high"
-    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
+    assert d.observe(down) == []           # no repeat while still down
     evs = d.observe(obs())
     assert kinds(evs) == ["wan_up"]
     assert evs[0].priority == "default"
 
 
+def test_wan_down_alert_waits_for_the_hold():
+    clk = FakeClock()
+    d = seeded(clk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"})
+    for _ in range(19):                    # 19 ticks x 0.5s = 9.5s: silent
+        assert d.observe(down) == []
+        clk.advance(0.5)
+    assert d.observe(down) == []           # t = 9.5s, still inside the hold
+    clk.advance(0.5)
+    evs = d.observe(down)                  # t = 10.0s
+    assert kinds(evs) == ["wan_down"]
+    assert "UP → DOWN" in evs[0].message
+
+
+def test_wan_blip_shorter_than_hold_is_silent():
+    clk = FakeClock()
+    d = seeded(clk)
+    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
+    clk.advance(9)
+    # Recovered before the hold expired: no down alert was sent, so no
+    # recovery alert either -- the flap is invisible.
+    assert d.observe(obs()) == []
+    clk.advance(60)
+    assert d.observe(obs()) == []
+
+
+def test_wan_down_hold_restarts_after_a_recovery():
+    clk = FakeClock()
+    d = seeded(clk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"})
+    d.observe(down)
+    clk.advance(9)
+    d.observe(obs())                       # brief recovery clears the timer
+    clk.advance(9)
+    assert d.observe(down) == []           # fresh outage, fresh 10s hold
+    clk.advance(10)
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
 def test_unknown_down_transitions_do_not_fire():
-    d = seeded()
-    d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"}))
+    clk = FakeClock()
+    d = seeded(clk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"})
+    d.observe(down)
+    clk.advance(10)
+    assert kinds(d.observe(down)) == ["wan_down"]
     # DOWN -> UNKNOWN is not a recovery; UNKNOWN -> DOWN is not a new outage.
     assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "UNKNOWN"})) == []
+    assert d.observe(down) == []
+
+
+def test_non_up_states_accumulate_toward_one_hold():
+    clk = FakeClock()
+    d = seeded(clk)
+    # UNKNOWN for 6s then DOWN for 4s is 10s of not-UP: one alert at the end.
+    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "UNKNOWN"})) == []
+    clk.advance(6)
     assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
+    clk.advance(4)
+    evs = d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"}))
+    assert kinds(evs) == ["wan_down"]
+    assert "UP → DOWN" in evs[0].message   # reported from the last UP state
 
 
 def test_all_wans_down_fires_alongside_wan_down():
-    d = seeded()
+    clk = FakeClock()
+    d = seeded(clk)
     d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"}))
-    evs = d.observe(obs(wan_states={"wan1": "DOWN", "wan2": "DOWN"}))
+    clk.advance(10)
+    assert kinds(d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"}))) \
+        == ["wan_down"]
+    both = obs(wan_states={"wan1": "DOWN", "wan2": "DOWN"})
+    assert d.observe(both) == []           # wan1 and all-down both held
+    clk.advance(10)
+    evs = d.observe(both)
     assert sorted(kinds(evs)) == ["all_wans_down", "wan_down"]
     all_down = [e for e in evs if e.kind == "all_wans_down"][0]
     assert all_down.priority == "max"
     # No repeat while still down.
+    assert d.observe(both) == []
+
+
+def test_all_wans_down_blip_is_silent():
+    clk = FakeClock()
+    d = seeded(clk)
     assert d.observe(obs(wan_states={"wan1": "DOWN", "wan2": "DOWN"})) == []
+    clk.advance(5)
+    assert d.observe(obs()) == []          # recovered inside the hold
+    clk.advance(60)
+    assert d.observe(obs()) == []
 
 
 def test_wan_switch_passthrough():
@@ -306,8 +384,15 @@ def test_env_override_engage_and_clear():
     assert "env_override" in kinds(evs)          # cleared
 
 
-def test_fec_engage_disengage_and_max():
+def test_fec_alerts_are_off_by_default():
     d = seeded()
+    assert d.observe(obs(fec_engaged=True)) == []
+    assert d.observe(obs(fec_engaged=True, fec_at_max=True)) == []
+    assert d.observe(obs(fec_engaged=False, fec_at_max=False)) == []
+
+
+def test_fec_engage_disengage_and_max_when_enabled():
+    d = seeded(fec_alerts=True)
     evs = d.observe(obs(fec_engaged=True))
     assert kinds(evs) == ["fec"]
     assert "engaged" in evs[0].title.lower()
@@ -342,12 +427,34 @@ def test_relay_blip_below_threshold_is_silent():
 
 
 def test_wan_states_unknown_blip_keeps_edge_state():
-    d = seeded()   # wan1, wan2 both UP
-    evs = d.observe(obs(wan_states={"wan1": "UNKNOWN", "wan2": "UNKNOWN"}))
+    clk = FakeClock()
+    d = seeded(clk)   # wan1, wan2 both UP
+    unknown = obs(wan_states={"wan1": "UNKNOWN", "wan2": "UNKNOWN"})
+    assert d.observe(unknown) == []
+    clk.advance(10)
+    evs = d.observe(unknown)
     assert sorted(kinds(evs)) == ["all_wans_down", "wan_down", "wan_down"]
     # No WAN is UP, so the alert fires; UNKNOWN-only blips don't reset state.
     evs = d.observe(obs(wan_states={"wan1": "UP", "wan2": "UP"}))
     assert kinds(evs) == ["wan_up", "wan_up"]
+
+
+def test_wan_already_down_at_seed_never_alerts_but_recovery_does():
+    clk = FakeClock()
+    d = notify.EventDetector(clock=clk)
+    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
+    clk.advance(60)                        # a restart must not replay the outage
+    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
+    assert kinds(d.observe(obs())) == ["wan_up"]
+
+
+def test_all_wans_down_at_seed_never_alerts():
+    clk = FakeClock()
+    d = notify.EventDetector(clock=clk)
+    allbad = obs(wan_states={"wan1": "DOWN", "wan2": "DOWN"})
+    assert d.observe(allbad) == []
+    clk.advance(60)
+    assert d.observe(allbad) == []
 
 
 def test_seed_with_failing_relay_poll_counts_toward_threshold():

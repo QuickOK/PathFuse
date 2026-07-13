@@ -1088,6 +1088,8 @@ def load_config(path: str) -> Config:
                 min_interval_s=float(raw_notif.get("min_interval_s", 30.0)),
                 command=str(raw_notif.get("command",
                                           notify.DEFAULT_COMMAND)),
+                wan_down_hold_s=float(raw_notif.get("wan_down_hold_s", 10.0)),
+                fec_alerts=bool(raw_notif.get("fec_alerts", False)),
             )
 
         cfg = Config(
@@ -1138,6 +1140,10 @@ def load_config(path: str) -> Config:
             raise ValueError(
                 f"notifications.min_interval_s must be >= 0, "
                 f"got {cfg.notifications.min_interval_s}")
+        if cfg.notifications.wan_down_hold_s < 0:
+            raise ValueError(
+                f"notifications.wan_down_hold_s must be >= 0, "
+                f"got {cfg.notifications.wan_down_hold_s}")
 
     return cfg
 
@@ -1895,7 +1901,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             f"wans: {', '.join(cfg.wans)}", "low"))
         # ~10s of failed relay polls before alerting, at the actual poll cadence.
         detector = notify.EventDetector(
-            relay_fail_threshold=max(1, round(10.0 / remote_interval)))
+            relay_fail_threshold=max(1, round(10.0 / remote_interval)),
+            wan_down_hold_s=cfg.notifications.wan_down_hold_s,
+            fec_alerts=cfg.notifications.fec_alerts)
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -2103,6 +2111,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             "master_policy": policy,
             "master_wan": master_wan,
             "egress_mode": egress_mode,
+            # The UI renders its persist checkbox from this. Omit it and a
+            # freshly loaded page shows the box unchecked, so the next Apply
+            # posts persist=false and deletes the persisted overlay.
+            "persist": bool(ov.persist),
             "effective": eff,
             "wan_labels": {w: cfg.wans[w].label for w in cfg.wans},
             "engarde_server": f"{cfg.engarde.server_ip}:{cfg.engarde.server_port}",

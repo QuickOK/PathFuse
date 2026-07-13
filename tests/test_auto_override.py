@@ -271,3 +271,44 @@ def test_published_snapshot_includes_environmental_block(tmp_path, monkeypatch):
     assert snap["environmental"]["active"] is True
     assert snap["mode"] == "full"
     assert "precip ahead" in (snap["environmental"]["reason"] or "")
+
+
+@pytest.mark.parametrize("persisted", [True, False])
+def test_published_snapshot_reports_overlay_persist(tmp_path, monkeypatch, persisted):
+    """The UI's "persist across reboot" checkbox can only render the overlay's
+    real persist flag if the snapshot publishes it. Without this, a freshly
+    loaded page shows the box unchecked and the next Apply silently clears a
+    persisted overlay."""
+    import threading
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        policy=M.PolicyCfg(default_mode="master_backup", default_master_wan="wan2"),
+    )
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(
+        mode="master_backup", persist=persisted, set_by="ui", set_ts=1.0))
+
+    stop = threading.Event()
+    orig_publish = M.publish_state
+    def publish_and_stop(c, snap):
+        orig_publish(c, snap)
+        stop.set()
+    monkeypatch.setattr(M, "publish_state", publish_and_stop)
+    monkeypatch.setattr(M, "apply_nft_diff", lambda *a, **k: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda *a, **k: set())
+    monkeypatch.setattr(M, "apply_nft_init", lambda *a, **k: None)
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+                        lambda *a, **k: M.StateSnapshot(ok=False, per_wan={}, error="stub"))
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+                        lambda *a, **k: M.StateSnapshot(ok=False, per_wan={}, error="stub"))
+    monkeypatch.setattr(M, "read_wan_gateway", lambda *a, **k: None)
+    monkeypatch.setattr(M, "read_managed_default", lambda *a, **k: None)
+    monkeypatch.setattr(M, "read_engarde_table_default", lambda *a, **k: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda *a, **k: None)
+
+    M.run_controller(cfg, stop_event=stop)
+
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["persist"] is persisted

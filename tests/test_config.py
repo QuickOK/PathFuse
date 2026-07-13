@@ -182,17 +182,22 @@ def test_load_config_notifications_minimal(tmp_path: Path):
     assert cfg.notifications.topic == "pathfuse"
     assert cfg.notifications.min_interval_s == 30.0
     assert cfg.notifications.command == "/usr/local/sbin/spool-notify"
+    assert cfg.notifications.wan_down_hold_s == 10.0
+    assert cfg.notifications.fec_alerts is False
 
 
 def test_load_config_notifications_full(tmp_path: Path):
     raw = dict(SAMPLE)
     raw["notifications"] = {"topic": "pathfuse", "min_interval_s": 60,
-                            "command": "/tmp/fake-spool-notify"}
+                            "command": "/tmp/fake-spool-notify",
+                            "wan_down_hold_s": 25, "fec_alerts": True}
     p = tmp_path / "c.json"
     p.write_text(json.dumps(raw))
     cfg = sbfd_ctl.load_config(str(p))
     assert cfg.notifications.min_interval_s == 60.0
     assert cfg.notifications.command == "/tmp/fake-spool-notify"
+    assert cfg.notifications.wan_down_hold_s == 25.0
+    assert cfg.notifications.fec_alerts is True
 
 
 def test_load_config_notifications_missing_topic_raises(tmp_path: Path):
@@ -219,4 +224,13 @@ def test_load_config_notifications_negative_interval_raises(tmp_path: Path):
     p = tmp_path / "bad.json"
     p.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="min_interval_s"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_notifications_negative_wan_down_hold_raises(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse", "wan_down_hold_s": -1}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="wan_down_hold_s"):
         sbfd_ctl.load_config(str(p))
