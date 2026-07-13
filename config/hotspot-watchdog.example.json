@@ -1,0 +1,18 @@
+{
+  "iface": "wan1",
+  "peer_iface": "wan2",
+  "sbfd_state_path": "/run/sbfd/state.json",
+  "state_max_age_s": 30,
+  "admin_url": "http://192.0.2.1",
+  "secret_path": "/etc/sbfd-ctl/hotspot-admin.secret",
+  "poll_interval_s": 30,
+  "dwell_s": 600,
+  "grace_s": 600,
+  "max_reboots_per_episode": 3,
+  "holdoff_s": 7200,
+  "healthy_reset_s": 1800,
+  "startup_grace_s": 300,
+  "state_path": "/run/hotspot-watchdog/state.json",
+  "notify_bin": "/usr/local/sbin/spool-notify",
+  "dry_run": true
+}

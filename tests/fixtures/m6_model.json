@@ -1,0 +1,23 @@
+{
+ "session": {
+  "userRole": "Guest",
+  "secToken": "FIXTURETOKEN123"
+ },
+ "general": {
+  "deviceName": "Nighthawk M6 Pro",
+  "apiVersion": "2.0",
+  "configURL": "/Forms/config"
+ },
+ "wwan": {
+  "connection": "Connected",
+  "connectionText": "5G",
+  "signalStrength": {
+   "bars": 5
+  }
+ },
+ "power": {
+  "batteryTemperature": 41,
+  "deviceTempCritical": false,
+  "battChargeLevel": 70
+ }
+}
