@@ -173,3 +173,110 @@ def test_peer_of_raises_on_unrecognized_iface(tmp_path):
     cfg = write_cfg(tmp_path)
     with pytest.raises(ValueError):
         M.peer_of(cfg, "wan9")
+
+
+class FakeRunner:
+    """Captures argv and replays canned results, like tests/test_actuator.py."""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        rc, out = self.results.pop(0) if self.results else (0, "{}")
+
+        class P:
+            returncode = rc
+            stdout = out
+            stderr = ""
+        return P()
+
+
+STATUS_IDLE = _json.dumps({"dishGetStatus": {
+    "deviceInfo": {"bootcount": 1321, "softwareVersion": "2026.06.28"},
+    "deviceState": {"uptimeS": 90000},
+    "softwareUpdateState": "IDLE",
+    "secondsUntilSwupdateRebootPossible": -1,
+}})
+
+STATUS_UPDATE_STAGED = _json.dumps({"dishGetStatus": {
+    "deviceInfo": {"bootcount": 1321},
+    "deviceState": {"uptimeS": 90000},
+    "softwareUpdateState": "IDLE",
+    "swupdateRebootReady": True,
+    "secondsUntilSwupdateRebootPossible": 0,
+}})
+
+STATUS_APPLYING = _json.dumps({"dishGetStatus": {
+    "deviceInfo": {"bootcount": 1321},
+    "deviceState": {"uptimeS": 90000},
+    "softwareUpdateState": "APPLYING",
+}})
+
+
+def dish(tmp_path, results):
+    cfg = write_cfg(tmp_path)
+    r = FakeRunner(results)
+    return M.DishClient(cfg.wan2, runner=r), r
+
+
+def test_status_parses_and_targets_the_configured_addr(tmp_path):
+    d, r = dish(tmp_path, [(0, STATUS_IDLE)])
+    st = d.status()
+    assert st["deviceInfo"]["bootcount"] == 1321
+    argv = r.calls[0]
+    assert argv[0] == "/usr/local/bin/grpcurl"
+    assert "192.0.2.1:9200" in argv
+    assert "-plaintext" in argv
+
+
+def test_status_none_on_grpcurl_failure(tmp_path):
+    d, _ = dish(tmp_path, [(1, "")])
+    assert d.status() is None
+
+
+def test_bootcount_and_uptime(tmp_path):
+    d, _ = dish(tmp_path, [(0, STATUS_IDLE), (0, STATUS_IDLE)])
+    assert d.bootcount() == 1321
+    assert d.uptime_s() == 90000
+
+
+def test_update_staged_detects_reboot_ready(tmp_path):
+    d, _ = dish(tmp_path, [(0, STATUS_UPDATE_STAGED)])
+    assert d.update_staged() is True
+
+
+def test_update_not_staged_when_seconds_negative(tmp_path):
+    # swupdateRebootReady is omitted (proto3 default) when false — a missing
+    # key must read as False, not as "unknown, go ahead".
+    d, _ = dish(tmp_path, [(0, STATUS_IDLE)])
+    assert d.update_staged() is False
+
+
+def test_update_in_flight_blocks_on_applying(tmp_path):
+    # Interrupting a firmware write is how terminals get bricked.
+    d, _ = dish(tmp_path, [(0, STATUS_APPLYING)])
+    assert d.update_in_flight() is True
+
+
+def test_reboot_sends_plain_reboot_request(tmp_path):
+    d, r = dish(tmp_path, [(0, "{}")])
+    assert d.reboot() is True
+    argv = r.calls[0]
+    assert "SpaceX.API.Device.Device/Handle" in argv
+    payload = _json.loads(argv[argv.index("-d") + 1])
+    assert payload == {"reboot": {}}
+
+
+def test_apply_update_sends_schedule_reboot(tmp_path):
+    d, r = dish(tmp_path, [(0, "{}")])
+    assert d.apply_update() is True
+    argv = r.calls[0]
+    payload = _json.loads(argv[argv.index("-d") + 1])
+    assert payload == {"update": {"schedule_reboot": True}}
+
+
+def test_reboot_false_on_grpcurl_failure(tmp_path):
+    d, _ = dish(tmp_path, [(1, "")])
+    assert d.reboot() is False

@@ -158,3 +158,90 @@ def peer_of(cfg: MrConfig, wan: str) -> str:
     if wan == cfg.wan2.iface:
         return cfg.wan1.iface
     raise ValueError(f"unrecognized WAN iface {wan!r}")
+
+
+GRPC_METHOD = "SpaceX.API.Device.Device/Handle"
+GRPC_TIMEOUT_S = 20
+
+
+class DishClient:
+    """Talks to the wan2 terminal's gRPC API by shelling out to grpcurl.
+
+    grpcurl rather than a generated stub because the device serves protobuf
+    reflection: no .proto files to vendor, nothing to re-sync when the vendor
+    changes the schema, and no protobuf dependency in a stdlib-only repo."""
+
+    def __init__(self, cfg: Wan2Cfg, runner=subprocess.run):
+        self.cfg = cfg
+        self._run = runner
+
+    def _call(self, payload: dict) -> Optional[dict]:
+        argv = [self.cfg.grpcurl_bin, "-plaintext",
+                "-max-time", str(GRPC_TIMEOUT_S),
+                "-d", json.dumps(payload),
+                self.cfg.addr, GRPC_METHOD]
+        try:
+            r = self._run(argv, capture_output=True, text=True,
+                          timeout=GRPC_TIMEOUT_S + 10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("grpcurl failed: %s", e)
+            return None
+        if r.returncode != 0:
+            log.warning("grpcurl rc=%s: %s", r.returncode,
+                        (r.stderr or "").strip()[:200])
+            return None
+        try:
+            return json.loads(r.stdout or "{}")
+        except ValueError:
+            log.warning("grpcurl returned non-JSON")
+            return None
+
+    def status(self) -> Optional[dict]:
+        resp = self._call({"get_status": {}})
+        if resp is None:
+            return None
+        return resp.get("dishGetStatus") or {}
+
+    def bootcount(self) -> Optional[int]:
+        """The reboot receipt. BFD coming back says the path recovered; only a
+        bumped bootcount says the device actually rebooted."""
+        st = self.status()
+        if not st:
+            return None
+        bc = (st.get("deviceInfo") or {}).get("bootcount")
+        return bc if isinstance(bc, int) else None
+
+    def uptime_s(self) -> Optional[float]:
+        st = self.status()
+        if not st:
+            return None
+        up = (st.get("deviceState") or {}).get("uptimeS")
+        return float(up) if isinstance(up, (int, float)) else None
+
+    def update_staged(self, st: Optional[dict] = None) -> bool:
+        """A firmware update is staged and waiting for a reboot to apply it.
+        Note swupdateRebootReady is omitted when false (proto3), so a missing
+        key means False."""
+        st = self.status() if st is None else st
+        if not st:
+            return False
+        if st.get("swupdateRebootReady") is True:
+            return True
+        secs = st.get("secondsUntilSwupdateRebootPossible")
+        return isinstance(secs, (int, float)) and secs >= 0
+
+    def update_in_flight(self, st: Optional[dict] = None) -> bool:
+        """The device is fetching or writing firmware — do not touch it."""
+        st = self.status() if st is None else st
+        if not st:
+            return False
+        return st.get("softwareUpdateState") in ("FETCHING", "APPLYING")
+
+    def reboot(self) -> bool:
+        return self._call({"reboot": {}}) is not None
+
+    def apply_update(self) -> bool:
+        """Initiate the staged update; the device reboots as part of applying
+        it. Preferred over a plain reboot when an update is staged — a plain
+        reboot discards it, and the next night would find it staged again."""
+        return self._call({"update": {"schedule_reboot": True}}) is not None
