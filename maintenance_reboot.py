@@ -164,6 +164,27 @@ GRPC_METHOD = "SpaceX.API.Device.Device/Handle"
 GRPC_TIMEOUT_S = 20
 
 
+def _as_number(v):
+    """Coerce a protojson field to a number.
+
+    grpcurl renders int64/uint64 fields (e.g. uptimeS) as JSON strings, not
+    plain numbers, so a naive isinstance(v, (int, float)) check silently
+    drops them. Accept a numeric string too. Reject bools explicitly —
+    isinstance(True, int) is True in Python, and a bool must never be
+    mistaken for a device-reported count. Anything else (None, list, dict,
+    a non-numeric string) returns None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+
 class DishClient:
     """Talks to the wan2 terminal's gRPC API by shelling out to grpcurl.
 
@@ -191,10 +212,14 @@ class DishClient:
                         (r.stderr or "").strip()[:200])
             return None
         try:
-            return json.loads(r.stdout or "{}")
+            resp = json.loads(r.stdout or "{}")
         except ValueError:
             log.warning("grpcurl returned non-JSON")
             return None
+        if not isinstance(resp, dict):
+            log.warning("grpcurl body is not an object (%r)", type(resp).__name__)
+            return None
+        return resp
 
     def status(self) -> Optional[dict]:
         resp = self._call({"get_status": {}})
@@ -209,14 +234,16 @@ class DishClient:
         if not st:
             return None
         bc = (st.get("deviceInfo") or {}).get("bootcount")
-        return bc if isinstance(bc, int) else None
+        n = _as_number(bc)
+        return int(n) if n is not None else None
 
     def uptime_s(self) -> Optional[float]:
         st = self.status()
         if not st:
             return None
         up = (st.get("deviceState") or {}).get("uptimeS")
-        return float(up) if isinstance(up, (int, float)) else None
+        n = _as_number(up)
+        return float(n) if n is not None else None
 
     def update_staged(self, st: Optional[dict] = None) -> bool:
         """A firmware update is staged and waiting for a reboot to apply it.
@@ -227,8 +254,8 @@ class DishClient:
             return False
         if st.get("swupdateRebootReady") is True:
             return True
-        secs = st.get("secondsUntilSwupdateRebootPossible")
-        return isinstance(secs, (int, float)) and secs >= 0
+        secs = _as_number(st.get("secondsUntilSwupdateRebootPossible"))
+        return secs is not None and secs >= 0
 
     def update_in_flight(self, st: Optional[dict] = None) -> bool:
         """The device is fetching or writing firmware — do not touch it."""
@@ -238,6 +265,9 @@ class DishClient:
         return st.get("softwareUpdateState") in ("FETCHING", "APPLYING")
 
     def reboot(self) -> bool:
+        """True means grpcurl accepted and sent the reboot command, NOT that
+        the device rebooted — the real proof is a bootcount delta, which the
+        sequencer checks separately."""
         return self._call({"reboot": {}}) is not None
 
     def apply_update(self) -> bool:

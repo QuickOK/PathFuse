@@ -181,9 +181,11 @@ class FakeRunner:
     def __init__(self, results):
         self.results = list(results)
         self.calls = []
+        self.kwargs = []
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
+        self.kwargs.append(kw)
         rc, out = self.results.pop(0) if self.results else (0, "{}")
 
         class P:
@@ -191,6 +193,22 @@ class FakeRunner:
             stdout = out
             stderr = ""
         return P()
+
+
+class RaisingRunner:
+    """Simulates a runner that never returns: OSError (binary missing / not
+    executable) or subprocess.TimeoutExpired (grpcurl hung past its own
+    timeout)."""
+
+    def __init__(self, exc):
+        self.exc = exc
+        self.calls = []
+        self.kwargs = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        self.kwargs.append(kw)
+        raise self.exc
 
 
 STATUS_IDLE = _json.dumps({"dishGetStatus": {
@@ -213,6 +231,37 @@ STATUS_APPLYING = _json.dumps({"dishGetStatus": {
     "deviceState": {"uptimeS": 90000},
     "softwareUpdateState": "APPLYING",
 }})
+
+# Real observed grpcurl output: protojson renders the uint64 uptimeS field as
+# a quoted JSON string, not a plain number. bootcount and
+# secondsUntilSwupdateRebootPossible arrive as plain numbers today.
+STATUS_STRING_UPTIME = _json.dumps({"dishGetStatus": {
+    "bootcount": 1321,
+    "deviceInfo": {"bootcount": 1321},
+    "deviceState": {"uptimeS": "16610"},
+    "softwareUpdateState": "IDLE",
+    "secondsUntilSwupdateRebootPossible": -1,
+}})
+
+# A firmware could widen bootcount/secondsUntilSwupdateRebootPossible to a
+# 64-bit field too; grpcurl would then quote them exactly like uptimeS.
+STATUS_STRING_WIDENED_FIELDS = _json.dumps({"dishGetStatus": {
+    "deviceInfo": {"bootcount": "1321"},
+    "deviceState": {"uptimeS": "16610"},
+    "softwareUpdateState": "IDLE",
+    "secondsUntilSwupdateRebootPossible": "5",
+}})
+
+# grpcurl booleans must never be mistaken for numbers: isinstance(True, int)
+# is True in Python, so a naive numeric check would let a bool through.
+STATUS_BOOL_FIELDS = _json.dumps({"dishGetStatus": {
+    "deviceInfo": {"bootcount": True},
+    "deviceState": {"uptimeS": True},
+    "softwareUpdateState": "IDLE",
+    "secondsUntilSwupdateRebootPossible": True,
+}})
+
+NON_DICT_BODIES = ("[]", '"x"', "3", "null")
 
 
 def dish(tmp_path, results):
@@ -280,3 +329,129 @@ def test_apply_update_sends_schedule_reboot(tmp_path):
 def test_reboot_false_on_grpcurl_failure(tmp_path):
     d, _ = dish(tmp_path, [(1, "")])
     assert d.reboot() is False
+
+
+def test_uptime_s_accepts_protojson_string_encoded_uint64(tmp_path):
+    # CONFIRMED bug: grpcurl quotes uptimeS ("16610") since it's a uint64;
+    # this must parse to 16610.0, not silently return None on every call.
+    d, _ = dish(tmp_path, [(0, STATUS_STRING_UPTIME)])
+    assert d.uptime_s() == 16610.0
+
+
+def test_bootcount_and_seconds_tolerate_string_encoding_too(tmp_path):
+    # a future firmware could widen bootcount / secondsUntilSwupdateRebootPossible
+    # to a 64-bit field, quoting them exactly like uptimeS; accessors must not break
+    d, r = dish(tmp_path, [(0, STATUS_STRING_WIDENED_FIELDS),
+                           (0, STATUS_STRING_WIDENED_FIELDS)])
+    assert d.bootcount() == 1321
+    assert d.update_staged() is True  # secs "5" >= 0 must still mean staged
+
+
+def test_bootcount_rejects_bool(tmp_path):
+    # a bool bootcount (isinstance(True, int) is True) must never be handed
+    # back as the reboot receipt the sequencer compares before/after
+    d, _ = dish(tmp_path, [(0, STATUS_BOOL_FIELDS)])
+    assert d.bootcount() is None
+
+
+def test_uptime_s_rejects_bool(tmp_path):
+    # a bool uptimeS must not be coerced into a float via bool-as-int
+    d, _ = dish(tmp_path, [(0, STATUS_BOOL_FIELDS)])
+    assert d.uptime_s() is None
+
+
+def test_update_staged_rejects_bool_seconds(tmp_path):
+    # secondsUntilSwupdateRebootPossible: true must not satisfy the ">= 0" check
+    d, _ = dish(tmp_path, [(0, STATUS_BOOL_FIELDS)])
+    assert d.update_staged() is False
+
+
+def test_status_none_on_non_dict_json_bodies(tmp_path):
+    # grpcurl printing valid JSON that isn't an object ([]/"x"/3/null) must
+    # yield None, not raise
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.status() is None
+
+
+def test_bootcount_none_on_non_dict_json_bodies(tmp_path):
+    # this is where the AttributeError shipped: resp.get(...) on a list/str/int/None
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.bootcount() is None
+
+
+def test_uptime_s_none_on_non_dict_json_bodies(tmp_path):
+    # a non-dict grpcurl body must not raise out of uptime_s()
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.uptime_s() is None
+
+
+def test_update_staged_false_on_non_dict_json_bodies(tmp_path):
+    # a non-dict grpcurl body must not raise out of update_staged()
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.update_staged() is False
+
+
+def test_update_in_flight_false_on_non_dict_json_bodies(tmp_path):
+    # a non-dict grpcurl body must not raise out of update_in_flight()
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.update_in_flight() is False
+
+
+def test_reboot_false_on_non_dict_json_bodies(tmp_path):
+    # a non-dict grpcurl body must not raise out of reboot(), and must not
+    # be mistaken for success
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.reboot() is False
+
+
+def test_apply_update_false_on_non_dict_json_bodies(tmp_path):
+    # a non-dict grpcurl body must not raise out of apply_update(), and must
+    # not be mistaken for success
+    for body in NON_DICT_BODIES:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.apply_update() is False
+
+
+def test_status_none_when_grpcurl_binary_missing(tmp_path):
+    # grpcurl missing / not executable raises OSError from subprocess.run;
+    # that must yield None, never propagate
+    cfg = write_cfg(tmp_path)
+    r = RaisingRunner(OSError("no such file or directory"))
+    d = M.DishClient(cfg.wan2, runner=r)
+    assert d.status() is None
+
+
+def test_status_none_when_grpcurl_times_out(tmp_path):
+    # a hung grpcurl raises subprocess.TimeoutExpired; that must yield None,
+    # never propagate and abort the nightly run mid-sequence
+    import subprocess
+    cfg = write_cfg(tmp_path)
+    r = RaisingRunner(subprocess.TimeoutExpired(cmd="grpcurl", timeout=30))
+    d = M.DishClient(cfg.wan2, runner=r)
+    assert d.status() is None
+
+
+def test_status_none_on_non_json_garbage(tmp_path):
+    # grpcurl printing non-JSON garbage must yield None, not raise ValueError
+    d, _ = dish(tmp_path, [(0, "not json at all {{{")])
+    assert d.status() is None
+
+
+def test_call_passes_max_time_and_a_longer_subprocess_timeout(tmp_path):
+    # a hung grpcurl must self-terminate via -max-time before subprocess's
+    # own timeout reaps it — if a later edit drops -max-time or shrinks the
+    # subprocess timeout below it, this must fail
+    d, r = dish(tmp_path, [(0, STATUS_IDLE)])
+    d.status()
+    argv = r.calls[0]
+    assert "-max-time" in argv
+    max_time = float(argv[argv.index("-max-time") + 1])
+    kw = r.kwargs[0]
+    assert "timeout" in kw
+    assert kw["timeout"] > max_time
