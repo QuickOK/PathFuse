@@ -480,3 +480,100 @@ def test_unknown_carrier_still_allows_reboot():
                  wan_carrier=None)
     acts = p.step(s, now=_after_dwell())
     assert any(a.kind == "reboot" for a in acts)
+
+
+# -- scheduled_reboot: guarded one-shot for the maintenance sequencer --------
+
+
+class _StubClient:
+    def __init__(self, login_ok=True, reboot_ok=True, model={"x": 1}):
+        self.login_ok, self.reboot_ok, self.model = login_ok, reboot_ok, model
+        self.rebooted = False
+
+    def fetch_model(self):
+        return self.model
+
+    def login(self, pw):
+        return self.login_ok
+
+    def reboot(self):
+        self.rebooted = self.reboot_ok
+        return self.reboot_ok
+
+    @staticmethod
+    def diagnostics(model):
+        return "diag"
+
+
+def sched_cfg(tmp_path, **kw):
+    secret = tmp_path / "secret"
+    secret.write_text("hunter2\n")
+    state = tmp_path / "sbfd.json"
+    state.write_text(_json.dumps({
+        "timestamp": 1000.0,
+        "sessions": {
+            "a": {"iface": "wan1", "state": "DOWN"},
+            "b": {"iface": "wan2", "state": "UP"},
+        }}))
+    base = dict(iface="wan1", peer_iface="wan2", sbfd_state_path=str(state),
+                state_max_age_s=30, admin_url="http://192.0.2.1",
+                secret_path=str(secret), poll_interval_s=30, dwell_s=600,
+                grace_s=600, max_reboots_per_episode=3, holdoff_s=7200,
+                healthy_reset_s=1800, startup_grace_s=300,
+                state_path=str(tmp_path / "wd.json"),
+                notify_bin="/bin/true", dry_run=False)
+    base.update(kw)
+    return W.WdConfig(**base)
+
+
+def test_scheduled_reboot_skips_when_peer_down(tmp_path, monkeypatch):
+    # The whole point of the feature: never take out the last standing WAN.
+    cfg = sched_cfg(tmp_path)
+    state = _json.loads(Path(cfg.sbfd_state_path).read_text())
+    state["sessions"]["b"]["state"] = "DOWN"
+    Path(cfg.sbfd_state_path).write_text(_json.dumps(state))
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient()
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is False
+    assert "peer" in reason
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_skips_when_no_carrier(tmp_path, monkeypatch):
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: False)
+    c = _StubClient()
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is False
+    assert "carrier" in reason
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_issues_when_guards_pass(tmp_path, monkeypatch):
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient()
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is True
+    assert c.rebooted is True
+
+
+def test_scheduled_reboot_dry_run_does_not_reboot(tmp_path, monkeypatch):
+    cfg = sched_cfg(tmp_path, dry_run=True)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient()
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is False
+    assert "dry-run" in reason
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_reports_login_failure(tmp_path, monkeypatch):
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient(login_ok=False)
+    issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
+    assert issued is False
+    assert "login" in reason
+    assert c.rebooted is False

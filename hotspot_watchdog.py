@@ -495,6 +495,45 @@ def take_sample(cfg, now) -> Sample:
                   peer_bfd_up=peer_up, wan_carrier=read_carrier(cfg.iface))
 
 
+def _scheduled_reboot_verbose(cfg: WdConfig, client, now: float):
+    """Implementation shared by scheduled_reboot() and the CLI. Returns
+    (issued, reason, guard_skipped) -- guard_skipped is True iff a *guard*
+    (never-take-out-the-last-WAN / carrier / dry-run) is why no reboot
+    happened, as opposed to the admin API failing partway through. Only the
+    CLI's exit code cares about that distinction; scheduled_reboot() below
+    drops it to keep the (issued, reason) contract a later task depends on."""
+    if read_carrier(cfg.iface) is False:
+        return (False, f"{cfg.iface} has no carrier — admin API unreachable",
+                True)
+    _wan_up, peer_up = read_bfd_states(cfg.sbfd_state_path, cfg.iface,
+                                       cfg.peer_iface, now, cfg.state_max_age_s)
+    if peer_up is not True:
+        return (False, (f"peer {cfg.peer_iface} is not UP (={peer_up}) — "
+                        f"refusing to disturb the last standing WAN"), True)
+    if cfg.dry_run:
+        return False, "dry-run: would reboot", True
+    if client.fetch_model() is None:
+        return False, f"admin UI unreachable at {cfg.admin_url}", False
+    pw = _read_secret(cfg.secret_path)
+    if pw is None:
+        return False, f"cannot read admin secret ({cfg.secret_path})", False
+    if not client.login(pw):
+        return False, "login rejected — check the admin secret", False
+    if not client.reboot():
+        return False, "reboot POST failed", False
+    return True, "reboot issued", False
+
+
+def scheduled_reboot(cfg: WdConfig, client, now: float) -> tuple:
+    """One-shot, guarded reboot for the daily maintenance window.
+
+    Deliberately does NOT read or write the daemon's policy state: a scheduled
+    reboot is not an outage episode, and must neither consume the episode
+    budget nor be consumed by a holdoff. Returns (issued, reason)."""
+    issued, reason, _guard_skipped = _scheduled_reboot_verbose(cfg, client, now)
+    return issued, reason
+
+
 _running = True
 
 
@@ -514,6 +553,9 @@ def main():
                     help="verify admin API login with the stored secret")
     ap.add_argument("--test-reboot", action="store_true",
                     help="login and reboot the hotspot NOW (supervised test)")
+    ap.add_argument("--scheduled-reboot", action="store_true",
+                    help="guarded one-shot reboot for the maintenance window "
+                         "(exit 0=issued, 1=failed, 2=skipped by a guard)")
     args = ap.parse_args()
     cfg = load_config(args.config)
     client = NetgearClient(cfg.admin_url, cfg.iface,
@@ -543,6 +585,16 @@ def main():
         ok = client.reboot()
         print("REBOOT ISSUED" if ok else "REBOOT POST FAILED")
         return 0 if ok else 1
+    if args.scheduled_reboot:
+        # Separate session jar: the daemon may be mid-login with the shared one.
+        sc = NetgearClient(cfg.admin_url, cfg.iface,
+                           "/run/hotspot-watchdog/cookies-scheduled.txt")
+        issued, reason, guard_skipped = _scheduled_reboot_verbose(
+            cfg, sc, time.time())
+        print(reason)
+        if issued:
+            return 0
+        return 2 if guard_skipped else 1
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
