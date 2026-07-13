@@ -98,8 +98,10 @@ def read_published(path: str, now: float,
         raw = json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return None
-    ts = raw.get("ts") or raw.get("timestamp")
-    if not isinstance(ts, (int, float)) or now - ts > max_age_s:
+    if not isinstance(raw, dict):
+        return None
+    ts = raw.get("ts", raw.get("timestamp"))
+    if not isinstance(ts, (int, float)) or abs(now - ts) > max_age_s:
         return None
     return raw
 
@@ -107,13 +109,17 @@ def read_published(path: str, now: float,
 def should_run(published: dict, now_local_hour: int) -> tuple:
     """(ok, reason). The timer fires hourly; this is the gate that makes it
     daily, so the hour can move from the UI without a daemon-reload."""
-    m = (published or {}).get("maintenance") or {}
+    m = (published or {}).get("maintenance")
+    if m is None:
+        m = {}
+    if not isinstance(m, dict):
+        return False, f"published maintenance is not an object ({m!r})"
     if not m.get("configured"):
         return False, "maintenance reboot not configured"
     if not m.get("enabled"):
         return False, "maintenance reboot disabled by operator"
     hour = m.get("hour")
-    if not isinstance(hour, int) or not 0 <= hour <= 23:
+    if isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
         return False, f"published hour is not valid ({hour!r})"
     if now_local_hour != hour:
         return False, f"not the configured hour ({now_local_hour} != {hour})"
@@ -127,18 +133,28 @@ def read_wan_states(path: str, now: float, max_age_s: float = 30.0) -> dict:
         raw = json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return {}
+    if not isinstance(raw, dict):
+        return {}
     ts = raw.get("timestamp")
-    if not isinstance(ts, (int, float)) or now - ts > max_age_s:
+    if not isinstance(ts, (int, float)) or abs(now - ts) > max_age_s:
         return {}
     sessions = raw.get("sessions")
     if not isinstance(sessions, dict):
         return {}
     out = {}
     for s in sessions.values():
-        if isinstance(s, dict) and "iface" in s:
-            out[s["iface"]] = s.get("state", "UNKNOWN")
+        if not isinstance(s, dict):
+            continue
+        iface = s.get("iface")
+        if not isinstance(iface, str):
+            continue
+        out[iface] = s.get("state", "UNKNOWN")
     return out
 
 
 def peer_of(cfg: MrConfig, wan: str) -> str:
-    return cfg.wan2.iface if wan == cfg.wan1.iface else cfg.wan1.iface
+    if wan == cfg.wan1.iface:
+        return cfg.wan2.iface
+    if wan == cfg.wan2.iface:
+        return cfg.wan1.iface
+    raise ValueError(f"unrecognized WAN iface {wan!r}")

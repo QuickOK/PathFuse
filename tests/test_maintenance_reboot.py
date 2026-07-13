@@ -88,3 +88,88 @@ def test_read_wan_states_maps_iface_to_state(tmp_path):
         "wan1": "UP", "wan2": "DOWN"}
     # stale => unknown, not "UP"
     assert M.read_wan_states(str(p), now=9999.0, max_age_s=30) == {}
+
+
+def test_should_run_true_at_midnight(tmp_path):
+    # hour 0 (midnight) is a valid configured hour and must not be treated as falsy
+    pub = {"maintenance": {"configured": True, "enabled": True, "hour": 0}}
+    ok, why = M.should_run(pub, now_local_hour=0)
+    assert ok is True
+
+
+def test_should_run_rejects_bool_hour_true(tmp_path):
+    # a bool hour must never authorize a reboot, even though True == 1 in Python
+    pub = {"maintenance": {"configured": True, "enabled": True, "hour": True}}
+    ok, why = M.should_run(pub, now_local_hour=1)
+    assert ok is False
+    assert "hour" in why
+
+
+def test_should_run_rejects_bool_hour_false(tmp_path):
+    # a bool hour must never authorize a reboot, even at local hour 0 (midnight)
+    pub = {"maintenance": {"configured": True, "enabled": True, "hour": False}}
+    ok, why = M.should_run(pub, now_local_hour=0)
+    assert ok is False
+    assert "hour" in why
+
+
+def test_should_run_rejects_non_dict_maintenance(tmp_path):
+    # a maintenance value that parsed but isn't an object must fail safe, not raise
+    ok, why = M.should_run({"maintenance": ["not", "a", "dict"]}, 3)
+    assert ok is False
+    ok, why = M.should_run({"maintenance": None}, 3)
+    assert ok is False
+
+
+def test_read_published_rejects_non_dict_json_bodies(tmp_path):
+    # valid JSON that isn't an object (null, list, scalar) must return None, not raise
+    for body in ("null", "[]", "123", '"x"'):
+        p = tmp_path / "state.json"
+        p.write_text(body)
+        assert M.read_published(str(p), now=1000.0, max_age_s=60) is None
+
+
+def test_read_wan_states_rejects_non_dict_json_bodies(tmp_path):
+    # valid JSON that isn't an object (null, list, scalar) must return {}, not raise
+    for body in ("null", "[]", "123", '"x"'):
+        p = tmp_path / "sbfd.json"
+        p.write_text(body)
+        assert M.read_wan_states(str(p), now=1000.0, max_age_s=30) == {}
+
+
+def test_read_wan_states_tolerates_malformed_sessions(tmp_path):
+    # sessions as a list, a non-dict entry, and an unhashable iface must all be
+    # skipped without raising and without inventing a phantom UP state
+    p = tmp_path / "sbfd.json"
+    p.write_text(_json.dumps({"timestamp": 1000.0, "sessions": ["not", "a", "dict"]}))
+    assert M.read_wan_states(str(p), now=1000.0, max_age_s=30) == {}
+
+    p.write_text(_json.dumps({"timestamp": 1000.0, "sessions": {
+        "s1": "not-a-dict-entry",
+        "s2": {"iface": ["wan1"], "state": "UP"},
+    }}))
+    assert M.read_wan_states(str(p), now=1000.0, max_age_s=30) == {}
+
+
+def test_read_published_rejects_future_timestamp(tmp_path):
+    # a clock-skewed future timestamp (e.g. pre-NTP-sync boot) must not look fresh
+    p = tmp_path / "state.json"
+    p.write_text(_json.dumps({"ts": 100000.0, "maintenance": {"enabled": True}}))
+    assert M.read_published(str(p), now=1000.0, max_age_s=60) is None
+
+
+def test_read_wan_states_rejects_future_timestamp(tmp_path):
+    # a clock-skewed future timestamp must not make a stale UP look current
+    p = tmp_path / "sbfd.json"
+    p.write_text(_json.dumps({"timestamp": 100000.0, "sessions": {
+        "s1": {"iface": "wan1", "state": "UP"},
+    }}))
+    assert M.read_wan_states(str(p), now=1000.0, max_age_s=30) == {}
+
+
+def test_peer_of_raises_on_unrecognized_iface(tmp_path):
+    import pytest
+    # an unrecognized iface must raise, not silently hand back a plausible wan1
+    cfg = write_cfg(tmp_path)
+    with pytest.raises(ValueError):
+        M.peer_of(cfg, "wan9")
