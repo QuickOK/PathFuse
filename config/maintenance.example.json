@@ -1,0 +1,21 @@
+{
+  "published_state": "/run/sbfd-ctl/state.json",
+  "sbfd_state_path": "/run/sbfd/state.json",
+  "window_path": "/run/sbfd-ctl/maintenance_window.json",
+  "wan1": {
+    "iface": "wan1",
+    "watchdog_bin": "/opt/sbfd-ctl/hotspot_watchdog.py",
+    "watchdog_config": "/etc/sbfd-ctl/hotspot-watchdog.json"
+  },
+  "wan2": {
+    "iface": "wan2",
+    "grpcurl_bin": "/usr/local/bin/grpcurl",
+    "addr": "192.0.2.1:9200",
+    "min_uptime_s": 43200
+  },
+  "recovery_deadline_s": 600,
+  "settle_s": 30,
+  "notify_bin": "/usr/local/sbin/spool-notify",
+  "notify_topic": "pathfuse",
+  "dry_run": true
+}
