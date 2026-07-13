@@ -9,24 +9,57 @@ configured hour, which lets the schedule be changed from the UI without
 rewriting the unit.
 
 Silent on a normal night: while a leg is in flight it publishes a maintenance
-window that sbfd-ctl reads to suppress that WAN's alerts. It only speaks when a
-WAN fails to come back."""
+window that sbfd-ctl reads to suppress that WAN's alerts, and it holds that
+window open across the post-reboot settle, when a freshly booted link is still
+flapping. It pages only when a WAN goes down and fails to come back; a reboot
+that was never issued left the link untouched, and says so quietly."""
 import argparse
+import enum
 import json
 import logging
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 log = logging.getLogger("maintenance-reboot")
 
 DEFAULT_NOTIFY = "/usr/local/sbin/spool-notify"
 PUBLISHED_MAX_AGE_S = 60.0
+
+
+class Outcome(enum.Enum):
+    """How a leg ended, structurally.
+
+    The question that decides what the operator hears is "was the WAN's link
+    actually disturbed?", and the answer must never be inferred by
+    prefix-matching a human sentence: a rejected reboot request ("reboot
+    request failed") means the WAN never went down at all, yet reads like a
+    failure, and paging "wan2 did not return from maintenance reboot" for a WAN
+    that never left is both alarming and untrue."""
+
+    RECOVERED = "recovered"        # rebooted, and observed back up
+    SKIPPED = "skipped"            # deliberately not touched; the link is fine
+    NOT_ISSUED = "not_issued"      # the reboot never took; no down was observed
+    NOT_RETURNED = "not_returned"  # the WAN went down and did not come back
+
+
+class LegResult(NamedTuple):
+    """What a leg reports back. `ok` and `reason` are the human-facing pair;
+    `status` is what the caller branches on."""
+
+    ok: bool
+    status: Outcome
+    reason: str
+
+
+def _leg(status: Outcome, reason: str) -> LegResult:
+    return LegResult(status is Outcome.RECOVERED, status, reason)
 
 
 @dataclass
@@ -332,21 +365,36 @@ POLL_S = 5.0
 
 
 def await_up(cfg: MrConfig, wan: str, deadline_s: float, extra_ok=None,
-             sleep=time.sleep, clock=time.monotonic, states_fn=None) -> bool:
+             sleep=time.sleep, clock=time.monotonic, states_fn=None,
+             require_down_first: bool = False) -> bool:
     """Poll until `wan` is UP on BFD (and `extra_ok()` if given), or give up.
 
     extra_ok exists because BFD returning only proves the path came back — for
     wan2 we additionally require a bumped bootcount, which proves the device
     actually rebooted rather than the request being silently dropped.
 
+    require_down_first is the same idea for a WAN that has no such receipt.
+    Issuing a reboot is not the same as the device going down: the hotspot's
+    admin API acknowledges the request and returns immediately, and the carrier
+    can take longer to drop than the first poll takes to arrive. Accepting that
+    first sample would mean accepting the STALE pre-reboot UP as proof of
+    recovery, and the sequencer would then go on to reboot the other WAN while
+    this one was still on its way down — both WANs off the air at once. So the
+    caller can demand that `wan` be OBSERVED not-UP before any later UP counts:
+    for a WAN with no reboot receipt, the observed down IS the receipt.
+
     Bounded by deadline_s in every case, including an extra_ok that never
     passes: this must not be able to hang the run."""
     states_fn = states_fn or read_wan_states
+    seen_down = not require_down_first
     start = clock()
     while clock() - start < deadline_s:
         sleep(POLL_S)
         states = states_fn(cfg.sbfd_state_path, time.time())
-        if states.get(wan) == "UP" and (extra_ok is None or extra_ok()):
+        if states.get(wan) != "UP":
+            seen_down = True
+            continue
+        if seen_down and (extra_ok is None or extra_ok()):
             return True
     return False
 
@@ -366,60 +414,79 @@ def peer_is_up(cfg: MrConfig, wan: str) -> bool:
 
 
 def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
-                sleep=time.sleep, clock=time.monotonic) -> tuple:
+                sleep=time.sleep, clock=time.monotonic) -> LegResult:
     """Delegate to the watchdog's guarded one-shot: it owns the admin-API
     client and the carrier/peer guards already. We re-check the peer here too —
     the redundancy is deliberate, since this module, not the watchdog, is what
-    decides to disturb a WAN tonight."""
+    decides to disturb a WAN tonight.
+
+    The watchdog's one-shot returns as soon as the hotspot's admin API ACCEPTS
+    the reboot, which is well before the device drops carrier. wan1 has no
+    reboot receipt the way wan2 has a bootcount, so recovery is only credited
+    once wan1 has been observed DOWN and then UP again — see await_up's
+    require_down_first."""
     w1 = cfg.wan1.iface
     if not peer_is_up(cfg, w1):
-        return False, (f"skipped: peer {peer_of(cfg, w1)} is not UP — refusing "
-                       f"to disturb the last standing WAN")
+        return _leg(Outcome.SKIPPED,
+                    f"skipped: peer {peer_of(cfg, w1)} is not UP — refusing "
+                    f"to disturb the last standing WAN")
     argv = [cfg.wan1.watchdog_bin, "-c", cfg.wan1.watchdog_config,
             "--scheduled-reboot"]
     if cfg.dry_run:
         log.info("dry-run: would run %s", " ".join(argv))
-        return False, "dry-run"
+        return _leg(Outcome.SKIPPED, "dry-run")
     try:
         r = runner(argv, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return False, f"watchdog invocation failed: {e}"
+        return _leg(Outcome.NOT_ISSUED, f"watchdog invocation failed: {e}")
     out = (r.stdout or "").strip()
     if r.returncode == 2:
-        return False, f"skipped by guard: {out}"
+        return _leg(Outcome.SKIPPED, f"skipped by guard: {out}")
     if r.returncode != 0:
-        return False, f"reboot failed: {out}"
-    if not await_up(cfg, w1, cfg.recovery_deadline_s, sleep=sleep, clock=clock):
-        return False, (f"{w1} did not return within "
-                       f"{int(cfg.recovery_deadline_s)}s")
-    return True, "rebooted and recovered"
+        return _leg(Outcome.NOT_ISSUED, f"reboot failed: {out}")
+    if await_up(cfg, w1, cfg.recovery_deadline_s, sleep=sleep, clock=clock,
+                require_down_first=True):
+        return _leg(Outcome.RECOVERED, "rebooted and recovered")
+    # await_up gave up. Which of the two failures was it? If wan1 is still UP,
+    # it never dropped: the reboot we asked for never happened, and the link was
+    # never disturbed. Saying "did not return" about a WAN that never left would
+    # be a false page — and, worse, would read as an outage that is not one.
+    if read_wan_states(cfg.sbfd_state_path, time.time()).get(w1) == "UP":
+        return _leg(Outcome.NOT_ISSUED,
+                    f"{w1} never went down within "
+                    f"{int(cfg.recovery_deadline_s)}s — no reboot observed")
+    return _leg(Outcome.NOT_RETURNED,
+                f"{w1} did not return within {int(cfg.recovery_deadline_s)}s")
 
 
 def reboot_wan2(cfg: MrConfig, now: float, client=None,
-                sleep=time.sleep, clock=time.monotonic) -> tuple:
+                sleep=time.sleep, clock=time.monotonic) -> LegResult:
     """Reboot the terminal, preferring a staged firmware update when there is
     one. If the update does not apply, fall back to exactly one plain reboot."""
     client = client or DishClient(cfg.wan2)
     w2 = cfg.wan2.iface
     st = client.status()
     if st is None:
-        return False, "skipping: terminal unreachable"
+        return _leg(Outcome.SKIPPED, "skipping: terminal unreachable")
     if client.update_in_flight(st):
-        return False, "skipping: firmware update in flight"
+        return _leg(Outcome.SKIPPED, "skipping: firmware update in flight")
     up = client.uptime_s()
     if up is not None and up < cfg.wan2.min_uptime_s:
-        return False, (f"uptime {int(up)}s < minimum "
-                       f"{int(cfg.wan2.min_uptime_s)}s — rebooted recently")
+        return _leg(Outcome.SKIPPED,
+                    f"skipping: uptime {int(up)}s < minimum "
+                    f"{int(cfg.wan2.min_uptime_s)}s — rebooted recently")
     before = client.bootcount()
     if before is None:
         # No readable receipt means no way to prove the device actually
         # restarted, so BFD coming back would be the only evidence — and that
         # only proves the path recovered. Fail safe: skip rather than reboot
         # blind and then report a success we cannot stand behind.
-        return False, "skipping: bootcount unreadable — cannot verify a reboot"
+        return _leg(Outcome.SKIPPED,
+                    "skipping: bootcount unreadable — cannot verify a reboot")
     staged = client.update_staged(st)
     if cfg.dry_run:
-        return False, f"dry-run: would {'apply update' if staged else 'reboot'}"
+        return _leg(Outcome.SKIPPED,
+                    f"dry-run: would {'apply update' if staged else 'reboot'}")
 
     def rebooted():
         bc = client.bootcount()
@@ -428,42 +495,64 @@ def reboot_wan2(cfg: MrConfig, now: float, client=None,
     # The peer re-check goes here, as late as it can: immediately before the
     # only irreversible act in this function.
     if not peer_is_up(cfg, w2):
-        return False, (f"skipping: peer {peer_of(cfg, w2)} is not UP — "
-                       f"refusing to disturb the last standing WAN")
+        return _leg(Outcome.SKIPPED,
+                    f"skipping: peer {peer_of(cfg, w2)} is not UP — "
+                    f"refusing to disturb the last standing WAN")
     issued = client.apply_update() if staged else client.reboot()
     if not issued:
-        return False, "reboot request failed"
+        # The request was rejected, so the terminal never went down. This is a
+        # failure to do the maintenance, not an outage.
+        return _leg(Outcome.NOT_ISSUED, "reboot request failed")
     if await_up(cfg, w2, cfg.recovery_deadline_s, extra_ok=rebooted,
                 sleep=sleep, clock=clock):
-        return True, "update applied" if staged else "rebooted and recovered"
+        return _leg(Outcome.RECOVERED,
+                    "update applied" if staged else "rebooted and recovered")
     if not staged:
-        return False, (f"{w2} did not return within "
-                       f"{int(cfg.recovery_deadline_s)}s")
+        return _leg(Outcome.NOT_RETURNED,
+                    f"{w2} did not return within "
+                    f"{int(cfg.recovery_deadline_s)}s")
     # The staged update did not apply. One plain reboot, then verify again.
     notify(cfg, "📶 Terminal update did not apply", "default",
            "falling back to a plain reboot")
+    # Time has passed since the last peer check — a whole recovery deadline of
+    # it — and the fallback is a second chance to take out the last standing
+    # WAN. Re-check the peer immediately before issuing it, exactly as above.
     if not peer_is_up(cfg, w2):
-        return False, (f"skipping fallback reboot: peer {peer_of(cfg, w2)} is "
-                       f"not UP")
+        return _leg(Outcome.SKIPPED,
+                    f"skipping fallback reboot: peer {peer_of(cfg, w2)} is "
+                    f"not UP")
     if not client.reboot():
-        return False, "fallback reboot request failed"
+        return _leg(Outcome.NOT_ISSUED, "fallback reboot request failed")
     if await_up(cfg, w2, cfg.recovery_deadline_s, extra_ok=rebooted,
                 sleep=sleep, clock=clock):
-        return True, "update failed; plain reboot recovered"
-    return False, f"{w2} did not return after fallback reboot"
+        return _leg(Outcome.RECOVERED, "update failed; plain reboot recovered")
+    return _leg(Outcome.NOT_RETURNED,
+                f"{w2} did not return after fallback reboot")
 
 
-def _is_skip(why: str) -> bool:
-    """A skipped leg is a success, not a failure: tonight's reboot is never
-    worth risking the link. Skips are logged; only a WAN that fails to come
-    back pages the operator."""
-    return why.startswith(("dry-run", "skipped", "skipping", "uptime"))
+def report_leg(cfg: MrConfig, wan: str, res: LegResult) -> None:
+    """Tell the operator what happened to a leg that did not recover — and tell
+    them the truth. Only a WAN that went down and stayed down is an outage worth
+    a high-priority page; a reboot that was never issued left the link exactly
+    where it was, and must not be announced as a WAN that did not come back."""
+    if res.status is Outcome.NOT_RETURNED:
+        notify(cfg, f"⚠️ {wan} did not return from maintenance reboot",
+               "high", res.reason)
+    else:
+        notify(cfg, f"📶 {wan} was not rebooted tonight", "default", res.reason)
 
 
 def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
     """Leg 1 (wan1), then leg 2 (wan2) — and leg 2 only ever with wan1 verified
     back UP. `sleep` is injectable so an end-to-end test never has to wait out
     the real settle."""
+    # A window file outlives the process that wrote it: a previous run that was
+    # SIGKILLed (or a box that lost power mid-leg) leaves one behind, and the
+    # early-skip paths below return without ever entering the try/finally that
+    # would clear it. Clear it here, before any gate, so a stale window cannot
+    # keep suppressing a WAN's alerts across skipped runs until its TTL expires.
+    close_window(cfg)
+
     states = read_wan_states(cfg.sbfd_state_path, now)
     w1, w2 = cfg.wan1.iface, cfg.wan2.iface
     for wan in (w1, w2):
@@ -477,30 +566,37 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         # wan1 is still down. Carrying on with "the other WAN anyway" is
         # exactly how both WANs end up down at once.
         open_window(cfg, w1, now, cfg.recovery_deadline_s + cfg.settle_s)
-        ok, why = reboot_wan1(cfg, now)
-        close_window(cfg)
-        if not ok:
-            if not _is_skip(why):
-                notify(cfg, f"⚠️ {w1} did not return from maintenance reboot",
-                       "high", why)
-                return 1
-            # A skip means wan1 was never disturbed, so it is still up and
-            # leg 2 may proceed — with its own peer re-check to confirm.
-            log.info("wan1: %s", why)
-        else:
-            log.info("wan1: %s", why)
-            sleep(cfg.settle_s)
+        try:
+            res = reboot_wan1(cfg, now)
+            # The settle happens INSIDE the window. A WAN that has just booted
+            # is not done: its BFD session commonly flaps UP/DOWN/UP as the
+            # link finishes coming up, and those transitions are precisely what
+            # the window exists to suppress. Closing at the first UP and
+            # settling afterwards would fire alerts on a normal night.
+            if res.ok:
+                sleep(cfg.settle_s)
+        finally:
+            close_window(cfg)
+        log.info("wan1: %s", res.reason)
+        if not res.ok and res.status is not Outcome.SKIPPED:
+            report_leg(cfg, w1, res)
+            return 1
+        # A skip means wan1 was never disturbed, so it is still up and leg 2 may
+        # proceed — with its own peer re-check to confirm.
 
         # Leg 2, reached only with wan1 either untouched or verified back UP.
         open_window(cfg, w2, time.time(),
                     cfg.recovery_deadline_s * 2 + cfg.settle_s)
-        ok, why = reboot_wan2(cfg, time.time())
-        close_window(cfg)
-        if not ok and not _is_skip(why):
-            notify(cfg, f"⚠️ {w2} did not return from maintenance reboot",
-                   "high", why)
+        try:
+            res = reboot_wan2(cfg, time.time())
+            if res.ok:
+                sleep(cfg.settle_s)
+        finally:
+            close_window(cfg)
+        log.info("wan2: %s", res.reason)
+        if not res.ok and res.status is not Outcome.SKIPPED:
+            report_leg(cfg, w2, res)
             return 1
-        log.info("wan2: %s", why)
         return 0
     finally:
         # A window left open would suppress that WAN's alerts indefinitely —
@@ -509,9 +605,23 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         close_window(cfg)
 
 
+def _exit_on_sigterm(signum, frame):
+    """`systemctl stop` (and a timer's own timeout) sends SIGTERM, whose default
+    action kills the process outright — skipping run_once's finally and leaving
+    the maintenance window open until its TTL expires, with that WAN's alerts
+    suppressed the whole time. Raising SystemExit instead unwinds the stack, so
+    the window is closed on the way out."""
+    raise SystemExit(128 + signum)
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    install_signal_handlers()
     ap = argparse.ArgumentParser(prog="maintenance_reboot.py")
     ap.add_argument("-c", "--config", required=True)
     ap.add_argument("--now", action="store_true",
