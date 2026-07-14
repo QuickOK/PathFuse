@@ -918,6 +918,8 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 .fec-badges { margin-top: 8px; }
 .fec-effective { font-size: 12px; color: var(--fg-muted); margin-top: 6px; }
 #fec-block input:disabled + span { opacity: 0.4; }
+#maintenance-block input:disabled + span { opacity: 0.4; }
+#maintenance-hour:disabled { opacity: 0.4; }
 
 @media (max-width: 720px) {
   .fec-dirs { grid-template-columns: 1fr; }

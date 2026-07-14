@@ -127,6 +127,18 @@
           </div>
         </div>
 
+        <div class="ctl-block" id="maintenance-block">
+          <div class="ctl-label">Daily reboot
+            <span class="tip" title="Reboots wan1 then wan2 once a day, one at a time, waiting for each to come back before touching the next. Alerts for those WANs are suppressed during the reboot; a WAN that fails to return still pages.">i</span>
+          </div>
+          <label class="ctl-radio"><input type="radio" name="maintenance_enabled" value="on"><span>On <em>at hour</em>
+            <select id="maintenance-hour" class="ctl-select"></select></span></label>
+          <label class="ctl-radio"><input type="radio" name="maintenance_enabled" value="off"><span>Off</span></label>
+          <div class="fec-effective">
+            <span id="maintenance-effective">—</span>
+          </div>
+        </div>
+
         <div class="ctl-block" id="fec-block">
           <div class="ctl-label">FEC
             <span class="tip" title="Forward error correction over the engarde tunnel. Off forces 8:0 in both directions; Fixed holds the selected ratio; Adaptive scales to measured loss; Floor + adaptive keeps a 20:1 (~5%) floor and ramps up under loss.">i</span>
