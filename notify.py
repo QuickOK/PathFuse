@@ -12,6 +12,7 @@ worker thread. Delivery reliability (spool + redeliver when the uplink is
 down) is spool-notify's job, not ours.
 """
 import logging
+import math
 import os
 import subprocess
 import threading
@@ -279,8 +280,23 @@ class EventDetector:
         # Whatever is already broken at startup is treated as announced: no
         # alert now, and none once the hold expires either. A later recovery
         # still reports, which is the useful half of the edge.
+        #
+        # ...unless it is broken under an open maintenance window, and that
+        # exception is the whole point of consulting obs.maintenance here. A
+        # WAN down under a window has NOT been announced — its down edge was
+        # deliberately WITHHELD and is still PENDING. Seeding it as "already
+        # announced" would turn pending into never-sent: _wan_events skips any
+        # WAN in _down_alerted, so the outage would be swallowed forever, even
+        # long after the window expired. It belongs in _maint_suppressed, where
+        # a recovery inside the window stays silent and an outage that outlives
+        # the window still pages.
+        maint = self._maint_wan(obs)
         for wan, state in obs.wan_states.items():
-            if state != "UP":
+            if state == "UP":
+                continue
+            if wan == maint:
+                self._maint_suppressed.add(wan)
+            else:
                 self._down_alerted.add(wan)
         if obs.wan_states and not any(s == "UP"
                                       for s in obs.wan_states.values()):
@@ -299,12 +315,22 @@ class EventDetector:
         another process and must survive a restart of this one), so it is
         judged against the wall clock, NOT against self._clock() — that one is
         monotonic (seconds since boot) and would leave every window looking
-        open, muting a WAN's alerts indefinitely."""
+        open, muting a WAN's alerts indefinitely.
+
+        `until` must also be FINITE, and must not be a bool. json.loads accepts
+        bareword Infinity, and `now < inf` is true forever: a window file
+        carrying one would silence that WAN's outages permanently, which is the
+        single failure mode that can hide a real outage. (NaN fails the other
+        way — every comparison is False, so it suppresses nothing — but it is
+        no more a timestamp than Infinity is, and is rejected here too rather
+        than left to work by accident.)"""
         m = obs.maintenance
         if not isinstance(m, dict):
             return None
         wan, until = m.get("wan"), m.get("until")
-        if not isinstance(wan, str) or not isinstance(until, (int, float)):
+        if not isinstance(wan, str) or isinstance(until, bool):
+            return None
+        if not isinstance(until, (int, float)) or not math.isfinite(until):
             return None
         return wan if self._wall_clock() < until else None
 
@@ -385,10 +411,15 @@ class EventDetector:
             return []
         frm, to, reason = obs.switch
         maint = self._maint_wan(obs)
-        if maint is not None and maint in frm and maint not in to:
-            # The maintained WAN dropping out of the active set IS the reboot,
-            # not news. A switch it did not cause — the other WAN really failed,
-            # or the maintained WAN rejoining — still reports.
+        removed = set(frm) - set(to)
+        if maint is not None and removed == {maint}:
+            # The maintained WAN, and ONLY it, dropping out of the active set
+            # IS the reboot, not news. Anything else still reports: a switch it
+            # did not cause (the other WAN really failed, or the maintained WAN
+            # rejoining), and — the case a plain `maint in frm and maint not in
+            # to` got wrong — a switch that removed the maintained WAN AND
+            # another WAN at the same time, which is a strictly WORSE event
+            # than the one we are excusing.
             return []
         return [Event("wan_switch",
                       f"🔀 WAN switch → {','.join(to)}",

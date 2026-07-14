@@ -636,3 +636,103 @@ def test_maintained_wan_rejoining_the_active_set_still_reports():
     evs = d.observe(obs(maintenance=win,
                         switch=(["wan1"], ["wan1", "wan2"], "wan2 up")))
     assert kinds(evs) == ["wan_switch"]
+
+
+def test_switch_that_removed_the_other_wan_too_still_reports():
+    # `maint in frm and maint not in to` also swallowed a switch that removed
+    # the maintained WAN *and* another one — a strictly WORSE event than the
+    # reboot it was excusing. Only the maintained WAN being the SOLE member
+    # removed from the active set is the reboot.
+    clk, wclk = FakeClock(), FakeClock()
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    for to in ([], ["wan3"]):
+        d = seeded(FakeClock(), FakeClock())
+        evs = d.observe(obs(maintenance=win,
+                            switch=(["wan1", "wan2"], to, "wan1 died too")))
+        assert kinds(evs) == ["wan_switch"]
+        assert "wan1 died too" in evs[0].message
+
+
+def test_non_finite_until_suppresses_nothing():
+    # `{"until": Infinity}` is REACHABLE: json.loads accepts the bareword, and
+    # `self._wall_clock() < inf` is true forever — that WAN's outages would be
+    # silenced permanently, the one failure mode that can hide a real outage.
+    # NaN fails the other way (every comparison False) but is no more a
+    # timestamp, and a bool is not one either.
+    assert json.loads('{"until": Infinity}')["until"] == float("inf")
+    for until in (float("inf"), float("-inf"), float("nan"), True, False):
+        clk, wclk = FakeClock(), FakeClock()
+        d = seeded(clk, wclk)
+        win = {"wan": "wan2", "until": until}
+        down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+        assert d.observe(down) == []       # held: not down long enough yet
+        clk.advance(30)
+        wclk.advance(30)
+        assert kinds(d.observe(down)) == ["wan_down"]
+
+
+def test_bool_until_never_suppresses_even_on_an_unsynced_clock():
+    # `true` is not a timestamp — but isinstance(True, int) is True in Python,
+    # and True is finite, so only an explicit bool check catches it. On a box
+    # whose clock has not yet synced (no RTC: time.time() starts near the
+    # epoch), `0.0 < True` is True, and the window would mute a real outage.
+    clk, wclk = FakeClock(), FakeClock(0.0)
+    d = seeded(clk, wclk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
+               maintenance={"wan": "wan2", "until": True})
+    assert d.observe(down) == []           # held: not down long enough yet
+    clk.advance(30)
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
+def test_seed_under_a_window_leaves_the_down_pending_not_announced():
+    # THE PERMANENT SILENCE: sbfd-ctl restarting while a WAN is down under an
+    # open window used to seed it into _down_alerted ("already announced"), and
+    # _wan_events skips those forever — turning a WITHHELD outage into one that
+    # is never reported, even long after the window expires.
+    clk, wclk = FakeClock(), FakeClock()
+    d = notify.EventDetector(clock=clk, wall_clock=wclk)
+    win = {"wan": "wan2", "until": wclk.t + 100}
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []           # the seed: silent, as always
+    clk.advance(20)
+    wclk.advance(20)
+    assert d.observe(down) == []           # still inside the window: withheld
+    clk.advance(90)
+    wclk.advance(90)
+    assert d.observe(down) == []           # window just expired: hold restarts
+    clk.advance(10)
+    evs = d.observe(down)
+    assert kinds(evs) == ["wan_down"]      # now unexplained — page
+    assert evs[0].priority == "high"
+    assert kinds(d.observe(obs())) == ["wan_up"]   # and its recovery reports
+
+
+def test_seed_under_a_window_that_recovers_inside_it_stays_silent():
+    # the other half: a restart mid-window whose WAN comes back before the
+    # window closes is a normal maintenance night — no down, and no spurious up
+    clk, wclk = FakeClock(), FakeClock()
+    d = notify.EventDetector(clock=clk, wall_clock=wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
+                         maintenance=win)) == []
+    clk.advance(30)
+    wclk.advance(30)
+    assert d.observe(obs(maintenance=win)) == []   # back up: silent
+    clk.advance(600)
+    wclk.advance(600)
+    assert d.observe(obs()) == []                  # nothing deferred past it
+
+
+def test_seed_still_announces_nothing_for_a_wan_down_outside_any_window():
+    # the pre-existing invariant must not weaken: a WAN already down at seed
+    # with NO window is still treated as announced, so a restart never replays
+    # an outage the operator was already told about
+    clk, wclk = FakeClock(), FakeClock()
+    d = notify.EventDetector(clock=clk, wall_clock=wclk)
+    win = {"wan": "wan1", "until": wclk.t + 600}   # window is on the OTHER wan
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []
+    clk.advance(600)
+    wclk.advance(600)
+    assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
