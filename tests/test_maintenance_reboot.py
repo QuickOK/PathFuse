@@ -597,6 +597,43 @@ def both_up(*a, **k):
     return dict(BOTH_UP)
 
 
+class FakeLink:
+    """read_wan_states stand-in backed by a mutable BFD view, so a test can flip
+    a WAN's state mid-leg — a reboot that really does take the link off the air,
+    rather than a link that is politely constant while we pretend to reboot it."""
+
+    def __init__(self, **state):
+        self.state = dict(BOTH_UP)
+        self.state.update(state)
+
+    def __call__(self, *a, **k):
+        return dict(self.state)
+
+
+class DishThatDropsTheLink(FakeDish):
+    """A terminal whose reboot (or staged update) genuinely takes wan2 down —
+    and never brings it back. `on` picks which call does it."""
+
+    def __init__(self, link, on="reboot", **kw):
+        super().__init__(**kw)
+        self.link = link
+        self.on = on
+
+    def _maybe_drop(self, call):
+        if call == self.on:
+            self.link.state["wan2"] = "DOWN"
+
+    def reboot(self):
+        out = super().reboot()
+        self._maybe_drop("reboot")
+        return out
+
+    def apply_update(self):
+        out = super().apply_update()
+        self._maybe_drop("apply_update")
+        return out
+
+
 class StateTimeline:
     """read_wan_states stand-in that returns one frame per call, repeating the
     last frame forever. Lets a test drive a realistic UP -> DOWN -> UP timeline
@@ -719,6 +756,55 @@ def test_await_up_requires_an_observed_down_when_asked(tmp_path):
                     require_down_first=True)
     assert ok is True
     assert states.calls == 4            # it did not stop at the stale UP
+
+
+def test_await_up_does_not_forge_a_down_from_an_unreadable_read(tmp_path):
+    # {} means the read FAILED (file missing, sbfd restarting, stale past its
+    # freshness window, clock stepped) — the ABSENCE of an observation, not an
+    # observation of DOWN. Crediting it forges the observed-down that IS wan1's
+    # only reboot receipt, and a receipt you can forge by not looking is no
+    # receipt: the stale pre-reboot UP that follows must still not count.
+    cfg = write_cfg(tmp_path)
+    clk = FakeClock()
+    states = StateTimeline({},            # unreadable: we know NOTHING
+                           BOTH_UP)       # stale pre-reboot UP, forever
+    ok = M.await_up(cfg, "wan1", deadline_s=60, clock=clk,
+                    sleep=instant(clk), states_fn=states,
+                    require_down_first=True)
+    assert ok is False
+
+
+def test_await_up_still_counts_a_fresh_read_with_no_session_as_down(tmp_path):
+    # the flip side: a fresh read in which wan1's session is simply absent IS an
+    # observation of not-UP, and must still satisfy require_down_first
+    cfg = write_cfg(tmp_path)
+    clk = FakeClock()
+    states = StateTimeline({"wan2": "UP"},   # fresh, but wan1 has no session
+                           BOTH_UP)
+    ok = M.await_up(cfg, "wan1", deadline_s=60, clock=clk,
+                    sleep=instant(clk), states_fn=states,
+                    require_down_first=True)
+    assert ok is True
+
+
+def test_reboot_wan1_does_not_forge_a_down_from_an_unreadable_read(
+        tmp_path, monkeypatch):
+    # THE STRANDING BUG, re-opened by an unreadable read: wan1's carrier has not
+    # dropped yet, one BFD read fails, and the stale UP behind it gets credited
+    # as recovery — clearing the way to reboot wan2 while wan1 is still on its
+    # way down. An unreadable read must credit nothing.
+    cfg = write_cfg(tmp_path, dry_run=False, recovery_deadline_s=30)
+    states = StateTimeline(BOTH_UP,      # the peer re-check
+                           {},           # t+5: BFD state unreadable
+                           BOTH_UP)      # t+10: stale pre-reboot UP, forever
+    monkeypatch.setattr(M, "read_wan_states", states)
+    clk = FakeClock()
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(0, "reboot issued")]),
+                        sleep=instant(clk), clock=clk)
+    assert res.ok is False                        # NOT "recovered"
+    assert res.status is M.Outcome.NOT_ISSUED     # no down was ever observed
+    assert clk.t - 1000.0 >= cfg.recovery_deadline_s
 
 
 def test_reboot_wan1_refuses_when_peer_is_down(tmp_path, monkeypatch):
@@ -899,6 +985,9 @@ def test_reboot_wan2_requires_a_bootcount_bump_not_just_bfd(tmp_path, monkeypatc
                         sleep=instant(clk), clock=clk)
     assert res.ok is False
     assert d.calls == ["reboot"]
+    # ...and BFD stayed UP the whole time, so the link was never disturbed: a
+    # dropped reboot is a failed maintenance, not a WAN that did not come back
+    assert res.status is M.Outcome.NOT_ISSUED
 
 
 def test_reboot_wan2_rejected_request_is_not_reported_as_a_lost_wan(
@@ -982,7 +1071,11 @@ def test_reboot_wan2_rechecks_the_peer_before_the_fallback_reboot(
     assert d.calls == ["apply_update"]   # the fallback reboot was NOT issued
 
 
-def test_reboot_wan2_fails_after_a_failed_fallback_reboot(tmp_path, monkeypatch):
+def test_reboot_wan2_dropped_fallback_reboot_is_not_a_lost_wan(tmp_path, monkeypatch):
+    # THE FALSE PAGE, fallback edition: neither the update nor the plain reboot
+    # bumped the bootcount while BFD stayed UP throughout — the silently-dropped
+    # reboot the receipt exists to catch. wan2 never left, so it must not page
+    # "wan2 did not return". (This test previously pinned exactly that bug.)
     cfg = write_cfg(tmp_path, dry_run=False)
     monkeypatch.setattr(M, "read_wan_states", both_up)
     monkeypatch.setattr(M, "notify", lambda *a, **k: None)
@@ -991,8 +1084,89 @@ def test_reboot_wan2_fails_after_a_failed_fallback_reboot(tmp_path, monkeypatch)
     res = M.reboot_wan2(cfg, now=1000.0, client=d,
                         sleep=instant(clk), clock=clk)
     assert res.ok is False
+    assert res.status is M.Outcome.NOT_ISSUED
+    assert res.status is not M.Outcome.NOT_RETURNED
+    assert d.calls == ["apply_update", "reboot"]   # exactly one fallback
+
+
+def test_reboot_wan2_pages_when_a_bricked_terminal_refuses_the_fallback(
+        tmp_path, monkeypatch):
+    # THE MISSED PAGE: the staged update took the terminal down for good, and
+    # the fallback request fails BECAUSE the device is dead. A failed request is
+    # not evidence the link is fine — only BFD is — so this is an outage, not a
+    # quiet "wan2 was not rebooted tonight".
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    monkeypatch.setattr(M, "read_wan_states", link)
+    monkeypatch.setattr(M, "notify", lambda *a, **k: None)
+    clk = FakeClock()
+    d = DishThatDropsTheLink(link, on="apply_update", staged=True,
+                             apply_bumps=False, reboot_ok=False)
+    res = M.reboot_wan2(cfg, now=1000.0, client=d,
+                        sleep=instant(clk), clock=clk)
+    assert res.ok is False
     assert res.status is M.Outcome.NOT_RETURNED
     assert d.calls == ["apply_update", "reboot"]   # exactly one fallback
+
+
+def test_reboot_wan2_pages_when_the_terminal_never_comes_back(
+        tmp_path, monkeypatch):
+    # the plain-reboot outage: the terminal went down on command and stayed
+    # down. This, and only this, is what pages the operator.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    monkeypatch.setattr(M, "read_wan_states", link)
+    clk = FakeClock()
+    d = DishThatDropsTheLink(link, on="reboot")
+    res = M.reboot_wan2(cfg, now=1000.0, client=d,
+                        sleep=instant(clk), clock=clk)
+    assert res.ok is False
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert "did not return" in res.reason
+
+
+def test_reboot_wan2_rejected_request_on_a_dead_terminal_is_an_outage(
+        tmp_path, monkeypatch):
+    # the terminal died on its own mid-run and then refused the reboot request.
+    # The request result says "not issued"; the link says wan2 is off the air.
+    # The link wins — a request failing because the device is dead must page.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink(wan2="DOWN")       # wan1 still UP, so the peer check passes
+    monkeypatch.setattr(M, "read_wan_states", link)
+    clk = FakeClock()
+    d = FakeDish(reboot_ok=False)
+    res = M.reboot_wan2(cfg, now=1000.0, client=d,
+                        sleep=instant(clk), clock=clk)
+    assert res.ok is False
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert d.calls == ["reboot"]
+
+
+def test_reboot_wan2_declined_fallback_on_a_down_link_still_pages(
+        tmp_path, monkeypatch):
+    # declining the second reboot while the peer is down is right; calling the
+    # leg "skipped" (silent, rc 0) while wan2 is itself off the air is not
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    monkeypatch.setattr(M, "read_wan_states", link)
+    sent = []
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p)))
+
+    class DishWhoseUpdateKillsBoth(DishThatDropsTheLink):
+        def apply_update(self):
+            out = super().apply_update()
+            link.state["wan1"] = "DOWN"    # the peer dies on its own, mid-leg
+            return out
+
+    clk = FakeClock()
+    d = DishWhoseUpdateKillsBoth(link, on="apply_update", staged=True,
+                                 apply_bumps=False)
+    res = M.reboot_wan2(cfg, now=1000.0, client=d,
+                        sleep=instant(clk), clock=clk)
+    assert res.ok is False
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert d.calls == ["apply_update"]     # the fallback reboot was NOT issued
+    assert sent == []                      # ...and was never promised, either
 
 
 def test_reboot_wan2_skips_when_the_terminal_is_unreachable(tmp_path):
@@ -1265,3 +1439,69 @@ def test_run_once_pages_when_wan2_does_not_return(tmp_path, monkeypatch):
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert rc == 1
     assert any(p == "high" for _t, p in sent)
+
+
+def drive_leg2(cfg, monkeypatch, link, dish_):
+    """Run the real reboot_wan2 end-to-end through run_once, with leg 1 already
+    recovered, and report (outcome, exit code, priorities the operator saw)."""
+    monkeypatch.setattr(M, "read_wan_states", link)
+    monkeypatch.setattr(M, "reboot_wan1", recovered)
+    sent = []
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p)))
+    clk = FakeClock()
+    real = M.reboot_wan2
+    seen = []
+
+    def leg2(c, now, **k):
+        res = real(c, now, client=dish_, sleep=instant(clk), clock=clk)
+        seen.append(res)
+        return res
+
+    monkeypatch.setattr(M, "reboot_wan2", leg2)
+    rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
+    return seen[0].status, rc, [p for _t, p in sent]
+
+
+def test_e2e_wan2_bricked_by_the_update_pages_high(tmp_path, monkeypatch):
+    # scenario 1: update applied, terminal bricked, fallback request fails —
+    # a real outage, and the request's failure must not hide it
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    status, rc, prio = drive_leg2(cfg, monkeypatch, link, DishThatDropsTheLink(
+        link, on="apply_update", staged=True, apply_bumps=False,
+        reboot_ok=False))
+    assert (status, rc) == (M.Outcome.NOT_RETURNED, 1)
+    assert "high" in prio
+
+
+def test_e2e_wan2_rejected_request_on_a_live_link_does_not_page(
+        tmp_path, monkeypatch):
+    # scenario 2: the request was rejected and wan2 is verifiably still UP —
+    # failed maintenance, not an outage: exit 1, informational, no page
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    status, rc, prio = drive_leg2(cfg, monkeypatch, link,
+                                  FakeDish(reboot_ok=False))
+    assert (status, rc) == (M.Outcome.NOT_ISSUED, 1)
+    assert prio == ["default"]
+
+
+def test_e2e_wan2_dropped_reboot_does_not_page(tmp_path, monkeypatch):
+    # scenario 3: BFD stayed UP and the bootcount never bumped — the reboot was
+    # silently dropped. The link never left; paging "did not return" is a lie.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    status, rc, prio = drive_leg2(cfg, monkeypatch, link,
+                                  FakeDish(reboot_bumps=False))
+    assert (status, rc) == (M.Outcome.NOT_ISSUED, 1)
+    assert prio == ["default"]
+
+
+def test_e2e_wan2_down_and_never_back_pages_high(tmp_path, monkeypatch):
+    # scenario 4: the terminal went down on command and stayed down
+    cfg = write_cfg(tmp_path, dry_run=False)
+    link = FakeLink()
+    status, rc, prio = drive_leg2(cfg, monkeypatch, link,
+                                  DishThatDropsTheLink(link, on="reboot"))
+    assert (status, rc) == (M.Outcome.NOT_RETURNED, 1)
+    assert "high" in prio

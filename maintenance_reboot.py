@@ -38,14 +38,17 @@ class Outcome(enum.Enum):
 
     The question that decides what the operator hears is "was the WAN's link
     actually disturbed?", and the answer must never be inferred by
-    prefix-matching a human sentence: a rejected reboot request ("reboot
-    request failed") means the WAN never went down at all, yet reads like a
-    failure, and paging "wan2 did not return from maintenance reboot" for a WAN
-    that never left is both alarming and untrue."""
+    prefix-matching a human sentence, nor by the RESULT OF A REQUEST. Both are
+    guesses about the link rather than observations of it, and both guess wrong
+    in the direction that hurts: a rejected reboot request reads like a failure
+    though the WAN never went down, and a request that failed because the device
+    is already dead reads like "nothing was disturbed" though the WAN is off the
+    air. Every classification here is made by looking at BFD — see
+    classify_by_link."""
 
     RECOVERED = "recovered"        # rebooted, and observed back up
     SKIPPED = "skipped"            # deliberately not touched; the link is fine
-    NOT_ISSUED = "not_issued"      # the reboot never took; no down was observed
+    NOT_ISSUED = "not_issued"      # reboot didn't take; the link is still UP
     NOT_RETURNED = "not_returned"  # the WAN went down and did not come back
 
 
@@ -391,7 +394,18 @@ def await_up(cfg: MrConfig, wan: str, deadline_s: float, extra_ok=None,
     while clock() - start < deadline_s:
         sleep(POLL_S)
         states = states_fn(cfg.sbfd_state_path, time.time())
+        if not states:
+            # read_wan_states returns {} for every unreadable case: file
+            # missing, unparseable, stale past its freshness window, sbfd
+            # restarting, the clock stepped under us. That is the ABSENCE of an
+            # observation, not an observation of DOWN — and for a WAN whose
+            # only reboot receipt IS the observed down, crediting it would
+            # forge that receipt and re-open the stranding bug. Knowing nothing
+            # advances nothing; poll again.
+            continue
         if states.get(wan) != "UP":
+            # A FRESH read in which the session is absent, or reports anything
+            # but UP, is a real observation of not-UP. That still counts.
             seen_down = True
             continue
         if seen_down and (extra_ok is None or extra_ok()):
@@ -411,6 +425,28 @@ def peer_is_up(cfg: MrConfig, wan: str) -> bool:
     peer = peer_of(cfg, wan)
     states = read_wan_states(cfg.sbfd_state_path, time.time())
     return states.get(peer) == "UP"
+
+
+def classify_by_link(cfg: MrConfig, wan: str, up_status: Outcome,
+                     up_reason: str, down_reason: str) -> LegResult:
+    """Classify a leg that did not recover by OBSERVING the link — never by the
+    result of a request.
+
+    A request's result says nothing about the link. `client.reboot()` can fail
+    precisely BECAUSE the device is already dead (a firmware update bricked it,
+    grpcurl cannot reach it), and calling that "not issued — the link was never
+    disturbed" would swallow a real outage. Conversely, a WAN that stayed UP for
+    the whole deadline while its reboot receipt never arrived was never
+    disturbed at all, and paging "did not return" for a WAN that never left is
+    a false page. Only BFD can tell the two apart, so ask BFD.
+
+    up_status is what to report when the link is verifiably still UP —
+    NOT_ISSUED for a reboot that did not take, SKIPPED when we deliberately
+    declined to issue one. A link that is not UP is always NOT_RETURNED: it went
+    down and has not come back, which is the one condition worth a page."""
+    if read_wan_states(cfg.sbfd_state_path, time.time()).get(wan) == "UP":
+        return _leg(up_status, up_reason)
+    return _leg(Outcome.NOT_RETURNED, down_reason)
 
 
 def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
@@ -447,16 +483,14 @@ def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
     if await_up(cfg, w1, cfg.recovery_deadline_s, sleep=sleep, clock=clock,
                 require_down_first=True):
         return _leg(Outcome.RECOVERED, "rebooted and recovered")
-    # await_up gave up. Which of the two failures was it? If wan1 is still UP,
-    # it never dropped: the reboot we asked for never happened, and the link was
-    # never disturbed. Saying "did not return" about a WAN that never left would
-    # be a false page — and, worse, would read as an outage that is not one.
-    if read_wan_states(cfg.sbfd_state_path, time.time()).get(w1) == "UP":
-        return _leg(Outcome.NOT_ISSUED,
-                    f"{w1} never went down within "
-                    f"{int(cfg.recovery_deadline_s)}s — no reboot observed")
-    return _leg(Outcome.NOT_RETURNED,
-                f"{w1} did not return within {int(cfg.recovery_deadline_s)}s")
+    # await_up gave up. Which of the two failures was it? Ask the link, not the
+    # request: if wan1 is still UP it never dropped, and saying "did not return"
+    # about a WAN that never left would be a false page.
+    return classify_by_link(
+        cfg, w1, Outcome.NOT_ISSUED,
+        f"{w1} never went down within {int(cfg.recovery_deadline_s)}s — "
+        f"no reboot observed",
+        f"{w1} did not return within {int(cfg.recovery_deadline_s)}s")
 
 
 def reboot_wan2(cfg: MrConfig, now: float, client=None,
@@ -498,36 +532,58 @@ def reboot_wan2(cfg: MrConfig, now: float, client=None,
         return _leg(Outcome.SKIPPED,
                     f"skipping: peer {peer_of(cfg, w2)} is not UP — "
                     f"refusing to disturb the last standing WAN")
+    deadline = int(cfg.recovery_deadline_s)
     issued = client.apply_update() if staged else client.reboot()
     if not issued:
-        # The request was rejected, so the terminal never went down. This is a
-        # failure to do the maintenance, not an outage.
-        return _leg(Outcome.NOT_ISSUED, "reboot request failed")
+        # A rejected request does NOT mean the terminal is still up: the request
+        # can fail precisely because the device is already dead. Ask the link.
+        return classify_by_link(
+            cfg, w2, Outcome.NOT_ISSUED, "reboot request failed",
+            f"{w2} is down and the reboot request failed — the terminal is "
+            f"not answering")
     if await_up(cfg, w2, cfg.recovery_deadline_s, extra_ok=rebooted,
                 sleep=sleep, clock=clock):
         return _leg(Outcome.RECOVERED,
                     "update applied" if staged else "rebooted and recovered")
     if not staged:
-        return _leg(Outcome.NOT_RETURNED,
-                    f"{w2} did not return within "
-                    f"{int(cfg.recovery_deadline_s)}s")
+        # await_up gave up for one of two reasons, and only the link says which:
+        # the terminal is down and did not come back (an outage), or it stayed
+        # UP throughout and the bootcount never bumped — the silently-dropped
+        # reboot the receipt exists to catch, in which nothing was disturbed.
+        return classify_by_link(
+            cfg, w2, Outcome.NOT_ISSUED,
+            f"{w2} stayed UP and its bootcount never bumped within "
+            f"{deadline}s — the reboot was dropped",
+            f"{w2} did not return within {deadline}s")
     # The staged update did not apply. One plain reboot, then verify again.
-    notify(cfg, "📶 Terminal update did not apply", "default",
-           "falling back to a plain reboot")
     # Time has passed since the last peer check — a whole recovery deadline of
     # it — and the fallback is a second chance to take out the last standing
-    # WAN. Re-check the peer immediately before issuing it, exactly as above.
+    # WAN. Re-check the peer immediately before issuing it, exactly as above,
+    # and BEFORE announcing a fallback we might not go on to issue.
     if not peer_is_up(cfg, w2):
-        return _leg(Outcome.SKIPPED,
-                    f"skipping fallback reboot: peer {peer_of(cfg, w2)} is "
-                    f"not UP")
+        return classify_by_link(
+            cfg, w2, Outcome.SKIPPED,
+            f"skipping fallback reboot: peer {peer_of(cfg, w2)} is not UP",
+            f"{w2} is down after the update and the fallback reboot was "
+            f"declined: peer {peer_of(cfg, w2)} is not UP")
+    notify(cfg, "📶 Terminal update did not apply", "default",
+           "falling back to a plain reboot")
     if not client.reboot():
-        return _leg(Outcome.NOT_ISSUED, "fallback reboot request failed")
+        # The classic bricked terminal: the update took it down for good, and
+        # the fallback request fails BECAUSE it is dead. Under-paging this as
+        # "not rebooted tonight" would leave a real outage unannounced.
+        return classify_by_link(
+            cfg, w2, Outcome.NOT_ISSUED, "fallback reboot request failed",
+            f"{w2} is down after the update and the fallback reboot request "
+            f"failed — the terminal is not answering")
     if await_up(cfg, w2, cfg.recovery_deadline_s, extra_ok=rebooted,
                 sleep=sleep, clock=clock):
         return _leg(Outcome.RECOVERED, "update failed; plain reboot recovered")
-    return _leg(Outcome.NOT_RETURNED,
-                f"{w2} did not return after fallback reboot")
+    return classify_by_link(
+        cfg, w2, Outcome.NOT_ISSUED,
+        f"{w2} stayed UP and its bootcount never bumped after the fallback "
+        f"reboot — the reboot was dropped",
+        f"{w2} did not return after fallback reboot")
 
 
 def report_leg(cfg: MrConfig, wan: str, res: LegResult) -> None:
