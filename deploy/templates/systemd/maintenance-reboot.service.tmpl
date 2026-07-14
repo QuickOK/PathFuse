@@ -23,11 +23,15 @@ ExecStart=$paths_sbfdctl_opt/maintenance_reboot.py -c $paths_sbfdctl_etc/mainten
 # unit's own exit from deleting the directory — verified against the live
 # hotspot-watchdog.service on this host: its cookies.txt/state.json survived
 # a oneshot run sharing the same RuntimeDirectory name while the daemon was
-# active. It also guarantees the directory exists on a run where the watchdog
-# daemon itself is stopped (the scenario --scheduled-reboot's own mkdir
-# fallback exists for), which a "-/run/hotspot-watchdog" ReadWritePaths entry
-# alone would not: under ProtectSystem=strict a missing path left out of the
-# mount table stays read-only, so the code's own mkdir would fail.
+# active. RuntimeDirectory is still the right call over a bare
+# "-/run/hotspot-watchdog" ReadWritePaths entry — that WOULD also work here
+# (/run stays a read-write tmpfs under ProtectSystem=strict, unlike /var/spool
+# below, which is why the spool-dir rationale there is different): declaring
+# RuntimeDirectory= explicitly documents the dependency and gets systemd to
+# create the dir with the right mode/owner up front, rather than relying on
+# the invoked process's own mkdir as a side effect. Preserve=yes is what stops
+# this oneshot's exit from deleting a directory the long-running watchdog
+# daemon is still using.
 RuntimeDirectory=hotspot-watchdog
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes

@@ -26,9 +26,20 @@ done
 # ProtectSystem=strict a missing path left out of the mount table stays read-only, so
 # spool-notify's own `mkdir -p` cannot self-heal from inside the sandbox. Create it here
 # so notifications actually work instead of silently degrading every time.
+#
+# Creation-only, and group-owned + 0770: sbfd-ctl.service also spools into this
+# same directory as the unprivileged sbfd-ctl user (via a SupplementaryGroups=
+# drop-in — see deploy/spool-notify/README.md), which needs group write access,
+# not world-readable 0755. Only chgrp/chmod when we're the one creating the
+# directory — never touch an existing dir's owner/mode, so a re-run on a
+# correctly-configured box is a no-op instead of reverting a working setup.
 if [ "$ROLE" = "client" ]; then
-  run "sudo mkdir -p /var/spool/spool-notify"
-  run "sudo chmod 0755 /var/spool/spool-notify"
+  getent group spool-notify >/dev/null 2>&1 || run "sudo groupadd -f spool-notify"
+  if [ ! -d /var/spool/spool-notify ]; then
+    run "sudo mkdir -p /var/spool/spool-notify"
+    run "sudo chgrp spool-notify /var/spool/spool-notify"
+    run "sudo chmod 0770 /var/spool/spool-notify"
+  fi
 fi
 
 # 4) place rendered files per manifest (dest + mode), backing up existing
