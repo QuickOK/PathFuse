@@ -474,12 +474,24 @@ def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
     try:
         r = runner(argv, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return _leg(Outcome.NOT_ISSUED, f"watchdog invocation failed: {e}")
+        # The watchdog invocation itself can fail to return precisely BECAUSE
+        # the hotspot is already going down under it (the admin API call hangs
+        # or the process is killed mid-request) — ask the link, not the result.
+        return classify_by_link(
+            cfg, w1, Outcome.NOT_ISSUED, f"watchdog invocation failed: {e}",
+            f"{w1} is down and the watchdog could not reboot it: {e}")
     out = (r.stdout or "").strip()
     if r.returncode == 2:
         return _leg(Outcome.SKIPPED, f"skipped by guard: {out}")
     if r.returncode != 0:
-        return _leg(Outcome.NOT_ISSUED, f"reboot failed: {out}")
+        # Same reasoning: a non-zero exit from the watchdog is not proof wan1
+        # is still up. Rebooting the hotspot over its admin API characteristically
+        # tears down the connection as the device goes down, so this exit is
+        # entirely consistent with the reboot having succeeded and wan1 never
+        # coming back. Only BFD can tell the two apart.
+        return classify_by_link(
+            cfg, w1, Outcome.NOT_ISSUED, f"reboot failed: {out}",
+            "wan1 is down and the watchdog could not reboot it")
     if await_up(cfg, w1, cfg.recovery_deadline_s, sleep=sleep, clock=clock,
                 require_down_first=True):
         return _leg(Outcome.RECOVERED, "rebooted and recovered")

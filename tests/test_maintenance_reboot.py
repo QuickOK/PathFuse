@@ -923,6 +923,70 @@ def test_reboot_wan1_survives_a_missing_watchdog_binary(tmp_path, monkeypatch):
     assert res.ok is False
 
 
+def test_reboot_wan1_rejected_request_pages_when_wan1_is_down(
+        tmp_path, monkeypatch):
+    # THE BUG: a non-zero exit from the watchdog is not proof wan1 stayed up —
+    # rebooting over the admin API tears down the connection as the device
+    # goes down, so this exit is equally consistent with the reboot having
+    # succeeded and wan1 never coming back. A real outage must still page.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", lambda *a, **k: dict(WAN1_DOWN))
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(1, "admin API rejected it")]))
+    assert res.ok is False
+    assert res.status is M.Outcome.NOT_RETURNED
+    sent = []
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    M.report_leg(cfg, "wan1", res)
+    assert any(p == "high" for _t, p in sent)
+
+
+def test_reboot_wan1_rejected_request_does_not_page_when_wan1_stayed_up(
+        tmp_path, monkeypatch):
+    # the flip side of the same fix: wan1 genuinely never left, so a rejected
+    # request must stay informational, not escalate to a high-priority page
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(1, "admin API rejected it")]))
+    assert res.ok is False
+    assert res.status is M.Outcome.NOT_ISSUED
+    sent = []
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    M.report_leg(cfg, "wan1", res)
+    assert not any(p == "high" for _t, p in sent)
+
+
+def test_reboot_wan1_watchdog_invocation_error_pages_when_wan1_is_down(
+        tmp_path, monkeypatch):
+    # an OSError/TimeoutExpired from the invocation itself is just as
+    # consistent with a reboot that succeeded and took wan1 off the air for
+    # good as it is with a harmless invocation glitch — ask the link
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", lambda *a, **k: dict(WAN1_DOWN))
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=RaisingRunner(OSError("nope")))
+    assert res.ok is False
+    assert res.status is M.Outcome.NOT_RETURNED
+    sent = []
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    M.report_leg(cfg, "wan1", res)
+    assert any(p == "high" for _t, p in sent)
+
+
+def test_classify_by_link_pages_on_an_unreadable_bfd_read(tmp_path, monkeypatch):
+    # classify_by_link is the single decision point for whether a human gets
+    # woken. An unreadable/stale read (read_wan_states returning {}) is the
+    # ABSENCE of an observation, not an observation of "still UP", and an
+    # absent observation must never SILENCE a page.
+    cfg = write_cfg(tmp_path)
+    monkeypatch.setattr(M, "read_wan_states", lambda *a, **k: {})
+    res = M.classify_by_link(cfg, "wan1", M.Outcome.NOT_ISSUED,
+                             "up reason", "down reason")
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert res.reason == "down reason"
+
+
 def test_wan2_guard_skips_when_uptime_too_low(tmp_path):
     cfg = write_cfg(tmp_path, dry_run=False)
 
