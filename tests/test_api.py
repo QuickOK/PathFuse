@@ -638,3 +638,70 @@ def test_run_controller_client_wire_none_without_tracker(cfg_with_fec, monkeypat
     M.run_controller(cfg_with_fec, stop_event=stop)  # no wire_tracker
     snap = json.loads(Path(cfg_with_fec.published_state).read_text())
     assert snap["fec"]["directions"]["client_to_relay"]["wire"] is None
+
+
+def test_post_runtime_accepts_maintenance_keys(cfg):
+    # hour 0 is midnight and falsy: the handler must use the `in payload` idiom,
+    # not `payload.get(k) or default`, or it would rewrite 0 into the default.
+    Path(cfg.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        body = json.dumps({"maintenance_enabled": True,
+                           "maintenance_hour": 0}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/runtime",
+            data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            assert r.status == 200
+        ov = M.load_runtime_overlay(cfg)
+        assert ov.maintenance_enabled is True
+        assert ov.maintenance_hour == 0
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_post_runtime_rejects_bool_maintenance_hour(cfg):
+    # bool is an int subclass: a POSTed hour of `true` must be a 400, not a
+    # reboot of both uplinks at hour 1.
+    Path(cfg.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        body = json.dumps({"maintenance_hour": True}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/runtime",
+            data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=2)
+        assert e.value.code == 400
+        assert M.load_runtime_overlay(cfg).maintenance_hour is None
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_post_runtime_omitting_maintenance_keys_leaves_them_alone(cfg):
+    # An unrelated Apply from the UI must not clear the maintenance schedule.
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(
+        maintenance_enabled=True, maintenance_hour=3))
+    Path(cfg.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        body = json.dumps({"mode": "full"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/runtime",
+            data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            assert r.status == 200
+        ov = M.load_runtime_overlay(cfg)
+        assert ov.maintenance_enabled is True
+        assert ov.maintenance_hour == 3
+    finally:
+        stop.set()
+        httpd.shutdown()

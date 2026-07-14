@@ -234,3 +234,52 @@ def test_load_config_notifications_negative_wan_down_hold_raises(tmp_path: Path)
     p.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="wan_down_hold_s"):
         sbfd_ctl.load_config(str(p))
+
+
+def _cfg_with_maint(tmp_path: Path, maint=None):
+    raw = dict(SAMPLE)
+    if maint is not None:
+        raw["maintenance_reboot"] = maint
+    p = tmp_path / "maint.json"
+    p.write_text(json.dumps(raw))
+    return sbfd_ctl.load_config(str(p))
+
+
+def test_maintenance_section_parses(tmp_path: Path):
+    # The optional maintenance_reboot block populates cfg.maintenance.
+    cfg = _cfg_with_maint(tmp_path, {
+        "enabled": True, "hour": 3,
+        "window": {"path": "/run/sbfd-ctl/maintenance_window.json"}})
+    assert cfg.maintenance.enabled is True
+    assert cfg.maintenance.hour == 3
+    assert cfg.maintenance.window_path == "/run/sbfd-ctl/maintenance_window.json"
+
+
+def test_maintenance_absent_is_unconfigured(tmp_path: Path):
+    # No section => feature unconfigured => cfg.maintenance is None.
+    cfg = _cfg_with_maint(tmp_path)
+    assert cfg.maintenance is None
+
+
+def test_maintenance_window_path_defaults(tmp_path: Path):
+    # window.path is optional; it falls back to the /run default.
+    cfg = _cfg_with_maint(tmp_path, {"enabled": False, "hour": 0})
+    assert cfg.maintenance.window_path == "/run/sbfd-ctl/maintenance_window.json"
+
+
+def test_maintenance_hour_out_of_range_rejected(tmp_path: Path):
+    # hour is validated 0..23 at config-load time, like the other bounds checks.
+    with pytest.raises(ValueError, match="maintenance_reboot.hour"):
+        _cfg_with_maint(tmp_path, {"enabled": True, "hour": 24})
+
+
+def test_maintenance_hour_zero_is_valid(tmp_path: Path):
+    # 0 is midnight, the most likely configured value, and must not be rejected.
+    cfg = _cfg_with_maint(tmp_path, {"enabled": True, "hour": 0})
+    assert cfg.maintenance.hour == 0
+
+
+def test_maintenance_hour_bool_rejected(tmp_path: Path):
+    # int(True) == 1: a boolean hour must not read as 1am.
+    with pytest.raises(ValueError, match="maintenance_reboot.hour"):
+        _cfg_with_maint(tmp_path, {"enabled": True, "hour": True})

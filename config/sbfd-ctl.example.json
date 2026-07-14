@@ -86,6 +86,12 @@
       "ttl_s": 180
     }
   },
+
+  "maintenance_reboot": {
+    "enabled": false,
+    "hour": 0,
+    "window": { "path": "/run/sbfd-ctl/maintenance_window.json" }
+  },
   "map": {
     "gpsd": {
       "host": "192.0.2.10",

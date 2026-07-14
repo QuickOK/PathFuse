@@ -96,6 +96,17 @@ class EnvironmentalCfg:
 
 
 @dataclass
+class MaintenanceCfg:
+    """Nightly one-at-a-time WAN reboot. `enabled`/`hour` here are boot-time
+    DEFAULTS only — the operator's runtime overlay wins in either direction.
+    sbfd-ctl resolves the pair and publishes it; maintenance_reboot.py reads
+    the resolved values and never re-derives this precedence."""
+    enabled: bool
+    hour: int
+    window_path: str = "/run/sbfd-ctl/maintenance_window.json"
+
+
+@dataclass
 class Config:
     wans: dict[str, WanCfg]
     relay: RelayCfg
@@ -110,6 +121,7 @@ class Config:
     egress: EgressCfg = field(default_factory=EgressCfg)
     fec: Optional[FecCfg] = None
     environmental: Optional[EnvironmentalCfg] = None
+    maintenance: Optional[MaintenanceCfg] = None
     notifications: Optional["notify.NotifyCfg"] = None
     map: object = None                 # raw `map` config section (dict | None)
 
@@ -1080,6 +1092,23 @@ def load_config(path: str) -> Config:
                 auto_override_ttl_s=float(ao.get("ttl_s", 180.0)),
             )
 
+        raw_maint = raw.get("maintenance_reboot")
+        maint_cfg = None
+        if raw_maint is not None:
+            win = raw_maint.get("window", {})
+            raw_hour = raw_maint.get("hour", 0)
+            # int(True) == 1: without this, "hour": true reads as 1am.
+            if isinstance(raw_hour, bool):
+                raise ValueError(
+                    "maintenance_reboot.hour must be an integer 0..23, "
+                    f"got {raw_hour!r}")
+            maint_cfg = MaintenanceCfg(
+                enabled=bool(raw_maint.get("enabled", False)),
+                hour=int(raw_hour),
+                window_path=win.get(
+                    "path", "/run/sbfd-ctl/maintenance_window.json"),
+            )
+
         raw_notif = raw.get("notifications")
         notif_cfg = None
         if raw_notif is not None:
@@ -1106,6 +1135,7 @@ def load_config(path: str) -> Config:
             egress=egress,
             fec=fec_cfg,
             environmental=env_cfg,
+            maintenance=maint_cfg,
             notifications=notif_cfg,
             map=raw.get("map"),
         )
@@ -1133,6 +1163,9 @@ def load_config(path: str) -> Config:
     if env_cfg is not None and env_cfg.auto_override_ttl_s <= 0:
         raise ValueError(
             f"environmental.auto_override.ttl_s must be > 0, got {env_cfg.auto_override_ttl_s}")
+    if maint_cfg is not None and not 0 <= maint_cfg.hour <= 23:
+        raise ValueError(
+            f"maintenance_reboot.hour must be 0..23, got {maint_cfg.hour}")
     if cfg.notifications is not None:
         if not cfg.notifications.topic:
             raise ValueError("notifications.topic must be a non-empty string")
@@ -1165,6 +1198,10 @@ class RuntimeOverlay:
     fec_mode: Optional[str] = None
     fec_fixed_ratio: Optional[str] = None
     environmental_enabled: Optional[bool] = None
+    # First integer overlay field. Note hour 0 (midnight) is falsy and real, so
+    # every read/write path here must test for None, never for truthiness.
+    maintenance_enabled: Optional[bool] = None
+    maintenance_hour: Optional[int] = None
 
 
 def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
@@ -1192,6 +1229,8 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_mode=loaded_fec_mode,
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
                 environmental_enabled=raw.get("environmental_enabled"),
+                maintenance_enabled=raw.get("maintenance_enabled"),
+                maintenance_hour=raw.get("maintenance_hour"),
             )
         except (FileNotFoundError, ValueError, OSError):
             continue
@@ -1220,6 +1259,8 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
         "fec_mode": ov.fec_mode,
         "fec_fixed_ratio": ov.fec_fixed_ratio,
         "environmental_enabled": ov.environmental_enabled,
+        "maintenance_enabled": ov.maintenance_enabled,
+        "maintenance_hour": ov.maintenance_hour,
     }
     body = _json.dumps(payload, indent=2)
     Path(cfg.runtime_state).parent.mkdir(parents=True, exist_ok=True)
@@ -1262,6 +1303,34 @@ def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
         reason=str(raw.get("reason", "")),
         set_ts=set_ts,
     )
+
+
+def load_maintenance_window(cfg: Config, now: float) -> Optional[dict]:
+    """The WAN currently being rebooted on purpose, or None.
+
+    `now` must be a WALL-CLOCK epoch: `until` is written by maintenance_reboot,
+    a different process, as time.time(). Comparing it to a monotonic clock would
+    be a silent always-true/always-false test.
+
+    Fail-open, like load_auto_override: unconfigured, missing, unparseable,
+    not-a-dict, no/invalid `until`, or expired all return None. A bad window
+    must suppress NOTHING — the failure mode of this feature is a spurious page,
+    never a missed one."""
+    if cfg.maintenance is None:
+        return None
+    try:
+        raw = _json.loads(Path(cfg.maintenance.window_path).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    until = raw.get("until")
+    # bool is an int subclass; `until: true` is not a deadline.
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return None
+    if now >= until:
+        return None
+    return raw
 
 
 def effective_policy(cfg: Config, ov: RuntimeOverlay) -> tuple:
@@ -1314,6 +1383,29 @@ def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     if ov.environmental_enabled is not None:
         return ov.environmental_enabled
     return bool(cfg.environmental.enabled)
+
+
+def effective_maintenance_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
+    """Resolve the maintenance-reboot toggle. Same shape as environmental (NOT
+    FEC): cfg.maintenance.enabled is only the boot default and the operator's
+    overlay wins in either direction. Hard-off only when unconfigured."""
+    if cfg.maintenance is None:
+        return False
+    if ov.maintenance_enabled is not None:
+        return ov.maintenance_enabled
+    return bool(cfg.maintenance.enabled)
+
+
+def effective_maintenance_hour(cfg: Config, ov: RuntimeOverlay) -> int:
+    """Resolve the reboot hour. The overlay wins only when it is a sane hour:
+    bool is an int subclass, so True must not be read as hour 1, and 0 is
+    midnight — falsy but perfectly valid, so this tests the value, not truth."""
+    if cfg.maintenance is None:
+        return 0
+    h = ov.maintenance_hour
+    if not isinstance(h, bool) and isinstance(h, int) and 0 <= h <= 23:
+        return h
+    return cfg.maintenance.hour
 
 
 def apply_auto_override(mode: str, env_enabled: bool,
@@ -1444,6 +1536,17 @@ def validate_runtime_payload(payload: dict, wan_names: set):
             return False, "fec_fixed_ratio out of bounds (a>=1, b>=0, a+b<=254)"
     if "environmental_enabled" in payload and not isinstance(payload["environmental_enabled"], bool):
         return False, "environmental_enabled must be true or false"
+    if ("maintenance_enabled" in payload
+            and not isinstance(payload["maintenance_enabled"], bool)):
+        return False, "maintenance_enabled must be true or false"
+    if "maintenance_hour" in payload:
+        h = payload["maintenance_hour"]
+        # bool is an int subclass: reject True/False BEFORE the range check, or
+        # `true` passes as hour 1 and authorizes a reboot nobody asked for.
+        if isinstance(h, bool) or not isinstance(h, int):
+            return False, "maintenance_hour must be an integer 0..23"
+        if not 0 <= h <= 23:
+            return False, "maintenance_hour must be 0..23"
     return True, None
 
 
@@ -1844,6 +1947,12 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                 ov.fec_fixed_ratio = payload["fec_fixed_ratio"]
             if "environmental_enabled" in payload:
                 ov.environmental_enabled = payload["environmental_enabled"]
+            # `in payload`, never `payload.get(k) or default`: hour 0 is midnight
+            # and falsy, and the `or` idiom would rewrite it to the config default.
+            if "maintenance_enabled" in payload:
+                ov.maintenance_enabled = payload["maintenance_enabled"]
+            if "maintenance_hour" in payload:
+                ov.maintenance_hour = payload["maintenance_hour"]
             ov.set_by = "ui"
             ov.set_ts = time.time()
             save_runtime_overlay(cfg, ov)
@@ -1917,6 +2026,11 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
         env_auto = load_auto_override(cfg, loop_start)
         env_enabled = effective_environmental_enabled(cfg, ov)
         mode, env_active = apply_auto_override(mode, env_enabled, env_auto)
+        maint_enabled = effective_maintenance_enabled(cfg, ov)
+        maint_hour = effective_maintenance_hour(cfg, ov)
+        # loop_start is time.time() — a wall clock, which is what the window's
+        # `until` epoch must be judged against.
+        maint_window = load_maintenance_window(cfg, loop_start)
 
         local = read_local_sbfd_state(cfg.sbfd_local_state, sid_to_wan)
         fec_reconcile_due = False
@@ -2195,6 +2309,14 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 configured=cfg.environmental is not None,
                 env_enabled=env_enabled, active=env_active,
                 auto=env_auto, now=loop_start),
+            # The resolved schedule, published so maintenance_reboot.py reads it
+            # rather than re-deriving the config-vs-overlay precedence. (Its
+            # read_published() also demands the snapshot's fresh "ts" above.)
+            "maintenance": {
+                "configured": cfg.maintenance is not None,
+                "enabled": maint_enabled,
+                "hour": maint_hour,
+            },
         }
         if detector is not None:
             fec_engaged = False
@@ -2218,7 +2340,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                     fec_at_max=fec_at_max,
                     relay_polled=relay_polled,
                     relay_ok=last_remote.ok,
-                    switch=switch_event)):
+                    switch=switch_event,
+                    maintenance=maint_window)):
                 notifier.notify(_ev)
         publish_state(cfg, snapshot)
 

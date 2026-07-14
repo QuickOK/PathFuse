@@ -312,3 +312,187 @@ def test_published_snapshot_reports_overlay_persist(tmp_path, monkeypatch, persi
 
     snap = json.loads(Path(cfg.published_state).read_text())
     assert snap["persist"] is persisted
+
+
+# -- maintenance-reboot schedule: overlay, resolvers, window ------------------
+
+def test_effective_maintenance_overlay_wins_both_ways():
+    # Config is the boot default only; the operator's overlay wins either way.
+    cfg = base_cfg(maintenance=M.MaintenanceCfg(
+        enabled=False, hour=0,
+        window_path="/run/sbfd-ctl/maintenance_window.json"))
+    ov = M.RuntimeOverlay()
+    assert M.effective_maintenance_enabled(cfg, ov) is False
+    assert M.effective_maintenance_hour(cfg, ov) == 0
+    ov.maintenance_enabled = True
+    ov.maintenance_hour = 3
+    assert M.effective_maintenance_enabled(cfg, ov) is True
+    assert M.effective_maintenance_hour(cfg, ov) == 3
+
+
+def test_effective_maintenance_overlay_can_disable_a_config_enabled_feature():
+    # The overlay must be able to turn OFF what config turned on (not a kill-switch).
+    cfg = base_cfg(maintenance=M.MaintenanceCfg(enabled=True, hour=4))
+    assert M.effective_maintenance_enabled(cfg, M.RuntimeOverlay()) is True
+    assert M.effective_maintenance_enabled(
+        cfg, M.RuntimeOverlay(maintenance_enabled=False)) is False
+
+
+def test_effective_maintenance_unconfigured_is_off():
+    # Unconfigured => hard off, whatever the overlay says.
+    cfg = base_cfg()
+    assert M.effective_maintenance_enabled(
+        cfg, M.RuntimeOverlay(maintenance_enabled=True)) is False
+    assert M.effective_maintenance_hour(
+        cfg, M.RuntimeOverlay(maintenance_hour=5)) == 0
+
+
+def test_effective_maintenance_hour_zero_from_overlay_is_honoured():
+    # 0 is falsy but real: an overlay hour of 0 must not fall back to config.
+    cfg = base_cfg(maintenance=M.MaintenanceCfg(enabled=True, hour=4))
+    ov = M.RuntimeOverlay(maintenance_hour=0)
+    assert M.effective_maintenance_hour(cfg, ov) == 0
+
+
+def test_effective_maintenance_hour_ignores_junk_overlay():
+    # A bool or out-of-range overlay hour must not authorize a reboot.
+    cfg = base_cfg(maintenance=M.MaintenanceCfg(enabled=True, hour=4))
+    assert M.effective_maintenance_hour(cfg, M.RuntimeOverlay(maintenance_hour=True)) == 4
+    assert M.effective_maintenance_hour(cfg, M.RuntimeOverlay(maintenance_hour=99)) == 4
+    assert M.effective_maintenance_hour(cfg, M.RuntimeOverlay(maintenance_hour="3")) == 4
+
+
+def test_maintenance_hour_validation_rejects_bools_and_range():
+    wans = {"wan1", "wan2"}
+    # bool is an int subclass in Python: True must not pass as an hour.
+    ok, err = M.validate_runtime_payload({"maintenance_hour": True}, wans)
+    assert ok is False
+    ok, err = M.validate_runtime_payload({"maintenance_hour": 24}, wans)
+    assert ok is False
+    ok, err = M.validate_runtime_payload({"maintenance_hour": -1}, wans)
+    assert ok is False
+    ok, err = M.validate_runtime_payload({"maintenance_hour": "3"}, wans)
+    assert ok is False
+    ok, err = M.validate_runtime_payload({"maintenance_hour": 0}, wans)
+    assert ok is True                     # 0 is midnight, and it is valid
+
+
+def test_maintenance_enabled_validation_rejects_non_bool():
+    # maintenance_enabled is a plain boolean toggle.
+    wans = {"wan1", "wan2"}
+    ok, _ = M.validate_runtime_payload({"maintenance_enabled": "yes"}, wans)
+    assert ok is False
+    ok, _ = M.validate_runtime_payload({"maintenance_enabled": True}, wans)
+    assert ok is True
+
+
+def test_maintenance_hour_zero_survives_the_overlay_round_trip(tmp_path):
+    # Guards the `payload.get(k) or default` bug: hour 0 is falsy but real.
+    cfg = base_cfg(runtime_state=str(tmp_path / "rt.json"),
+                   persist_state=str(tmp_path / "p.json"))
+    ov = M.RuntimeOverlay(maintenance_enabled=True, maintenance_hour=0)
+    M.save_runtime_overlay(cfg, ov)
+    back = M.load_runtime_overlay(cfg)
+    assert back.maintenance_hour == 0
+    assert back.maintenance_enabled is True
+
+
+def test_load_maintenance_window_returns_fresh_window(tmp_path):
+    # A window whose wall-clock `until` is in the future is returned as-is.
+    w = tmp_path / "win.json"
+    w.write_text(json.dumps({"wan": "wan1", "until": 1000.0}))
+    cfg = base_cfg(maintenance=M.MaintenanceCfg(
+        enabled=True, hour=3, window_path=str(w)))
+    got = M.load_maintenance_window(cfg, 900.0)
+    assert got["wan"] == "wan1"
+
+
+def test_load_maintenance_window_fails_open(tmp_path):
+    # Every bad path suppresses NOTHING: the failure mode is a spurious page,
+    # never a missed one.
+    w = tmp_path / "win.json"
+    cfg = base_cfg(maintenance=M.MaintenanceCfg(
+        enabled=True, hour=3, window_path=str(w)))
+    assert M.load_maintenance_window(cfg, 900.0) is None          # missing file
+    w.write_text("{not json")
+    assert M.load_maintenance_window(cfg, 900.0) is None          # unparseable
+    w.write_text(json.dumps([1, 2, 3]))
+    assert M.load_maintenance_window(cfg, 900.0) is None          # not a dict
+    w.write_text(json.dumps({"wan": "wan1"}))
+    assert M.load_maintenance_window(cfg, 900.0) is None          # no `until`
+    w.write_text(json.dumps({"wan": "wan1", "until": "soon"}))
+    assert M.load_maintenance_window(cfg, 900.0) is None          # `until` not a number
+    w.write_text(json.dumps({"wan": "wan1", "until": True}))
+    assert M.load_maintenance_window(cfg, 900.0) is None          # `until` is a bool
+    w.write_text(json.dumps({"wan": "wan1", "until": 1000.0}))
+    assert M.load_maintenance_window(cfg, 1000.0) is None         # expired (now == until)
+    assert M.load_maintenance_window(cfg, 1200.0) is None         # expired
+
+
+def test_load_maintenance_window_unconfigured_is_none(tmp_path):
+    # Feature unconfigured: never read a file, never suppress.
+    assert M.load_maintenance_window(base_cfg(), 900.0) is None
+
+
+def _stub_controller_io(monkeypatch, stop):
+    orig_publish = M.publish_state
+    def publish_and_stop(c, snap):
+        orig_publish(c, snap)
+        stop.set()
+    monkeypatch.setattr(M, "publish_state", publish_and_stop)
+    monkeypatch.setattr(M, "apply_nft_diff", lambda *a, **k: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda *a, **k: set())
+    monkeypatch.setattr(M, "apply_nft_init", lambda *a, **k: None)
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+                        lambda *a, **k: M.StateSnapshot(ok=False, per_wan={}, error="stub"))
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+                        lambda *a, **k: M.StateSnapshot(ok=False, per_wan={}, error="stub"))
+    monkeypatch.setattr(M, "read_wan_gateway", lambda *a, **k: None)
+    monkeypatch.setattr(M, "read_managed_default", lambda *a, **k: None)
+    monkeypatch.setattr(M, "read_engarde_table_default", lambda *a, **k: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda *a, **k: None)
+
+
+def test_published_snapshot_carries_the_resolved_maintenance_schedule(tmp_path, monkeypatch):
+    # maintenance_reboot.read_published() consumes exactly this block, and it
+    # rejects a snapshot with no fresh `ts` as stale (which would skip the night).
+    import threading
+    import time
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        maintenance=M.MaintenanceCfg(enabled=False, hour=2,
+                                     window_path=str(tmp_path / "win.json")),
+    )
+    # Operator's overlay wins over the config default, in both directions.
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(
+        maintenance_enabled=True, maintenance_hour=0, set_by="ui", set_ts=1.0))
+
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["maintenance"] == {"configured": True, "enabled": True, "hour": 0}
+    assert abs(snap["ts"] - time.time()) < 60      # fresh wall-clock ts, or the night is skipped
+
+
+def test_published_snapshot_maintenance_unconfigured(tmp_path, monkeypatch):
+    # No config section => configured:false => the UI greys it out and the
+    # one-shot skips.
+    import threading
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+    )
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["maintenance"]["configured"] is False
+    assert snap["maintenance"]["enabled"] is False
