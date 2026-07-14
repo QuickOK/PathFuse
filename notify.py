@@ -211,6 +211,11 @@ class Observation:
     relay_polled: bool
     relay_ok: bool
     switch: Optional[tuple]   # (from_list, to_list, reason) or None
+    # Set while a WAN is being rebooted on purpose. Suppresses that WAN's
+    # down/up/switch events -- never all_wans_down. A missing, malformed, or
+    # expired window suppresses nothing: the failure mode of this feature must
+    # be a spurious page, never a missed one.
+    maintenance: Optional[dict] = None
 
 
 class EventDetector:
@@ -280,11 +285,39 @@ class EventDetector:
 
     # -- per-category edges ----------------------------------------------
 
+    def _maint_wan(self, obs) -> Optional[str]:
+        """The WAN currently under maintenance, or None. Fails open.
+
+        Compared against self._clock(), the same clock used for this
+        detector's own hold timers, rather than the wall-clock time.time()
+        directly: everything this class measures "now" against goes through
+        the injected clock, and `until` is meaningless unless read against
+        that same frame of reference."""
+        m = obs.maintenance
+        if not isinstance(m, dict):
+            return None
+        wan, until = m.get("wan"), m.get("until")
+        if not isinstance(wan, str) or not isinstance(until, (int, float)):
+            return None
+        return wan if self._clock() < until else None
+
     def _wan_events(self, obs):
         now = self._clock()
+        maint = self._maint_wan(obs)
         evs = []
         for wan, state in obs.wan_states.items():
             label = obs.wan_labels.get(wan, wan)
+            if wan == maint:
+                # Rebooting on purpose. Keep the bookkeeping honest so the
+                # WAN's real edges resume cleanly once the window closes, but
+                # emit nothing.
+                if state == "UP":
+                    self._down_since.pop(wan, None)
+                    self._down_from.pop(wan, None)
+                    self._down_alerted.discard(wan)
+                else:
+                    self._down_alerted.add(wan)
+                continue
             if state == "UP":
                 self._down_since.pop(wan, None)
                 self._down_from.pop(wan, None)
@@ -330,6 +363,8 @@ class EventDetector:
     def _switch_events(self, obs):
         if obs.switch is None:
             return []
+        if self._maint_wan(obs) is not None:
+            return []       # the switch is the maintenance reboot, not news
         frm, to, reason = obs.switch
         return [Event("wan_switch",
                       f"🔀 WAN switch → {','.join(to)}",

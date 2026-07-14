@@ -465,3 +465,70 @@ def test_seed_with_failing_relay_poll_counts_toward_threshold():
     assert d.observe(obs(relay_polled=True, relay_ok=False)) == []
     evs = d.observe(obs(relay_polled=True, relay_ok=False))
     assert kinds(evs) == ["relay"]
+
+
+# -- maintenance-window suppression -------------------------------------
+
+
+def test_maintenance_window_suppresses_that_wans_down_and_up():
+    clk = FakeClock()
+    d = seeded(clk)
+    win = {"wan": "wan2", "until": clk.t + 600}
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    clk.advance(30)
+    assert d.observe(down) == []                # no wan_down: it's on purpose
+    up = obs(maintenance=win)
+    assert d.observe(up) == []                  # and no wan_up on the way back
+
+
+def test_maintenance_window_does_not_suppress_the_other_wan():
+    clk = FakeClock()
+    d = seeded(clk)
+    win = {"wan": "wan2", "until": clk.t + 600}
+    down = obs(wan_states={"wan1": "DOWN", "wan2": "UP"}, maintenance=win)
+    assert d.observe(down) == []           # held: not down long enough yet
+    clk.advance(30)
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
+def test_all_wans_down_always_pages_even_during_maintenance():
+    # Whatever else maintenance silences, "the vehicle is offline" always pages.
+    clk = FakeClock()
+    d = seeded(clk)
+    win = {"wan": "wan2", "until": clk.t + 600}
+    both = obs(wan_states={"wan1": "DOWN", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(both) == []           # held: not down long enough yet
+    clk.advance(30)
+    evs = d.observe(both)
+    assert "all_wans_down" in kinds(evs)
+    assert [e for e in evs if e.kind == "all_wans_down"][0].priority == "max"
+
+
+def test_expired_maintenance_window_suppresses_nothing():
+    # Fail safe: a stale window must not mute a real outage.
+    clk = FakeClock()
+    d = seeded(clk)
+    win = {"wan": "wan2", "until": clk.t - 1}
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []           # held: not down long enough yet
+    clk.advance(30)
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
+def test_malformed_maintenance_window_suppresses_nothing():
+    clk = FakeClock()
+    d = seeded(clk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
+               maintenance={"garbage": True})
+    assert d.observe(down) == []           # held: not down long enough yet
+    clk.advance(30)
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
+def test_maintenance_window_suppresses_the_switch_event():
+    clk = FakeClock()
+    d = seeded(clk)
+    win = {"wan": "wan2", "until": clk.t + 600}
+    evs = d.observe(obs(maintenance=win,
+                        switch=(["wan1", "wan2"], ["wan1"], "wan2 down")))
+    assert kinds(evs) == []
