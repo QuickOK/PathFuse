@@ -1685,8 +1685,12 @@ def test_run_once_continues_to_wan2_when_leg_one_was_never_issued(
                         lambda cfg, t, p, m: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert called == ["w2"]                      # leg 2 still ran
-    assert rc == 1                               # ...and leg 1 still failed
-    # ...but it does NOT page "wan1 did not return" for a WAN that never left
+    # ...and the run is NOT a failure: exit 1 is reserved for an OUTAGE (a WAN
+    # we took down that did not come back). wan1 never left, so marking the unit
+    # `failed` in systemctl status would train the operator to ignore red.
+    assert rc == 0
+    # ...but it IS reported, at informational priority — never as "did not
+    # return", which would be a lie about a WAN that never left.
     assert [p for _t, p in sent] == ["default"]
     assert "did not return" not in sent[0][0]
 
@@ -1739,7 +1743,7 @@ def test_run_once_does_not_page_high_when_the_request_was_rejected(
     monkeypatch.setattr(M, "notify",
                         lambda cfg, t, p, m: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
-    assert rc == 1
+    assert rc == 0        # link untouched => reported, but not a unit failure
     assert not any(p == "high" for _t, p in sent)
     assert not any("did not return" in t for t, _p in sent)
 
@@ -1964,7 +1968,9 @@ def test_e2e_wan2_rejected_request_on_a_live_link_does_not_page(
     link = FakeLink()
     status, rc, prio = drive_leg2(cfg, monkeypatch, link,
                                   FakeDish(reboot_ok=False))
-    assert (status, rc) == (M.Outcome.NOT_ISSUED, 1)
+    # rc 0: the link was never disturbed, so this is a report, not a unit
+    # failure. Exit 1 is reserved for a WAN we took down that stayed down.
+    assert (status, rc) == (M.Outcome.NOT_ISSUED, 0)
     assert prio == ["default"]
 
 
@@ -1975,7 +1981,9 @@ def test_e2e_wan2_dropped_reboot_does_not_page(tmp_path, monkeypatch):
     link = FakeLink()
     status, rc, prio = drive_leg2(cfg, monkeypatch, link,
                                   FakeDish(reboot_bumps=False))
-    assert (status, rc) == (M.Outcome.NOT_ISSUED, 1)
+    # rc 0: the link was never disturbed, so this is a report, not a unit
+    # failure. Exit 1 is reserved for a WAN we took down that stayed down.
+    assert (status, rc) == (M.Outcome.NOT_ISSUED, 0)
     assert prio == ["default"]
 
 
@@ -2209,8 +2217,9 @@ def test_attempted_unknown_that_really_never_landed_still_reaches_leg2(
     assert legs["wan2"].status is M.Outcome.RECOVERED   # leg 2 DID run
     assert "reboot" in dish.calls
     assert v.stranded == []
-    assert rc == 1                                      # leg 1 still failed...
-    # ...quietly: wan1 never left, so this is not a page
+    # wan1 never left, so this is neither a page nor a unit failure — just a
+    # report. Exit 1 is reserved for a WAN we took down that did not come back.
+    assert rc == 0
     assert not any(p == "high" for _t, p, _m in sent)
 
 

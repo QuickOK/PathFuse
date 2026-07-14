@@ -562,10 +562,17 @@ def test_unknown_carrier_still_allows_reboot():
 
 
 class _StubClient:
-    def __init__(self, login_ok=True, reboot_ok=True, model=None):
+    def __init__(self, login_ok=True, reboot_ok=True, model=None,
+                 reboot_outcome=None):
         self.login_ok, self.reboot_ok = login_ok, reboot_ok
         self.model = model if model is not None else {"x": 1}
         self.rebooted = False
+        # reboot_ok=False keeps its old meaning: the POST went out and we could
+        # not confirm it. A test that means "the restart never left the box"
+        # must say so explicitly with reboot_outcome=REBOOT_NOT_POSTED — the two
+        # are exactly what the tri-state exists to separate.
+        self.reboot_outcome = reboot_outcome or (
+            W.REBOOT_CONFIRMED if reboot_ok else W.REBOOT_UNKNOWN)
 
     def fetch_model(self):
         return self.model
@@ -573,9 +580,13 @@ class _StubClient:
     def login(self, pw):
         return self.login_ok
 
+    def reboot_ex(self):
+        if self.reboot_outcome == W.REBOOT_CONFIRMED:
+            self.rebooted = True
+        return self.reboot_outcome
+
     def reboot(self):
-        self.rebooted = self.reboot_ok
-        return self.reboot_ok
+        return self.reboot_ex() == W.REBOOT_CONFIRMED
 
     @staticmethod
     def diagnostics(model):
@@ -739,9 +750,36 @@ def test_scheduled_reboot_exit_3_when_the_post_outcome_is_unknown(tmp_path,
     code = _sched_code(cfg, c)
     assert code == W.EXIT_ATTEMPTED_UNKNOWN == 3
     assert code != W.EXIT_UNTOUCHED
-    _issued, reason, _ = W._scheduled_reboot_verbose(cfg, c, 1000.0)
-    assert _issued is False               # still not a CONFIRMED reboot...
-    assert "UNKNOWN" in reason            # ...but it does not claim innocence
+
+
+def test_scheduled_reboot_exit_1_when_the_restart_was_never_sent(tmp_path,
+                                                                 monkeypatch):
+    # The other half of the same distinction: no security token means the
+    # restart never left this box, so wan1 is untouched and the caller may say
+    # so. Sharing exit 3 with "posted, answer lost" made the sequencer watch the
+    # link for the full 600s recovery deadline for a drop that could never come.
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient(reboot_outcome=W.REBOOT_NOT_POSTED)
+    code = _sched_code(cfg, c)
+    assert code == W.EXIT_UNTOUCHED == 1
+    assert code != W.EXIT_ATTEMPTED_UNKNOWN
+    assert c.rebooted is False
+
+
+def test_reboot_ex_never_claims_untouched_on_a_misjudged_redirect():
+    # The redirect pattern is a guess against a device response nobody has ever
+    # captured. If the guess is WRONG (a success redirect that merely looks like
+    # an error), reporting NOT_POSTED would tell the sequencer "wan1 is fine" —
+    # and it would go on to reboot the OTHER WAN while wan1 was going down.
+    # A misjudged redirect must stay UNKNOWN, so the link decides.
+    c, r = make_client([FIXTURE, "/error.json"])
+    outcome = c.reboot_ex()
+    assert outcome == W.REBOOT_UNKNOWN
+    assert outcome != W.REBOOT_NOT_POSTED
+    # ...and the restart really did go out, which is why we cannot call it
+    # untouched.
+    assert "general.shutdown=restart" in " ".join(r.calls[1])
 
 
 def test_scheduled_reboot_exit_3_when_the_redirect_heuristic_misjudges(

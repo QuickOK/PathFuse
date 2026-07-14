@@ -865,7 +865,12 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
                      "last standing WAN", wan, states.get(wan))
             return 0
 
-    failed = False
+    # Exit 1 is reserved for an OUTAGE: a WAN we took down that did not come
+    # back. A leg that never disturbed its link (NOT_ISSUED) is reported to the
+    # operator but is NOT a unit failure — marking the unit `failed` in
+    # `systemctl status` for a benign, link-untouched condition trains the
+    # operator to ignore red, which is how a real outage gets missed.
+    outage = False
     try:
         # Leg 1. A leg 1 that left wan1 DOWN aborts the run: never proceed to
         # wan2 while wan1 is still down. Carrying on with "the other WAN
@@ -897,7 +902,6 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
             # exists to solve (a terminal sitting on a staged firmware update
             # forever) for as long as wan1's reboot stays broken.
             report_leg(cfg, w1, res)
-            failed = True
 
         # Leg 2. Note what does NOT hold here: a leg-1 SKIPPED does not prove
         # wan1 is up. The watchdog's own `no carrier` guard exits 2 — a skip —
@@ -915,8 +919,9 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         log.info("wan2: %s", res.reason)
         if not res.ok and res.status is not Outcome.SKIPPED:
             report_leg(cfg, w2, res)
-            return 1
-        return 1 if failed else 0
+            # Only a WAN that went down and stayed down is a failure of the run.
+            outage = res.status is Outcome.NOT_RETURNED
+        return 1 if outage else 0
     finally:
         # A window left open would suppress that WAN's alerts indefinitely —
         # the one failure mode that could hide a real outage. Closed here on

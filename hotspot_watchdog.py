@@ -58,6 +58,15 @@ EXIT_UNTOUCHED = 1
 EXIT_SKIPPED = 2
 EXIT_ATTEMPTED_UNKNOWN = 3
 
+# NetgearClient.reboot_ex() outcomes. The distinction that matters: NOT_POSTED
+# means the restart never left this box (the link is untouched, and a caller may
+# rely on that); UNKNOWN means it WAS sent and the answer was lost — which is
+# exactly what a successful reboot looks like from here, because the hotspot
+# tears the connection down on its way down.
+REBOOT_NOT_POSTED = "not_posted"
+REBOOT_UNKNOWN = "unknown"
+REBOOT_CONFIRMED = "confirmed"
+
 # -- Samplers -----------------------------------------------------------------
 
 
@@ -287,21 +296,51 @@ class NetgearClient:
         role = (m or {}).get("session", {}).get("userRole")
         return role == "Admin"
 
-    def reboot(self) -> bool:
+    def reboot_ex(self) -> str:
+        """Reboot the hotspot, distinguishing the three outcomes a caller must
+        NOT confuse:
+
+          REBOOT_NOT_POSTED — the restart never left this box. Nothing was sent,
+            so the link is exactly where it was and a caller may say so.
+          REBOOT_UNKNOWN    — the restart WAS sent and we cannot tell whether it
+            landed. The hotspot tears the connection down as it goes down, so a
+            lost answer is what a SUCCESSFUL reboot looks like from here. The
+            caller must watch the link, never assume.
+          REBOOT_CONFIRMED  — the hotspot acknowledged it.
+
+        Collapsing the first two into one `False` is what let a never-sent
+        reboot burn the full recovery deadline waiting for a drop that could
+        never come."""
         token, _ = self._sec_token()
         if token is None:
-            return False
+            # We never got a token, so no restart was POSTed. Nothing was sent.
+            log.warning("reboot: no security token — restart was NOT sent")
+            return REBOOT_NOT_POSTED
         redirect = self._post_config(token, [("general.shutdown", "restart")])
+        # Always log the redirect: this device's reboot response has never been
+        # captured, so _is_error_redirect() below is a heuristic. This line is
+        # what lets a real reboot teach us the true value.
+        log.info("reboot POST answered with redirect=%r", redirect)
         if redirect is None:
-            log.warning("reboot POST got no usable HTTP response")
-            return False
+            log.warning("reboot POST got no usable HTTP response — it may well "
+                        "have landed and the hotspot may be going down now")
+            return REBOOT_UNKNOWN
         if self._is_error_redirect(redirect):
-            # The hotspot took the POST and bounced it at its error page: the
-            # reboot did NOT happen. Reporting it as issued would both lie in
-            # the alert and burn an attempt from the episode budget.
-            log.warning("reboot POST redirected to an error target: %r", redirect)
-            return False
-        return True
+            # It LOOKS like the hotspot bounced the POST at its error page. But
+            # the pattern is a guess against an uncaptured response, so we do
+            # NOT downgrade this to NOT_POSTED: if the guess is wrong, we would
+            # be telling the caller "wan1 is untouched" while it reboots — and
+            # the caller would go on to reboot the other WAN. Stay UNKNOWN and
+            # let the link settle it.
+            log.warning("reboot POST redirected to what looks like an error "
+                        "target: %r", redirect)
+            return REBOOT_UNKNOWN
+        return REBOOT_CONFIRMED
+
+    def reboot(self) -> bool:
+        """True only for a CONFIRMED reboot. Kept for the reactive daemon, whose
+        Executor treats anything else as a failed attempt."""
+        return self.reboot_ex() == REBOOT_CONFIRMED
 
     @staticmethod
     def diagnostics(model) -> str:
@@ -682,7 +721,14 @@ def _scheduled_reboot_verbose(cfg: WdConfig, client, now: float):
                 EXIT_UNTOUCHED)
     if not client.login(pw):
         return False, "login rejected — check the admin secret", EXIT_UNTOUCHED
-    if not client.reboot():
+    outcome = client.reboot_ex()
+    if outcome == REBOOT_NOT_POSTED:
+        # The restart never left this box, so wan1 is exactly where it was. Say
+        # so plainly: the caller would otherwise spend the whole recovery
+        # deadline watching for a carrier drop that can never come.
+        return (False, "no security token — the restart was never sent",
+                EXIT_UNTOUCHED)
+    if outcome == REBOOT_UNKNOWN:
         return (False, "reboot POST was attempted but its outcome is UNKNOWN "
                        "(no usable response) — the hotspot may well have taken "
                        "it and be going down now; watch the link",
