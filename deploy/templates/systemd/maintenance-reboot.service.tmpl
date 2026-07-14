@@ -1,7 +1,12 @@
 [Unit]
 Description=PathFuse daily maintenance reboot (wan1 + wan2, one at a time)
-After=network-online.target sbfd.service sbfd-ctl.service
-Wants=network-online.target
+# hotspot-watchdog.service: the wan1 leg is carried out by that unit's script
+# (hotspot_watchdog.py --scheduled-reboot), and the watchdog owns the admin-API
+# session + /run/hotspot-watchdog. Wants= (not Requires=) on purpose: if the
+# watchdog is absent or dead, the wan1 leg reports a failure and the wan2 leg
+# still runs — a half-done maintenance pass beats none at all.
+After=network-online.target sbfd.service sbfd-ctl.service hotspot-watchdog.service
+Wants=network-online.target hotspot-watchdog.service
 
 [Service]
 Type=oneshot

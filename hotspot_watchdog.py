@@ -10,6 +10,9 @@ Spec: docs/superpowers/specs/2026-07-05-hotspot-watchdog-design.md
 import argparse
 import json
 import logging
+import math
+import os
+import re
 import signal
 import subprocess
 import sys
@@ -130,15 +133,34 @@ class Action:
     message: str = ""
 
 
+class _Stdin:
+    """Marker for a field value curl must read from stdin, never from argv."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
 class NetgearClient:
     """Nighthawk M6 Pro admin API via curl subprocess (API v2.0, verified live).
 
     curl is used (not urllib) because reaching the hotspot's admin address
     requires binding to the wan iface (SO_BINDTODEVICE) — the main routing
-    table sends that prefix out the default WAN. The password passes via
-    --data-urlencode argv; argv is visible only to root on this box and is
-    never logged.
+    table sends that prefix out the default WAN.
+
+    The admin password is handed to curl on STDIN (`--data-urlencode name@-`),
+    never in argv: argv is world-readable in /proc, so an inline `name=value`
+    leaks the secret to every process table on the box. curl URL-encodes the
+    stdin bytes exactly as it would an inline value and keeps the field in its
+    argv position, so the request on the wire is byte-for-byte what it was.
     """
+
+    # A /Forms/config POST answers 302 for BOTH outcomes — the M6 honours the
+    # posted ok_redirect and err_redirect — so "curl exited 0" says only that
+    # the hotspot replied, not that it accepted the form. Judge the Location it
+    # hands back instead: an error redirect names an error target.
+    _ERROR_REDIRECT_RE = re.compile(r"error|err_|fail", re.IGNORECASE)
 
     def __init__(self, admin_url, iface, cookie_jar, curl_bin="curl",
                  timeout_s=10.0, runner=subprocess.run):
@@ -149,20 +171,39 @@ class NetgearClient:
         self.timeout_s = timeout_s
         self.runner = runner
 
-    def _curl(self, extra):
+    @classmethod
+    def _is_error_redirect(cls, url) -> bool:
+        """True iff the hotspot redirected the POST at an error target. An empty
+        Location is NOT an error: absence of evidence only."""
+        return bool(url) and bool(cls._ERROR_REDIRECT_RE.search(url))
+
+    def _curl(self, extra, stdin_data=None):
         # --fail: HTTP 4xx/5xx exits 22 instead of 0, so an error page from the
-        # hotspot can't masquerade as a successful POST (3xx still passes; the
-        # M6 answers /Forms/config with 302 for both ok_ and err_redirect).
+        # hotspot can't masquerade as a successful POST. 3xx still passes --
+        # hence _is_error_redirect() above for the POSTs that answer with one.
         argv = [self.curl_bin, "-s", "--fail", "-m", str(self.timeout_s),
                 "--interface", self.iface,
                 "-c", self.cookie_jar, "-b", self.cookie_jar] + extra
+        kw = {"capture_output": True, "text": True,
+              "timeout": self.timeout_s + 5}
+        if stdin_data is not None:
+            kw["input"] = stdin_data     # no trailing newline: curl would encode it
         try:
-            out = self.runner(argv, capture_output=True, text=True,
-                              timeout=self.timeout_s + 5)
+            out = self.runner(argv, **kw)
         except (OSError, subprocess.TimeoutExpired) as e:
             log.warning("curl failed: %s", e)
             return None
         return out.stdout if out.returncode == 0 else None
+
+    def _reset_cookies(self):
+        """Drop any existing session cookie. Without this a STALE Admin cookie
+        in the jar makes the post-login model.json read back userRole=Admin even
+        when the password we just posted was rejected — a failed login reported
+        as a success, which then credits a reboot that never happened."""
+        try:
+            Path(self.cookie_jar).unlink()
+        except OSError:
+            pass                          # absent (the normal case) or unremovable
 
     def fetch_model(self):
         out = self._curl(["-L", f"{self.admin_url}/api/model.json?internalapi=1"])
@@ -182,18 +223,33 @@ class NetgearClient:
             return None, m
 
     def _post_config(self, token, fields):
-        data = []
+        """POST fields to /Forms/config. Returns the redirect target the hotspot
+        handed back (possibly ""), or None if the request itself failed."""
+        data, stdin_data = [], None
         for k, v in [("token", token)] + fields:
-            data += ["--data-urlencode", f"{k}={v}"]
-        return self._curl(data + [f"{self.admin_url}/Forms/config"])
+            if isinstance(v, _Stdin):
+                data += ["--data-urlencode", f"{k}@-"]
+                stdin_data = v.value      # at most one such field per request
+            else:
+                data += ["--data-urlencode", f"{k}={v}"]
+        # -o devnull + -w: the form's response body is a redirect stub we never
+        # read, so swap stdout for the one thing we DO need to judge it.
+        return self._curl(data + ["-o", os.devnull, "-w", "%{redirect_url}",
+                                  f"{self.admin_url}/Forms/config"],
+                          stdin_data=stdin_data)
 
     def login(self, password) -> bool:
+        self._reset_cookies()
         token, _ = self._sec_token()
         if token is None:
             return False
-        self._post_config(token, [("session.password", password),
-                                  ("err_redirect", "/error.json"),
-                                  ("ok_redirect", "/success.json")])
+        redirect = self._post_config(token, [
+            ("session.password", _Stdin(password)),
+            ("err_redirect", "/error.json"),
+            ("ok_redirect", "/success.json")])
+        if redirect is None or self._is_error_redirect(redirect):
+            log.warning("admin login rejected (redirect=%r)", redirect)
+            return False
         m = self.fetch_model()
         role = (m or {}).get("session", {}).get("userRole")
         return role == "Admin"
@@ -202,7 +258,17 @@ class NetgearClient:
         token, _ = self._sec_token()
         if token is None:
             return False
-        return self._post_config(token, [("general.shutdown", "restart")]) is not None
+        redirect = self._post_config(token, [("general.shutdown", "restart")])
+        if redirect is None:
+            log.warning("reboot POST got no usable HTTP response")
+            return False
+        if self._is_error_redirect(redirect):
+            # The hotspot took the POST and bounced it at its error page: the
+            # reboot did NOT happen. Reporting it as issued would both lie in
+            # the alert and burn an attempt from the episode budget.
+            log.warning("reboot POST redirected to an error target: %r", redirect)
+            return False
+        return True
 
     @staticmethod
     def diagnostics(model) -> str:
@@ -394,10 +460,24 @@ def load_config(path: str) -> WdConfig:
         notify_bin=raw.get("notify_bin", notify_mod.DEFAULT_COMMAND),
         dry_run=bool(raw.get("dry_run", True)),
     )
+    # Finiteness FIRST: json.loads accepts the barewords NaN and Infinity, and
+    # every comparison against NaN is False — so a NaN dwell_s sails straight
+    # through a `<= 0` check and then makes `now - unusable_since < dwell_s`
+    # false forever (the watchdog never fires) while a NaN grace_s makes the
+    # holdoff comparisons false too (it fires every poll). Reject both here.
+    for k in ("state_max_age_s", "poll_interval_s", "dwell_s", "grace_s",
+              "holdoff_s", "healthy_reset_s", "startup_grace_s"):
+        v = getattr(cfg, k)
+        if not math.isfinite(v):
+            raise ValueError(f"{k} must be a finite number, got {v!r}")
     for k in ("poll_interval_s", "dwell_s", "grace_s", "holdoff_s",
               "healthy_reset_s"):
         if getattr(cfg, k) <= 0:
             raise ValueError(f"{k} must be > 0")
+    # These two may legitimately be 0 (no startup grace / accept any state age).
+    for k in ("state_max_age_s", "startup_grace_s"):
+        if getattr(cfg, k) < 0:
+            raise ValueError(f"{k} must be >= 0")
     if cfg.max_reboots_per_episode < 1:
         raise ValueError("max_reboots_per_episode must be >= 1")
     return cfg
@@ -476,15 +556,45 @@ def _load_policy_state(cfg, kwargs):
         return WatchdogPolicy(**kwargs)
 
 
-def _save_policy_state(cfg, policy):
+def _save_policy_state(cfg, policy) -> bool:
+    """Persist episode state. Returns True iff it is durably on disk — callers
+    gate the reboot on that (see _persist_then_execute)."""
     try:
         p = Path(cfg.state_path)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(policy.to_dict()))
         tmp.replace(p)
+        return True
     except OSError as e:
         log.warning("cannot persist state: %s", e)
+        return False
+
+
+def _persist_then_execute(cfg, policy, executor, actions):
+    """Make the episode state durable BEFORE any reboot leaves the box.
+
+    policy.step() has already consumed the attempt (reboots_issued += 1, grace
+    armed) by the time it hands back a reboot Action. Persisting after the
+    reboot went out — as this did — means a crash, an OOM kill or a power cut in
+    that gap loses the increment: the daemon restarts, reloads a state file that
+    never saw the attempt, and can exceed max_reboots_per_episode. So write
+    first, and if the write is not durable, DROP the reboot. A missed reboot
+    costs one dwell; an unbounded reboot loop costs the link.
+    """
+    saved = _save_policy_state(cfg, policy)
+    if saved or not any(a.kind == "reboot" for a in actions):
+        executor.execute(actions)
+        return
+    # The in-memory policy still holds the consumed attempt and the armed grace,
+    # so this cannot spin: no further reboot is proposed until grace_s elapses.
+    log.error("suppressing hotspot reboot: episode state is not durable (%s)",
+              cfg.state_path)
+    kept = [a for a in actions if a.kind != "reboot"]
+    kept.append(Action("notify", "hotspot reboot suppressed", "urgent",
+                       f"cannot persist watchdog state to {cfg.state_path} — "
+                       f"refusing to reboot with an untracked budget"))
+    executor.execute(kept)
 
 
 def take_sample(cfg, now) -> Sample:
@@ -615,11 +725,13 @@ def main():
         t0 = time.time()
         try:
             actions = policy.step(take_sample(cfg, t0), t0)
-            if actions:
-                executor.execute(actions)
-            # persist every poll (not just on actions) so a daemon restart
-            # mid-dwell doesn't reset the dwell timer; /run is RAM-backed
-            _save_policy_state(cfg, policy)
+            # Persist every poll (not just when actions fire) so a daemon
+            # restart mid-dwell doesn't reset the dwell timer; /run is
+            # RAM-backed. This happens BEFORE the actions run because a reboot
+            # action has already consumed budget that must not be lost — see
+            # _persist_then_execute. Nothing in execute() mutates the policy, so
+            # writing first records exactly the same state it used to.
+            _persist_then_execute(cfg, policy, executor, actions)
         except Exception as e:  # noqa: BLE001 - keep the daemon alive
             log.error("poll error: %s", e)
         deadline = t0 + cfg.poll_interval_s

@@ -29,13 +29,24 @@ fi
 
 echo "== grpcurl (wan2 terminal gRPC) =="
 GRPCURL_VERSION="${GRPCURL_VERSION:-1.9.1}"
-GRPCURL_SHA256="${GRPCURL_SHA256:-fc0d0453dd9f276fa2158f34ba1666f7fd4d6e4053f781d0945226ebe8914cb1}"
+# Per-arch digests from the upstream v1.9.1 release checksums. Every arch we are
+# willing to install MUST have one: an unverified download of a binary we then
+# `install -m0755` into /usr/local/bin is a supply-chain hole, not a convenience.
+# An arch with no pinned digest is treated as unsupported and installed by hand.
+# Override GRPCURL_SHA256_<ARCH> only if you also override GRPCURL_VERSION.
+GRPCURL_SHA256_arm64="${GRPCURL_SHA256_arm64:-fc0d0453dd9f276fa2158f34ba1666f7fd4d6e4053f781d0945226ebe8914cb1}"
+GRPCURL_SHA256_x86_64="${GRPCURL_SHA256_x86_64:-588c9c429476d9ed66cd3b2ae32283a6da36e0cfbb7e446f5d6a1b68dc770214}"
 if ! command -v grpcurl >/dev/null && [ ! -x /usr/local/bin/grpcurl ]; then
   case "$(uname -m)" in
-    aarch64|arm64) GRPCURL_ARCH=arm64 ;;
-    x86_64|amd64)  GRPCURL_ARCH=x86_64 ;;
-    *) echo "unsupported arch $(uname -m) for grpcurl — install it manually"; GRPCURL_ARCH="" ;;
+    aarch64|arm64) GRPCURL_ARCH=arm64;  GRPCURL_SHA256="$GRPCURL_SHA256_arm64" ;;
+    x86_64|amd64)  GRPCURL_ARCH=x86_64; GRPCURL_SHA256="$GRPCURL_SHA256_x86_64" ;;
+    *) echo "unsupported arch $(uname -m) for grpcurl — install it manually"
+       GRPCURL_ARCH=""; GRPCURL_SHA256="" ;;
   esac
+  if [ -n "$GRPCURL_ARCH" ] && [ -z "$GRPCURL_SHA256" ]; then
+    echo "no pinned sha256 for grpcurl $GRPCURL_VERSION/$GRPCURL_ARCH — refusing to install unverified; install it manually"
+    GRPCURL_ARCH=""
+  fi
   if [ -n "$GRPCURL_ARCH" ]; then
     TARBALL="grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz"
     URL="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/${TARBALL}"
@@ -52,11 +63,10 @@ if ! command -v grpcurl >/dev/null && [ ! -x /usr/local/bin/grpcurl ]; then
       trap 'rm -rf "$TMP"' EXIT
     fi
     run "curl -fsSL -o '$TMP/$TARBALL' '$URL'"
-    # Checksum is pinned for the arm64 tarball; skip the gate on other arches
-    # rather than assert a hash we have not verified.
-    if [ "$GRPCURL_ARCH" = arm64 ]; then
-      run "echo '$GRPCURL_SHA256  $TMP/$TARBALL' | sha256sum -c -"
-    fi
+    # Unconditional: we only get here with a pinned digest for this arch (the
+    # case block above drops any arch we have no digest for). Under `set -e` a
+    # mismatch aborts before the install, and the EXIT trap removes the tarball.
+    run "echo '$GRPCURL_SHA256  $TMP/$TARBALL' | sha256sum -c -"
     run "tar -xzf '$TMP/$TARBALL' -C '$TMP' grpcurl"
     run "sudo install -m0755 '$TMP/grpcurl' /usr/local/bin/grpcurl"
     if [ "$DRY" = 1 ]; then

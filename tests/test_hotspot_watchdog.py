@@ -199,13 +199,15 @@ FIXTURE = (Path(__file__).parent / "fixtures" / "m6_model.json").read_text()
 
 
 class FakeRunner:
-    """Records curl argv; returns canned stdout per call."""
+    """Records curl argv (and kwargs); returns canned stdout per call."""
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.calls = []
+        self.kwargs = []
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
+        self.kwargs.append(kw)
         out = self.outputs.pop(0)
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
@@ -229,7 +231,41 @@ def test_login_success_requires_admin_role():
     assert c.login("hunter2") is True
     joined = " ".join(r.calls[1])
     assert "token=FIXTURETOKEN123" in joined
-    assert "session.password=hunter2" in joined
+    # the password field is still POSTed, in its original argv position...
+    assert "--data-urlencode session.password@-" in joined
+
+
+def test_login_password_never_appears_in_curl_argv():
+    # argv is world-readable in /proc: an inline --data-urlencode name=value
+    # leaks the hotspot admin password to every process table on the box. It
+    # must reach curl on stdin instead (curl URL-encodes it identically).
+    admin = FIXTURE.replace('"Guest"', '"Admin"')
+    c, r = make_client([FIXTURE, "", admin])
+    assert c.login("hunter2") is True
+    for argv in r.calls:
+        assert not any("hunter2" in a for a in argv), argv
+    # ...and it is fed on stdin, verbatim (a trailing newline would be encoded
+    # into the value and change the password on the wire).
+    assert r.kwargs[1]["input"] == "hunter2"
+
+
+def test_login_starts_from_a_fresh_cookie_jar(tmp_path):
+    # A STALE Admin cookie left in the jar would make the post-login model.json
+    # read back userRole=Admin even when the password we just posted was
+    # rejected — a failed login reported as a success.
+    jar = tmp_path / "jar.txt"
+    jar.write_text("# stale Admin session cookie\n")
+    r = FakeRunner([FIXTURE, "", FIXTURE])          # role stays Guest = rejected
+    c = W.NetgearClient("http://192.0.2.1", "wan1", str(jar), runner=r)
+    assert c.login("wrong") is False
+    assert not jar.exists()                          # dropped before the attempt
+
+
+def test_login_rejected_when_hotspot_redirects_to_error():
+    # login posts err_redirect=/error.json, so an error Location is conclusive.
+    admin = FIXTURE.replace('"Guest"', '"Admin"')
+    c, _ = make_client([FIXTURE, "http://192.0.2.1/error.json", admin])
+    assert c.login("wrong") is False
 
 
 def test_login_failure_when_still_guest():
@@ -241,6 +277,27 @@ def test_reboot_posts_shutdown_restart():
     c, r = make_client([FIXTURE, ""])
     assert c.reboot() is True
     assert "general.shutdown=restart" in " ".join(r.calls[1])
+
+
+def test_reboot_asks_curl_for_the_redirect_target():
+    # /Forms/config answers 302 for BOTH outcomes, so the exit code alone cannot
+    # tell an accepted form from a rejected one — we must read the Location.
+    c, r = make_client([FIXTURE, ""])
+    c.reboot()
+    assert "%{redirect_url}" in r.calls[1]
+
+
+def test_reboot_error_redirect_is_not_success():
+    # The hotspot took the POST and bounced it at its error page: a 302, exit 0,
+    # and NO reboot. Reporting that as issued lies in the alert and (since the
+    # episode budget is consumed up front) burns a real attempt.
+    c, _ = make_client([FIXTURE, "http://192.0.2.1/error.json"])
+    assert c.reboot() is False
+
+
+def test_reboot_ok_redirect_is_success():
+    c, _ = make_client([FIXTURE, "http://192.0.2.1/success.json"])
+    assert c.reboot() is True
 
 
 def test_fetch_model_none_on_bad_json():
@@ -280,6 +337,25 @@ def test_load_config_rejects_bad_values(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         W.load_config(write_cfg(tmp_path, dwell_s=0))
+
+
+def test_load_config_rejects_non_finite_durations(tmp_path):
+    # json.loads accepts the barewords NaN / Infinity, and EVERY comparison
+    # against NaN is False — so NaN slides straight through a `<= 0` check and
+    # then makes the dwell test false forever (watchdog never fires) or the
+    # holdoff tests false (it fires every poll). Both are silent.
+    import pytest
+    for key in ("state_max_age_s", "poll_interval_s", "dwell_s", "grace_s",
+                "holdoff_s", "healthy_reset_s", "startup_grace_s"):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="finite"):
+                W.load_config(write_cfg(tmp_path, **{key: bad}))
+
+
+def test_load_config_allows_zero_where_zero_is_meaningful(tmp_path):
+    # 0 startup grace / 0 max state age are legitimate ("no grace", "any age").
+    cfg = W.load_config(write_cfg(tmp_path, startup_grace_s=0, state_max_age_s=0))
+    assert cfg.startup_grace_s == 0.0 and cfg.state_max_age_s == 0.0
 
 
 def test_load_config_requires_admin_url(tmp_path):
@@ -617,3 +693,95 @@ def test_scheduled_reboot_issues_when_carrier_unknown(tmp_path, monkeypatch):
     issued, reason = W.scheduled_reboot(cfg, c, now=1000.0)
     assert issued is True
     assert c.rebooted is True
+
+
+# -- the reboot budget must be durable BEFORE the reboot leaves the box --------
+
+class _RecordingExecutor:
+    """Stands in for Executor: records what it was asked to do, and when."""
+
+    def __init__(self, journal, cfg):
+        self.journal = journal
+        self.cfg = cfg
+
+    def execute(self, actions):
+        for a in actions:
+            self.journal.append(("execute", a.kind))
+
+
+def _reboot_policy(tmp_path, **over):
+    cfg = W.load_config(write_cfg(tmp_path, **over))
+    p = W.WatchdogPolicy(dwell_s=1, grace_s=600, max_reboots_per_episode=1,
+                         holdoff_s=7200, healthy_reset_s=1800,
+                         startup_grace_s=0, start_time=0.0)
+    return cfg, p
+
+
+def test_reboot_budget_is_persisted_before_the_reboot_is_issued(tmp_path):
+    # The crash window: policy.step() consumes the attempt in memory, the reboot
+    # goes out, THEN state is saved. A crash in that gap loses the increment, so
+    # the reloaded daemon can exceed max_reboots_per_episode. The write must
+    # therefore land first.
+    cfg, policy = _reboot_policy(tmp_path)
+    journal = []
+    real_save = W._save_policy_state
+
+    def spy_save(c, p):
+        journal.append(("save", p.reboots_issued))
+        return real_save(c, p)
+
+    W_save, W._save_policy_state = W._save_policy_state, spy_save
+    try:
+        policy.step(BAD_PRIV, 1000.0)                       # start the dwell
+        actions = policy.step(BAD_PRIV, 2000.0)             # dwell elapsed -> reboot
+        assert [a.kind for a in actions] == ["notify", "reboot"]
+        W._persist_then_execute(cfg, policy, _RecordingExecutor(journal, cfg),
+                                actions)
+    finally:
+        W._save_policy_state = W_save
+
+    assert journal[0] == ("save", 1)                        # durable, attempt counted
+    assert ("execute", "reboot") in journal
+    assert journal.index(("save", 1)) < journal.index(("execute", "reboot"))
+    # and what landed on disk really does carry the consumed attempt
+    assert _json.loads(Path(cfg.state_path).read_text())["reboots_issued"] == 1
+
+
+def test_reboot_is_suppressed_when_state_cannot_be_persisted(tmp_path):
+    # Better a missed reboot than an unbounded one: if the attempt cannot be
+    # recorded durably, do not spend it.
+    cfg, policy = _reboot_policy(tmp_path)
+    journal = []
+    W_save, W._save_policy_state = W._save_policy_state, lambda c, p: False
+    try:
+        policy.step(BAD_PRIV, 1000.0)
+        actions = policy.step(BAD_PRIV, 2000.0)
+        assert any(a.kind == "reboot" for a in actions)
+        W._persist_then_execute(cfg, policy, _RecordingExecutor(journal, cfg),
+                                actions)
+    finally:
+        W._save_policy_state = W_save
+
+    kinds = [k for what, k in journal if what == "execute"]
+    assert "reboot" not in kinds          # the reboot did NOT go out
+    assert "notify" in kinds              # and the operator was told why
+
+
+def test_suppressed_reboot_does_not_spin(tmp_path):
+    # The in-memory policy still holds the consumed attempt + armed grace, so a
+    # failed persist must not turn into a reboot proposed on every single poll.
+    cfg, policy = _reboot_policy(tmp_path)
+    policy.step(BAD_PRIV, 1000.0)
+    policy.step(BAD_PRIV, 2000.0)                     # reboot proposed (suppressed)
+    assert policy.reboots_issued == 1
+    assert policy.step(BAD_PRIV, 2030.0) == []        # still inside grace: nothing
+
+
+def test_save_policy_state_reports_failure(tmp_path):
+    cfg = W.load_config(write_cfg(tmp_path))
+    p = make_policy()
+    assert W._save_policy_state(cfg, p) is True
+    # parent is a regular file, so the mkdir/write cannot succeed (OSError)
+    (tmp_path / "blocked").write_text("not a directory")
+    cfg.state_path = str(tmp_path / "blocked" / "state.json")
+    assert W._save_policy_state(cfg, p) is False

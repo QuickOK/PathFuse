@@ -95,6 +95,46 @@ sudo systemctl enable --now hotspot-watchdog
 # hotspot-watchdog above for its wan1 leg)
 sudo systemctl enable --now maintenance-reboot.timer
 ```
+
+### Daily maintenance reboot — turning it on
+Enabling the timer is only half of it. The timer ticks **hourly** on purpose and the run
+self-gates: it exits immediately unless the feature is enabled *and* the current local hour is
+the configured one. Two separate switches, both shipped **off/safe** by default:
+
+| switch | where | default | meaning |
+|---|---|---|---|
+| `maintenance.enabled` | `values.json` → `/etc/sbfd-ctl/config.json` | `false` | boot default for the feature. Turn it on here, or from the UI toggle (which overrides it at runtime). |
+| `maintenance.hour` | `values.json` → `/etc/sbfd-ctl/config.json` | `3` | local hour (0–23) the reboot runs. Also settable from the UI. |
+| `maintenance.dry_run` | `values.json` → `/etc/sbfd-ctl/maintenance.json` | `true` | **`true` = no WAN is actually rebooted** — it only logs/notifies what it *would* do. |
+
+Leave `dry_run: true` for at least one cycle and read the notifications to confirm the sequence
+looks right. Only then set `"dry_run": false` in `values.json`'s `maintenance` block, re-run
+`install.sh`, and `systemctl restart maintenance-reboot.timer`. Until you do, **no real reboot
+ever happens** — a `dry_run` node with the timer enabled is a no-op by design.
+
+The run also takes an exclusive `flock` on `lock_path` (`/run/sbfd-ctl/maintenance.lock`, already
+covered by the unit's `ReadWritePaths=/run/sbfd-ctl`) so an hourly tick can never overlap a run
+still in progress.
+
+### If your host uses a different notifier spool
+These units notify by invoking `spool-notify`, which writes into `/var/spool/spool-notify`. If
+your host already runs a *different* notifier (its own auth file and spool directory under
+another name), do **not** edit the tracked unit files — `install.sh` overwrites them. Instead add
+a host-local drop-in per unit, which both points the helper at your paths and re-grants write
+access (`ProtectSystem=strict` makes everything outside `ReadWritePaths=` read-only, so a spool
+directory the unit is not granted becomes silently unwritable and alerts stop):
+
+```ini
+# /etc/systemd/system/<unit>.service.d/notifications.conf
+[Service]
+Environment=NOTIFY_AUTH=/etc/<your-notifier>.auth
+Environment=NOTIFY_SPOOL=/var/spool/<your-notifier>
+ReadWritePaths=/var/spool/<your-notifier>
+```
+Apply it to **`maintenance-reboot.service`** and **`hotspot-watchdog.service`** (and, for the
+unprivileged `sbfd-ctl.service`, add `SupplementaryGroups=<your-notifier-group>` too — it needs
+group write access, the root units do not). Then `systemctl daemon-reload`. Drop-ins survive
+`install.sh`, which only rewrites the main unit file.
 > wg0's Endpoint is the local udpspeeder-client (`127.0.0.1:59411`) from the start in this kit.
 > Start `udpspeeder-client` only **after** engarde-client is up: engarde-client latches its
 > single return path to whatever last sent to its input port, so `udpspeeder-client` must

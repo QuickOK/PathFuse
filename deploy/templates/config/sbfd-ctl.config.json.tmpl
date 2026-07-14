@@ -56,5 +56,10 @@
   "environmental": {
     "enabled": true,
     "auto_override": { "path": "/run/sbfd-ctl/auto_override.json", "ttl_s": 180 }
+  },
+  "maintenance_reboot": {
+    "enabled": $maintenance_enabled,
+    "hour": $maintenance_hour,
+    "window": { "path": "/run/sbfd-ctl/maintenance_window.json" }
   }
 }

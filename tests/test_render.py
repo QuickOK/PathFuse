@@ -20,6 +20,45 @@ def test_template_vars_flattens_scalars_and_nested():
     assert tv["wg_mtu"] == "1280"
     assert json.loads(tv["wans_json"]) == {"wan1": {"iface": "eth0", "session_id": 1}}
 
+def test_template_vars_renders_booleans_as_json_not_python():
+    # str(True) is "True", which is neither JSON nor systemd — a `"dry_run": $x`
+    # field in a .json template would render an unparseable config. Booleans must
+    # come out as true/false. (bool is a subclass of int, so order matters.)
+    r = _render()
+    tv = r.template_vars({"maintenance": {"enabled": False, "dry_run": True,
+                                          "hour": 3}})
+    assert tv["maintenance_enabled"] == "false"
+    assert tv["maintenance_dry_run"] == "true"
+    assert tv["maintenance_hour"] == "3"          # ints stay bare numbers
+
+
+def test_rendered_client_configs_are_valid_json_with_right_types():
+    # The whole maintenance-reboot feature is dead on a fresh node if sbfd-ctl's
+    # config has no maintenance_reboot section (cfg.maintenance is None ->
+    # published {"configured": false} -> the timer fires hourly and does
+    # nothing, forever, with the UI toggle greyed out).
+    import tempfile
+    r = _render()
+    values = json.loads((ROOT / "deploy" / "values.example.json").read_text())
+    values["role"] = "client"
+    with tempfile.TemporaryDirectory() as td:
+        r.render_all(values, td)
+        ctl = json.loads((Path(td) / "etc/sbfd-ctl/config.json").read_text())
+        maint = json.loads((Path(td) / "etc/sbfd-ctl/maintenance.json").read_text())
+
+    m = ctl["maintenance_reboot"]
+    assert isinstance(m["enabled"], bool)
+    assert isinstance(m["hour"], int) and not isinstance(m["hour"], bool)
+    assert 0 <= m["hour"] <= 23
+    assert m["window"]["path"] == "/run/sbfd-ctl/maintenance_window.json"
+    # dry_run must default to TRUE: a deployed node must not reboot real WANs
+    # until the operator deliberately says so.
+    assert maint["dry_run"] is True
+    assert maint["lock_path"] == "/run/sbfd-ctl/maintenance.lock"
+    assert isinstance(maint["recovery_deadline_s"], int)
+    assert isinstance(maint["wan2"]["min_uptime_s"], int)
+
+
 def test_render_text_strict_missing_placeholder_raises():
     r = _render()
     with pytest.raises(KeyError):

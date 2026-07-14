@@ -12,6 +12,17 @@ SupplementaryGroups=sbfd systemd-journal
 ExecStart=$paths_sbfdctl_opt/sbfd_ctl.py -c $paths_sbfdctl_etc/config.json
 ExecStopPost=-/usr/sbin/nft delete table inet sbfd_ctl
 RuntimeDirectory=sbfd-ctl
+# systemd DELETES a RuntimeDirectory when the unit stops, so without this every
+# `systemctl restart sbfd-ctl` wipes /run/sbfd-ctl — taking runtime.json (the
+# operator's WAN-mode overlay), auto_override.json and maintenance_window.json
+# with it, and silently reverting the mode to policy.default_mode.
+# "yes", not "restart": "restart" only survives a restart job and still clears
+# on a full stop, and a stop/start pair (an upgrade, a manual stop, a failed
+# start that gives up) is exactly when an operator override most needs to
+# outlive the daemon. The overlay's entire purpose is to survive the daemon;
+# `persist_state` (/var/lib/sbfd-ctl, StateDirectory=) is the separate mechanism
+# that carries it across a *reboot*, since /run is a tmpfs either way.
+RuntimeDirectoryPreserve=yes
 StateDirectory=sbfd-ctl
 Restart=always
 RestartSec=2

@@ -30,6 +30,9 @@
     "grpcurl_bin": "/usr/local/bin/grpcurl"
   },
   "maintenance": {
+    "enabled": false,
+    "hour": 3,
+    "dry_run": true,
     "dish_addr": "192.0.2.1:9200",
     "min_uptime_s": 43200,
     "recovery_deadline_s": 600

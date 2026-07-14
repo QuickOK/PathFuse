@@ -17,7 +17,14 @@ def load_values(path):
 
 def template_vars(values):
     """Flatten values for templates: scalars as-is; nested dict scalars as
-    `<key>_<subkey>`; any dict/list also exposed as `<key>_json` (compact JSON)."""
+    `<key>_<subkey>`; any dict/list also exposed as `<key>_json` (compact JSON).
+
+    Every value is stringified, because a template is text. Booleans are the one
+    scalar that cannot be stringified with str(): that yields Python's `True` /
+    `False`, which are not JSON (nor systemd) tokens, so a `"dry_run": $x` field
+    in a .json template would render an unparseable config. json.dumps() gives
+    the `true` / `false` the templates actually want. bool is checked before the
+    generic branch on purpose — bool is a subclass of int."""
     out = {}
     for k, v in values.items():
         if isinstance(v, dict):
@@ -29,7 +36,8 @@ def template_vars(values):
             out[f"{k}_json"] = json.dumps(v)
         else:
             out[k] = v
-    return {k: str(v) for k, v in out.items()}
+    return {k: (json.dumps(v) if isinstance(v, bool) else str(v))
+            for k, v in out.items()}
 
 def render_text(text, tvars):
     """Strict render of one template string. Raises KeyError on a missing placeholder."""

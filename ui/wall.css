@@ -920,6 +920,12 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 #fec-block input:disabled + span { opacity: 0.4; }
 #maintenance-block input:disabled + span { opacity: 0.4; }
 #maintenance-hour:disabled { opacity: 0.4; }
+/* The hour <select> is nested INSIDE the "On at hour" label's span, and opacity
+   multiplies down the tree: when the whole row is dimmed by the rule above, a
+   disabled select would compound to 0.4 x 0.4 = 0.16 and read as invisible.
+   Reset it there so the intended 0.4 is applied exactly once. (Two ids out-rank
+   the single-id rule above, so this wins regardless of order.) */
+#maintenance-block input:disabled + span #maintenance-hour:disabled { opacity: 1; }
 
 @media (max-width: 720px) {
   .fec-dirs { grid-template-columns: 1fr; }
