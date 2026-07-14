@@ -14,5 +14,9 @@
   {"template":"wireguard/wg0.client.conf.tmpl","roles":["client"],"dest":"/etc/wireguard/wg0.conf","mode":"0600"},
   {"template":"wireguard/wg0.relay.conf.tmpl","roles":["relay"],"dest":"/etc/wireguard/wg0.conf","mode":"0600"},
   {"template":"nftables/pathfuse-relay.nft.tmpl","roles":["relay"],"dest":"/etc/nftables.d/pathfuse.nft","mode":"0644"},
-  {"template":"journald/pathfuse-persistent.conf.tmpl","roles":["client"],"dest":"/etc/systemd/journald.conf.d/pathfuse-persistent.conf","mode":"0644"}
+  {"template":"journald/pathfuse-persistent.conf.tmpl","roles":["client"],"dest":"/etc/systemd/journald.conf.d/pathfuse-persistent.conf","mode":"0644"},
+  {"template":"systemd/hotspot-watchdog.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/hotspot-watchdog.service","mode":"0644"},
+  {"template":"systemd/maintenance-reboot.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/maintenance-reboot.service","mode":"0644"},
+  {"template":"systemd/maintenance-reboot.timer.tmpl","roles":["client"],"dest":"/etc/systemd/system/maintenance-reboot.timer","mode":"0644"},
+  {"template":"config/maintenance.config.json.tmpl","roles":["client"],"dest":"/etc/sbfd-ctl/maintenance.json","mode":"0644"}
 ]

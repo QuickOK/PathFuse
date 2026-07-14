@@ -1,0 +1,15 @@
+[Unit]
+Description=Hourly tick for the PathFuse daily maintenance reboot
+
+[Timer]
+# Hourly on purpose: the unit exits immediately unless the current local hour
+# is the operator's configured hour, so the schedule can be changed from the UI
+# without rewriting this file. Persistent so a tick missed while powered off
+# still runs at boot.
+OnCalendar=*-*-* *:00:00
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=90
+
+[Install]
+WantedBy=timers.target

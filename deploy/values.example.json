@@ -26,7 +26,13 @@
     "sbfd_opt": "/opt/sbfd", "sbfd_etc": "/etc/sbfd",
     "sbfdctl_opt": "/opt/sbfd-ctl", "sbfdctl_etc": "/etc/sbfd-ctl",
     "udpspeeder_etc": "/etc/udpspeeder", "udpspeeder_fec_etc": "/etc/udpspeeder-fec",
-    "speederv2_bin": "/usr/local/bin/speederv2"
+    "speederv2_bin": "/usr/local/bin/speederv2",
+    "grpcurl_bin": "/usr/local/bin/grpcurl"
+  },
+  "maintenance": {
+    "dish_addr": "192.0.2.1:9200",
+    "min_uptime_s": 43200,
+    "recovery_deadline_s": 600
   },
   "users": { "sbfd": "sbfd", "sbfdctl": "sbfd-ctl" },
   "egress_default": "relay_vpn",

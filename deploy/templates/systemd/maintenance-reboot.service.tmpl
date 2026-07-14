@@ -1,0 +1,40 @@
+[Unit]
+Description=PathFuse daily maintenance reboot (wan1 + wan2, one at a time)
+After=network-online.target sbfd.service sbfd-ctl.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$paths_sbfdctl_opt/maintenance_reboot.py -c $paths_sbfdctl_etc/maintenance.json
+# Root: it invokes the watchdog, which needs the 0600 admin secret.
+#
+# No RuntimeDirectory=sbfd-ctl here even though sbfd-ctl.service (which owns
+# /run/sbfd-ctl) declares one: verified empirically that a SECOND unit
+# declaring the same RuntimeDirectory (a) deletes the whole directory,
+# including the other unit's live files, the moment ITS OWN instance stops —
+# even while the owning daemon is still running — and (b) chowns the
+# directory (and everything in it) to the STARTING unit's User=/Group=, which
+# for this root oneshot would flip /run/sbfd-ctl from the sbfd-ctl user to
+# root and could lock sbfd-ctl.service out of writing its own state. sbfd-ctl
+# is required (see After=), so the plain ReadWritePaths grant below is enough.
+#
+# RuntimeDirectory=hotspot-watchdog + Preserve=yes is different and safe: that
+# unit also runs as root (no chown mismatch), and Preserve=yes stops THIS
+# unit's own exit from deleting the directory — verified against the live
+# hotspot-watchdog.service on this host: its cookies.txt/state.json survived
+# a oneshot run sharing the same RuntimeDirectory name while the daemon was
+# active. It also guarantees the directory exists on a run where the watchdog
+# daemon itself is stopped (the scenario --scheduled-reboot's own mkdir
+# fallback exists for), which a "-/run/hotspot-watchdog" ReadWritePaths entry
+# alone would not: under ProtectSystem=strict a missing path left out of the
+# mount table stays read-only, so the code's own mkdir would fail.
+RuntimeDirectory=hotspot-watchdog
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ReadWritePaths=/run/sbfd-ctl /var/spool/spool-notify

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # PathFuse — fetch/build the third-party data-plane PathFuse integrates with.
-# Installs: wireguard-tools (distro pkg), UDPspeeder/speederv2 (build), engarde (build).
+# Installs: wireguard-tools (distro pkg), UDPspeeder/speederv2 (build), engarde (build),
+# grpcurl (pinned binary download, checksum-verified).
 # It does NOT configure your management overlay or egress VPN — those are operator choices
 # (see deploy/README.md). Re-runnable. Use --dry-run to preview.
 set -euo pipefail
@@ -24,6 +25,31 @@ echo "== engarde =="
 if ! command -v engarde-client >/dev/null && ! command -v engarde-server >/dev/null; then
   echo "Build engarde from source (Go) at ref $ENGARDE_REF and install engarde-client/engarde-server."
   run "echo 'see README: engarde build steps'"
+fi
+
+echo "== grpcurl (wan2 terminal gRPC) =="
+GRPCURL_VERSION="${GRPCURL_VERSION:-1.9.1}"
+GRPCURL_SHA256="${GRPCURL_SHA256:-fc0d0453dd9f276fa2158f34ba1666f7fd4d6e4053f781d0945226ebe8914cb1}"
+if ! command -v grpcurl >/dev/null && [ ! -x /usr/local/bin/grpcurl ]; then
+  case "$(uname -m)" in
+    aarch64|arm64) GRPCURL_ARCH=arm64 ;;
+    x86_64|amd64)  GRPCURL_ARCH=x86_64 ;;
+    *) echo "unsupported arch $(uname -m) for grpcurl — install it manually"; GRPCURL_ARCH="" ;;
+  esac
+  if [ -n "$GRPCURL_ARCH" ]; then
+    TARBALL="grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz"
+    URL="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/${TARBALL}"
+    TMP=$(mktemp -d)
+    run "curl -fsSL -o '$TMP/$TARBALL' '$URL'"
+    # Checksum is pinned for the arm64 tarball; skip the gate on other arches
+    # rather than assert a hash we have not verified.
+    if [ "$GRPCURL_ARCH" = arm64 ]; then
+      run "echo '$GRPCURL_SHA256  $TMP/$TARBALL' | sha256sum -c -"
+    fi
+    run "tar -xzf '$TMP/$TARBALL' -C '$TMP' grpcurl"
+    run "sudo install -m0755 '$TMP/grpcurl' /usr/local/bin/grpcurl"
+    run "rm -rf '$TMP'"
+  fi
 fi
 
 echo "Management overlay (for the relay's control ports) and the egress VPN (relay_vpn mode)"

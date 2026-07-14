@@ -34,6 +34,9 @@ sudo install -D -m0644 fec_control.py     /opt/sbfd-ctl/fec_control.py
 sudo install -D -m0644 fec_report.py      /opt/sbfd-ctl/fec_report.py
 sudo install -D -m0755 environ_ctl.py     /opt/sbfd-ctl/environ_ctl.py   # optional: environmental redundancy (precip+smoke), needs gpsd reachable
 sudo install -d /opt/sbfd-ctl/ui && sudo install -m0644 ui/* /opt/sbfd-ctl/ui/
+sudo install -D -m0644 notify.py             /opt/sbfd-ctl/notify.py             # required by sbfd-ctl and hotspot_watchdog
+sudo install -D -m0755 hotspot_watchdog.py   /opt/sbfd-ctl/hotspot_watchdog.py   # optional: wan1 auto-reboot watchdog
+sudo install -D -m0755 maintenance_reboot.py /opt/sbfd-ctl/maintenance_reboot.py # optional: daily maintenance reboot
 ```
 
 ## 2. Fill in your values
@@ -73,6 +76,11 @@ sudo systemctl enable --now wg-quick@wg0
 # bring up YOUR engarde-client (operator-managed; see step 0) FIRST, then the FEC client:
 sudo systemctl enable --now udpspeeder-client
 sudo systemctl enable --now sbfd sbfd-ctl
+# optional: wan1 hotspot auto-reboot watchdog
+sudo systemctl enable --now hotspot-watchdog
+# optional: daily maintenance reboot (enable the TIMER, not the service; needs
+# hotspot-watchdog above for its wan1 leg)
+sudo systemctl enable --now maintenance-reboot.timer
 ```
 > wg0's Endpoint is the local udpspeeder-client (`127.0.0.1:59411`) from the start in this kit.
 > Start `udpspeeder-client` only **after** engarde-client is up: engarde-client latches its
