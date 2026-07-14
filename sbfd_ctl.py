@@ -1118,6 +1118,7 @@ def load_config(path: str) -> Config:
                 command=str(raw_notif.get("command",
                                           notify.DEFAULT_COMMAND)),
                 wan_down_hold_s=float(raw_notif.get("wan_down_hold_s", 10.0)),
+                switch_hold_s=float(raw_notif.get("switch_hold_s", 60.0)),
                 fec_alerts=bool(raw_notif.get("fec_alerts", False)),
             )
 
@@ -1177,6 +1178,10 @@ def load_config(path: str) -> Config:
             raise ValueError(
                 f"notifications.wan_down_hold_s must be >= 0, "
                 f"got {cfg.notifications.wan_down_hold_s}")
+        if cfg.notifications.switch_hold_s < 0:
+            raise ValueError(
+                f"notifications.switch_hold_s must be >= 0, "
+                f"got {cfg.notifications.switch_hold_s}")
 
     return cfg
 
@@ -2012,6 +2017,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
         detector = notify.EventDetector(
             relay_fail_threshold=max(1, round(10.0 / remote_interval)),
             wan_down_hold_s=cfg.notifications.wan_down_hold_s,
+            switch_hold_s=cfg.notifications.switch_hold_s,
             fec_alerts=cfg.notifications.fec_alerts)
 
     if stop_event is None:

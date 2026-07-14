@@ -86,11 +86,12 @@
       "ttl_s": 180
     }
   },
-
   "maintenance_reboot": {
     "enabled": false,
     "hour": 0,
-    "window": { "path": "/run/sbfd-ctl/maintenance_window.json" }
+    "window": {
+      "path": "/run/sbfd-ctl/maintenance_window.json"
+    }
   },
   "map": {
     "gpsd": {
@@ -107,6 +108,7 @@
     "topic": "pathfuse",
     "min_interval_s": 30,
     "wan_down_hold_s": 10,
+    "switch_hold_s": 60,
     "fec_alerts": false
   }
 }

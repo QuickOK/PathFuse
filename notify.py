@@ -30,6 +30,13 @@ class NotifyCfg:
     min_interval_s: float = 30.0
     command: str = DEFAULT_COMMAND
     wan_down_hold_s: float = 10.0
+    # A switch must hold for this long before it is announced. The satellite WAN
+    # routinely drops for ~25s and fails back, and each excursion produced TWO
+    # high-priority pages (away, then back) — 10 in six hours on one observed
+    # afternoon. That is the noise that teaches an operator to ignore their
+    # phone. Same "blip vs outage" logic wan_down_hold_s already applies to WAN
+    # down events; switches never got it.
+    switch_hold_s: float = 60.0
     fec_alerts: bool = False
 
 
@@ -231,9 +238,11 @@ class EventDetector:
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
+                 switch_hold_s: float = 60.0,
                  clock=time.monotonic, wall_clock=time.time):
         self.relay_fail_threshold = max(1, int(relay_fail_threshold))
         self.wan_down_hold_s = max(0.0, float(wan_down_hold_s))
+        self.switch_hold_s = max(0.0, float(switch_hold_s))
         self.fec_alerts = bool(fec_alerts)
         # Two clocks on purpose: durations (the hold timers) are measured on a
         # monotonic clock, which cannot jump; the maintenance window's `until`
@@ -248,6 +257,12 @@ class EventDetector:
         self._down_from = {}       # wan -> last UP-or-seeded state before that
         self._down_alerted = set()  # wans whose outage has been announced
         self._maint_suppressed = set()  # wans whose down we withheld (window)
+        # Switch hysteresis. _announced_active is the active set the operator
+        # currently believes in; _pending_switch is a switch waiting out the
+        # hold. A switch that reverts to _announced_active before the hold
+        # expires never happened as far as they are concerned.
+        self._announced_active = None
+        self._pending_switch = None
         self._all_down_since = None
         self._all_down_alerted = False
         self._mode = None
@@ -407,26 +422,61 @@ class EventDetector:
         return [Event("all_wans_down", "🚨 All WANs down", detail, "max")]
 
     def _switch_events(self, obs):
-        if obs.switch is None:
+        """Announce a switch only once the new active set has HELD.
+
+        A satellite WAN that drops for ~25s and fails back produces two switch
+        edges — away, then home — and announcing both means two high-priority
+        pages for an excursion the operator can do nothing about. Holding the
+        announcement means a flap that reverts within switch_hold_s is never
+        mentioned at all, while a switch that sticks still pages. A genuinely
+        dead WAN is not hidden by this: its own `wan_down` fires on its own,
+        much shorter, hold."""
+        now = self._clock()
+
+        if obs.switch is not None:
+            frm, to, reason = obs.switch
+            frm_s, to_s = frozenset(frm), frozenset(to)
+            if self._announced_active is None:
+                # First switch we have ever seen: the operator implicitly
+                # believes in the set we were in before it.
+                self._announced_active = frm_s
+            maint = self._maint_wan(obs)
+            if maint is not None and (frm_s ^ to_s) == {maint}:
+                # The maintained WAN, and ONLY it, entering or leaving the
+                # active set IS the reboot, not news — both halves of it.
+                # Suppressing only its departure still paged on its RETURN (the
+                # fail-back), which a live run confirmed fires on every
+                # maintenance night. Anything else still reports: a switch the
+                # maintained WAN did not cause (the other WAN really failed),
+                # or one that moved it AND another WAN at once — strictly worse
+                # than the event we are excusing.
+                #
+                # Track the new set silently, so we never later announce a
+                # "return" from a departure we never announced.
+                self._announced_active = to_s
+                self._pending_switch = None
+                return []
+            if to_s == self._announced_active:
+                # It flapped straight back to what they already believe. Drop
+                # the pending announcement: as far as they are concerned,
+                # nothing happened.
+                self._pending_switch = None
+            else:
+                # A new target restarts the hold — while the active set is
+                # still churning, there is nothing stable worth announcing.
+                self._pending_switch = (to_s, list(frm), list(to), reason, now)
+
+        p = self._pending_switch
+        if p is None:
             return []
-        frm, to, reason = obs.switch
-        maint = self._maint_wan(obs)
-        changed = set(frm) ^ set(to)
-        if maint is not None and changed == {maint}:
-            # The maintained WAN, and ONLY it, entering or leaving the active
-            # set IS the reboot, not news — both halves of it. Suppressing only
-            # its departure still paged on its RETURN (the fail-back), which a
-            # live run confirmed fires on every maintenance night.
-            #
-            # Anything else still reports: a switch the maintained WAN did not
-            # cause (the other WAN really failed), and — the case a plain
-            # `maint in frm and maint not in to` got wrong — a switch that
-            # moved the maintained WAN AND another WAN at once, which is a
-            # strictly WORSE event than the one we are excusing.
+        to_s, frm_list, to_list, reason, since = p
+        if now - since < self.switch_hold_s:
             return []
+        self._pending_switch = None
+        self._announced_active = to_s
         return [Event("wan_switch",
-                      f"🔀 WAN switch → {','.join(to)}",
-                      f"active {','.join(frm)} → {','.join(to)}\n"
+                      f"🔀 WAN switch → {','.join(to_list)}",
+                      f"active {','.join(frm_list)} → {','.join(to_list)}\n"
                       f"reason: {reason}", "high")]
 
     def _mode_events(self, obs):

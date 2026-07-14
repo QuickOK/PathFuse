@@ -356,7 +356,7 @@ def test_all_wans_down_blip_is_silent():
 
 
 def test_wan_switch_passthrough():
-    d = seeded()
+    d = seeded(switch_hold_s=0.0)   # the hold has its own tests; isolate the rule
     evs = d.observe(obs(switch=(["wan1", "wan2"], ["wan2"], "master down")))
     assert kinds(evs) == ["wan_switch"]
     assert "wan2" in evs[0].title
@@ -631,7 +631,7 @@ def test_maintenance_window_suppresses_the_maintained_wans_FAIL_BACK():
 def test_maintenance_window_still_reports_a_switch_the_other_wan_caused():
     # wan2 is under maintenance, but wan1 REALLY failed. That must still report.
     clk, wclk = FakeClock(), FakeClock()
-    d = seeded(clk, wclk)
+    d = seeded(clk, wclk, switch_hold_s=0.0)
     win = {"wan": "wan2", "until": wclk.t + 600}
     evs = d.observe(obs(maintenance=win,
                         switch=(["wan1", "wan2"], ["wan2"], "wan1 down")))
@@ -642,7 +642,7 @@ def test_switch_caused_by_the_other_wan_still_reports_during_a_window():
     # Only the maintained WAN *leaving* the active set is the reboot; a switch
     # it did not cause is real context and must still report.
     clk, wclk = FakeClock(), FakeClock()
-    d = seeded(clk, wclk)
+    d = seeded(clk, wclk, switch_hold_s=0.0)
     win = {"wan": "wan2", "until": wclk.t + 600}
     evs = d.observe(obs(maintenance=win,
                         switch=(["wan1", "wan2"], ["wan2"], "wan1 down")))
@@ -671,7 +671,7 @@ def test_switch_that_removed_the_other_wan_too_still_reports():
     clk, wclk = FakeClock(), FakeClock()
     win = {"wan": "wan2", "until": wclk.t + 600}
     for to in ([], ["wan3"]):
-        d = seeded(FakeClock(), FakeClock())
+        d = seeded(FakeClock(), FakeClock(), switch_hold_s=0.0)
         evs = d.observe(obs(maintenance=win,
                             switch=(["wan1", "wan2"], to, "wan1 died too")))
         assert kinds(evs) == ["wan_switch"]
@@ -761,3 +761,86 @@ def test_seed_still_announces_nothing_for_a_wan_down_outside_any_window():
     clk.advance(600)
     wclk.advance(600)
     assert d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"})) == []
+
+
+# -- switch hysteresis --------------------------------------------------------
+
+def test_a_switch_that_flaps_straight_back_is_never_announced():
+    # THE BUG THIS FIXES, replayed from a real afternoon: the satellite WAN
+    # dropped and failed back ~25s later, five times in six hours. Each
+    # excursion produced TWO high-priority pages (away, then home) — 10 pages
+    # for an outage the operator can do nothing about. A switch that reverts
+    # within the hold never happened, as far as they are concerned.
+    clk = FakeClock()
+    d = seeded(clk, switch_hold_s=60.0)
+    assert d.observe(obs(switch=(["wan2"], ["wan1"], "master (wan2) DOWN"))) == []
+    clk.advance(25)                       # the observed flap interval
+    assert d.observe(obs(switch=(["wan1"], ["wan2"], "master (wan2) UP, fail-back"))) == []
+    clk.advance(300)                      # ...and it stays quiet forever after
+    assert d.observe(obs()) == []
+
+
+def test_a_switch_that_sticks_still_pages():
+    # Hysteresis must not swallow a real failover — only a flap.
+    clk = FakeClock()
+    d = seeded(clk, switch_hold_s=60.0)
+    assert d.observe(obs(switch=(["wan2"], ["wan1"], "master (wan2) DOWN"))) == []
+    clk.advance(59)
+    assert d.observe(obs()) == []         # still inside the hold
+    clk.advance(1)
+    evs = d.observe(obs())                # t = 60s: it held
+    assert kinds(evs) == ["wan_switch"]
+    assert evs[0].priority == "high"
+    assert "wan1" in evs[0].title
+
+
+def test_a_switch_is_announced_once_not_repeatedly():
+    clk = FakeClock()
+    d = seeded(clk, switch_hold_s=60.0)
+    d.observe(obs(switch=(["wan2"], ["wan1"], "master (wan2) DOWN")))
+    clk.advance(60)
+    assert kinds(d.observe(obs())) == ["wan_switch"]
+    clk.advance(600)
+    assert d.observe(obs()) == []         # no repeat
+
+
+def test_continuous_churn_stays_silent_until_it_settles():
+    # While the active set is still churning there is nothing stable worth
+    # announcing; each new target restarts the hold. When it finally settles,
+    # the operator hears the outcome once.
+    clk = FakeClock()
+    d = seeded(clk, switch_hold_s=60.0)
+    for _ in range(4):
+        assert d.observe(obs(switch=(["wan2"], ["wan1"], "flap"))) == []
+        clk.advance(20)
+        assert d.observe(obs(switch=(["wan1"], ["wan2"], "flap back"))) == []
+        clk.advance(20)
+    assert d.observe(obs(switch=(["wan2"], ["wan1"], "master (wan2) DOWN"))) == []
+    clk.advance(60)
+    assert kinds(d.observe(obs())) == ["wan_switch"]
+
+
+def test_a_flapping_wan_still_reports_its_own_outage():
+    # The switch hold must never hide a WAN that is actually down: wan_down has
+    # its own, much shorter hold and is untouched by this.
+    clk = FakeClock()
+    d = seeded(clk, switch_hold_s=60.0)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
+               switch=(["wan2"], ["wan1"], "master (wan2) DOWN"))
+    assert d.observe(down) == []
+    clk.advance(15)                       # past wan_down_hold_s, inside switch hold
+    evs = d.observe(obs(wan_states={"wan1": "UP", "wan2": "DOWN"}))
+    assert kinds(evs) == ["wan_down"]     # the outage still pages...
+    assert evs[0].priority == "high"
+
+
+def test_maintenance_still_wins_over_the_switch_hold():
+    # A maintained WAN's departure/return is excused outright — it must not sit
+    # pending and then fire once the hold expires.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk, switch_hold_s=60.0)
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    assert d.observe(obs(maintenance=win,
+                         switch=(["wan1", "wan2"], ["wan1"], "wan2 down"))) == []
+    clk.advance(300)
+    assert d.observe(obs(maintenance=win)) == []
