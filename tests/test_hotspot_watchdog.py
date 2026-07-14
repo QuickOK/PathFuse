@@ -695,6 +695,137 @@ def test_scheduled_reboot_issues_when_carrier_unknown(tmp_path, monkeypatch):
     assert c.rebooted is True
 
 
+# -- --scheduled-reboot's exit-code contract ----------------------------------
+#
+# The maintenance sequencer runs this mode as a SUBPROCESS and decides, from
+# the exit code alone, whether it is safe to go on and reboot the OTHER WAN.
+# So the code is a safety interface, not a diagnostic, and its one load-bearing
+# distinction is:
+#
+#   1  we PROVABLY never POSTed a restart      -> wan1 is where it was
+#   3  we POSTed one and cannot confirm it     -> wan1 may be going down NOW
+#
+# Collapsing 3 into 1 is what stranded the vehicle. A hotspot that ACCEPTS the
+# restart tears the connection down as it goes, so the missing response is the
+# SIGNATURE OF SUCCESS, not of failure — and its carrier then takes the better
+# part of a minute to drop. A caller told "never touched" reads wan1's stale
+# pre-reboot UP, believes it, and reboots the terminal into a wan1 that is
+# seconds from going dark.
+
+
+def _sched_code(cfg, client, now=1000.0):
+    """The exit code --scheduled-reboot would return (main() returns it
+    verbatim; it is not exercised directly here because its /run mkdir has no
+    business running in a test)."""
+    _issued, _reason, code = W._scheduled_reboot_verbose(cfg, client, now)
+    return code
+
+
+def test_scheduled_reboot_exit_0_when_the_reboot_is_confirmed(tmp_path,
+                                                              monkeypatch):
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    assert _sched_code(cfg, _StubClient()) == W.EXIT_ISSUED == 0
+
+
+def test_scheduled_reboot_exit_3_when_the_post_outcome_is_unknown(tmp_path,
+                                                                  monkeypatch):
+    # THE FIX. reboot() returning False means the restart WAS posted and the
+    # answer was lost — which is what a reboot that WORKED looks like from
+    # here. It must NOT share exit 1 with the never-touched cases.
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient(reboot_ok=False)
+    code = _sched_code(cfg, c)
+    assert code == W.EXIT_ATTEMPTED_UNKNOWN == 3
+    assert code != W.EXIT_UNTOUCHED
+    _issued, reason, _ = W._scheduled_reboot_verbose(cfg, c, 1000.0)
+    assert _issued is False               # still not a CONFIRMED reboot...
+    assert "UNKNOWN" in reason            # ...but it does not claim innocence
+
+
+def test_scheduled_reboot_exit_3_when_the_redirect_heuristic_misjudges(
+        tmp_path, monkeypatch):
+    # reboot()'s "is this Location an error target?" test is a REGEX against an
+    # uncaptured device response: an unfamiliar redirect containing "err" can
+    # be judged a failure although the hotspot took the restart and is going
+    # down. That misjudgement must land in 3, not 1 — then the sequencer
+    # watches the link and gets the right answer anyway.
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    admin = FIXTURE.replace('"Guest"', '"Admin"')
+    r = FakeRunner([FIXTURE,                          # the reachability check
+                    FIXTURE, "", admin,               # login: token, POST, role
+                    FIXTURE,                          # reboot: token
+                    "http://192.0.2.1/error.json"])   # ...judged an error
+    c = W.NetgearClient("http://192.0.2.1", "wan1", str(tmp_path / "jar.txt"),
+                        runner=r)                    # the real client, no stub
+    assert _sched_code(cfg, c) == W.EXIT_ATTEMPTED_UNKNOWN
+    # and the restart really was posted before the heuristic judged the answer
+    assert "general.shutdown=restart" in " ".join(r.calls[-1])
+
+
+class _UnreachableClient(_StubClient):
+    """The admin UI answers nothing at all — no token, so nothing was POSTed."""
+
+    def fetch_model(self):
+        return None
+
+
+def test_scheduled_reboot_exit_1_when_the_admin_ui_is_unreachable(tmp_path,
+                                                                  monkeypatch):
+    # Never touched: we never got a token, so no restart was ever POSTed.
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _UnreachableClient()
+    assert _sched_code(cfg, c) == W.EXIT_UNTOUCHED == 1
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_exit_1_when_the_secret_is_unreadable(tmp_path,
+                                                               monkeypatch):
+    cfg = sched_cfg(tmp_path)
+    Path(cfg.secret_path).unlink()
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient()
+    assert _sched_code(cfg, c) == W.EXIT_UNTOUCHED
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_exit_1_when_the_login_is_rejected(tmp_path,
+                                                            monkeypatch):
+    # The rotated-password case, and the reason leg-1 NOT_ISSUED may continue
+    # to leg 2 at all: the hotspot really was never disturbed.
+    cfg = sched_cfg(tmp_path)
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    c = _StubClient(login_ok=False)
+    assert _sched_code(cfg, c) == W.EXIT_UNTOUCHED
+    assert c.rebooted is False
+
+
+def test_scheduled_reboot_exit_2_for_every_guard(tmp_path, monkeypatch):
+    # A guard declining is not a failure, and it is not an unknown either: it
+    # is the one case where we chose not to POST. All three still exit 2.
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: False)
+    assert _sched_code(sched_cfg(tmp_path), _StubClient()) == W.EXIT_SKIPPED == 2
+
+    monkeypatch.setattr(W, "read_carrier", lambda *a, **k: True)
+    cfg = sched_cfg(tmp_path)
+    state = _json.loads(Path(cfg.sbfd_state_path).read_text())
+    state["sessions"]["b"]["state"] = "DOWN"          # peer down
+    Path(cfg.sbfd_state_path).write_text(_json.dumps(state))
+    assert _sched_code(cfg, _StubClient()) == W.EXIT_SKIPPED
+
+    assert _sched_code(sched_cfg(tmp_path, dry_run=True),
+                       _StubClient()) == W.EXIT_SKIPPED
+
+
+def test_scheduled_reboot_exit_codes_are_all_distinct():
+    codes = (W.EXIT_ISSUED, W.EXIT_UNTOUCHED, W.EXIT_SKIPPED,
+             W.EXIT_ATTEMPTED_UNKNOWN)
+    assert len(set(codes)) == 4
+
+
 # -- the reboot budget must be durable BEFORE the reboot leaves the box --------
 
 class _RecordingExecutor:

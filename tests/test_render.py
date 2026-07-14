@@ -100,3 +100,45 @@ def test_sbfd_sessions_count_agnostic_three_wans():
          "wans": {"a": {"iface": "e0", "session_id": 1}, "b": {"iface": "e1", "session_id": 2},
                   "c": {"iface": "e2", "session_id": 3}}}
     assert len(r.sbfd_sessions(v, "client")) == 3
+
+
+UNITS = ROOT / "deploy" / "templates" / "systemd"
+
+
+def test_every_unit_sharing_run_sbfd_ctl_preserves_it():
+    """RuntimeDirectoryPreserve is PER-UNIT, and /run/sbfd-ctl is SHARED.
+
+    systemd deletes a RuntimeDirectory when the unit that declares it stops —
+    even if another unit that declares the same one is still running. So a unit
+    that names RuntimeDirectory=sbfd-ctl without Preserve=yes wipes the whole
+    directory on every `systemctl restart` of ITSELF, taking three live things
+    with it:
+
+      runtime.json            the operator's WAN-mode overlay — its loss
+                              silently reverts the mode to policy.default_mode.
+      maintenance_window.json alert suppression, killed mid-window.
+      maintenance.lock        the worst. flock is PER-INODE: a second
+                              maintenance run does not find the lock missing and
+                              wait, it CREATES A FRESH INODE at the same path and
+                              locks that. Both runs then believe they hold the
+                              lock, and the mutual exclusion that stops two runs
+                              from taking both WANs down at once is gone.
+
+    Fixing sbfd-ctl.service alone does not cover the others. Every unit that
+    declares the directory must preserve it."""
+    sharers = []
+    for tmpl in sorted(UNITS.glob("*.service.tmpl")):
+        # real directives only: maintenance-reboot.service.tmpl DISCUSSES
+        # RuntimeDirectory=sbfd-ctl at length in a comment explaining why it
+        # must not declare one.
+        directives = [ln.strip() for ln in tmpl.read_text().splitlines()
+                      if ln.strip() and not ln.lstrip().startswith("#")]
+        if "RuntimeDirectory=sbfd-ctl" not in directives:
+            continue
+        sharers.append(tmpl.name)
+        assert "RuntimeDirectoryPreserve=yes" in directives, (
+            f"{tmpl.name} declares RuntimeDirectory=sbfd-ctl but does not "
+            f"preserve it — restarting it would wipe /run/sbfd-ctl out from "
+            f"under sbfd-ctl.service (WAN overlay, maintenance window, run lock)")
+    # the two units known to share it; a new one must come here deliberately
+    assert sharers == ["environ-ctl.service.tmpl", "sbfd-ctl.service.tmpl"]

@@ -34,6 +34,16 @@ DEFAULT_NOTIFY = "/usr/local/sbin/spool-notify"
 DEFAULT_LOCK = "/run/sbfd-ctl/maintenance.lock"
 PUBLISHED_MAX_AGE_S = 60.0
 
+# hotspot_watchdog.py --scheduled-reboot's exit-code contract, mirrored rather
+# than imported: the watchdog runs as a SUBPROCESS, so what this module can
+# actually rely on is the code on the wire, and a test pins the two copies
+# together. The distinction that matters is between WD_UNTOUCHED and
+# WD_ATTEMPTED_UNKNOWN — see reboot_wan1.
+WD_ISSUED = 0
+WD_UNTOUCHED = 1
+WD_SKIPPED = 2
+WD_ATTEMPTED_UNKNOWN = 3
+
 
 class Outcome(enum.Enum):
     """How a leg ended, structurally.
@@ -623,7 +633,29 @@ def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
     the reboot, which is well before the device drops carrier. wan1 has no
     reboot receipt the way wan2 has a bootcount, so recovery is only credited
     once wan1 has been observed DOWN and then UP again — see await_up's
-    require_down_first."""
+    require_down_first.
+
+    Which exit codes go down that path is the whole safety story. TWO do:
+
+      WD_ISSUED (0)            the restart was accepted, and
+      WD_ATTEMPTED_UNKNOWN (3) the restart was POSTed and the answer was lost.
+
+    Code 3 must be handled EXACTLY like code 0, because the commonest cause of
+    it is a reboot that WORKED: the hotspot tears the connection down as it
+    goes, taking the response with it, and its carrier then takes the better
+    part of a minute to actually drop. Classifying it off BFD there and then
+    would read the STALE pre-reboot UP, call wan1 untouched, and clear leg 2 to
+    reboot the terminal — while wan1 was seconds from going down. Both WANs
+    off the air. So on 3 we do not ask what the request returned; we go and
+    WATCH the link, which is the only thing that can tell a landed reboot from
+    a lost one. await_up(require_down_first=True) then sorts it out for us: a
+    down-then-up is RECOVERED, a continuous UP for the whole deadline really
+    was a reboot that never landed (NOT_ISSUED, and leg 2 is then safe), and a
+    down that never returns is NOT_RETURNED, which pages and aborts.
+
+    Only WD_UNTOUCHED (1) — the watchdog never got as far as POSTing anything —
+    may be classified immediately, because there is no reboot in flight to be
+    stale about."""
     w1 = cfg.wan1.iface
     if not peer_is_up(cfg, w1):
         return _leg(Outcome.SKIPPED,
@@ -645,17 +677,21 @@ def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
             cfg, w1, Outcome.NOT_ISSUED, f"watchdog invocation failed: {e}",
             f"{w1} is down and the watchdog could not reboot it: {e}")
     out = (r.stdout or "").strip()
-    if r.returncode == 2:
+    if r.returncode == WD_SKIPPED:
         return _leg(Outcome.SKIPPED, f"skipped by guard: {out}")
-    if r.returncode != 0:
-        # Same reasoning: a non-zero exit from the watchdog is not proof wan1
-        # is still up. Rebooting the hotspot over its admin API characteristically
-        # tears down the connection as the device goes down, so this exit is
-        # entirely consistent with the reboot having succeeded and wan1 never
-        # coming back. Only BFD can tell the two apart.
+    if r.returncode not in (WD_ISSUED, WD_ATTEMPTED_UNKNOWN):
+        # WD_UNTOUCHED, or any code this module does not recognise. The watchdog
+        # never POSTed a restart, so nothing is in flight and BFD cannot be
+        # stale on our account — classify off the link now. That still means
+        # ASKING the link rather than trusting the exit code: the watchdog can
+        # fail to reach an admin API precisely BECAUSE the hotspot is already
+        # dead, and calling that "never disturbed" would swallow a real outage.
         return classify_by_link(
             cfg, w1, Outcome.NOT_ISSUED, f"reboot failed: {out}",
             "wan1 is down and the watchdog could not reboot it")
+    # WD_ISSUED or WD_ATTEMPTED_UNKNOWN: a restart went out and wan1 may be on
+    # its way down RIGHT NOW. The only honest reading of the link is one that
+    # has seen it go down first.
     if await_up(cfg, w1, cfg.recovery_deadline_s, sleep=sleep, clock=clock,
                 require_down_first=True):
         return _leg(Outcome.RECOVERED, "rebooted and recovered")

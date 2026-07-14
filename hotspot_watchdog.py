@@ -5,6 +5,31 @@ Detects an unusable wan1 (private/NAT IP from the hotspot = cellular modem
 detached, or wan1 BFD session DOWN), and after a dwell reboots the Netgear
 Nighthawk M6 Pro via its admin API, with bounded retries and ntfy alerts.
 Spec: docs/superpowers/specs/2026-07-05-hotspot-watchdog-design.md
+
+--scheduled-reboot exit-code contract
+------------------------------------
+The maintenance sequencer drives this mode as a subprocess and decides, from
+the exit code alone, whether it is safe to go on and reboot the OTHER WAN. The
+two "no reboot happened" codes are therefore NOT interchangeable — collapsing
+them is how both WANs end up down at once:
+
+  0  ISSUED    the hotspot accepted the restart. wan1 is on its way down.
+  1  UNTOUCHED the hotspot was PROVABLY never disturbed: we never got as far as
+               POSTing the restart at all (admin UI unreachable, admin secret
+               unreadable, login rejected). wan1 is exactly where it was.
+  2  SKIPPED   a guard declined (no carrier / peer not UP / dry-run). Same
+               guarantee as 1: nothing was disturbed.
+  3  UNKNOWN   the restart WAS POSTed and we could not confirm what came back.
+
+Code 3 is the subtle one, and it is not an edge case: it is the ORDINARY
+outcome of a reboot that WORKED. The hotspot tears the connection down as it
+goes, so the very success we are trying to observe is what destroys the
+response we would observe it with. It is also what an unrecognised or
+error-looking redirect target produces. Nothing in this process can tell a
+landed reboot from a lost one, so 3 says exactly that and hands the question
+to the only thing that can answer it: the link. The caller must go and WATCH
+wan1 (maintenance_reboot enters await_up(require_down_first=True)) rather than
+read its current, possibly stale, "UP" and call the WAN untouched.
 """
 
 import argparse
@@ -24,6 +49,14 @@ from typing import Optional, Tuple
 import notify as notify_mod
 
 log = logging.getLogger("hotspot_watchdog")
+
+# --scheduled-reboot's exit codes. See the module docstring for the contract;
+# maintenance_reboot.py mirrors these (WD_ISSUED &c) and a test pins the two
+# copies together.
+EXIT_ISSUED = 0
+EXIT_UNTOUCHED = 1
+EXIT_SKIPPED = 2
+EXIT_ATTEMPTED_UNKNOWN = 3
 
 # -- Samplers -----------------------------------------------------------------
 
@@ -607,31 +640,54 @@ def take_sample(cfg, now) -> Sample:
 
 def _scheduled_reboot_verbose(cfg: WdConfig, client, now: float):
     """Implementation shared by scheduled_reboot() and the CLI. Returns
-    (issued, reason, guard_skipped) -- guard_skipped is True iff a *guard*
-    (never-take-out-the-last-WAN / carrier / dry-run) is why no reboot
-    happened, as opposed to the admin API failing partway through. Only the
-    CLI's exit code cares about that distinction; scheduled_reboot() below
-    drops it to keep the (issued, reason) contract a later task depends on."""
+    (issued, reason, code) where `code` is the --scheduled-reboot exit code
+    documented in the module docstring: EXIT_ISSUED, EXIT_UNTOUCHED,
+    EXIT_SKIPPED or EXIT_ATTEMPTED_UNKNOWN.
+
+    Only the CLI needs `code`; scheduled_reboot() below drops it to keep the
+    (issued, reason) contract its other callers depend on. But the CALLER'S
+    SAFETY lives in it, so the boundary between the codes is drawn with care:
+
+      * Everything ABOVE client.reboot() is a case in which no restart was ever
+        POSTed. Those are EXIT_UNTOUCHED (or EXIT_SKIPPED for a guard), and the
+        caller may believe them: wan1 is where it was.
+
+      * client.reboot() returning False is NOT such a case. By then we have
+        logged in and posted the restart; what failed is our reading of the
+        ANSWER. A hotspot that ACCEPTS the restart drops the connection as it
+        goes down, which is precisely how that answer goes missing — so this is
+        what a SUCCESSFUL reboot usually looks like from here. It is also what
+        the 302-target heuristic produces when it misjudges an unfamiliar
+        redirect. Reporting either as "never touched" would hand the caller a
+        licence to go and reboot the other WAN while this one is on its way
+        down. So: EXIT_ATTEMPTED_UNKNOWN, and let the link settle it.
+    """
     if read_carrier(cfg.iface) is False:
         return (False, f"{cfg.iface} has no carrier — admin API unreachable",
-                True)
+                EXIT_SKIPPED)
     _wan_up, peer_up = read_bfd_states(cfg.sbfd_state_path, cfg.iface,
                                        cfg.peer_iface, now, cfg.state_max_age_s)
     if peer_up is not True:
         return (False, (f"peer {cfg.peer_iface} is not UP (={peer_up}) — "
-                        f"refusing to disturb the last standing WAN"), True)
+                        f"refusing to disturb the last standing WAN"),
+                EXIT_SKIPPED)
     if cfg.dry_run:
-        return False, "dry-run: would reboot", True
+        return False, "dry-run: would reboot", EXIT_SKIPPED
     if client.fetch_model() is None:
-        return False, f"admin UI unreachable at {cfg.admin_url}", False
+        return (False, f"admin UI unreachable at {cfg.admin_url}",
+                EXIT_UNTOUCHED)
     pw = _read_secret(cfg.secret_path)
     if pw is None:
-        return False, f"cannot read admin secret ({cfg.secret_path})", False
+        return (False, f"cannot read admin secret ({cfg.secret_path})",
+                EXIT_UNTOUCHED)
     if not client.login(pw):
-        return False, "login rejected — check the admin secret", False
+        return False, "login rejected — check the admin secret", EXIT_UNTOUCHED
     if not client.reboot():
-        return False, "reboot POST failed", False
-    return True, "reboot issued", False
+        return (False, "reboot POST was attempted but its outcome is UNKNOWN "
+                       "(no usable response) — the hotspot may well have taken "
+                       "it and be going down now; watch the link",
+                EXIT_ATTEMPTED_UNKNOWN)
+    return True, "reboot issued", EXIT_ISSUED
 
 
 def scheduled_reboot(cfg: WdConfig, client, now: float) -> Tuple[bool, str]:
@@ -639,8 +695,12 @@ def scheduled_reboot(cfg: WdConfig, client, now: float) -> Tuple[bool, str]:
 
     Deliberately does NOT read or write the daemon's policy state: a scheduled
     reboot is not an outage episode, and must neither consume the episode
-    budget nor be consumed by a holdoff. Returns (issued, reason)."""
-    issued, reason, _guard_skipped = _scheduled_reboot_verbose(cfg, client, now)
+    budget nor be consumed by a holdoff. Returns (issued, reason).
+
+    `issued` is True only for a CONFIRMED reboot. It is False both for "never
+    touched" and for "posted, outcome unknown", which is why the CLI (and the
+    maintenance sequencer behind it) uses the exit code, not this bool."""
+    issued, reason, _code = _scheduled_reboot_verbose(cfg, client, now)
     return issued, reason
 
 
@@ -664,8 +724,15 @@ def main():
     ap.add_argument("--test-reboot", action="store_true",
                     help="login and reboot the hotspot NOW (supervised test)")
     ap.add_argument("--scheduled-reboot", action="store_true",
-                    help="guarded one-shot reboot for the maintenance window "
-                         "(exit 0=issued, 1=failed, 2=skipped by a guard)")
+                    help="guarded one-shot reboot for the maintenance window. "
+                         "Exit 0=reboot issued; 1=hotspot provably untouched "
+                         "(never POSTed: admin UI unreachable, secret "
+                         "unreadable, login rejected); 2=skipped by a guard; "
+                         "3=restart was POSTed but its outcome is UNKNOWN — "
+                         "which is what a reboot that WORKED looks like, since "
+                         "the hotspot drops the connection as it goes down. On "
+                         "3 the caller must watch the link, and must NOT treat "
+                         "the WAN as undisturbed")
     args = ap.parse_args()
     cfg = load_config(args.config)
     client = NetgearClient(cfg.admin_url, cfg.iface,
@@ -704,12 +771,10 @@ def main():
         Path("/run/hotspot-watchdog").mkdir(parents=True, exist_ok=True)
         sc = NetgearClient(cfg.admin_url, cfg.iface,
                            "/run/hotspot-watchdog/cookies-scheduled.txt")
-        issued, reason, guard_skipped = _scheduled_reboot_verbose(
+        _issued, reason, code = _scheduled_reboot_verbose(
             cfg, sc, time.time())
         print(reason)
-        if issued:
-            return 0
-        return 2 if guard_skipped else 1
+        return code
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)

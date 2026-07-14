@@ -1987,3 +1987,314 @@ def test_e2e_wan2_down_and_never_back_pages_high(tmp_path, monkeypatch):
                                   DishThatDropsTheLink(link, on="reboot"))
     assert (status, rc) == (M.Outcome.NOT_RETURNED, 1)
     assert "high" in prio
+
+
+# == THE STRANDING BUG, re-entered through the NOT_ISSUED door =================
+#
+# hotspot_watchdog --scheduled-reboot used to exit 1 for FOUR different reasons.
+# Three of them genuinely never touched the hotspot. The fourth — the restart
+# POST got no usable response — is what a SUCCESSFUL reboot looks like from
+# inside the process: the hotspot accepts the restart and tears the connection
+# down as it goes. Its carrier then takes ~45s to actually drop.
+#
+# So reboot_wan1 classified off BFD a few seconds later, read the STALE
+# pre-reboot UP, called it NOT_ISSUED — and NOT_ISSUED continues to leg 2. Leg
+# 2's peer check re-read the same stale UP and rebooted the terminal:
+#
+#   t+0    watchdog POSTs the restart; the hotspot takes it; the answer is lost
+#   t+8    classify_by_link reads wan1 "UP" (STALE)  -> NOT_ISSUED
+#   t+9    leg 2's peer_is_up reads wan1 "UP" (STALE) -> REBOOTS THE TERMINAL
+#   t+14   wan2 DOWN
+#   t+45   wan1's carrier finally drops   *** BOTH WANS DOWN — stranded ***
+#
+# The watchdog now exits 3 for that case, and reboot_wan1 treats 3 exactly like
+# 0: it goes and WATCHES the link. These tests hold that shut.
+
+
+class Vehicle:
+    """Both WANs on one clock, with the hotspot's CARRIER LAG modelled.
+
+    The lag is the whole bug. A restart POSTed to the hotspot does not take
+    wan1 down when the POST returns; the carrier drops `lag` polls later. Every
+    BFD read in between is a stale pre-reboot UP, and believing one is what
+    authorises the terminal's reboot into a wan1 that is already dying.
+
+    Any moment at which BOTH WANs are down is recorded in `stranded`. That list
+    must stay empty: it is the vehicle's connectivity."""
+
+    def __init__(self, lag=3, wan1_down_polls=4, wan1_returns=True,
+                 wan2_down_polls=2):
+        self.wan1 = "UP"
+        self.wan2 = "UP"
+        self.polls = 0
+        self.lag = lag
+        self.wan1_down_polls = wan1_down_polls
+        self.wan1_returns = wan1_returns
+        self.wan2_down_polls = wan2_down_polls
+        self.w1_drop_at = None
+        self.w1_return_at = None
+        self.w2_return_at = None
+        self.stranded = []          # poll indices at which both WANs were down
+        self.terminal_reboots = 0
+
+    def hotspot_took_the_restart(self):
+        """The hotspot ACCEPTED the restart (which is why the answer was lost).
+        Its carrier holds up for `lag` more polls before it actually drops."""
+        self.w1_drop_at = self.polls + self.lag
+        if self.wan1_returns:
+            self.w1_return_at = self.w1_drop_at + self.wan1_down_polls
+
+    def terminal_rebooted(self):
+        """The terminal, unlike the hotspot, drops the moment it is told to."""
+        self.terminal_reboots += 1
+        self.wan2 = "DOWN"
+        self.w2_return_at = self.polls + self.wan2_down_polls
+        self._check()
+
+    def _check(self):
+        if self.wan1 == "DOWN" and self.wan2 == "DOWN":
+            self.stranded.append(self.polls)
+
+    def read(self, *a, **k):
+        """read_wan_states: one BFD poll."""
+        self.polls += 1
+        if self.w1_drop_at is not None and self.polls > self.w1_drop_at:
+            self.wan1 = "DOWN"
+        if self.w1_return_at is not None and self.polls > self.w1_return_at:
+            self.wan1 = "UP"
+        if self.w2_return_at is not None and self.polls > self.w2_return_at:
+            self.wan2 = "UP"
+        self._check()
+        return {"wan1": self.wan1, "wan2": self.wan2}
+
+    def peek_wan1(self):
+        """wan1's TRUE state, without consuming a poll."""
+        return self.wan1
+
+
+class VehicleDish(FakeDish):
+    """The terminal, wired into the Vehicle: its reboot really does take wan2
+    off the air (and bumps the bootcount, which is its reboot receipt)."""
+
+    def __init__(self, vehicle, **kw):
+        super().__init__(**kw)
+        self.vehicle = vehicle
+
+    def reboot(self):
+        out = super().reboot()
+        if out:
+            self.vehicle.terminal_rebooted()
+        return out
+
+
+class HotspotThatTakesTheRestart:
+    """The watchdog one-shot, as a subprocess: it POSTs the restart, the hotspot
+    takes it, and the response dies with the connection. Exit 3 — attempted,
+    outcome unknown — NOT exit 1."""
+
+    def __init__(self, vehicle, rc=M.WD_ATTEMPTED_UNKNOWN, takes_it=True):
+        self.vehicle = vehicle
+        self.rc = rc
+        self.takes_it = takes_it
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(argv)
+        if self.takes_it:
+            self.vehicle.hotspot_took_the_restart()
+
+        class P:
+            returncode = self.rc
+            stdout = "reboot POST was attempted but its outcome is UNKNOWN"
+            stderr = ""
+        return P()
+
+
+def drive_the_night(cfg, monkeypatch, vehicle, watchdog, dish=None):
+    """A whole maintenance run, end to end, through the REAL reboot_wan1 and the
+    REAL reboot_wan2 — nothing about the leg logic is stubbed. Returns
+    (rc, wan1_at_leg2_entry, notifications, leg statuses)."""
+    monkeypatch.setattr(M, "read_wan_states", vehicle.read)
+    dish = dish or FakeDish()
+    sent, legs, at_leg2 = [], {}, []
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p, m)))
+    clk = FakeClock()
+
+    real1, real2 = M.reboot_wan1, M.reboot_wan2
+
+    def leg1(c, now, **k):
+        legs["wan1"] = res = real1(c, now, runner=watchdog,
+                                   sleep=instant(clk), clock=clk)
+        return res
+
+    def leg2(c, now, **k):
+        # what wan1 TRULY is at the instant leg 2 begins — the question the
+        # whole invariant turns on
+        at_leg2.append(vehicle.peek_wan1())
+        legs["wan2"] = res = real2(c, now, client=dish,
+                                   sleep=instant(clk), clock=clk)
+        return res
+
+    monkeypatch.setattr(M, "reboot_wan1", leg1)
+    monkeypatch.setattr(M, "reboot_wan2", leg2)
+    rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
+    return rc, (at_leg2[0] if at_leg2 else None), sent, legs
+
+
+def test_stranding_scenario_cannot_happen(tmp_path, monkeypatch):
+    # THE SCENARIO ITSELF. The watchdog reports "attempted, unknown"; the
+    # hotspot has in fact taken the restart, and wan1 reads a STALE UP for the
+    # first several polls before its carrier drops. wan1 does come back.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    v = Vehicle(lag=3, wan1_down_polls=4)
+    wd = HotspotThatTakesTheRestart(v)
+    dish = VehicleDish(v)              # a terminal reboot really drops wan2
+
+    rc, wan1_at_leg2, sent, legs = drive_the_night(cfg, monkeypatch, v, wd,
+                                                   dish=dish)
+
+    # 1. The vehicle was NEVER off the air on both WANs. This is the invariant.
+    assert v.stranded == []
+    # 2. Leg 1 was not fooled by the stale UP: it watched wan1 go down and come
+    #    back, which is the only thing that can prove the reboot landed.
+    assert legs["wan1"].status is M.Outcome.RECOVERED
+    # 3. Leg 2 was not entered until wan1 was TRULY back up.
+    assert wan1_at_leg2 == "UP"
+    assert v.terminal_reboots == 1        # ...and only then was it disturbed
+    # 4. No false success and no false page: a night that worked is silent.
+    assert rc == 0
+    assert not any(p == "high" for _t, p, _m in sent)
+    assert not any("not rebooted tonight" in t for t, _p, _m in sent)
+
+
+def test_stranding_scenario_leg2_is_never_reached_while_wan1_is_down(
+        tmp_path, monkeypatch):
+    # The same reboot, but wan1 NEVER COMES BACK. The run must abort: NOT_RETURNED
+    # still stops the night dead, and the terminal is never touched.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    v = Vehicle(lag=3, wan1_returns=False)
+    wd = HotspotThatTakesTheRestart(v)
+    dish = FakeDish()
+
+    rc, wan1_at_leg2, sent, legs = drive_the_night(cfg, monkeypatch, v, wd,
+                                                   dish=dish)
+
+    assert legs["wan1"].status is M.Outcome.NOT_RETURNED
+    assert "wan2" not in legs                 # leg 2 was never reached...
+    assert wan1_at_leg2 is None
+    assert dish.calls == []                   # ...and the terminal never touched
+    assert v.stranded == []
+    assert rc == 1
+    assert any(p == "high" for _t, p, _m in sent)     # and it pages
+
+
+def test_attempted_unknown_that_really_never_landed_still_reaches_leg2(
+        tmp_path, monkeypatch):
+    # The flip side, and the reason exit 3 may not simply ABORT: an "attempted,
+    # unknown" whose restart genuinely never landed leaves wan1 continuously UP
+    # for the whole deadline. That IS a NOT_ISSUED — the link was never
+    # disturbed — so the night must go on and reboot the terminal, or a hotspot
+    # whose admin API is permanently confused would mean wan2 is never rebooted
+    # again.
+    cfg = write_cfg(tmp_path, dry_run=False, recovery_deadline_s=60)
+    v = Vehicle()
+    wd = HotspotThatTakesTheRestart(v, takes_it=False)   # wan1 never goes down
+    dish = VehicleDish(v)
+
+    rc, wan1_at_leg2, sent, legs = drive_the_night(cfg, monkeypatch, v, wd,
+                                                   dish=dish)
+
+    assert legs["wan1"].status is M.Outcome.NOT_ISSUED
+    assert wan1_at_leg2 == "UP"
+    assert legs["wan2"].status is M.Outcome.RECOVERED   # leg 2 DID run
+    assert "reboot" in dish.calls
+    assert v.stranded == []
+    assert rc == 1                                      # leg 1 still failed...
+    # ...quietly: wan1 never left, so this is not a page
+    assert not any(p == "high" for _t, p, _m in sent)
+
+
+# -- reboot_wan1's handling of the new exit code, in isolation ----------------
+
+
+def test_reboot_wan1_awaits_recovery_on_attempted_unknown(tmp_path, monkeypatch):
+    # exit 3 must be handled EXACTLY like exit 0: enter await_up with
+    # require_down_first=True. It must NOT classify immediately off a stale UP.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    states = StateTimeline(BOTH_UP,               # the peer re-check
+                           BOTH_UP, BOTH_UP,      # STALE pre-reboot UP
+                           WAN1_DOWN, WAN1_DOWN,  # the carrier drops at last
+                           BOTH_UP)               # and wan1 comes back
+    monkeypatch.setattr(M, "read_wan_states", states)
+    clk = FakeClock()
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(M.WD_ATTEMPTED_UNKNOWN, "unknown")]),
+                        sleep=instant(clk), clock=clk)
+    assert res.status is M.Outcome.RECOVERED
+    assert res.ok is True
+    # it waited for the DOWN rather than crediting the first (stale) UP
+    assert clk.t - 1000.0 == 5 * M.POLL_S
+
+
+def test_reboot_wan1_attempted_unknown_pages_when_wan1_never_returns(
+        tmp_path, monkeypatch):
+    # the reboot landed and the hotspot never came back: a real outage, and the
+    # one leg-1 outcome that aborts the night
+    cfg = write_cfg(tmp_path, dry_run=False)
+    states = StateTimeline(BOTH_UP,                  # the peer re-check
+                           BOTH_UP,                  # stale UP
+                           WAN1_DOWN)                # down, and stays down
+    monkeypatch.setattr(M, "read_wan_states", states)
+    clk = FakeClock()
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(M.WD_ATTEMPTED_UNKNOWN, "unknown")]),
+                        sleep=instant(clk), clock=clk)
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert "did not return" in res.reason
+
+
+def test_reboot_wan1_attempted_unknown_is_not_issued_if_wan1_never_drops(
+        tmp_path, monkeypatch):
+    # continuously UP for the whole deadline: the restart really did not land
+    cfg = write_cfg(tmp_path, dry_run=False, recovery_deadline_s=30)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    clk = FakeClock()
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(M.WD_ATTEMPTED_UNKNOWN, "unknown")]),
+                        sleep=instant(clk), clock=clk)
+    assert res.status is M.Outcome.NOT_ISSUED
+    assert clk.t - 1000.0 >= cfg.recovery_deadline_s   # it really did watch
+
+
+def test_reboot_wan1_untouched_exit_does_not_await(tmp_path, monkeypatch):
+    # exit 1 keeps its old meaning and its old speed: the watchdog never POSTed
+    # anything, so there is no reboot in flight for BFD to be stale about, and
+    # the link can be read straight away.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    clk = FakeClock()
+    res = M.reboot_wan1(cfg, now=1000.0,
+                        runner=FakeRunner([(M.WD_UNTOUCHED, "login rejected")]),
+                        sleep=instant(clk), clock=clk)
+    assert res.status is M.Outcome.NOT_ISSUED
+    assert clk.t == 1000.0                    # no await_up, no polls
+
+
+def test_reboot_wan1_treats_an_unknown_exit_code_as_untouched(tmp_path,
+                                                              monkeypatch):
+    # a watchdog from the future exiting 7 must not be mistaken for a success:
+    # anything not in (0, 3) is classified off the link, and 2 is the guard skip
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    res = M.reboot_wan1(cfg, now=1000.0, runner=FakeRunner([(7, "???")]))
+    assert res.status is M.Outcome.NOT_ISSUED
+    assert res.ok is False
+
+
+def test_watchdog_exit_codes_match_the_watchdog(tmp_path):
+    # the contract is on the wire between two processes; the two copies of it
+    # must not drift apart
+    import hotspot_watchdog as W
+    assert (M.WD_ISSUED, M.WD_UNTOUCHED, M.WD_SKIPPED, M.WD_ATTEMPTED_UNKNOWN) \
+        == (W.EXIT_ISSUED, W.EXIT_UNTOUCHED, W.EXIT_SKIPPED,
+            W.EXIT_ATTEMPTED_UNKNOWN)
