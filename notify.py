@@ -230,16 +230,23 @@ class EventDetector:
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
-                 clock=time.monotonic):
+                 clock=time.monotonic, wall_clock=time.time):
         self.relay_fail_threshold = max(1, int(relay_fail_threshold))
         self.wan_down_hold_s = max(0.0, float(wan_down_hold_s))
         self.fec_alerts = bool(fec_alerts)
+        # Two clocks on purpose: durations (the hold timers) are measured on a
+        # monotonic clock, which cannot jump; the maintenance window's `until`
+        # is a wall-clock epoch written by another process, so it can only be
+        # judged against a wall clock. Comparing an epoch against monotonic
+        # seconds-since-boot would make every window look open forever.
         self._clock = clock
+        self._wall_clock = wall_clock
         self._seeded = False
         self._wan_states = {}
         self._down_since = {}      # wan -> clock time it stopped being UP
         self._down_from = {}       # wan -> last UP-or-seeded state before that
         self._down_alerted = set()  # wans whose outage has been announced
+        self._maint_suppressed = set()  # wans whose down we withheld (window)
         self._all_down_since = None
         self._all_down_alerted = False
         self._mode = None
@@ -288,18 +295,18 @@ class EventDetector:
     def _maint_wan(self, obs) -> Optional[str]:
         """The WAN currently under maintenance, or None. Fails open.
 
-        Compared against self._clock(), the same clock used for this
-        detector's own hold timers, rather than the wall-clock time.time()
-        directly: everything this class measures "now" against goes through
-        the injected clock, and `until` is meaningless unless read against
-        that same frame of reference."""
+        `until` is an absolute wall-clock epoch (the window is written by
+        another process and must survive a restart of this one), so it is
+        judged against the wall clock, NOT against self._clock() — that one is
+        monotonic (seconds since boot) and would leave every window looking
+        open, muting a WAN's alerts indefinitely."""
         m = obs.maintenance
         if not isinstance(m, dict):
             return None
         wan, until = m.get("wan"), m.get("until")
         if not isinstance(wan, str) or not isinstance(until, (int, float)):
             return None
-        return wan if self._clock() < until else None
+        return wan if self._wall_clock() < until else None
 
     def _wan_events(self, obs):
         now = self._clock()
@@ -308,16 +315,29 @@ class EventDetector:
         for wan, state in obs.wan_states.items():
             label = obs.wan_labels.get(wan, wan)
             if wan == maint:
-                # Rebooting on purpose. Keep the bookkeeping honest so the
-                # WAN's real edges resume cleanly once the window closes, but
-                # emit nothing.
+                # Rebooting on purpose: emit nothing. Crucially, a withheld
+                # outage is NOT recorded as announced — the down edge stays
+                # PENDING, so a WAN still down when the window expires is
+                # reported then (hold restarted from the window's close).
                 if state == "UP":
                     self._down_since.pop(wan, None)
                     self._down_from.pop(wan, None)
-                    self._down_alerted.discard(wan)
+                    if wan in self._maint_suppressed:
+                        # We withheld the down, so withhold the up too.
+                        self._down_alerted.discard(wan)
+                        self._maint_suppressed.discard(wan)
+                        continue
+                    # Otherwise this is a REAL outage that was already
+                    # announced before the window opened: fall through to the
+                    # normal UP path, because whoever was paged must be told
+                    # it is back.
+                elif wan not in self._down_alerted:
+                    self._maint_suppressed.add(wan)
+                    continue
                 else:
-                    self._down_alerted.add(wan)
-                continue
+                    continue    # real, already-announced outage: no repeat
+            # Not suppressed (or no longer): drop any stale suppression flag.
+            self._maint_suppressed.discard(wan)
             if state == "UP":
                 self._down_since.pop(wan, None)
                 self._down_from.pop(wan, None)
@@ -363,9 +383,13 @@ class EventDetector:
     def _switch_events(self, obs):
         if obs.switch is None:
             return []
-        if self._maint_wan(obs) is not None:
-            return []       # the switch is the maintenance reboot, not news
         frm, to, reason = obs.switch
+        maint = self._maint_wan(obs)
+        if maint is not None and maint in frm and maint not in to:
+            # The maintained WAN dropping out of the active set IS the reboot,
+            # not news. A switch it did not cause — the other WAN really failed,
+            # or the maintained WAN rejoining — still reports.
+            return []
         return [Event("wan_switch",
                       f"🔀 WAN switch → {','.join(to)}",
                       f"active {','.join(frm)} → {','.join(to)}\n"

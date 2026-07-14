@@ -228,9 +228,11 @@ def obs(**kw):
     return notify.Observation(**base)
 
 
-def seeded(clk=None, **kw):
+def seeded(clk=None, wall=None, **kw):
+    # `wall` is the wall clock the maintenance window's `until` epoch is read
+    # against; `clk` is the monotonic clock the hold timers are measured on.
     d = notify.EventDetector(relay_fail_threshold=3, clock=clk or FakeClock(),
-                             **kw)
+                             wall_clock=wall or FakeClock(), **kw)
     assert d.observe(obs()) == []          # first observation seeds silently
     return d
 
@@ -471,20 +473,27 @@ def test_seed_with_failing_relay_poll_counts_toward_threshold():
 
 
 def test_maintenance_window_suppresses_that_wans_down_and_up():
-    clk = FakeClock()
-    d = seeded(clk)
-    win = {"wan": "wan2", "until": clk.t + 600}
+    # (b) Down and back inside the window: no wan_down, and no spurious wan_up.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
     down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []                # tick 1 starts the down timer
     clk.advance(30)
-    assert d.observe(down) == []                # no wan_down: it's on purpose
-    up = obs(maintenance=win)
+    wclk.advance(30)
+    assert d.observe(down) == []                # would be wan_down but for the
+    up = obs(maintenance=win)                   # window: 30s > the 10s hold
     assert d.observe(up) == []                  # and no wan_up on the way back
+    clk.advance(600)
+    wclk.advance(600)
+    assert d.observe(obs()) == []               # nothing deferred to after it
 
 
 def test_maintenance_window_does_not_suppress_the_other_wan():
-    clk = FakeClock()
-    d = seeded(clk)
-    win = {"wan": "wan2", "until": clk.t + 600}
+    # Suppression is per-WAN: a window on wan2 must not mute a real wan1 outage.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
     down = obs(wan_states={"wan1": "DOWN", "wan2": "UP"}, maintenance=win)
     assert d.observe(down) == []           # held: not down long enough yet
     clk.advance(30)
@@ -493,9 +502,9 @@ def test_maintenance_window_does_not_suppress_the_other_wan():
 
 def test_all_wans_down_always_pages_even_during_maintenance():
     # Whatever else maintenance silences, "the vehicle is offline" always pages.
-    clk = FakeClock()
-    d = seeded(clk)
-    win = {"wan": "wan2", "until": clk.t + 600}
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
     both = obs(wan_states={"wan1": "DOWN", "wan2": "DOWN"}, maintenance=win)
     assert d.observe(both) == []           # held: not down long enough yet
     clk.advance(30)
@@ -506,18 +515,91 @@ def test_all_wans_down_always_pages_even_during_maintenance():
 
 def test_expired_maintenance_window_suppresses_nothing():
     # Fail safe: a stale window must not mute a real outage.
-    clk = FakeClock()
-    d = seeded(clk)
-    win = {"wan": "wan2", "until": clk.t - 1}
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t - 1}
     down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
     assert d.observe(down) == []           # held: not down long enough yet
     clk.advance(30)
     assert kinds(d.observe(down)) == ["wan_down"]
 
 
+def test_window_expiry_is_judged_on_the_wall_clock_not_the_monotonic_one():
+    # `until` is a wall-clock epoch; read against seconds-since-boot every
+    # window looks open forever and a stale one would hide a real outage.
+    clk = FakeClock(2_200_000.0)                 # monotonic: uptime
+    wclk = FakeClock(1_780_000_000.0)            # wall clock: an epoch
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t - 86_400}   # expired 24h ago
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []           # held: not down long enough yet
+    clk.advance(30)
+    wclk.advance(30)
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
+def test_wan_still_down_when_the_window_expires_is_announced():
+    # (a) The window ends the excuse, not the outage: the down edge is only
+    # deferred, and fires once the window closes (hold restarted from close).
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 100}
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []           # suppressed: on purpose
+    clk.advance(50)
+    wclk.advance(50)
+    assert d.observe(down) == []           # still inside the window
+    clk.advance(60)
+    wclk.advance(60)
+    assert d.observe(down) == []           # window just expired: hold restarts
+    clk.advance(10)
+    evs = d.observe(down)
+    assert kinds(evs) == ["wan_down"]      # now unexplained -- page
+    assert evs[0].priority == "high"
+    # And the recovery of that announced outage still reports.
+    assert kinds(d.observe(obs())) == ["wan_up"]
+
+
+def test_recovery_during_a_window_of_an_outage_announced_before_it():
+    # (c) The operator was paged for a real outage; a window opening afterwards
+    # must not swallow the "it's back" for the alert they already have.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"})
+    assert d.observe(down) == []
+    clk.advance(10)
+    assert kinds(d.observe(down)) == ["wan_down"]      # real, announced
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    maint_down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
+                     maintenance=win)
+    assert d.observe(maint_down) == []                 # no repeat
+    assert kinds(d.observe(obs(maintenance=win))) == ["wan_up"]
+
+
+def test_pre_existing_outage_inside_the_hold_alerts_after_the_window():
+    # (d) An outage whose hold had not elapsed when the window opened is only
+    # deferred by it, never absorbed: it alerts once the window expires.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"})
+    assert d.observe(down) == []           # real outage, 5s into its 10s hold
+    clk.advance(5)
+    wclk.advance(5)
+    win = {"wan": "wan2", "until": wclk.t + 100}
+    maint_down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
+                     maintenance=win)
+    assert d.observe(maint_down) == []     # window opens over it: deferred
+    clk.advance(50)
+    wclk.advance(50)
+    assert d.observe(maint_down) == []
+    clk.advance(60)
+    wclk.advance(60)                       # window expired, still down
+    assert kinds(d.observe(down)) == ["wan_down"]
+
+
 def test_malformed_maintenance_window_suppresses_nothing():
-    clk = FakeClock()
-    d = seeded(clk)
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
     down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"},
                maintenance={"garbage": True})
     assert d.observe(down) == []           # held: not down long enough yet
@@ -526,9 +608,31 @@ def test_malformed_maintenance_window_suppresses_nothing():
 
 
 def test_maintenance_window_suppresses_the_switch_event():
-    clk = FakeClock()
-    d = seeded(clk)
-    win = {"wan": "wan2", "until": clk.t + 600}
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
     evs = d.observe(obs(maintenance=win,
                         switch=(["wan1", "wan2"], ["wan1"], "wan2 down")))
     assert kinds(evs) == []
+
+
+def test_switch_caused_by_the_other_wan_still_reports_during_a_window():
+    # Only the maintained WAN *leaving* the active set is the reboot; a switch
+    # it did not cause is real context and must still report.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    evs = d.observe(obs(maintenance=win,
+                        switch=(["wan1", "wan2"], ["wan2"], "wan1 down")))
+    assert kinds(evs) == ["wan_switch"]
+    assert "wan1 down" in evs[0].message
+
+
+def test_maintained_wan_rejoining_the_active_set_still_reports():
+    # The maintained WAN coming BACK is a switch it caused, but not the reboot.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    evs = d.observe(obs(maintenance=win,
+                        switch=(["wan1"], ["wan1", "wan2"], "wan2 up")))
+    assert kinds(evs) == ["wan_switch"]
