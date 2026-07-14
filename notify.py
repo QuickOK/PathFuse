@@ -411,15 +411,18 @@ class EventDetector:
             return []
         frm, to, reason = obs.switch
         maint = self._maint_wan(obs)
-        removed = set(frm) - set(to)
-        if maint is not None and removed == {maint}:
-            # The maintained WAN, and ONLY it, dropping out of the active set
-            # IS the reboot, not news. Anything else still reports: a switch it
-            # did not cause (the other WAN really failed, or the maintained WAN
-            # rejoining), and — the case a plain `maint in frm and maint not in
-            # to` got wrong — a switch that removed the maintained WAN AND
-            # another WAN at the same time, which is a strictly WORSE event
-            # than the one we are excusing.
+        changed = set(frm) ^ set(to)
+        if maint is not None and changed == {maint}:
+            # The maintained WAN, and ONLY it, entering or leaving the active
+            # set IS the reboot, not news — both halves of it. Suppressing only
+            # its departure still paged on its RETURN (the fail-back), which a
+            # live run confirmed fires on every maintenance night.
+            #
+            # Anything else still reports: a switch the maintained WAN did not
+            # cause (the other WAN really failed), and — the case a plain
+            # `maint in frm and maint not in to` got wrong — a switch that
+            # moved the maintained WAN AND another WAN at once, which is a
+            # strictly WORSE event than the one we are excusing.
             return []
         return [Event("wan_switch",
                       f"🔀 WAN switch → {','.join(to)}",

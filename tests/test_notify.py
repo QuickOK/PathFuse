@@ -616,6 +616,28 @@ def test_maintenance_window_suppresses_the_switch_event():
     assert kinds(evs) == []
 
 
+def test_maintenance_window_suppresses_the_maintained_wans_FAIL_BACK():
+    # The maintained WAN REJOINING the active set is the other half of its own
+    # reboot, not news. A live run paged "🔀 WAN switch → wan2" on every
+    # maintenance night because only its departure was suppressed.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    evs = d.observe(obs(maintenance=win,
+                        switch=(["wan1"], ["wan1", "wan2"], "wan2 up, fail-back")))
+    assert kinds(evs) == []
+
+
+def test_maintenance_window_still_reports_a_switch_the_other_wan_caused():
+    # wan2 is under maintenance, but wan1 REALLY failed. That must still report.
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": wclk.t + 600}
+    evs = d.observe(obs(maintenance=win,
+                        switch=(["wan1", "wan2"], ["wan2"], "wan1 down")))
+    assert kinds(evs) == ["wan_switch"]
+
+
 def test_switch_caused_by_the_other_wan_still_reports_during_a_window():
     # Only the maintained WAN *leaving* the active set is the reboot; a switch
     # it did not cause is real context and must still report.
@@ -628,14 +650,17 @@ def test_switch_caused_by_the_other_wan_still_reports_during_a_window():
     assert "wan1 down" in evs[0].message
 
 
-def test_maintained_wan_rejoining_the_active_set_still_reports():
-    # The maintained WAN coming BACK is a switch it caused, but not the reboot.
+def test_maintained_wan_rejoining_the_active_set_is_also_the_reboot():
+    # This test used to assert the REJOIN reports ("a switch it caused, but not
+    # the reboot"). The live supervised run disproved that: the fail-back is the
+    # other half of the same reboot, and it paged on every maintenance night.
+    # Its departure and its return are one event; excuse both.
     clk, wclk = FakeClock(), FakeClock()
     d = seeded(clk, wclk)
     win = {"wan": "wan2", "until": wclk.t + 600}
     evs = d.observe(obs(maintenance=win,
                         switch=(["wan1"], ["wan1", "wan2"], "wan2 up")))
-    assert kinds(evs) == ["wan_switch"]
+    assert kinds(evs) == []
 
 
 def test_switch_that_removed_the_other_wan_too_still_reports():
