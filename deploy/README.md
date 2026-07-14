@@ -60,6 +60,14 @@ deploy/scripts/install.sh -c deploy/values.json              # render + place fi
 `install.sh` renders only your role's files, backs up anything it overwrites (`.bak.<ts>`), and
 does **not** auto-start services (the client has a cutover ordering constraint — next step).
 
+On the client, `install.sh` also creates `/var/spool/spool-notify` (the spool dir the
+`spool-notify` helper drains from — see `deploy/spool-notify/README.md`). This is a real
+prerequisite, not just documentation: `maintenance-reboot.service` and `hotspot-watchdog.service`
+mount it via a tolerant `ReadWritePaths=-/var/spool/spool-notify` entry so a *missing* dir only
+costs a lost notification, but under `ProtectSystem=strict` the sandbox is otherwise read-only —
+`spool-notify`'s own `mkdir -p` cannot create the directory from inside the unit, so it must exist
+beforehand for notifications to actually work.
+
 ## 5. Start services — order matters
 
 **Relay:**

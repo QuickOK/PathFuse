@@ -4,8 +4,11 @@ Description=Hourly tick for the PathFuse daily maintenance reboot
 [Timer]
 # Hourly on purpose: the unit exits immediately unless the current local hour
 # is the operator's configured hour, so the schedule can be changed from the UI
-# without rewriting this file. Persistent so a tick missed while powered off
-# still runs at boot.
+# without rewriting this file. Persistent so a missed tick still fires at boot —
+# but should_run() gates on the CURRENT hour matching the configured one, so a
+# tick replayed at a boot outside that hour self-gates out and no reboot
+# happens (fail-safe: this never causes an extra/unexpected reboot, it just
+# means a missed 03:00 window isn't retroactively made up at 07:00).
 OnCalendar=*-*-* *:00:00
 Persistent=true
 AccuracySec=1min

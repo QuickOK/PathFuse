@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=simple
 ExecStart=$paths_sbfdctl_opt/hotspot_watchdog.py -c $paths_sbfdctl_etc/hotspot-watchdog.json
 RuntimeDirectory=hotspot-watchdog
+# keep /run/hotspot-watchdog (policy state + cookie jar) across restarts —
+# the daemon persists episode state every poll precisely to survive them
+RuntimeDirectoryPreserve=restart
 Restart=always
 RestartSec=10
 # Hardening: stays root (needs the 0600 admin secret + notify auth), but
@@ -17,7 +20,13 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ReadWritePaths=/run/hotspot-watchdog /var/spool/spool-notify
+# The leading "-" on the spool path tolerates it being absent (see
+# maintenance-reboot.service.tmpl for the full rationale): a plain entry
+# pointing at a missing dir fails the whole unit (226/NAMESPACE), which for
+# this Restart=always daemon means a crash loop to the systemd start-limit —
+# i.e. the wan1 auto-reboot watchdog going dark. deploy/README.md documents
+# creating /var/spool/spool-notify as a real prerequisite.
+ReadWritePaths=/run/hotspot-watchdog -/var/spool/spool-notify
 
 [Install]
 WantedBy=multi-user.target

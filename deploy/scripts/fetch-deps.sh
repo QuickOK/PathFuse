@@ -39,7 +39,18 @@ if ! command -v grpcurl >/dev/null && [ ! -x /usr/local/bin/grpcurl ]; then
   if [ -n "$GRPCURL_ARCH" ]; then
     TARBALL="grpcurl_${GRPCURL_VERSION}_linux_${GRPCURL_ARCH}.tar.gz"
     URL="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/${TARBALL}"
-    TMP=$(mktemp -d)
+    # Only create a real temp dir (and only clean it up) outside --dry-run: under
+    # --dry-run the whole block below is just echoed via run(), but mktemp -d
+    # itself is a real side effect that ran unconditionally before, leaking a
+    # directory even in preview mode. The trap covers a mid-download failure
+    # under `set -e` (e.g. checksum mismatch) that would otherwise skip the
+    # final `rm -rf` and leak too.
+    if [ "$DRY" = 1 ]; then
+      TMP="/tmp/fetch-deps-grpcurl.XXXXXX"   # preview path only; nothing created
+    else
+      TMP=$(mktemp -d)
+      trap 'rm -rf "$TMP"' EXIT
+    fi
     run "curl -fsSL -o '$TMP/$TARBALL' '$URL'"
     # Checksum is pinned for the arm64 tarball; skip the gate on other arches
     # rather than assert a hash we have not verified.
@@ -48,7 +59,12 @@ if ! command -v grpcurl >/dev/null && [ ! -x /usr/local/bin/grpcurl ]; then
     fi
     run "tar -xzf '$TMP/$TARBALL' -C '$TMP' grpcurl"
     run "sudo install -m0755 '$TMP/grpcurl' /usr/local/bin/grpcurl"
-    run "rm -rf '$TMP'"
+    if [ "$DRY" = 1 ]; then
+      echo "DRY: rm -rf '$TMP'"
+    else
+      rm -rf "$TMP"
+      trap - EXIT
+    fi
   fi
 fi
 

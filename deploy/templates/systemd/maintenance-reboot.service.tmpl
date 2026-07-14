@@ -37,4 +37,12 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ReadWritePaths=/run/sbfd-ctl /var/spool/spool-notify
+# The leading "-" on the spool path tolerates it being absent: notify() in
+# maintenance_reboot.py is contractually fail-open (never raises — a failed
+# notification must not abort a reboot sequence), so degrading to a lost
+# notification beats a maintenance reboot that can never start at all. Under
+# ProtectSystem=strict a plain (non-dash) entry pointing at a missing path
+# fails the WHOLE unit at launch (code=exited, status=226/NAMESPACE) — see
+# deploy/README.md for making the directory a real prerequisite instead of
+# relying on this tolerance.
+ReadWritePaths=/run/sbfd-ctl -/var/spool/spool-notify

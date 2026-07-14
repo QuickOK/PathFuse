@@ -19,7 +19,19 @@ for u in $(python3 -c "import json;v=json.load(open('$VALUES'));print(v['users']
   id "$u" >/dev/null 2>&1 || run "sudo useradd --system --no-create-home --shell /usr/sbin/nologin $u"
 done
 
-# 3) place rendered files per manifest (dest + mode), backing up existing
+# 3) spool-notify's spool dir: a real prerequisite, not just documentation. The
+# client-only root units that notify (maintenance-reboot.service, hotspot-watchdog.service)
+# use a tolerant "-/var/spool/spool-notify" ReadWritePaths entry so a missing dir degrades
+# to a lost notification instead of an unstartable unit (226/NAMESPACE) — but under
+# ProtectSystem=strict a missing path left out of the mount table stays read-only, so
+# spool-notify's own `mkdir -p` cannot self-heal from inside the sandbox. Create it here
+# so notifications actually work instead of silently degrading every time.
+if [ "$ROLE" = "client" ]; then
+  run "sudo mkdir -p /var/spool/spool-notify"
+  run "sudo chmod 0755 /var/spool/spool-notify"
+fi
+
+# 4) place rendered files per manifest (dest + mode), backing up existing
 python3 - "$VALUES" "$OUT/$ROLE" "$HERE/templates/manifest.json" <<'PY' | while read -r src dest mode; do
 import json,sys,os
 values=json.load(open(sys.argv[1])); role=values["role"]; out=sys.argv[2]
@@ -32,7 +44,7 @@ PY
   run "sudo install -D -m '$mode' '$src' '$dest'"
 done
 
-# 4) reload systemd; do NOT auto-enable/start (see README cutover order)
+# 5) reload systemd; do NOT auto-enable/start (see README cutover order)
 run "sudo systemctl daemon-reload"
 echo "Rendered+installed. NOT auto-enabling/starting services — see deploy/README.md for the"
 echo "start order (the client's udpspeeder-client must start only after the wg0 Endpoint cutover)."
