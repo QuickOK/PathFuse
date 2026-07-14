@@ -15,6 +15,7 @@ flapping. It pages only when a WAN goes down and fails to come back; a reboot
 that was never issued left the link untouched, and says so quietly."""
 import argparse
 import enum
+import fcntl
 import json
 import logging
 import math
@@ -30,6 +31,7 @@ from typing import NamedTuple, Optional
 log = logging.getLogger("maintenance-reboot")
 
 DEFAULT_NOTIFY = "/usr/local/sbin/spool-notify"
+DEFAULT_LOCK = "/run/sbfd-ctl/maintenance.lock"
 PUBLISHED_MAX_AGE_S = 60.0
 
 
@@ -85,6 +87,7 @@ class MrConfig:
     published_state: str
     sbfd_state_path: str
     window_path: str
+    lock_path: str
     wan1: Wan1Cfg
     wan2: Wan2Cfg
     recovery_deadline_s: float
@@ -103,6 +106,7 @@ def load_config(path: str) -> MrConfig:
         sbfd_state_path=raw.get("sbfd_state_path", "/run/sbfd/state.json"),
         window_path=raw.get("window_path",
                             "/run/sbfd-ctl/maintenance_window.json"),
+        lock_path=raw.get("lock_path", DEFAULT_LOCK),
         wan1=Wan1Cfg(iface=w1.get("iface", "wan1"),
                      watchdog_bin=w1["watchdog_bin"],
                      watchdog_config=w1["watchdog_config"]),
@@ -117,12 +121,49 @@ def load_config(path: str) -> MrConfig:
         notify_topic=raw.get("notify_topic", "pathfuse"),
         dry_run=bool(raw.get("dry_run", True)),
     )
+    # The two ifaces must be real and DISTINCT. peer_of() pairs each WAN with
+    # the other one; if both names are the same string it hands a WAN back
+    # ITSELF as its own peer, and peer_is_up() — the never-both-down guard —
+    # degenerates into "is the WAN I am about to reboot currently up?", which
+    # is true precisely when it is about to stop being true.
+    for name, iface in (("wan1.iface", cfg.wan1.iface),
+                        ("wan2.iface", cfg.wan2.iface)):
+        if not isinstance(iface, str) or not iface.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+    if cfg.wan1.iface == cfg.wan2.iface:
+        raise ValueError("wan1.iface and wan2.iface must differ — a WAN "
+                         "cannot be its own peer")
+    # Finiteness before positivity: json.loads accepts bareword Infinity/NaN,
+    # and every comparison against NaN is False, so a NaN deadline would sail
+    # through a bare `<= 0` check and then make await_up's bound meaningless.
     for k in ("recovery_deadline_s", "settle_s"):
-        if getattr(cfg, k) <= 0:
+        v = getattr(cfg, k)
+        if not math.isfinite(v):
+            raise ValueError(f"{k} must be finite")
+        if v <= 0:
             raise ValueError(f"{k} must be > 0")
+    if not math.isfinite(cfg.wan2.min_uptime_s):
+        raise ValueError("wan2.min_uptime_s must be finite")
     if cfg.wan2.min_uptime_s < 0:
         raise ValueError("wan2.min_uptime_s must be >= 0")
     return cfg
+
+
+def _fresh(ts, now: float, max_age_s: float) -> bool:
+    """Is `ts` a usable timestamp no older (and no newer) than max_age_s?
+
+    Rejects bools — isinstance(True, int) is True in Python, and a JSON `true`
+    must never be read as "one second past the epoch". Rejects non-finite
+    values, which json.loads happily produces from bareword NaN/Infinity: a
+    NaN timestamp makes `abs(now - ts) > max_age_s` False, so an arbitrarily
+    stale file would read as FRESH, and a stale file is how a WAN that is
+    already down gets read as a phantom UP."""
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False
+    if not math.isfinite(ts):
+        return False
+    age = abs(now - ts)
+    return math.isfinite(age) and age <= max_age_s
 
 
 def read_published(path: str, now: float,
@@ -137,8 +178,7 @@ def read_published(path: str, now: float,
         return None
     if not isinstance(raw, dict):
         return None
-    ts = raw.get("ts", raw.get("timestamp"))
-    if not isinstance(ts, (int, float)) or abs(now - ts) > max_age_s:
+    if not _fresh(raw.get("ts", raw.get("timestamp")), now, max_age_s):
         return None
     return raw
 
@@ -172,8 +212,7 @@ def read_wan_states(path: str, now: float, max_age_s: float = 30.0) -> dict:
         return {}
     if not isinstance(raw, dict):
         return {}
-    ts = raw.get("timestamp")
-    if not isinstance(ts, (int, float)) or abs(now - ts) > max_age_s:
+    if not _fresh(raw.get("timestamp"), now, max_age_s):
         return {}
     sessions = raw.get("sessions")
     if not isinstance(sessions, dict):
@@ -268,27 +307,61 @@ class DishClient:
         return resp
 
     def status(self) -> Optional[dict]:
+        """The status object, {} when the device reported none, or None when
+        the payload is malformed.
+
+        A malformed payload is treated as UNAVAILABLE, never as an empty-but-
+        valid one: every level of this structure is attacker-shaped input from
+        a device whose firmware changes under us, and `.get()` on a list is an
+        AttributeError out of whichever accessor happened to touch it."""
         resp = self._call({"get_status": {}})
         if resp is None:
             return None
-        return resp.get("dishGetStatus") or {}
-
-    def bootcount(self) -> Optional[int]:
-        """The reboot receipt. BFD coming back says the path recovered; only a
-        bumped bootcount says the device actually rebooted."""
-        st = self.status()
-        if not st:
+        st = resp.get("dishGetStatus")
+        if st is None:
+            return {}
+        if not isinstance(st, dict):
+            log.warning("dishGetStatus is not an object (%s)",
+                        type(st).__name__)
             return None
-        bc = (st.get("deviceInfo") or {}).get("bootcount")
-        n = _as_number(bc)
+        return st
+
+    @staticmethod
+    def _sub(st, key) -> Optional[dict]:
+        """A nested object of the status payload, or None when it is malformed
+        (which every caller must treat as "no reading", not as a default)."""
+        v = st.get(key)
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            log.warning("%s is not an object (%s)", key, type(v).__name__)
+            return None
+        return v
+
+    def bootcount(self, st: Optional[dict] = None) -> Optional[int]:
+        """The reboot receipt. BFD coming back says the path recovered; only a
+        bumped bootcount says the device actually rebooted.
+
+        `st` lets the caller read the count out of a snapshot it already has,
+        so the baseline it compares against can be taken from the same status
+        read as the reboot decision itself."""
+        st = self.status() if st is None else st
+        if not isinstance(st, dict) or not st:
+            return None
+        info = self._sub(st, "deviceInfo")
+        if not info:
+            return None
+        n = _as_number(info.get("bootcount"))
         return int(n) if n is not None else None
 
     def uptime_s(self) -> Optional[float]:
         st = self.status()
         if not st:
             return None
-        up = (st.get("deviceState") or {}).get("uptimeS")
-        n = _as_number(up)
+        state = self._sub(st, "deviceState")
+        if not state:
+            return None
+        n = _as_number(state.get("uptimeS"))
         return float(n) if n is not None else None
 
     def update_staged(self, st: Optional[dict] = None) -> bool:
@@ -296,7 +369,7 @@ class DishClient:
         Note swupdateRebootReady is omitted when false (proto3), so a missing
         key means False."""
         st = self.status() if st is None else st
-        if not st:
+        if not isinstance(st, dict) or not st:
             return False
         if st.get("swupdateRebootReady") is True:
             return True
@@ -306,7 +379,7 @@ class DishClient:
     def update_in_flight(self, st: Optional[dict] = None) -> bool:
         """The device is fetching or writing firmware — do not touch it."""
         st = self.status() if st is None else st
-        if not st:
+        if not isinstance(st, dict) or not st:
             return False
         return st.get("softwareUpdateState") in ("FETCHING", "APPLYING")
 
@@ -321,6 +394,53 @@ class DishClient:
         it. Preferred over a plain reboot when an update is staged — a plain
         reboot discards it, and the next night would find it staged again."""
         return self._call({"update": {"schedule_reboot": True}}) is not None
+
+
+def acquire_lock(path: str) -> Optional[int]:
+    """Take the exclusive, non-blocking run lock. Returns an open fd (hold it
+    for the whole run; closing it releases the lock), or None if we did not get
+    it.
+
+    systemd stops the timer from overlapping ITSELF, but nothing stops an
+    operator running `--now` by hand while the timer's run is in flight — and
+    `--now` skips the schedule gate entirely. Two runs interleaved is how BOTH
+    WANs go down at once: run A finishes leg 1 (wan1 back UP, both WANs read
+    UP) and enters leg 2; run B's gate sees both UP and issues wan1's reboot;
+    A's peer check still reads the stale pre-reboot UP for wan1 — the hotspot's
+    admin API returns before the carrier drops — and issues wan2's. Both links
+    then drop. B's close_window() would clobber A's window on the way in, too,
+    so the resulting outage would page unsuppressed.
+
+    Failing to CREATE the lock file counts as not holding it: we cannot prove
+    we are the only run, and an absent observation must never authorize an
+    irreversible act."""
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as e:
+        log.warning("cannot open lock file %s: %s", path, e)
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:              # BlockingIOError when already held
+        os.close(fd)
+        log.info("lock %s is held by another run (%s)", path, e)
+        return None
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass                          # the lock is what matters, not the pid
+    return fd
+
+
+def release_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)                  # closing the fd releases the flock
+    except OSError as e:
+        log.warning("cannot release lock: %s", e)
 
 
 def _atomic_write_text(path: str, body: str) -> None:
@@ -342,6 +462,36 @@ def open_window(cfg: MrConfig, wan: str, now: float, ttl_s: float) -> None:
     }))
 
 
+WATCHDOG_TIMEOUT_S = 120           # the wan1 one-shot subprocess's own bound
+GRPC_CALL_S = GRPC_TIMEOUT_S + 10  # what DishClient._call allows per round-trip
+WINDOW_MARGIN_S = 60.0
+
+
+def leg1_window_ttl(cfg: MrConfig) -> float:
+    """A TTL that bounds the WHOLE wan1 leg, not just its recovery poll.
+
+    The window must outlive the leg. `recovery_deadline_s + settle_s` did not:
+    before await_up even starts, the leg can sit in the watchdog subprocess for
+    its full timeout. A window that expires mid-leg un-suppresses exactly the
+    post-reboot BFD flap it exists to hide, so a slow-but-successful night
+    would page. (It fails open — a spurious alert, never a missed one — which
+    is why this is a broken promise rather than a danger.)"""
+    return (WATCHDOG_TIMEOUT_S + cfg.recovery_deadline_s + cfg.settle_s
+            + WINDOW_MARGIN_S)
+
+
+def leg2_window_ttl(cfg: MrConfig) -> float:
+    """Same, for wan2, whose leg is mostly gRPC round-trips.
+
+    Worst case, in order: three status/uptime round-trips before the decision,
+    the reboot request, a full recovery deadline whose last extra_ok bootcount
+    call can overrun it, the fallback's notify() and its reboot request, a
+    second deadline that can overrun the same way — seven round-trips in all —
+    and then the settle."""
+    return (7 * GRPC_CALL_S + NOTIFY_TIMEOUT_S
+            + 2 * cfg.recovery_deadline_s + cfg.settle_s + WINDOW_MARGIN_S)
+
+
 def close_window(cfg: MrConfig) -> None:
     try:
         Path(cfg.window_path).unlink()
@@ -351,17 +501,30 @@ def close_window(cfg: MrConfig) -> None:
         log.warning("cannot remove window file: %s", e)
 
 
+NOTIFY_TIMEOUT_S = 30
+
+
 def notify(cfg: MrConfig, title: str, priority: str, message: str) -> None:
-    """Never raises: a failed notification must not abort a reboot sequence."""
+    """Never raises: a failed notification must not abort a reboot sequence.
+
+    It does, though, have to LEAVE A TRACE. The spool helper exits 0 even when
+    it merely spooled the message, so a nonzero exit means something local is
+    broken, and discarding the CompletedProcess made a dropped page look
+    exactly like a delivered one."""
     if cfg.dry_run:
         log.info("dry-run notify: %s | %s", title, message)
         return
     env = dict(os.environ, NOTIFY_TOPIC=cfg.notify_topic)
     try:
-        subprocess.run([cfg.notify_bin, title, priority, message],
-                       env=env, capture_output=True, timeout=30)
+        r = subprocess.run([cfg.notify_bin, title, priority, message],
+                           env=env, capture_output=True, text=True,
+                           timeout=NOTIFY_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as e:
         log.warning("notify failed: %s", e)
+        return
+    if r.returncode != 0:
+        log.warning("notify exited %s: %s | %s", r.returncode,
+                    title, (r.stderr or "").strip()[:200])
 
 
 POLL_S = 5.0
@@ -472,7 +635,8 @@ def reboot_wan1(cfg: MrConfig, now: float, runner=subprocess.run,
         log.info("dry-run: would run %s", " ".join(argv))
         return _leg(Outcome.SKIPPED, "dry-run")
     try:
-        r = runner(argv, capture_output=True, text=True, timeout=120)
+        r = runner(argv, capture_output=True, text=True,
+                   timeout=WATCHDOG_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as e:
         # The watchdog invocation itself can fail to return precisely BECAUSE
         # the hotspot is already going down under it (the admin API call hangs
@@ -511,9 +675,18 @@ def reboot_wan2(cfg: MrConfig, now: float, client=None,
     one. If the update does not apply, fall back to exactly one plain reboot."""
     client = client or DishClient(cfg.wan2)
     w2 = cfg.wan2.iface
+    # Cheap pre-checks first, off an early snapshot: they exist to bail out
+    # before we spend any more round-trips on a terminal we are not going to
+    # touch tonight.
     st = client.status()
     if st is None:
-        return _leg(Outcome.SKIPPED, "skipping: terminal unreachable")
+        # "Unreachable" is not, on its own, a safe skip: the terminal can be
+        # unreachable BECAUSE IT IS DOWN, and a silent rc-0 skip would swallow
+        # a real wan2 outage. A skip is only honest if the LINK is verifiably
+        # up — so ask the link, exactly as every other unproven case does.
+        return classify_by_link(
+            cfg, w2, Outcome.SKIPPED, "skipping: terminal unreachable",
+            f"{w2} is down and the terminal is not answering")
     if client.update_in_flight(st):
         return _leg(Outcome.SKIPPED, "skipping: firmware update in flight")
     up = client.uptime_s()
@@ -521,14 +694,37 @@ def reboot_wan2(cfg: MrConfig, now: float, client=None,
         return _leg(Outcome.SKIPPED,
                     f"skipping: uptime {int(up)}s < minimum "
                     f"{int(cfg.wan2.min_uptime_s)}s — rebooted recently")
-    before = client.bootcount()
+
+    # ---- the decision snapshot -----------------------------------------
+    # Everything above came from ONE status read taken several seconds and
+    # several gRPC round-trips ago. A firmware update that entered
+    # FETCHING/APPLYING in that gap would not be in it — and interrupting a
+    # firmware write is how terminals get bricked. An unnoticed reboot in that
+    # gap would poison the receipt just as badly: `before` would be the
+    # pre-reboot count, so the very next read would look like a bump we caused.
+    # So in-flight, the bootcount baseline and the staged decision all come
+    # from a FRESH read taken immediately before the irreversible act: only the
+    # peer check (a local file read) and the dry-run branch sit between it and
+    # the reboot.
+    st = client.status()
+    if st is None:
+        return classify_by_link(
+            cfg, w2, Outcome.SKIPPED,
+            "skipping: terminal stopped answering before the reboot",
+            f"{w2} is down and the terminal is not answering")
+    if client.update_in_flight(st):
+        return _leg(Outcome.SKIPPED, "skipping: firmware update in flight")
+    before = client.bootcount(st)
     if before is None:
         # No readable receipt means no way to prove the device actually
         # restarted, so BFD coming back would be the only evidence — and that
-        # only proves the path recovered. Fail safe: skip rather than reboot
-        # blind and then report a success we cannot stand behind.
-        return _leg(Outcome.SKIPPED,
-                    "skipping: bootcount unreadable — cannot verify a reboot")
+        # only proves the path recovered. Fail safe: do not reboot blind. But
+        # the bootcount can also be unreadable because the terminal is dying,
+        # so this is a skip only if the link says so.
+        return classify_by_link(
+            cfg, w2, Outcome.SKIPPED,
+            "skipping: bootcount unreadable — cannot verify a reboot",
+            f"{w2} is down and its bootcount is unreadable")
     staged = client.update_staged(st)
     if cfg.dry_run:
         return _leg(Outcome.SKIPPED,
@@ -611,9 +807,13 @@ def report_leg(cfg: MrConfig, wan: str, res: LegResult) -> None:
 
 
 def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
-    """Leg 1 (wan1), then leg 2 (wan2) — and leg 2 only ever with wan1 verified
-    back UP. `sleep` is injectable so an end-to-end test never has to wait out
-    the real settle."""
+    """Leg 1 (wan1), then leg 2 (wan2), never both at once — and never leg 2
+    while wan1 is known to be down. `sleep` is injectable so an end-to-end test
+    never has to wait out the real settle.
+
+    The caller MUST hold the run lock (see acquire_lock): the very first thing
+    this does is delete any window file, which would clobber a concurrent run's
+    live suppression window."""
     # A window file outlives the process that wrote it: a previous run that was
     # SIGKILLed (or a box that lost power mid-leg) leaves one behind, and the
     # early-skip paths below return without ever entering the try/finally that
@@ -629,11 +829,12 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
                      "last standing WAN", wan, states.get(wan))
             return 0
 
+    failed = False
     try:
-        # Leg 1. A failed leg 1 aborts the run: never proceed to wan2 while
-        # wan1 is still down. Carrying on with "the other WAN anyway" is
-        # exactly how both WANs end up down at once.
-        open_window(cfg, w1, now, cfg.recovery_deadline_s + cfg.settle_s)
+        # Leg 1. A leg 1 that left wan1 DOWN aborts the run: never proceed to
+        # wan2 while wan1 is still down. Carrying on with "the other WAN
+        # anyway" is exactly how both WANs end up down at once.
+        open_window(cfg, w1, now, leg1_window_ttl(cfg))
         try:
             res = reboot_wan1(cfg, now)
             # The settle happens INSIDE the window. A WAN that has just booted
@@ -646,15 +847,29 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         finally:
             close_window(cfg)
         log.info("wan1: %s", res.reason)
-        if not res.ok and res.status is not Outcome.SKIPPED:
+        if res.status is Outcome.NOT_RETURNED:
+            # The one leg-1 outcome that stops the run: wan1 went down and did
+            # not come back. Rebooting wan2 now would take out the last WAN.
             report_leg(cfg, w1, res)
             return 1
-        # A skip means wan1 was never disturbed, so it is still up and leg 2 may
-        # proceed — with its own peer re-check to confirm.
+        if not res.ok and res.status is not Outcome.SKIPPED:
+            # NOT_ISSUED. classify_by_link only ever returns it with wan1
+            # VERIFIABLY still UP on BFD — the reboot did not take (the admin
+            # password rotated, say) and the link was never disturbed. Report
+            # it, but do NOT abort: aborting would mean wan2 never gets rebooted
+            # again either, silently reinstating the very problem this feature
+            # exists to solve (a terminal sitting on a staged firmware update
+            # forever) for as long as wan1's reboot stays broken.
+            report_leg(cfg, w1, res)
+            failed = True
 
-        # Leg 2, reached only with wan1 either untouched or verified back UP.
-        open_window(cfg, w2, time.time(),
-                    cfg.recovery_deadline_s * 2 + cfg.settle_s)
+        # Leg 2. Note what does NOT hold here: a leg-1 SKIPPED does not prove
+        # wan1 is up. The watchdog's own `no carrier` guard exits 2 — a skip —
+        # precisely BECAUSE wan1 is broken. What makes leg 2 safe is not any
+        # inference about leg 1 but leg 2's own peer_is_up() re-check, which
+        # re-reads BFD immediately before it issues anything and refuses to
+        # disturb wan2 unless wan1 is fresh-UP right then.
+        open_window(cfg, w2, time.time(), leg2_window_ttl(cfg))
         try:
             res = reboot_wan2(cfg, time.time())
             if res.ok:
@@ -665,7 +880,7 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         if not res.ok and res.status is not Outcome.SKIPPED:
             report_leg(cfg, w2, res)
             return 1
-        return 0
+        return 1 if failed else 0
     finally:
         # A window left open would suppress that WAN's alerts indefinitely —
         # the one failure mode that could hide a real outage. Closed here on
@@ -701,17 +916,29 @@ def main():
     if args.dry_run:
         cfg.dry_run = True
 
-    now = time.time()
-    if not args.now:
-        pub = read_published(cfg.published_state, now)
-        if pub is None:
-            log.info("skipping: published state missing or stale")
-            return 0
-        ok, why = should_run(pub, time.localtime(now).tm_hour)
-        if not ok:
-            log.info("skipping: %s", why)
-            return 0
-    return run_once(cfg, now)
+    # Held for the WHOLE run, released on every exit path. Without it, an
+    # operator's `--now` can interleave with the timer's run and put both WANs
+    # down at once (see acquire_lock). If we do not get it we do NOTHING: no
+    # peer checks, no window deletion, no reboots — and exit 0, because a run
+    # skipped for safety is a success, not a failure.
+    lock = acquire_lock(cfg.lock_path)
+    if lock is None:
+        log.info("skipping: another maintenance run is in progress")
+        return 0
+    try:
+        now = time.time()
+        if not args.now:
+            pub = read_published(cfg.published_state, now)
+            if pub is None:
+                log.info("skipping: published state missing or stale")
+                return 0
+            ok, why = should_run(pub, time.localtime(now).tm_hour)
+            if not ok:
+                log.info("skipping: %s", why)
+                return 0
+        return run_once(cfg, now)
+    finally:
+        release_lock(lock)
 
 
 if __name__ == "__main__":

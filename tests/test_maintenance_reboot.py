@@ -9,6 +9,9 @@ def cfg_dict(tmp_path, **kw):
         "published_state": str(tmp_path / "state.json"),
         "sbfd_state_path": str(tmp_path / "sbfd.json"),
         "window_path": str(tmp_path / "window.json"),
+        # never the real /run/sbfd-ctl/maintenance.lock: a test must not be
+        # able to lock out the live node's maintenance run
+        "lock_path": str(tmp_path / "maintenance.lock"),
         "wan1": {"iface": "wan1",
                  "watchdog_bin": "/opt/sbfd-ctl/hotspot_watchdog.py",
                  "watchdog_config": "/etc/sbfd-ctl/hotspot-watchdog.json"},
@@ -41,6 +44,72 @@ def test_load_config_rejects_bad_values(tmp_path):
     import pytest
     p = tmp_path / "bad.json"
     p.write_text(_json.dumps(cfg_dict(tmp_path, recovery_deadline_s=0)))
+    with pytest.raises(ValueError):
+        M.load_config(str(p))
+
+
+def test_load_config_defaults_the_lock_path(tmp_path):
+    # the lock is not optional plumbing: a config that omits it must still get
+    # one, or two concurrent runs could take both WANs down
+    raw = cfg_dict(tmp_path)
+    raw.pop("lock_path")
+    p = tmp_path / "nolock.json"
+    p.write_text(_json.dumps(raw))
+    assert M.load_config(str(p)).lock_path == M.DEFAULT_LOCK
+
+
+def test_load_config_rejects_identical_ifaces(tmp_path):
+    # peer_of() pairs each WAN with the OTHER one; identical names make a WAN
+    # its own peer, so peer_is_up() — the never-both-down guard — degenerates
+    # into "is the WAN I am about to reboot up?", which is true right up to the
+    # moment it stops being true
+    import pytest
+    p = tmp_path / "same.json"
+    raw = cfg_dict(tmp_path)
+    raw["wan2"]["iface"] = raw["wan1"]["iface"]
+    p.write_text(_json.dumps(raw))
+    with pytest.raises(ValueError):
+        M.load_config(str(p))
+
+
+def test_load_config_rejects_empty_ifaces(tmp_path):
+    # an empty iface name matches no BFD session, so every state read for it is
+    # "not UP" — a config that can never reboot anything, failing silently
+    import pytest
+    for blank in ("", "   "):
+        raw = cfg_dict(tmp_path)
+        raw["wan1"]["iface"] = blank
+        p = tmp_path / "blank.json"
+        p.write_text(_json.dumps(raw))
+        with pytest.raises(ValueError):
+            M.load_config(str(p))
+
+
+def test_load_config_rejects_non_finite_durations(tmp_path):
+    # json.loads accepts bareword NaN/Infinity, and every comparison against
+    # NaN is False — so a NaN deadline sails through a bare "<= 0" check and
+    # then makes await_up's bound meaningless
+    import pytest
+    p = tmp_path / "nonfinite.json"
+    for key, body in (("recovery_deadline_s", "NaN"),
+                      ("recovery_deadline_s", "Infinity"),
+                      ("settle_s", "NaN"),
+                      ("settle_s", "Infinity")):
+        raw = _json.dumps(cfg_dict(tmp_path)).replace(
+            f'"{key}": 600', f'"{key}": {body}').replace(
+            f'"{key}": 30', f'"{key}": {body}')
+        p.write_text(raw)
+        with pytest.raises(ValueError):
+            M.load_config(str(p))
+
+
+def test_load_config_rejects_non_finite_min_uptime(tmp_path):
+    # a NaN min_uptime_s makes "uptime < minimum" False for every uptime, so the
+    # just-rebooted guard would never fire
+    import pytest
+    p = tmp_path / "nanuptime.json"
+    p.write_text(_json.dumps(cfg_dict(tmp_path)).replace(
+        '"min_uptime_s": 43200', '"min_uptime_s": NaN'))
     with pytest.raises(ValueError):
         M.load_config(str(p))
 
@@ -165,6 +234,26 @@ def test_read_wan_states_rejects_future_timestamp(tmp_path):
         "s1": {"iface": "wan1", "state": "UP"},
     }}))
     assert M.read_wan_states(str(p), now=1000.0, max_age_s=30) == {}
+
+
+def test_read_published_rejects_bool_and_non_finite_timestamps(tmp_path):
+    # isinstance(True, int) is True, and json.loads parses bareword NaN into a
+    # float — with a NaN ts, abs(now - ts) > max_age_s is False, so an
+    # arbitrarily stale file reads as FRESH and its schedule licenses a reboot
+    p = tmp_path / "state.json"
+    for ts in ("true", "false", "NaN", "Infinity", "-Infinity"):
+        p.write_text('{"ts": %s, "maintenance": {"enabled": true}}' % ts)
+        assert M.read_published(str(p), now=1000.0, max_age_s=60) is None
+
+
+def test_read_wan_states_rejects_bool_and_non_finite_timestamps(tmp_path):
+    # the same phantom-freshness bug, but here it invents a phantom UP: a
+    # stale file read as fresh is how a WAN that is already down gets rebooted
+    p = tmp_path / "sbfd.json"
+    for ts in ("true", "false", "NaN", "Infinity", "-Infinity"):
+        p.write_text('{"timestamp": %s, "sessions": {"s1": '
+                     '{"iface": "wan1", "state": "UP"}}}' % ts)
+        assert M.read_wan_states(str(p), now=1000.0, max_age_s=30) == {}
 
 
 def test_peer_of_raises_on_unrecognized_iface(tmp_path):
@@ -489,6 +578,48 @@ def test_apply_update_false_on_non_dict_json_bodies(tmp_path):
         assert d.apply_update() is False
 
 
+# A payload whose nested objects are not objects. This bug class (".get() on a
+# thing that turned out to be a list") has already shipped three times in this
+# repo, one level up each time; every level is device-supplied and every level
+# must be checked.
+MALFORMED_NESTING = (
+    _json.dumps({"dishGetStatus": []}),
+    _json.dumps({"dishGetStatus": "nope"}),
+    _json.dumps({"dishGetStatus": {"deviceInfo": [], "deviceState": []}}),
+    _json.dumps({"dishGetStatus": {"deviceInfo": "x", "deviceState": 3}}),
+)
+
+
+def test_bootcount_none_on_malformed_nesting(tmp_path):
+    # AttributeError out of bootcount() would abort the run mid-sequence
+    for body in MALFORMED_NESTING:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.bootcount() is None
+
+
+def test_uptime_s_none_on_malformed_nesting(tmp_path):
+    # ...and out of uptime_s(), which gates the "rebooted recently" skip
+    for body in MALFORMED_NESTING:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.uptime_s() is None
+
+
+def test_update_flags_false_on_malformed_nesting(tmp_path):
+    # a malformed payload is UNAVAILABLE, never "no update staged, go ahead"
+    for body in MALFORMED_NESTING:
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.update_staged() is False
+        d, _ = dish(tmp_path, [(0, body)])
+        assert d.update_in_flight() is False
+
+
+def test_status_none_when_dish_get_status_is_not_an_object(tmp_path):
+    # a non-dict dishGetStatus must read as "terminal unavailable", not as a
+    # truthy status object that every accessor then indexes into
+    d, _ = dish(tmp_path, [(0, _json.dumps({"dishGetStatus": [1, 2]}))])
+    assert d.status() is None
+
+
 def test_status_none_when_grpcurl_binary_missing(tmp_path):
     # grpcurl missing / not executable raises OSError from subprocess.run;
     # that must yield None, never propagate
@@ -566,7 +697,7 @@ class FakeDish:
     def uptime_s(self):
         return self._uptime
 
-    def bootcount(self):
+    def bootcount(self, st=None):
         return self.boot
 
     def update_staged(self, st=None):
@@ -591,6 +722,7 @@ class FakeDish:
 
 BOTH_UP = {"wan1": "UP", "wan2": "UP"}
 WAN1_DOWN = {"wan1": "DOWN", "wan2": "UP"}
+WAN2_DOWN = {"wan1": "UP", "wan2": "DOWN"}
 
 
 def both_up(*a, **k):
@@ -682,6 +814,169 @@ def test_notify_never_raises_when_the_notifier_is_missing(tmp_path):
     cfg = write_cfg(tmp_path, dry_run=False,
                     notify_bin=str(tmp_path / "does-not-exist"))
     M.notify(cfg, "t", "high", "m")
+
+
+def test_notify_logs_the_return_code_when_the_notifier_fails(tmp_path, caplog):
+    # the spool helper exits 0 even when it only spooled the message, so a
+    # NON-zero exit means something local is broken. Discarding the
+    # CompletedProcess made a dropped page indistinguishable from a delivered
+    # one, and left no trace at all.
+    import logging
+    cfg = write_cfg(tmp_path, dry_run=False, notify_bin="/bin/false")
+    with caplog.at_level(logging.WARNING, logger="maintenance-reboot"):
+        M.notify(cfg, "t", "high", "m")     # still must not raise
+    assert any("notify exited 1" in r.getMessage() for r in caplog.records)
+
+
+def test_notify_is_silent_when_the_notifier_succeeds(tmp_path, caplog):
+    # ...and the happy path must not cry wolf
+    import logging
+    cfg = write_cfg(tmp_path, dry_run=False, notify_bin="/bin/true")
+    with caplog.at_level(logging.WARNING, logger="maintenance-reboot"):
+        M.notify(cfg, "t", "high", "m")
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_window_ttls_cover_the_whole_leg_not_just_the_recovery_poll(tmp_path):
+    # the window must outlive the leg. recovery_deadline_s + settle_s did not:
+    # leg 1 can also sit in the watchdog subprocess for its full timeout, and
+    # leg 2 spends several 30s gRPC round-trips outside its two deadlines. A
+    # window that expires mid-leg un-suppresses exactly the post-reboot BFD
+    # flap it exists to hide.
+    cfg = write_cfg(tmp_path)
+    assert M.leg1_window_ttl(cfg) > (M.WATCHDOG_TIMEOUT_S
+                                     + cfg.recovery_deadline_s + cfg.settle_s)
+    assert M.leg2_window_ttl(cfg) > (2 * cfg.recovery_deadline_s + cfg.settle_s
+                                     + 4 * M.GRPC_CALL_S)
+    # and the watchdog subprocess is bounded by the same constant the TTL uses
+    assert M.GRPC_CALL_S > M.GRPC_TIMEOUT_S
+
+
+def test_reboot_wan1_bounds_the_watchdog_with_the_ttl_constant(
+        tmp_path, monkeypatch):
+    # if the subprocess timeout and the window TTL ever drift apart, the window
+    # stops covering the leg again — pin them to the same constant
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    r = FakeRunner([(2, "skipped")])
+    M.reboot_wan1(cfg, now=1000.0, runner=r)
+    assert r.kwargs[0]["timeout"] == M.WATCHDOG_TIMEOUT_S
+
+
+def test_run_once_windows_cover_their_legs(tmp_path, monkeypatch):
+    # the TTL actually written to the window file, not just the helper
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    monkeypatch.setattr(M, "notify", lambda *a, **k: None)
+    seen = []
+
+    def peek(*a, **k):
+        seen.append(_json.loads(Path(cfg.window_path).read_text()))
+        return recovered()
+    monkeypatch.setattr(M, "reboot_wan1", peek)
+    monkeypatch.setattr(M, "reboot_wan2", peek)
+    import time
+    t0 = time.time()                    # leg 2's window is opened off time.time()
+    M.run_once(cfg, now=1000.0, sleep=lambda s: None)
+    assert seen[0]["until"] >= 1000.0 + M.leg1_window_ttl(cfg)
+    assert seen[1]["until"] >= t0 + M.leg2_window_ttl(cfg)
+
+
+# -- the run lock -------------------------------------------------------
+
+
+def run_main(tmp_path, monkeypatch, *extra):
+    """Drive main() with a real argv, restoring the SIGTERM handler it
+    installs so it cannot leak into the rest of the suite."""
+    import signal
+    import sys
+    prev = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(sys, "argv", [
+        "maintenance_reboot.py", "-c", str(tmp_path / "maintenance.json"),
+        *extra])
+    try:
+        return M.main()
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_acquire_lock_is_exclusive(tmp_path):
+    # flock is per open-file-description, so a second acquire — from this
+    # process or any other — must be refused rather than blocking
+    cfg = write_cfg(tmp_path)
+    first = M.acquire_lock(cfg.lock_path)
+    assert first is not None
+    try:
+        assert M.acquire_lock(cfg.lock_path) is None
+    finally:
+        M.release_lock(first)
+    second = M.acquire_lock(cfg.lock_path)      # released: available again
+    assert second is not None
+    M.release_lock(second)
+
+
+def test_acquire_lock_returns_none_when_the_lock_file_cannot_be_created(tmp_path):
+    # we cannot prove we are the only run, and an absent observation must never
+    # AUTHORIZE an irreversible act: no lock, no run
+    cfg = write_cfg(tmp_path, lock_path=str(tmp_path / "state.json" / "x.lock"))
+    (tmp_path / "state.json").write_text("i am a file, not a directory")
+    assert M.acquire_lock(cfg.lock_path) is None
+
+
+def test_main_does_nothing_at_all_when_another_run_holds_the_lock(
+        tmp_path, monkeypatch):
+    # THE BOTH-WANS-DOWN RACE: an operator's `--now` (which bypasses the
+    # schedule gate entirely) racing the timer's run. The second run must not
+    # reboot, must not peer-check, and must not delete the live run's window —
+    # deleting it would un-suppress the very outage it is about to cause.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    held = M.acquire_lock(cfg.lock_path)
+    assert held is not None
+    try:
+        M.open_window(cfg, "wan1", now=1000.0, ttl_s=600)   # run A's window
+        calls = []
+        monkeypatch.setattr(M, "run_once",
+                            lambda *a, **k: calls.append("run_once"))
+        monkeypatch.setattr(M, "close_window",
+                            lambda *a, **k: calls.append("close_window"))
+        monkeypatch.setattr(M, "read_wan_states",
+                            lambda *a, **k: calls.append("peer_check") or {})
+        rc = run_main(tmp_path, monkeypatch, "--now")
+        assert rc == 0                       # a run we declined is a success
+        assert calls == []                   # nothing happened at all
+        assert Path(cfg.window_path).exists()   # run A's window is intact
+    finally:
+        M.release_lock(held)
+
+
+def test_main_runs_and_releases_the_lock(tmp_path, monkeypatch):
+    # the lock must not leak: the next run (the next hour's timer) has to be
+    # able to take it
+    cfg = write_cfg(tmp_path, dry_run=False)
+    calls = []
+    monkeypatch.setattr(M, "run_once",
+                        lambda *a, **k: (calls.append("run_once"), 0)[1])
+    assert run_main(tmp_path, monkeypatch, "--now") == 0
+    assert calls == ["run_once"]
+    after = M.acquire_lock(cfg.lock_path)
+    assert after is not None
+    M.release_lock(after)
+
+
+def test_main_releases_the_lock_when_the_run_explodes(tmp_path, monkeypatch):
+    # released on EVERY exit path, including an unexpected exception — a leaked
+    # lock would disable the nightly reboot until the next boot
+    import pytest
+    cfg = write_cfg(tmp_path, dry_run=False)
+
+    def boom(*a, **k):
+        raise RuntimeError("kaboom")
+    monkeypatch.setattr(M, "run_once", boom)
+    with pytest.raises(RuntimeError):
+        run_main(tmp_path, monkeypatch, "--now")
+    after = M.acquire_lock(cfg.lock_path)
+    assert after is not None
+    M.release_lock(after)
 
 
 def test_await_up_returns_true_once_bfd_reports_up(tmp_path):
@@ -1233,17 +1528,101 @@ def test_reboot_wan2_declined_fallback_on_a_down_link_still_pages(
     assert sent == []                      # ...and was never promised, either
 
 
-def test_reboot_wan2_skips_when_the_terminal_is_unreachable(tmp_path):
-    cfg = write_cfg(tmp_path, dry_run=False)
+class Unreachable(FakeDish):
+    def status(self):
+        return None
 
-    class Unreachable(FakeDish):
-        def status(self):
-            return None
+
+def test_reboot_wan2_skips_when_the_terminal_is_unreachable(tmp_path, monkeypatch):
+    # a terminal we cannot reach while wan2 is verifiably UP was never
+    # disturbed: a silent skip is honest here
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
     d = Unreachable()
     res = M.reboot_wan2(cfg, now=1000.0, client=d)
     assert res.ok is False
     assert res.status is M.Outcome.SKIPPED
     assert d.calls == []
+
+
+def test_reboot_wan2_unreachable_terminal_on_a_down_link_pages(
+        tmp_path, monkeypatch):
+    # THE MASKED OUTAGE: the terminal may be unreachable BECAUSE IT IS DOWN. A
+    # skip is silent and exits 0, so classifying this by the request's result
+    # would bury a real wan2 outage. Only the link decides.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", lambda *a, **k: dict(WAN2_DOWN))
+    d = Unreachable()
+    res = M.reboot_wan2(cfg, now=1000.0, client=d)
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert d.calls == []
+    sent = []
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p)))
+    M.report_leg(cfg, "wan2", res)
+    assert any(p == "high" for _t, p in sent)
+
+
+def test_reboot_wan2_unreadable_bootcount_on_a_down_link_pages(
+        tmp_path, monkeypatch):
+    # same masked outage via the other precheck: a bootcount we cannot read
+    # because the terminal is dying must not be reported as a silent skip
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", lambda *a, **k: dict(WAN2_DOWN))
+    d = FakeDish(boot=None)
+    res = M.reboot_wan2(cfg, now=1000.0, client=d)
+    assert res.status is M.Outcome.NOT_RETURNED
+    assert d.calls == []
+
+
+def test_reboot_wan2_rereads_status_immediately_before_rebooting(
+        tmp_path, monkeypatch):
+    # THE STALE SNAPSHOT: the in-flight/staged/bootcount decision used to come
+    # from one status read taken several seconds and several round-trips before
+    # the reboot was issued. A firmware update that starts APPLYING in that gap
+    # must still be caught — interrupting a firmware write is how terminals get
+    # bricked.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+
+    class UpdateStartsMidLeg(FakeDish):
+        def status(self):
+            self.calls.append("status")
+            return self._st
+
+        def update_in_flight(self, st=None):
+            # idle on the first (precheck) snapshot; APPLYING by the time the
+            # decision snapshot is taken
+            return self.calls.count("status") > 1
+
+    clk = FakeClock()
+    d = UpdateStartsMidLeg()
+    res = M.reboot_wan2(cfg, now=1000.0, client=d,
+                        sleep=instant(clk), clock=clk)
+    assert res.status is M.Outcome.SKIPPED
+    assert "in flight" in res.reason
+    assert "reboot" not in d.calls and "apply_update" not in d.calls
+
+
+def test_reboot_wan2_takes_the_bootcount_baseline_from_the_final_snapshot(
+        tmp_path, monkeypatch):
+    # the baseline must be as fresh as the decision: a bootcount read early and
+    # compared late would credit a reboot that happened in the gap (or that we
+    # never caused) as OUR reboot's receipt
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    seen = []
+
+    class D(FakeDish):
+        def bootcount(self, st=None):
+            seen.append(st)
+            return self.boot
+
+    clk = FakeClock()
+    M.reboot_wan2(cfg, now=1000.0, client=D(), sleep=instant(clk), clock=clk)
+    # the first call passes the decision snapshot; the await_up receipt polls
+    # pass none, because they must be fresh reads
+    assert seen[0] is not None
+    assert seen[1:] and all(s is None for s in seen[1:])
 
 
 def test_run_once_skips_when_peer_is_down(tmp_path, monkeypatch):
@@ -1286,25 +1665,64 @@ def test_run_once_aborts_before_wan2_if_wan1_never_returns(tmp_path, monkeypatch
     assert any(p == "high" for _t, p in sent)   # it pages
 
 
-def test_run_once_aborts_before_wan2_if_wan1_was_never_rebooted(
+def test_run_once_continues_to_wan2_when_leg_one_was_never_issued(
         tmp_path, monkeypatch):
-    # a leg 1 that failed WITHOUT disturbing the link still stops the run: the
-    # watchdog's rc is not proof that the hotspot stayed up, so wan2 stays put
+    # NOT_ISSUED means, by classify_by_link's own definition, that wan1 is
+    # VERIFIABLY still UP and was never disturbed (the admin password rotated,
+    # say). Aborting on it would mean wan2 never gets rebooted again either —
+    # silently reinstating the exact problem this feature exists to solve, for
+    # as long as wan1's reboot stays broken. Report it; carry on. Leg 2's own
+    # peer re-check is what keeps the never-both-down invariant.
     cfg = write_cfg(tmp_path, dry_run=False)
     monkeypatch.setattr(M, "read_wan_states", both_up)
     monkeypatch.setattr(M, "reboot_wan1", lambda *a, **k: M.LegResult(
         False, M.Outcome.NOT_ISSUED, "reboot failed: admin API rejected it"))
     called = []
-    monkeypatch.setattr(M, "reboot_wan2", lambda *a, **k: called.append("w2"))
+    monkeypatch.setattr(M, "reboot_wan2",
+                        lambda *a, **k: (called.append("w2"), recovered())[1])
     sent = []
     monkeypatch.setattr(M, "notify",
                         lambda cfg, t, p, m: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
-    assert rc == 1
-    assert called == []
+    assert called == ["w2"]                      # leg 2 still ran
+    assert rc == 1                               # ...and leg 1 still failed
     # ...but it does NOT page "wan1 did not return" for a WAN that never left
     assert [p for _t, p in sent] == ["default"]
     assert "did not return" not in sent[0][0]
+
+
+def test_run_once_aborts_before_wan2_when_leg_one_did_not_return(
+        tmp_path, monkeypatch):
+    # the invariant NOT_ISSUED must not weaken: a wan1 that went DOWN and
+    # stayed down still stops the run dead, because rebooting wan2 now would
+    # take the last standing WAN off the air
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    monkeypatch.setattr(M, "reboot_wan1", lambda *a, **k: M.LegResult(
+        False, M.Outcome.NOT_RETURNED, "wan1 did not return within 600s"))
+    called = []
+    monkeypatch.setattr(M, "reboot_wan2", lambda *a, **k: called.append("w2"))
+    monkeypatch.setattr(M, "notify", lambda *a, **k: None)
+    rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
+    assert rc == 1
+    assert called == []
+
+
+def test_run_once_continues_to_wan2_after_a_skipped_leg_one(tmp_path, monkeypatch):
+    # a SKIPPED leg 1 also proceeds — but NOT because a skip proves wan1 is up
+    # (the watchdog's `no carrier` guard exits 2 precisely BECAUSE wan1 is
+    # broken). Leg 2's own peer_is_up() re-check is the guard that matters.
+    cfg = write_cfg(tmp_path, dry_run=False)
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    monkeypatch.setattr(M, "reboot_wan1", lambda *a, **k: M.LegResult(
+        False, M.Outcome.SKIPPED, "skipped by guard: no carrier"))
+    called = []
+    monkeypatch.setattr(M, "reboot_wan2",
+                        lambda *a, **k: (called.append("w2"), recovered())[1])
+    monkeypatch.setattr(M, "notify", lambda *a, **k: None)
+    rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
+    assert called == ["w2"]
+    assert rc == 0                     # a skip is a silent success
 
 
 def test_run_once_does_not_page_high_when_the_request_was_rejected(
