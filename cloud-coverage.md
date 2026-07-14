@@ -1,8 +1,8 @@
-# Starlink and Thunderstorm Cloud Coverage
+# Ku/Ka-band satellite links and thunderstorm cloud coverage
 
 ## Summary
 
-Smoke does not affect Starlink because particulate matter is orders of magnitude
+Smoke does not affect the satellite link because particulate matter is orders of magnitude
 smaller than Ku/Ka wavelengths and does not couple to the signal. Liquid water is
 the opposite: it attenuates strongly at those frequencies. A thunderstorm cell can
 degrade service **even when no rain is reaching the dish**, through several distinct
@@ -35,13 +35,13 @@ weather to explain it.
 
 ## Observable behavior
 
-In `dishy` stats this typically appears as SNR drops and obstruction-like outage
+In the terminal's own stats this typically appears as SNR drops and obstruction-like outage
 seconds rather than a hard disconnect, since the constellation reroutes around cells
 when it can.
 
 ## Practical impact (mobile stack)
 
-The Engarde master/backup logic may flap Starlink even on a "dry" day if a strong cell
+The Engarde master/backup logic may flap the satellite WAN even on a "dry" day if a strong cell
 crosses the slant path. This is exactly the case where keeping cellular warm as backup
 earns its keep.
 

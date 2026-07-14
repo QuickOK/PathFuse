@@ -17,7 +17,7 @@ echo "== gate: no deployment vocabulary =="
 # Scan TRACKED files only (skips .pytest_cache/.venv/out and other local cruft). Exclude the
 # gate's own files, which legitimately contain the term list / workflow docs.
 if git ls-files | grep -vE '^(scripts/preflight\.sh|MAINTAINING\.md|ui/vendor/)' \
-     | xargs grep -nIE "truck|[^a-z]ovh|starlink|t-?mobile|\btmo\b|tailscale|warp|cloudflare|raspberr|\bpi\b|\bcab\b" 2>/dev/null \
+     | xargs grep -niE "truck|[^a-z]ovh|starlink|t-?mobile|\btmo\b|tailscale|warp|cloudflare|raspberr|\bpi\b|\bcab\b" 2>/dev/null \
      | grep -viE "pip |pipe|pid |mapping"; then
   echo "!! deployment vocabulary found (above) — generalize it before pushing"; fail=1
 else
