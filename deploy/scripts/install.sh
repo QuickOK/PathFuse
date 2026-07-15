@@ -42,7 +42,22 @@ if [ "$ROLE" = "client" ]; then
   fi
 fi
 
-# 4) place rendered files per manifest (dest + mode), backing up existing
+# 4) ntfy-control (reboot-trigger) service user + scoped sudoers: the
+# generic service-user loop in step 2 does not support supplementary groups
+# (this user needs `pi-notify`, to read the group-readable /etc/pi-notify.auth
+# ntfy-control.service sources), and a NOPASSWD sudoers file needs its own
+# install + validate step — a bad sudoers file must fail the install, not
+# silently ship, so `visudo -cf` runs right after placing it. ntfy-dispatch
+# itself is code (like the .py modules), not config, so it is NOT installed
+# here — see deploy/README.md's manual install list.
+if [ "$ROLE" = "client" ]; then
+  getent group pi-notify >/dev/null 2>&1 || run "sudo groupadd -f pi-notify"
+  getent passwd ntfy-ctl >/dev/null 2>&1 || run "sudo useradd --system --no-create-home --shell /usr/sbin/nologin -G pi-notify ntfy-ctl"
+  run "sudo install -D -m0440 '$HERE/ntfy-control/sudoers-ntfy-ctl' /etc/sudoers.d/ntfy-ctl"
+  run "sudo visudo -cf /etc/sudoers.d/ntfy-ctl"
+fi
+
+# 5) place rendered files per manifest (dest + mode), backing up existing
 python3 - "$VALUES" "$OUT/$ROLE" "$HERE/templates/manifest.json" <<'PY' | while read -r src dest mode; do
 import json,sys,os
 values=json.load(open(sys.argv[1])); role=values["role"]; out=sys.argv[2]
@@ -55,7 +70,7 @@ PY
   run "sudo install -D -m '$mode' '$src' '$dest'"
 done
 
-# 5) reload systemd; do NOT auto-enable/start (see README cutover order)
+# 6) reload systemd; do NOT auto-enable/start (see README cutover order)
 run "sudo systemctl daemon-reload"
 echo "Rendered+installed. NOT auto-enabling/starting services — see deploy/README.md for the"
 echo "start order (the client's udpspeeder-client must start only after the wg0 Endpoint cutover)."

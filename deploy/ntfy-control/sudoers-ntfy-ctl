@@ -1,0 +1,11 @@
+# ntfy-ctl may run ONLY the three exact maintenance-reboot invocations that
+# ntfy-dispatch (deploy/ntfy-control/ntfy-dispatch) issues — no wildcards, no
+# extra tokens. These argvs must stay token-exact with REBOOT_CMD + the
+# allow-listed `extra` args there (verified in Task 4): the sudoers grant IS
+# the security boundary once NoNewPrivileges is off for this unit (see
+# ntfy-control.service.tmpl) — a looser match here would let a compromised
+# or buggy dispatcher run arbitrary maintenance_reboot.py flags as root.
+# Install destination: /etc/sudoers.d/ntfy-ctl, mode 0440 (see install.sh).
+ntfy-ctl ALL=(root) NOPASSWD: /opt/sbfd-ctl/maintenance_reboot.py -c /etc/sbfd-ctl/maintenance.json --now
+ntfy-ctl ALL=(root) NOPASSWD: /opt/sbfd-ctl/maintenance_reboot.py -c /etc/sbfd-ctl/maintenance.json --now --only wan1
+ntfy-ctl ALL=(root) NOPASSWD: /opt/sbfd-ctl/maintenance_reboot.py -c /etc/sbfd-ctl/maintenance.json --now --only wan2

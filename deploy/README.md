@@ -37,6 +37,7 @@ sudo install -d /opt/sbfd-ctl/ui && sudo install -m0644 ui/* /opt/sbfd-ctl/ui/
 sudo install -D -m0644 notify.py             /opt/sbfd-ctl/notify.py             # required by sbfd-ctl and hotspot_watchdog
 sudo install -D -m0755 hotspot_watchdog.py   /opt/sbfd-ctl/hotspot_watchdog.py   # optional: wan1 auto-reboot watchdog
 sudo install -D -m0755 maintenance_reboot.py /opt/sbfd-ctl/maintenance_reboot.py # optional: daily maintenance reboot
+sudo install -D -m0755 deploy/ntfy-control/ntfy-dispatch /usr/local/sbin/ntfy-dispatch # optional: ntfy reboot-trigger dispatcher
 ```
 
 ## 2. Fill in your values
@@ -73,6 +74,25 @@ chgrp/chmods an existing one, so a re-run leaves an already-correctly-permission
 The `sbfd-ctl.service.d/notifications.conf` drop-in itself is still a manual step — see
 `deploy/spool-notify/README.md`.
 
+On the client, `install.sh` also creates the `pi-notify` group, the `ntfy-ctl` service
+user (member of `pi-notify`, no login shell, no home), and `/etc/sudoers.d/ntfy-ctl`
+(mode `0440`, validated with `visudo -cf` — a bad sudoers file fails the install rather
+than shipping silently) — the pieces `ntfy-control.service` needs for the optional ntfy
+reboot-trigger feature (see `deploy/ntfy-control/`). `ntfy-dispatch` itself is code, not
+config, so it is installed manually (step 1 above), like the `.py` daemons.
+
+Two pieces remain manual, on-box, hand steps — nothing in this repo creates them:
+- **`/etc/pi-notify.auth`** (shell vars `NTFY_BASE`, `NTFY_USER`, `NTFY_PASS`) —
+  root-owned; `maintenance_reboot.py`'s "Reboot now" button reads it as root, but
+  `ntfy-control.service` runs as the unprivileged `ntfy-ctl` user, so this file must
+  additionally be group-owned `pi-notify` and mode `0640` (not the `0600` a
+  root-only reader would need) for the subscriber to source it. `ntfy-ctl` reaches
+  it via the `pi-notify` supplementary group `install.sh` grants it.
+- **`/etc/systemd/system/ntfy-control.service.d/topic.conf`** — copy from
+  `deploy/ntfy-control/ntfy-control.service.d/topic.conf.example` and set a real,
+  hard-to-guess `CONTROL_TOPIC` (not installed by `install.sh` on purpose — a topic
+  is secret-adjacent, chosen per box). Then `systemctl daemon-reload`.
+
 ## 5. Start services — order matters
 
 **Relay:**
@@ -94,6 +114,11 @@ sudo systemctl enable --now hotspot-watchdog
 # optional: daily maintenance reboot (enable the TIMER, not the service; needs
 # hotspot-watchdog above for its wan1 leg)
 sudo systemctl enable --now maintenance-reboot.timer
+# optional: ntfy reboot-trigger subscriber — only after creating BOTH
+# /etc/pi-notify.auth (group pi-notify, mode 0640) and the
+# ntfy-control.service.d/topic.conf drop-in (see step 4 above); otherwise it
+# starts with no topic/credentials to subscribe with.
+sudo systemctl enable --now ntfy-control.service
 ```
 
 ### Daily maintenance reboot — turning it on

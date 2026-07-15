@@ -1,0 +1,64 @@
+[Unit]
+Description=ntfy control-topic subscriber (reboot commands)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntfy-ctl
+Group=ntfy-ctl
+SupplementaryGroups=pi-notify
+# NTFY_BASE/USER/PASS come from /etc/pi-notify.auth (root-owned, group
+# pi-notify — see deploy/README.md); CONTROL_TOPIC comes from a host-local
+# drop-in (ntfy-control.service.d/*.conf — see
+# deploy/ntfy-control/ntfy-control.service.d/topic.conf.example) so the
+# tracked unit carries no secrets/topic.
+ExecStart=/bin/bash -lc 'set -a; . /etc/pi-notify.auth; set +a; \
+  exec ntfy subscribe --since=latest \
+    -u "$$NTFY_USER:$$NTFY_PASS" "$$NTFY_BASE/$$CONTROL_TOPIC" /usr/local/sbin/ntfy-dispatch'
+Restart=always
+RestartSec=5
+
+# --- Hardening -------------------------------------------------------------
+# NoNewPrivileges=yes is deliberately OMITTED, unlike the other sbfd-ctl
+# units. This unit's entire purpose is to escalate through sudo (see
+# ../sudoers-ntfy-ctl and ntfy-dispatch's REBOOT_CMD) — sudo needs its
+# setuid-root bit to work, and NoNewPrivileges=yes disables that for the
+# WHOLE process tree (the PR_SET_NO_NEW_PRIVS flag is inherited across
+# fork/exec, so it would apply to ntfy-dispatch and the sudo call it makes,
+# not just this ExecStart). Verified empirically: setting
+# PR_SET_NO_NEW_PRIVS then running `sudo -n true` fails with "sudo: The
+# 'no new privileges' flag is set, which prevents sudo from running as
+# root." — with it set, EVERY reboot command this unit exists to dispatch
+# would silently fail. The escalation boundary here is the narrowly-scoped
+# sudoers file (three exact argvs, no wildcards), not NoNewPrivileges. All
+# other hardening directives below still apply in full.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+# Dedicated runtime dir for ntfy-dispatch's dedupe/rate-limit state
+# (DISPATCH_STATE_DIR default /run/ntfy-ctl) — NOT shared with any other
+# unit, so (unlike sbfd-ctl's /run/sbfd-ctl, see
+# maintenance-reboot.service.tmpl and sbfd-ctl.service.tmpl) there is no
+# cross-unit wipe/chown hazard from a second unit declaring the same
+# RuntimeDirectory.
+RuntimeDirectory=ntfy-ctl
+RuntimeDirectoryMode=0750
+# Preserved across a plain restart so dedupe/rate state survives one. Not
+# strictly required for correctness — `ntfy subscribe --since=latest` never
+# replays old messages on reconnect, so a wiped dir would only reset the
+# rate-limit clock, never cause a duplicate reboot — but the state is cheap
+# to keep, and losing it needlessly narrows the metered-WAN loop guard for
+# one rate-limit window after every restart.
+RuntimeDirectoryPreserve=yes
+# The three exact reboot invocations run as root via the sudoers grant, but
+# that escalated process INHERITS this unit's mount namespace (sudo does not
+# unshare it) — so it needs the same write grants maintenance-reboot.service
+# already needs to run the identical script: the maintenance run-lock, and
+# (tolerantly) the notification spool.
+ReadWritePaths=/run/sbfd-ctl -/var/spool/spool-notify
+
+[Install]
+WantedBy=multi-user.target

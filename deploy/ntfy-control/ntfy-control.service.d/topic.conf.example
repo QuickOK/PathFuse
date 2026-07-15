@@ -1,0 +1,10 @@
+# Host-local drop-in for ntfy-control.service — documentation only, NOT
+# installed by install.sh (there is no manifest entry for it: a real
+# CONTROL_TOPIC is a secret-adjacent value, chosen per box, not shipped).
+#
+# Copy this to /etc/systemd/system/ntfy-control.service.d/topic.conf on the
+# box, replace CHANGE-ME-hard-to-guess with your real control topic, then
+# `systemctl daemon-reload`. NTFY_BASE/USER/PASS are NOT set here — they
+# come from /etc/pi-notify.auth (see deploy/README.md).
+[Service]
+Environment=CONTROL_TOPIC=CHANGE-ME-hard-to-guess
