@@ -1,7 +1,13 @@
 [Unit]
 Description=ntfy control-topic subscriber (reboot commands)
-After=network-online.target
-Wants=network-online.target
+# sbfd-ctl.service owns /run/sbfd-ctl (its RuntimeDirectory=sbfd-ctl). The
+# escalated maintenance_reboot.py run flock()s /run/sbfd-ctl/maintenance.lock
+# inside THIS unit's namespace, and the non-tolerant ReadWritePaths=/run/sbfd-ctl
+# below fails the unit 226/NAMESPACE if that dir is absent at start. Ordering
+# alone does not create it, so depend on the unit that does — same treatment
+# maintenance-reboot.service gives /run/sbfd-ctl (a hard requirement, After=+Wants=).
+After=network-online.target sbfd-ctl.service
+Wants=network-online.target sbfd-ctl.service
 
 [Service]
 Type=simple
@@ -57,8 +63,21 @@ RuntimeDirectoryPreserve=yes
 # that escalated process INHERITS this unit's mount namespace (sudo does not
 # unshare it) — so it needs the same write grants maintenance-reboot.service
 # already needs to run the identical script: the maintenance run-lock, and
-# (tolerantly) the notification spool.
-ReadWritePaths=/run/sbfd-ctl -/var/spool/spool-notify
+# (tolerantly) the notification spool. /run/hotspot-watchdog is the third
+# grant: the wan1 leg (reboot-wan1, and the wan1 half of reboot-cycle) spawns
+# hotspot_watchdog.py --scheduled-reboot, which mkdir()s /run/hotspot-watchdog
+# and writes cookies-scheduled.txt there — without a carve-out, ProtectSystem=
+# strict remounts /run read-only and that write hits EROFS, so those two
+# commands silently fail at the wan1 leg (reboot-wan2 is unaffected). It's the
+# dash-tolerant form, NOT RuntimeDirectory=hotspot-watchdog: this unit's
+# User=ntfy-ctl would chown the dir away from root and delete it on stop,
+# colliding with hotspot-watchdog.service / maintenance-reboot.service (the
+# exact cross-unit hazard their comments warn about). Residual: the dash form
+# bind-mounts rw only if the dir already EXISTS at unit start; if the watchdog
+# daemon is down the dir is absent and the subprocess's own mkdir still hits
+# read-only /run — acceptable, since a wan1 reboot presupposes the watchdog is
+# up (confirm in the Final on-box reboot-wan1 test).
+ReadWritePaths=/run/sbfd-ctl -/var/spool/spool-notify -/run/hotspot-watchdog
 
 [Install]
 WantedBy=multi-user.target
