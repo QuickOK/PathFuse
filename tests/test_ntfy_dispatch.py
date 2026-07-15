@@ -38,8 +38,14 @@ def test_cycle_has_no_only_flag(tmp_path):
 
 
 def test_duplicate_id_ignored(tmp_path):
-    run("reboot-wan1", "dup", str(tmp_path))
-    _, ran = run("reboot-wan1", "dup", str(tmp_path))   # same id again
+    # Disable the rate-limit (0-second window: now-last < 0 is always false,
+    # so nothing is ever throttled) so the ONLY thing that can block the
+    # second same-id call is the seen-${MID} dedupe marker. Without this,
+    # the default 1200 s rate-limit would block the repeat regardless of
+    # dedupe, making the test vacuous.
+    norate = {"RATE_LIMIT_S": "0"}
+    run("reboot-wan1", "dup", str(tmp_path), extra_env=norate)
+    _, ran = run("reboot-wan1", "dup", str(tmp_path), extra_env=norate)  # same id again
     assert len(ran) == 1       # second call deduped, did not run
 
 

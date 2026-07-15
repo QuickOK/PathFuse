@@ -8,6 +8,12 @@ set -uo pipefail
 
 STATE_DIR="${DISPATCH_STATE_DIR:-/run/ntfy-ctl}"
 RATE_LIMIT_S="${RATE_LIMIT_S:-1200}"
+# A non-integer RATE_LIMIT_S (e.g. a deployer typo in the drop-in) would make
+# the `[ ... -lt "$RATE_LIMIT_S" ]` test below error out, the `if` treat it as
+# false, and the reboot proceed UNTHROTTLED — the exact metered-WAN loop this
+# guard exists to prevent. Fail SAFE to the default, not open. (0 is all-digits
+# and still passes, so an intentional 0-window override is preserved.)
+case "$RATE_LIMIT_S" in *[!0-9]*|"") RATE_LIMIT_S=1200 ;; esac
 REBOOT_CMD="${REBOOT_CMD:-sudo /opt/sbfd-ctl/maintenance_reboot.py -c /etc/sbfd-ctl/maintenance.json --now}"
 MSG="${NTFY_MESSAGE:-}"
 MID="${NTFY_ID:-}"
