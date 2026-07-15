@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -144,3 +145,63 @@ def test_drain_falls_back_to_config_topic(tmp_path):
     r = run_drain(env_ok)
     assert r.returncode == 0
     assert curl_lines(curl_log_ok)[0].endswith("/configtopic")
+
+
+def test_actions_header_sent(tmp_path):
+    env, spool, curl_log = setup_env(tmp_path)
+    env["NOTIFY_ACTIONS"] = "http, Reboot, https://x/c, body=reboot-wan1"
+    r = run_notify(env, "t", "default", "m")
+    assert r.returncode == 0
+    lines = curl_lines(curl_log)
+    assert len(lines) == 1
+    assert "Actions: http, Reboot, https://x/c, body=reboot-wan1" in lines[0]
+
+
+def test_no_actions_header_when_unset(tmp_path):
+    env, spool, curl_log = setup_env(tmp_path)
+    r = run_notify(env, "t", "default", "m")
+    assert r.returncode == 0
+    lines = curl_lines(curl_log)
+    assert len(lines) == 1
+    assert "Actions:" not in lines[0]
+
+
+def test_spool_records_actions_on_send_failure(tmp_path):
+    env, spool, curl_log = setup_env(tmp_path, curl_exit=22)
+    env["NOTIFY_ACTIONS"] = "http, Reboot, https://x/c, body=reboot-wan1"
+    r = run_notify(env, "hello", "high", "body")
+    assert r.returncode == 0
+    files = list(spool.glob("*.msg"))
+    assert len(files) == 1
+    assert "ACTIONS=http, Reboot, https://x/c, body=reboot-wan1\n" in files[0].read_text()
+
+
+def test_spool_has_no_actions_line_without_override(tmp_path):
+    env, spool, curl_log = setup_env(tmp_path, curl_exit=22)
+    run_notify(env, "hello", "high", "body")
+    files = list(spool.glob("*.msg"))
+    assert len(files) == 1
+    assert "ACTIONS=" not in files[0].read_text()
+
+
+def test_drain_honors_spooled_actions(tmp_path):
+    env, spool, curl_log = setup_env(tmp_path, curl_exit=22)
+    spool.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    msg = spool / f"{ts}-1-1.msg"
+    msg.write_text(
+        f"TS={ts}\n"
+        "PRIORITY=high\n"
+        "TITLE=delayed alert\n"
+        "ACTIONS=http, Reboot, https://x/c, body=reboot-wan1\n"
+        "---\n"
+        "body"
+    )
+    env_ok, _, curl_log_ok = setup_env(tmp_path / "ok", curl_exit=0)
+    env_ok["NOTIFY_SPOOL"] = str(spool)
+    r = run_drain(env_ok)
+    assert r.returncode == 0
+    lines = curl_lines(curl_log_ok)
+    assert len(lines) == 1
+    assert "Actions: http, Reboot, https://x/c, body=reboot-wan1" in lines[0]
+    assert list(spool.glob("*.msg")) == []

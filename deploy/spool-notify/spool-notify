@@ -62,6 +62,7 @@ spool() {
          printf 'PRIORITY=%s\n' "$PRIORITY"
          printf 'TITLE=%s\n' "$TITLE"
          [ -z "${NOTIFY_TOPIC:-}" ] || printf 'TOPIC=%s\n' "$NOTIFY_TOPIC"
+         [ -z "${NOTIFY_ACTIONS:-}" ] || printf 'ACTIONS=%s\n' "$NOTIFY_ACTIONS"
          printf -- '---\n'
          printf '%s' "$MSG"; } > "${f}.tmp" 2>/dev/null && mv -f "${f}.tmp" "$f" 2>/dev/null; then
         log "spooled (${reason}): ${f##*/} title=[$TITLE]"
@@ -90,10 +91,13 @@ if [ -z "${NTFY_USER:-}" ] || [ -z "${NTFY_PASS:-}" ] || [ -z "${NTFY_BASE:-}" ]
 fi
 
 send() {
+    local extra=()
+    [ -n "${NOTIFY_ACTIONS:-}" ] && extra+=(-H "Actions: $NOTIFY_ACTIONS")
     "$CURL_BIN" -fsS --max-time "$SEND_TIMEOUT" \
         -u "$NTFY_USER:$NTFY_PASS" \
         -H "Title: $TITLE" \
         -H "Priority: $PRIORITY" \
+        "${extra[@]}" \
         --data-binary "$MSG" \
         "$NTFY_BASE/$TOPIC" >/dev/null 2>&1
 }

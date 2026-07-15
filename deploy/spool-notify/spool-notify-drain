@@ -61,7 +61,7 @@ sent=0
 for f in "${sorted[@]}"; do
     [ -f "$f" ] || continue
 
-    ts=""; prio="default"; title=""; ftopic=""; body=""; body_started=0
+    ts=""; prio="default"; title=""; ftopic=""; factions=""; body=""; body_started=0
     # `|| [ -n "$line" ]` so the final line is processed even when the file has
     # no trailing newline (spool-notify writes the body with `printf '%s'`, so the
     # last body line — often the diagnostic footer — has no newline).
@@ -75,6 +75,7 @@ for f in "${sorted[@]}"; do
             PRIORITY=*) prio="${line#PRIORITY=}" ;;
             TITLE=*)    title="${line#TITLE=}" ;;
             TOPIC=*)    ftopic="${line#TOPIC=}" ;;
+            ACTIONS=*)  factions="${line#ACTIONS=}" ;;
             ---)        body_started=1 ;;
         esac
     done < "$f"
@@ -96,10 +97,13 @@ for f in "${sorted[@]}"; do
         fi
     fi
 
+    ractions=()
+    [ -n "$factions" ] && ractions+=(-H "Actions: $factions")
     if "$CURL_BIN" -fsS --max-time "$SEND_TIMEOUT" \
             -u "$NTFY_USER:$NTFY_PASS" \
             -H "Title: $title" \
             -H "Priority: $prio" \
+            "${ractions[@]}" \
             --data-binary "$sendbody" \
             "$NTFY_BASE/${ftopic:-$TOPIC}" >/dev/null 2>&1; then
         rm -f "$f"; sent=$(( sent + 1 ))
