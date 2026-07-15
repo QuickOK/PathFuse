@@ -72,6 +72,21 @@ def test_load_config_rejects_identical_ifaces(tmp_path):
         M.load_config(str(p))
 
 
+def test_load_config_pins_ifaces_to_leg_labels(tmp_path):
+    # The leg labels "wan1"/"wan2" are load-bearing: --only, the start-gate,
+    # the ntfy reboot allow-list, and the scoped sudoers all key off them. An
+    # iface renamed to anything else must be rejected up front, not left to
+    # POST a dead command outside the allow-list.
+    import pytest
+    for wan, other in (("wan1", "starlink"), ("wan2", "starlink")):
+        raw = cfg_dict(tmp_path)
+        raw[wan]["iface"] = other
+        p = tmp_path / f"renamed-{wan}.json"
+        p.write_text(_json.dumps(raw))
+        with pytest.raises(ValueError):
+            M.load_config(str(p))
+
+
 def test_load_config_rejects_empty_ifaces(tmp_path):
     # an empty iface name matches no BFD session, so every state read for it is
     # "not UP" — a config that can never reboot anything, failing silently
@@ -2426,3 +2441,18 @@ def test_report_leg_no_button_when_auth_unreadable(tmp_path, monkeypatch):
         lambda c, t, p, m, actions=None: seen.update(actions=actions))
     M.report_leg(cfg, "wan1", M._leg(M.Outcome.NOT_ISSUED, "x"))
     assert seen["actions"] is None
+
+
+def test_report_leg_no_button_when_auth_missing_a_key(tmp_path, monkeypatch):
+    # control_topic is configured and the auth file EXISTS, but it lacks the
+    # NTFY_PASS / NTFY_BASE keys — the KeyError branch must fail open (page
+    # still sent, no button), exactly like a missing file.
+    cfg = write_cfg(tmp_path, control_topic="ctl-x9",
+                    ntfy_auth_path=str(tmp_path / "auth"))
+    (tmp_path / "auth").write_text('NTFY_USER=u\n')  # no PASS, no BASE
+    seen = {}
+    monkeypatch.setattr(M, "notify",
+        lambda c, t, p, m, actions=None: seen.update(fired=True, actions=actions))
+    M.report_leg(cfg, "wan1", M._leg(M.Outcome.NOT_ISSUED, "x"))
+    assert seen["fired"] is True        # the page is still sent
+    assert seen["actions"] is None      # but with no button

@@ -148,6 +148,18 @@ def load_config(path: str) -> MrConfig:
     if cfg.wan1.iface == cfg.wan2.iface:
         raise ValueError("wan1.iface and wan2.iface must differ — a WAN "
                          "cannot be its own peer")
+    # The leg LABELS are load-bearing, not just cosmetic: `--only {wan1,wan2}`,
+    # the start-gate's `set(legs) | {w1, w2}` peer check, the ntfy control
+    # allow-list (`reboot-<wan>`), and the scoped sudoers all key off the
+    # literal names "wan1"/"wan2". An iface renamed to anything else would
+    # quietly POST a command outside the allow-list — a dead button, no error.
+    # Pin the invariant every valid config already satisfies.
+    if cfg.wan1.iface != "wan1" or cfg.wan2.iface != "wan2":
+        raise ValueError(
+            "wan1.iface / wan2.iface must be exactly 'wan1' / 'wan2': the "
+            "maintenance-reboot leg labels (CLI --only, the ntfy allow-list "
+            "commands, the scoped sudoers, and the start-gate) are fixed to "
+            "these names")
     # Finiteness before positivity: json.loads accepts bareword Infinity/NaN,
     # and every comparison against NaN is False, so a NaN deadline would sail
     # through a bare `<= 0` check and then make await_up's bound meaningless.
