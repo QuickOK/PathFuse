@@ -2473,3 +2473,20 @@ def test_report_leg_no_button_when_auth_missing_a_key(tmp_path, monkeypatch):
     M.report_leg(cfg, "wan1", M._leg(M.Outcome.NOT_ISSUED, "x"))
     assert seen["fired"] is True        # the page is still sent
     assert seen["actions"] is None      # but with no button
+
+
+def test_report_leg_no_button_when_base_has_delimiter(tmp_path, monkeypatch):
+    # control_topic is configured and the auth file EXISTS with all keys, but
+    # NTFY_BASE contains a comma (operator typo) — interpolating it verbatim
+    # would corrupt the ntfy Actions header, so the button must fail open (page
+    # still sent, no button), like the other auth-fail-open cases.
+    cfg = write_cfg(tmp_path, control_topic="ctl-x9",
+                    ntfy_auth_path=str(tmp_path / "auth"))
+    (tmp_path / "auth").write_text(
+        'NTFY_USER=u\nNTFY_PASS=p\nNTFY_BASE=https://h,evil\n')
+    seen = {}
+    monkeypatch.setattr(M, "notify",
+        lambda c, t, p, m, actions=None: seen.update(fired=True, actions=actions))
+    M.report_leg(cfg, "wan1", M._leg(M.Outcome.NOT_ISSUED, "x"))
+    assert seen["fired"] is True        # the page is still sent
+    assert seen["actions"] is None      # but with no button

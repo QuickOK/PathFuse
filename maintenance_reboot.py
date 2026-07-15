@@ -881,9 +881,21 @@ def _reboot_button(cfg: MrConfig, wan: str) -> str | None:
     except (OSError, KeyError) as e:
         log.warning("no reboot button (auth unreadable): %s", e)
         return None
+    # base is interpolated verbatim into the Actions header below, so a comma,
+    # semicolon, or any whitespace/control char in NTFY_BASE (an operator typo
+    # in the auth file — not attacker- or message-derived) would malform or
+    # inject a second action field. Treat that like unreadable auth: fail open
+    # (no button, page still sent), consistent with the control_topic charset
+    # guard in load_config.
+    if any(c in base for c in ",;") or any(c.isspace() or ord(c) < 0x20
+                                           for c in base):
+        log.warning("no reboot button (NTFY_BASE has a delimiter/whitespace/"
+                    "control char): %r", base)
+        return None
     # Short-form http action; commas/semicolons in our values are absent by
-    # construction (topic is [a-z0-9-], token is base64). clear=true dismisses
-    # the notification on a successful publish.
+    # construction (base is validated just above, topic is [A-Za-z0-9_-] via
+    # load_config, token is base64). clear=true dismisses the notification on a
+    # successful publish.
     return (f"http, Reboot {wan} now, {base}/{cfg.control_topic}, "
             f"method=POST, headers.Authorization=Basic {token}, "
             f"body=reboot-{wan}, clear=true")
