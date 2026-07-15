@@ -1231,7 +1231,7 @@ def test_reboot_wan1_rejected_request_pages_when_wan1_is_down(
     assert res.ok is False
     assert res.status is M.Outcome.NOT_RETURNED
     sent = []
-    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     M.report_leg(cfg, "wan1", res)
     assert any(p == "high" for _t, p in sent)
 
@@ -1247,7 +1247,7 @@ def test_reboot_wan1_rejected_request_does_not_page_when_wan1_stayed_up(
     assert res.ok is False
     assert res.status is M.Outcome.NOT_ISSUED
     sent = []
-    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     M.report_leg(cfg, "wan1", res)
     assert not any(p == "high" for _t, p in sent)
 
@@ -1264,7 +1264,7 @@ def test_reboot_wan1_watchdog_invocation_error_pages_when_wan1_is_down(
     assert res.ok is False
     assert res.status is M.Outcome.NOT_RETURNED
     sent = []
-    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     M.report_leg(cfg, "wan1", res)
     assert any(p == "high" for _t, p in sent)
 
@@ -1509,7 +1509,7 @@ def test_reboot_wan2_declined_fallback_on_a_down_link_still_pages(
     link = FakeLink()
     monkeypatch.setattr(M, "read_wan_states", link)
     sent = []
-    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m, actions=None: sent.append((t, p)))
 
     class DishWhoseUpdateKillsBoth(DishThatDropsTheLink):
         def apply_update(self):
@@ -1557,7 +1557,7 @@ def test_reboot_wan2_unreachable_terminal_on_a_down_link_pages(
     assert res.status is M.Outcome.NOT_RETURNED
     assert d.calls == []
     sent = []
-    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m, actions=None: sent.append((t, p)))
     M.report_leg(cfg, "wan2", res)
     assert any(p == "high" for _t, p in sent)
 
@@ -1658,7 +1658,7 @@ def test_run_once_aborts_before_wan2_if_wan1_never_returns(tmp_path, monkeypatch
     called = []
     monkeypatch.setattr(M, "reboot_wan2", lambda *a, **k: called.append("w2"))
     sent = []
-    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert rc == 1
     assert called == []
@@ -1682,7 +1682,7 @@ def test_run_once_continues_to_wan2_when_leg_one_was_never_issued(
                         lambda *a, **k: (called.append("w2"), recovered())[1])
     sent = []
     monkeypatch.setattr(M, "notify",
-                        lambda cfg, t, p, m: sent.append((t, p)))
+                        lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert called == ["w2"]                      # leg 2 still ran
     # ...and the run is NOT a failure: exit 1 is reserved for an OUTAGE (a WAN
@@ -1741,7 +1741,7 @@ def test_run_once_does_not_page_high_when_the_request_was_rejected(
         False, M.Outcome.NOT_ISSUED, "reboot request failed"))
     sent = []
     monkeypatch.setattr(M, "notify",
-                        lambda cfg, t, p, m: sent.append((t, p)))
+                        lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert rc == 0        # link untouched => reported, but not a unit failure
     assert not any(p == "high" for _t, p in sent)
@@ -1908,7 +1908,7 @@ def test_run_once_does_not_page_for_a_skipped_leg(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "reboot_wan2", lambda *a, **k: M.LegResult(
         False, M.Outcome.SKIPPED, "skipping: terminal unreachable"))
     sent = []
-    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert rc == 0
     assert sent == []
@@ -1921,7 +1921,7 @@ def test_run_once_pages_when_wan2_does_not_return(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "reboot_wan2", lambda *a, **k: M.LegResult(
         False, M.Outcome.NOT_RETURNED, "wan2 did not return within 600s"))
     sent = []
-    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0, sleep=lambda s: None)
     assert rc == 1
     assert any(p == "high" for _t, p in sent)
@@ -1933,7 +1933,7 @@ def drive_leg2(cfg, monkeypatch, link, dish_):
     monkeypatch.setattr(M, "read_wan_states", link)
     monkeypatch.setattr(M, "reboot_wan1", recovered)
     sent = []
-    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p)))
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m, actions=None: sent.append((t, p)))
     clk = FakeClock()
     real = M.reboot_wan2
     seen = []
@@ -2125,7 +2125,7 @@ def drive_the_night(cfg, monkeypatch, vehicle, watchdog, dish=None):
     monkeypatch.setattr(M, "read_wan_states", vehicle.read)
     dish = dish or FakeDish()
     sent, legs, at_leg2 = [], {}, []
-    monkeypatch.setattr(M, "notify", lambda c, t, p, m: sent.append((t, p, m)))
+    monkeypatch.setattr(M, "notify", lambda c, t, p, m, actions=None: sent.append((t, p, m)))
     clk = FakeClock()
 
     real1, real2 = M.reboot_wan1, M.reboot_wan2
@@ -2390,3 +2390,39 @@ def test_main_maps_only_flag_to_legs(tmp_path, monkeypatch):
     assert run_main(tmp_path, monkeypatch, "--now", "--only", "wan2") == 0
     assert run_main(tmp_path, monkeypatch, "--now") == 0
     assert seen == [("wan1",), ("wan2",), ("wan1", "wan2")]
+
+
+def test_report_leg_button_targets_wan(tmp_path, monkeypatch):
+    cfg = write_cfg(tmp_path, control_topic="ctl-x9",
+                    ntfy_auth_path=str(tmp_path / "auth"))
+    (tmp_path / "auth").write_text(
+        'NTFY_USER=u\nNTFY_PASS=p\nNTFY_BASE=https://h.example\n')
+    seen = {}
+    monkeypatch.setattr(M, "notify",
+        lambda c, t, p, m, actions=None: seen.update(title=t, actions=actions))
+    M.report_leg(cfg, "wan1", M._leg(M.Outcome.NOT_ISSUED, "no reboot observed"))
+    assert "was not rebooted" in seen["title"]
+    assert "reboot-wan1" in seen["actions"]
+    assert "https://h.example/ctl-x9" in seen["actions"]
+    assert "Authorization=Basic " in seen["actions"]
+
+
+def test_report_leg_no_button_without_control_topic(tmp_path, monkeypatch):
+    cfg = write_cfg(tmp_path)  # control_topic defaults to ""
+    seen = {}
+    monkeypatch.setattr(M, "notify",
+        lambda c, t, p, m, actions=None: seen.update(actions=actions))
+    M.report_leg(cfg, "wan2", M._leg(M.Outcome.NOT_ISSUED, "x"))
+    assert seen["actions"] is None
+
+
+def test_report_leg_no_button_when_auth_unreadable(tmp_path, monkeypatch):
+    # control_topic is configured, but the auth file does not exist — the
+    # button must fail open (no button, no crash), not raise.
+    cfg = write_cfg(tmp_path, control_topic="ctl-x9",
+                    ntfy_auth_path=str(tmp_path / "missing-auth"))
+    seen = {}
+    monkeypatch.setattr(M, "notify",
+        lambda c, t, p, m, actions=None: seen.update(actions=actions))
+    M.report_leg(cfg, "wan1", M._leg(M.Outcome.NOT_ISSUED, "x"))
+    assert seen["actions"] is None

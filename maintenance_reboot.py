@@ -14,6 +14,7 @@ window open across the post-reboot settle, when a freshly booted link is still
 flapping. It pages only when a WAN goes down and fails to come back; a reboot
 that was never issued left the link untouched, and says so quietly."""
 import argparse
+import base64
 import enum
 import fcntl
 import json
@@ -105,6 +106,8 @@ class MrConfig:
     notify_bin: str
     notify_topic: str
     dry_run: bool
+    control_topic: str = ""
+    ntfy_auth_path: str = "/etc/pi-notify.auth"
 
 
 def load_config(path: str) -> MrConfig:
@@ -130,6 +133,8 @@ def load_config(path: str) -> MrConfig:
         notify_bin=raw.get("notify_bin", DEFAULT_NOTIFY),
         notify_topic=raw.get("notify_topic", "pathfuse"),
         dry_run=bool(raw.get("dry_run", True)),
+        control_topic=raw.get("control_topic", ""),
+        ntfy_auth_path=raw.get("ntfy_auth_path", "/etc/pi-notify.auth"),
     )
     # The two ifaces must be real and DISTINCT. peer_of() pairs each WAN with
     # the other one; if both names are the same string it hands a WAN back
@@ -514,7 +519,8 @@ def close_window(cfg: MrConfig) -> None:
 NOTIFY_TIMEOUT_S = 30
 
 
-def notify(cfg: MrConfig, title: str, priority: str, message: str) -> None:
+def notify(cfg: MrConfig, title: str, priority: str, message: str,
+           actions: str | None = None) -> None:
     """Never raises: a failed notification must not abort a reboot sequence.
 
     It does, though, have to LEAVE A TRACE. The spool helper exits 0 even when
@@ -525,6 +531,8 @@ def notify(cfg: MrConfig, title: str, priority: str, message: str) -> None:
         log.info("dry-run notify: %s | %s", title, message)
         return
     env = dict(os.environ, NOTIFY_TOPIC=cfg.notify_topic)
+    if actions:
+        env["NOTIFY_ACTIONS"] = actions
     try:
         r = subprocess.run([cfg.notify_bin, title, priority, message],
                            env=env, capture_output=True, text=True,
@@ -830,16 +838,46 @@ def reboot_wan2(cfg: MrConfig, now: float, client=None,
         f"{w2} did not return after fallback reboot")
 
 
+def _reboot_button(cfg: MrConfig, wan: str) -> str | None:
+    """An ntfy `http` action that publishes `reboot-<wan>` to the control topic.
+    Returns None (no button) when control is not configured or auth is
+    unreadable — a missing button must never block the page."""
+    if not cfg.control_topic:
+        return None
+    try:
+        vals = {}
+        with open(cfg.ntfy_auth_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(("NTFY_USER=", "NTFY_PASS=", "NTFY_BASE=")):
+                    k, _, v = line.partition("=")
+                    vals[k] = v
+        base = vals["NTFY_BASE"].rstrip("/")
+        token = base64.b64encode(
+            f'{vals["NTFY_USER"]}:{vals["NTFY_PASS"]}'.encode()).decode()
+    except (OSError, KeyError) as e:
+        log.warning("no reboot button (auth unreadable): %s", e)
+        return None
+    # Short-form http action; commas/semicolons in our values are absent by
+    # construction (topic is [a-z0-9-], token is base64). clear=true dismisses
+    # the notification on a successful publish.
+    return (f"http, Reboot {wan} now, {base}/{cfg.control_topic}, "
+            f"method=POST, headers.Authorization=Basic {token}, "
+            f"body=reboot-{wan}, clear=true")
+
+
 def report_leg(cfg: MrConfig, wan: str, res: LegResult) -> None:
     """Tell the operator what happened to a leg that did not recover — and tell
     them the truth. Only a WAN that went down and stayed down is an outage worth
     a high-priority page; a reboot that was never issued left the link exactly
     where it was, and must not be announced as a WAN that did not come back."""
+    button = _reboot_button(cfg, wan)
     if res.status is Outcome.NOT_RETURNED:
         notify(cfg, f"⚠️ {wan} did not return from maintenance reboot",
-               "high", res.reason)
+               "high", res.reason, actions=button)
     else:
-        notify(cfg, f"📶 {wan} was not rebooted tonight", "default", res.reason)
+        notify(cfg, f"📶 {wan} was not rebooted tonight", "default",
+               res.reason, actions=button)
 
 
 def run_once(cfg: MrConfig, now: float, sleep=time.sleep,
