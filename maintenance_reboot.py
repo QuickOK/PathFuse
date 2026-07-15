@@ -842,10 +842,16 @@ def report_leg(cfg: MrConfig, wan: str, res: LegResult) -> None:
         notify(cfg, f"📶 {wan} was not rebooted tonight", "default", res.reason)
 
 
-def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
+def run_once(cfg: MrConfig, now: float, sleep=time.sleep,
+             legs=("wan1", "wan2")) -> int:
     """Leg 1 (wan1), then leg 2 (wan2), never both at once — and never leg 2
     while wan1 is known to be down. `sleep` is injectable so an end-to-end test
     never has to wait out the real settle.
+
+    `legs` selects which leg(s) actually run — `("wan1",)` and `("wan2",)`
+    reboot a single WAN on demand, and the default `("wan1", "wan2")` is the
+    nightly full cycle. Restricting `legs` never relaxes the safety gate: see
+    the `required` set below.
 
     The caller MUST hold the run lock (see acquire_lock): the very first thing
     this does is delete any window file, which would clobber a concurrent run's
@@ -859,7 +865,11 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
 
     states = read_wan_states(cfg.sbfd_state_path, now)
     w1, w2 = cfg.wan1.iface, cfg.wan2.iface
-    for wan in (w1, w2):
+    # The selected legs must be UP, and so must every OTHER WAN (the peer we
+    # must not strand). For a full cycle that is both; for a single leg it is
+    # the target plus its peer — never disturb the last standing WAN.
+    required = set(legs) | {w1, w2}
+    for wan in sorted(required):
         if states.get(wan) != "UP":
             log.info("skipping: %s is %s, not UP — refusing to disturb the "
                      "last standing WAN", wan, states.get(wan))
@@ -875,33 +885,37 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         # Leg 1. A leg 1 that left wan1 DOWN aborts the run: never proceed to
         # wan2 while wan1 is still down. Carrying on with "the other WAN
         # anyway" is exactly how both WANs end up down at once.
-        open_window(cfg, w1, now, leg1_window_ttl(cfg))
-        try:
-            res = reboot_wan1(cfg, now)
-            # The settle happens INSIDE the window. A WAN that has just booted
-            # is not done: its BFD session commonly flaps UP/DOWN/UP as the
-            # link finishes coming up, and those transitions are precisely what
-            # the window exists to suppress. Closing at the first UP and
-            # settling afterwards would fire alerts on a normal night.
-            if res.ok:
-                sleep(cfg.settle_s)
-        finally:
-            close_window(cfg)
-        log.info("wan1: %s", res.reason)
-        if res.status is Outcome.NOT_RETURNED:
-            # The one leg-1 outcome that stops the run: wan1 went down and did
-            # not come back. Rebooting wan2 now would take out the last WAN.
-            report_leg(cfg, w1, res)
-            return 1
-        if not res.ok and res.status is not Outcome.SKIPPED:
-            # NOT_ISSUED. classify_by_link only ever returns it with wan1
-            # VERIFIABLY still UP on BFD — the reboot did not take (the admin
-            # password rotated, say) and the link was never disturbed. Report
-            # it, but do NOT abort: aborting would mean wan2 never gets rebooted
-            # again either, silently reinstating the very problem this feature
-            # exists to solve (a terminal sitting on a staged firmware update
-            # forever) for as long as wan1's reboot stays broken.
-            report_leg(cfg, w1, res)
+        if "wan1" in legs:
+            open_window(cfg, w1, now, leg1_window_ttl(cfg))
+            try:
+                res = reboot_wan1(cfg, now)
+                # The settle happens INSIDE the window. A WAN that has just
+                # booted is not done: its BFD session commonly flaps
+                # UP/DOWN/UP as the link finishes coming up, and those
+                # transitions are precisely what the window exists to
+                # suppress. Closing at the first UP and settling afterwards
+                # would fire alerts on a normal night.
+                if res.ok:
+                    sleep(cfg.settle_s)
+            finally:
+                close_window(cfg)
+            log.info("wan1: %s", res.reason)
+            if res.status is Outcome.NOT_RETURNED:
+                # The one leg-1 outcome that stops the run: wan1 went down
+                # and did not come back. Rebooting wan2 now would take out
+                # the last WAN.
+                report_leg(cfg, w1, res)
+                return 1
+            if not res.ok and res.status is not Outcome.SKIPPED:
+                # NOT_ISSUED. classify_by_link only ever returns it with wan1
+                # VERIFIABLY still UP on BFD — the reboot did not take (the
+                # admin password rotated, say) and the link was never
+                # disturbed. Report it, but do NOT abort: aborting would mean
+                # wan2 never gets rebooted again either, silently
+                # reinstating the very problem this feature exists to solve
+                # (a terminal sitting on a staged firmware update forever)
+                # for as long as wan1's reboot stays broken.
+                report_leg(cfg, w1, res)
 
         # Leg 2. Note what does NOT hold here: a leg-1 SKIPPED does not prove
         # wan1 is up. The watchdog's own `no carrier` guard exits 2 — a skip —
@@ -909,18 +923,20 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep) -> int:
         # inference about leg 1 but leg 2's own peer_is_up() re-check, which
         # re-reads BFD immediately before it issues anything and refuses to
         # disturb wan2 unless wan1 is fresh-UP right then.
-        open_window(cfg, w2, time.time(), leg2_window_ttl(cfg))
-        try:
-            res = reboot_wan2(cfg, time.time())
-            if res.ok:
-                sleep(cfg.settle_s)
-        finally:
-            close_window(cfg)
-        log.info("wan2: %s", res.reason)
-        if not res.ok and res.status is not Outcome.SKIPPED:
-            report_leg(cfg, w2, res)
-            # Only a WAN that went down and stayed down is a failure of the run.
-            outage = res.status is Outcome.NOT_RETURNED
+        if "wan2" in legs:
+            open_window(cfg, w2, time.time(), leg2_window_ttl(cfg))
+            try:
+                res = reboot_wan2(cfg, time.time())
+                if res.ok:
+                    sleep(cfg.settle_s)
+            finally:
+                close_window(cfg)
+            log.info("wan2: %s", res.reason)
+            if not res.ok and res.status is not Outcome.SKIPPED:
+                report_leg(cfg, w2, res)
+                # Only a WAN that went down and stayed down is a failure of
+                # the run.
+                outage = res.status is Outcome.NOT_RETURNED
         return 1 if outage else 0
     finally:
         # A window left open would suppress that WAN's alerts indefinitely —
@@ -952,6 +968,8 @@ def main():
                     help="ignore the scheduled hour and run immediately")
     ap.add_argument("--dry-run", action="store_true",
                     help="force dry_run regardless of config")
+    ap.add_argument("--only", choices=["wan1", "wan2"], default=None,
+                    help="reboot only this WAN (default: full cycle)")
     args = ap.parse_args()
     cfg = load_config(args.config)
     if args.dry_run:
@@ -977,7 +995,8 @@ def main():
             if not ok:
                 log.info("skipping: %s", why)
                 return 0
-        return run_once(cfg, now)
+        legs = (args.only,) if args.only else ("wan1", "wan2")
+        return run_once(cfg, now, legs=legs)
     finally:
         release_lock(lock)
 

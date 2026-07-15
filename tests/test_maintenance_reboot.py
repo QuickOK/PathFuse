@@ -2307,3 +2307,36 @@ def test_watchdog_exit_codes_match_the_watchdog(tmp_path):
     assert (M.WD_ISSUED, M.WD_UNTOUCHED, M.WD_SKIPPED, M.WD_ATTEMPTED_UNKNOWN) \
         == (W.EXIT_ISSUED, W.EXIT_UNTOUCHED, W.EXIT_SKIPPED,
             W.EXIT_ATTEMPTED_UNKNOWN)
+
+
+def test_run_once_only_wan1_skips_wan2(tmp_path, monkeypatch):
+    cfg = write_cfg(tmp_path)
+    # both WANs UP so the start-gate passes
+    (tmp_path / "sbfd.json").write_text(_json.dumps(
+        {"timestamp": 0, "sessions": {
+            "s1": {"iface": "wan1", "state": "UP"},
+            "s2": {"iface": "wan2", "state": "UP"}}}))
+    calls = []
+    monkeypatch.setattr(M, "reboot_wan1",
+                        lambda c, n: (calls.append("wan1"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    monkeypatch.setattr(M, "reboot_wan2",
+                        lambda c, n: (calls.append("wan2"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    rc = M.run_once(cfg, 0.0, sleep=lambda *_: None, legs=("wan1",))
+    assert calls == ["wan1"]          # wan2 leg never ran
+    assert rc == 0
+
+
+def test_run_once_only_wan2_skips_wan1(tmp_path, monkeypatch):
+    cfg = write_cfg(tmp_path)
+    (tmp_path / "sbfd.json").write_text(_json.dumps(
+        {"timestamp": 0, "sessions": {
+            "s1": {"iface": "wan1", "state": "UP"},
+            "s2": {"iface": "wan2", "state": "UP"}}}))
+    calls = []
+    monkeypatch.setattr(M, "reboot_wan1",
+                        lambda c, n: (calls.append("wan1"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    monkeypatch.setattr(M, "reboot_wan2",
+                        lambda c, n: (calls.append("wan2"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    rc = M.run_once(cfg, 0.0, sleep=lambda *_: None, legs=("wan2",))
+    assert calls == ["wan2"]
+    assert rc == 0
