@@ -108,7 +108,7 @@ class MrConfig:
     notify_topic: str
     dry_run: bool
     control_topic: str = ""
-    ntfy_auth_path: str = "/etc/pi-notify.auth"
+    ntfy_auth_path: str = "/etc/spool-notify.auth"
 
 
 def load_config(path: str) -> MrConfig:
@@ -135,7 +135,7 @@ def load_config(path: str) -> MrConfig:
         notify_topic=raw.get("notify_topic", "pathfuse"),
         dry_run=bool(raw.get("dry_run", True)),
         control_topic=raw.get("control_topic", ""),
-        ntfy_auth_path=raw.get("ntfy_auth_path", "/etc/pi-notify.auth"),
+        ntfy_auth_path=raw.get("ntfy_auth_path", "/etc/spool-notify.auth"),
     )
     # The two ifaces must be real and DISTINCT. peer_of() pairs each WAN with
     # the other one; if both names are the same string it hands a WAN back

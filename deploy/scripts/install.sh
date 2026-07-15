@@ -44,15 +44,16 @@ fi
 
 # 4) ntfy-control (reboot-trigger) service user + scoped sudoers: the
 # generic service-user loop in step 2 does not support supplementary groups
-# (this user needs `pi-notify`, to read the group-readable /etc/pi-notify.auth
+# (this user needs the `spool-notify` group — already created in step 3 — to
+# read the group-readable /etc/spool-notify.auth
 # ntfy-control.service sources), and a NOPASSWD sudoers file needs its own
 # install + validate step — a bad sudoers file must fail the install, not
 # silently ship, so `visudo -cf` runs right after placing it. ntfy-dispatch
 # itself is code (like the .py modules), not config, so it is NOT installed
 # here — see deploy/README.md's manual install list.
 if [ "$ROLE" = "client" ]; then
-  getent group pi-notify >/dev/null 2>&1 || run "sudo groupadd -f pi-notify"
-  getent passwd ntfy-ctl >/dev/null 2>&1 || run "sudo useradd --system --no-create-home --shell /usr/sbin/nologin -G pi-notify ntfy-ctl"
+  # The spool-notify group is created in step 3 (client role); reuse it here.
+  getent passwd ntfy-ctl >/dev/null 2>&1 || run "sudo useradd --system --no-create-home --shell /usr/sbin/nologin -G spool-notify ntfy-ctl"
   # Validate the REPO SOURCE first, so a malformed sudoers file never lands in
   # /etc/sudoers.d (where a broken file could break the sudo this very script
   # relies on for its remaining steps). Only install once the source parses;

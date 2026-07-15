@@ -74,8 +74,8 @@ chgrp/chmods an existing one, so a re-run leaves an already-correctly-permission
 The `sbfd-ctl.service.d/notifications.conf` drop-in itself is still a manual step — see
 `deploy/spool-notify/README.md`.
 
-On the client, `install.sh` also creates the `pi-notify` group, the `ntfy-ctl` service
-user (member of `pi-notify`, no login shell, no home), and `/etc/sudoers.d/ntfy-ctl`
+On the client, `install.sh` also creates the `spool-notify` group, the `ntfy-ctl` service
+user (member of `spool-notify`, no login shell, no home), and `/etc/sudoers.d/ntfy-ctl`
 (mode `0440`, validated with `visudo -cf` — a bad sudoers file fails the install rather
 than shipping silently) — the pieces `ntfy-control.service` needs for the optional ntfy
 reboot-trigger feature (see `deploy/ntfy-control/`). `ntfy-dispatch` itself is code, not
@@ -94,12 +94,12 @@ drop-in below — one is what the button POSTs to, the other is what the subscri
 listens on; they must match.
 
 Two pieces remain manual, on-box, hand steps — nothing in this repo creates them:
-- **`/etc/pi-notify.auth`** (shell vars `NTFY_BASE`, `NTFY_USER`, `NTFY_PASS`) —
+- **`/etc/spool-notify.auth`** (shell vars `NTFY_BASE`, `NTFY_USER`, `NTFY_PASS`) —
   root-owned; `maintenance_reboot.py`'s "Reboot now" button reads it as root, but
   `ntfy-control.service` runs as the unprivileged `ntfy-ctl` user, so this file must
-  additionally be group-owned `pi-notify` and mode `0640` (not the `0600` a
+  additionally be group-owned `spool-notify` and mode `0640` (not the `0600` a
   root-only reader would need) for the subscriber to source it. `ntfy-ctl` reaches
-  it via the `pi-notify` supplementary group `install.sh` grants it.
+  it via the `spool-notify` supplementary group `install.sh` grants it.
 - **`/etc/systemd/system/ntfy-control.service.d/topic.conf`** — copy from
   `deploy/ntfy-control/ntfy-control.service.d/topic.conf.example` and set a real,
   hard-to-guess `CONTROL_TOPIC` (not installed by `install.sh` on purpose — a topic
@@ -128,7 +128,7 @@ sudo systemctl enable --now hotspot-watchdog
 # hotspot-watchdog above for its wan1 leg)
 sudo systemctl enable --now maintenance-reboot.timer
 # optional: ntfy reboot-trigger subscriber — only after creating BOTH
-# /etc/pi-notify.auth (group pi-notify, mode 0640) and the
+# /etc/spool-notify.auth (group spool-notify, mode 0640) and the
 # ntfy-control.service.d/topic.conf drop-in (see step 4 above); otherwise it
 # starts with no topic/credentials to subscribe with.
 sudo systemctl enable --now ntfy-control.service

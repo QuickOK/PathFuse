@@ -78,7 +78,7 @@ def test_load_config_pins_ifaces_to_leg_labels(tmp_path):
     # iface renamed to anything else must be rejected up front, not left to
     # POST a dead command outside the allow-list.
     import pytest
-    for wan, other in (("wan1", "starlink"), ("wan2", "starlink")):
+    for wan, other in (("wan1", "eth9"), ("wan2", "eth9")):
         raw = cfg_dict(tmp_path)
         raw[wan]["iface"] = other
         p = tmp_path / f"renamed-{wan}.json"
