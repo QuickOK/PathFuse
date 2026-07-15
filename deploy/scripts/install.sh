@@ -53,6 +53,11 @@ fi
 if [ "$ROLE" = "client" ]; then
   getent group pi-notify >/dev/null 2>&1 || run "sudo groupadd -f pi-notify"
   getent passwd ntfy-ctl >/dev/null 2>&1 || run "sudo useradd --system --no-create-home --shell /usr/sbin/nologin -G pi-notify ntfy-ctl"
+  # Validate the REPO SOURCE first, so a malformed sudoers file never lands in
+  # /etc/sudoers.d (where a broken file could break the sudo this very script
+  # relies on for its remaining steps). Only install once the source parses;
+  # the post-install check then confirms the placed copy too.
+  run "sudo visudo -cf '$HERE/ntfy-control/sudoers-ntfy-ctl'"
   run "sudo install -D -m0440 '$HERE/ntfy-control/sudoers-ntfy-ctl' /etc/sudoers.d/ntfy-ctl"
   run "sudo visudo -cf /etc/sudoers.d/ntfy-ctl"
 fi

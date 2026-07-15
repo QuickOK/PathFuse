@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -160,6 +161,16 @@ def load_config(path: str) -> MrConfig:
             "maintenance-reboot leg labels (CLI --only, the ntfy allow-list "
             "commands, the scoped sudoers, and the start-gate) are fixed to "
             "these names")
+    # control_topic is interpolated verbatim into the ntfy `Actions:` curl
+    # header built by _reboot_button, so a stray comma / space / CRLF from an
+    # operator typo could malform (or inject a second) header field. No
+    # message-derived value ever reaches it — this is operator self-harm, not
+    # an attacker path — but pin the charset the topic is meant to be anyway.
+    # Empty stays valid: empty control_topic means "no button", by design.
+    if cfg.control_topic and not re.fullmatch(r"[A-Za-z0-9_-]+", cfg.control_topic):
+        raise ValueError(
+            "control_topic must contain only [A-Za-z0-9_-] (or be empty for "
+            "no reboot button): it is interpolated into the ntfy Actions header")
     # Finiteness before positivity: json.loads accepts bareword Infinity/NaN,
     # and every comparison against NaN is False, so a NaN deadline would sail
     # through a bare `<= 0` check and then make await_up's bound meaningless.

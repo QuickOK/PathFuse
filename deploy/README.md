@@ -81,6 +81,18 @@ than shipping silently) — the pieces `ntfy-control.service` needs for the opti
 reboot-trigger feature (see `deploy/ntfy-control/`). `ntfy-dispatch` itself is code, not
 config, so it is installed manually (step 1 above), like the `.py` daemons.
 
+To make the maintenance-reboot notifications carry a **"Reboot now" button**, set
+`maintenance.control_topic` (the same hard-to-guess control topic, below) in **your
+`values.json`** and re-run `install.sh`. It renders into
+`/etc/sbfd-ctl/maintenance.json` as `control_topic`, which `maintenance_reboot.py`
+reads to build the button. Do **not** hand-edit the deployed `maintenance.json` —
+`install.sh` re-renders and overwrites it on every run, so a hand-edit is lost on the
+next deploy (and hand-editing deploy targets is against this kit's rules). An empty
+`control_topic` (the example default) means no button, which is the safe default until
+you have a control topic. Use the **same topic value** here and in the `topic.conf`
+drop-in below — one is what the button POSTs to, the other is what the subscriber
+listens on; they must match.
+
 Two pieces remain manual, on-box, hand steps — nothing in this repo creates them:
 - **`/etc/pi-notify.auth`** (shell vars `NTFY_BASE`, `NTFY_USER`, `NTFY_PASS`) —
   root-owned; `maintenance_reboot.py`'s "Reboot now" button reads it as root, but
@@ -91,7 +103,8 @@ Two pieces remain manual, on-box, hand steps — nothing in this repo creates th
 - **`/etc/systemd/system/ntfy-control.service.d/topic.conf`** — copy from
   `deploy/ntfy-control/ntfy-control.service.d/topic.conf.example` and set a real,
   hard-to-guess `CONTROL_TOPIC` (not installed by `install.sh` on purpose — a topic
-  is secret-adjacent, chosen per box). Then `systemctl daemon-reload`.
+  is secret-adjacent, chosen per box). Use the **same** topic as
+  `maintenance.control_topic` in your `values.json` (above). Then `systemctl daemon-reload`.
 
 ## 5. Start services — order matters
 

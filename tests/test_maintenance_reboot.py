@@ -87,6 +87,23 @@ def test_load_config_pins_ifaces_to_leg_labels(tmp_path):
             M.load_config(str(p))
 
 
+def test_load_config_pins_control_topic_charset(tmp_path):
+    # control_topic is interpolated verbatim into the ntfy Actions curl header
+    # by _reboot_button, so a comma/space/CRLF from an operator typo could
+    # malform it. A bad topic must be rejected up front; empty (= no button)
+    # and a clean [A-Za-z0-9_-] topic must both load fine.
+    import pytest
+    bad = cfg_dict(tmp_path, control_topic="bad topic,x")
+    p = tmp_path / "bad-topic.json"
+    p.write_text(_json.dumps(bad))
+    with pytest.raises(ValueError):
+        M.load_config(str(p))
+    # empty is valid: it disables the button
+    assert write_cfg(tmp_path, control_topic="").control_topic == ""
+    # a well-formed topic loads unchanged
+    assert write_cfg(tmp_path, control_topic="ctl-x9").control_topic == "ctl-x9"
+
+
 def test_load_config_rejects_empty_ifaces(tmp_path):
     # an empty iface name matches no BFD session, so every state read for it is
     # "not UP" — a config that can never reboot anything, failing silently
