@@ -1,0 +1,56 @@
+#!/bin/bash
+# Runs once per ntfy control message (invoked by ntfy-control.service's
+# `ntfy subscribe <topic> ntfy-dispatch`). Turns an ALLOW-LISTED command word
+# into a guarded reboot. The message body is NEVER eval'd — only matched
+# against a fixed case list. Dedupe (by message id) defeats --since replay on
+# service restart; a per-command rate-limit is the metered-WAN loop guard.
+set -uo pipefail
+
+STATE_DIR="${DISPATCH_STATE_DIR:-/run/ntfy-ctl}"
+RATE_LIMIT_S="${RATE_LIMIT_S:-1200}"
+REBOOT_CMD="${REBOOT_CMD:-sudo /opt/sbfd-ctl/maintenance_reboot.py -c /etc/sbfd-ctl/maintenance.json --now}"
+MSG="${NTFY_MESSAGE:-}"
+MID="${NTFY_ID:-}"
+
+log() { logger -t ntfy-dispatch -- "$*"; }
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+# Map allow-listed command -> extra args. Anything else: log and exit.
+case "$MSG" in
+    reboot-wan1)  extra=(--only wan1); key=wan1 ;;
+    reboot-wan2)  extra=(--only wan2); key=wan2 ;;
+    reboot-cycle) extra=();            key=cycle ;;
+    *) log "ignoring unknown command: [$MSG]"; exit 0 ;;
+esac
+
+# Dedupe by message id (defeats --since replay). Empty id = cannot dedupe;
+# fall through (the rate-limit still bounds it).
+if [ -n "$MID" ]; then
+    seen="${STATE_DIR}/seen-${MID}"
+    if [ -e "$seen" ]; then log "duplicate id ${MID}; ignoring"; exit 0; fi
+    : > "$seen"
+fi
+
+# Per-command rate-limit. This is the ONLY loop guard — neither reboot path
+# throttles repeat calls.
+stamp="${STATE_DIR}/last-${key}"
+now=$(date +%s)
+if [ -f "$stamp" ]; then
+    last=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [ $(( now - last )) -lt "$RATE_LIMIT_S" ]; then
+        log "rate-limited: ${MSG} (last $(( now - last ))s ago < ${RATE_LIMIT_S}s)"
+        exit 0
+    fi
+fi
+echo "$now" > "$stamp"
+
+log "executing: ${MSG}"
+# REBOOT_CMD is a shell command STRING (e.g. "sudo /path/to/bin --now"), not
+# user input — it is set by the deployer/env, never derived from
+# $NTFY_MESSAGE. Re-parse it with bash -c (rather than naive unquoted
+# word-splitting, which would mangle any embedded quoting) and append the
+# allow-listed extra args as real positional parameters via "$@".
+bash -c "$REBOOT_CMD"' "$@"' _ "${extra[@]}"
+rc=$?
+log "reboot command exit ${rc} for ${MSG}"
+exit 0
