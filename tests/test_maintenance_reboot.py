@@ -2340,3 +2340,53 @@ def test_run_once_only_wan2_skips_wan1(tmp_path, monkeypatch):
     rc = M.run_once(cfg, 0.0, sleep=lambda *_: None, legs=("wan2",))
     assert calls == ["wan2"]
     assert rc == 0
+
+
+def test_run_once_only_wan1_refuses_when_the_peer_is_down(tmp_path, monkeypatch):
+    # The safety property this feature exists to guarantee: a single-leg reboot
+    # of wan1 must still refuse to disturb it while wan2 — the WAN that would be
+    # left standing — is down. `required = set(legs) | {w1, w2}` includes wan2.
+    cfg = write_cfg(tmp_path)
+    (tmp_path / "sbfd.json").write_text(_json.dumps(
+        {"timestamp": 0, "sessions": {
+            "s1": {"iface": "wan1", "state": "UP"},
+            "s2": {"iface": "wan2", "state": "DOWN"}}}))
+    calls = []
+    monkeypatch.setattr(M, "reboot_wan1",
+                        lambda c, n: (calls.append("wan1"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    monkeypatch.setattr(M, "reboot_wan2",
+                        lambda c, n: (calls.append("wan2"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    rc = M.run_once(cfg, 0.0, sleep=lambda *_: None, legs=("wan1",))
+    assert calls == []                 # never disturb the last standing WAN
+    assert rc == 0                     # a skip is a success, not a failure
+
+
+def test_run_once_only_wan2_refuses_when_the_peer_is_down(tmp_path, monkeypatch):
+    # Symmetric: a single-leg reboot of wan2 must refuse while wan1 is down.
+    cfg = write_cfg(tmp_path)
+    (tmp_path / "sbfd.json").write_text(_json.dumps(
+        {"timestamp": 0, "sessions": {
+            "s1": {"iface": "wan1", "state": "DOWN"},
+            "s2": {"iface": "wan2", "state": "UP"}}}))
+    calls = []
+    monkeypatch.setattr(M, "reboot_wan1",
+                        lambda c, n: (calls.append("wan1"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    monkeypatch.setattr(M, "reboot_wan2",
+                        lambda c, n: (calls.append("wan2"), M._leg(M.Outcome.SKIPPED, "x"))[1])
+    rc = M.run_once(cfg, 0.0, sleep=lambda *_: None, legs=("wan2",))
+    assert calls == []
+    assert rc == 0
+
+
+def test_main_maps_only_flag_to_legs(tmp_path, monkeypatch):
+    # --only wanX must reach run_once as legs=(wanX,); no --only is the full
+    # cycle legs=("wan1", "wan2"). Capture run_once's kwargs to prove the wiring.
+    write_cfg(tmp_path, dry_run=False)
+    seen = []
+    monkeypatch.setattr(M, "run_once",
+                        lambda *a, **k: (seen.append(k.get("legs")), 0)[1])
+
+    assert run_main(tmp_path, monkeypatch, "--now", "--only", "wan1") == 0
+    assert run_main(tmp_path, monkeypatch, "--now", "--only", "wan2") == 0
+    assert run_main(tmp_path, monkeypatch, "--now") == 0
+    assert seen == [("wan1",), ("wan2",), ("wan1", "wan2")]
