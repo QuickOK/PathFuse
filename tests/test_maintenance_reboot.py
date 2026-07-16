@@ -1658,26 +1658,41 @@ def test_reboot_wan2_takes_the_bootcount_baseline_from_the_final_snapshot(
 
 
 def test_run_once_skips_when_peer_is_down(tmp_path, monkeypatch):
+    # A fresh read in which a WAN is DOWN is a real OBSERVATION, not an absence:
+    # skip it, but do NOT page — a WAN merely down at midnight is not an
+    # operator emergency, and paging on it would cry wolf. (Contrast the
+    # unreadable-state case below, which DOES page.)
     cfg = write_cfg(tmp_path, dry_run=False)
     monkeypatch.setattr(M, "read_wan_states",
                         lambda *a, **k: {"wan1": "UP", "wan2": "DOWN"})
     calls = []
     monkeypatch.setattr(M, "reboot_wan1", lambda *a, **k: calls.append("w1"))
     monkeypatch.setattr(M, "reboot_wan2", lambda *a, **k: calls.append("w2"))
+    sent = []
+    monkeypatch.setattr(M, "notify",
+                        lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0)
     assert rc == 0                     # a skip is a success, not a failure
     assert calls == []                 # never disturb the last standing WAN
+    assert sent == []                  # an observed-down WAN is not a page
 
 
-def test_run_once_skips_when_the_state_file_is_unreadable(tmp_path, monkeypatch):
-    # {} from read_wan_states means "unknown", which must never read as UP
+def test_run_once_pages_when_the_state_file_is_unreadable(tmp_path, monkeypatch):
+    # {} from read_wan_states means "unknown" — an ABSENT observation, not a WAN
+    # we can see is down. It must never read as UP, and (the rule this whole
+    # sequencer turns on) it must never be a SILENT skip: a state path that
+    # quietly went missing is exactly how the nightly reboot no-op'd, unnoticed.
     cfg = write_cfg(tmp_path, dry_run=False)
     monkeypatch.setattr(M, "read_wan_states", lambda *a, **k: {})
     calls = []
     monkeypatch.setattr(M, "reboot_wan1", lambda *a, **k: calls.append("w1"))
+    sent = []
+    monkeypatch.setattr(M, "notify",
+                        lambda cfg, t, p, m, actions=None: sent.append((t, p)))
     rc = M.run_once(cfg, now=1000.0)
     assert rc == 0
-    assert calls == []
+    assert calls == []                          # never disturb the last WAN
+    assert any(p == "high" for _t, p in sent)   # but it PAGES, not silent
 
 
 def test_run_once_aborts_before_wan2_if_wan1_never_returns(tmp_path, monkeypatch):

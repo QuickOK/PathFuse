@@ -292,8 +292,14 @@ def write_state_file(cfg: DaemonConfig, sessions: list):
     state_path = Path(cfg.state_file)
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
-    except (PermissionError, OSError):
-        # If we can't make the dir, fall back to a writable path
+    except (PermissionError, OSError) as e:
+        # We run unprivileged, so we cannot recreate a directory whose parent
+        # is root-owned (e.g. /run): if the state dir is removed out from under
+        # a running daemon, this fails on every tick and we stop publishing
+        # state. A silently-unpublished state file is how downstream readers
+        # (the maintenance-reboot gate, sbfd-ctl) go blind unnoticed — so make
+        # noise, but only on the transition into failure (this runs ~1/s).
+        _warn_state_publish_broken(f"cannot create state dir {state_path.parent}", e)
         return
 
     out = {
@@ -326,7 +332,26 @@ def write_state_file(cfg: DaemonConfig, sessions: list):
             json.dump(out, f, indent=2)
         os.replace(tmp, state_path)
     except (PermissionError, OSError) as e:
-        logging.debug("state file write failed: %s", e)
+        _warn_state_publish_broken(f"state file write to {state_path} failed", e)
+        return
+    # A clean write after a failure: announce recovery once, so the log shows a
+    # matched broken/recovered pair rather than an unexplained silence.
+    if write_state_file._broken:
+        logging.warning("state publishing recovered: writing %s again", state_path)
+        write_state_file._broken = False
+
+
+# Tracks whether state publishing is currently failing, so the warnings above
+# fire on the broken->working edges only and never flood at the ~1/s write rate.
+write_state_file._broken = False
+
+
+def _warn_state_publish_broken(what: str, err: Exception):
+    """Warn once on the transition into a state-publishing failure."""
+    if not write_state_file._broken:
+        logging.warning("%s: %s — WAN state is not being published; readers "
+                        "will see no fresh state until this recovers", what, err)
+        write_state_file._broken = True
 
 # -- Optional HTTP /state listener --------------------------------------------
 

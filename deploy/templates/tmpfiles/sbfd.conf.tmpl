@@ -1,0 +1,15 @@
+# PathFuse — declaratively provision sbfd's runtime state directory.
+#
+# sbfd's unit already gets /run/sbfd via `RuntimeDirectory=sbfd`, but that is
+# created ONCE, at service start, and torn down/recreated only across the
+# service's own lifecycle. It runs as an unprivileged user, so if the directory
+# is ever removed out from under the running daemon (a deploy that cleans up an
+# adjacent unit, a stray operator command), the daemon cannot recreate it under
+# root-owned /run and silently stops publishing state — and every downstream
+# reader (the maintenance-reboot gate, sbfd-ctl) then reads blind.
+#
+# This rule makes the directory a first-class, declarative object: recreated at
+# every boot and on demand via `systemd-tmpfiles --create`, independent of when
+# (or whether) the daemon restarts. install.sh runs `--create` so a deploy that
+# disturbs it puts it back before the deploy finishes.
+d /run/sbfd 0755 $users_sbfd $users_sbfd -

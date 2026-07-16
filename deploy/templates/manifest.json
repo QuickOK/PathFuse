@@ -1,6 +1,7 @@
 [
   {"template":"systemd/sbfd-server.service.tmpl","roles":["relay"],"dest":"/etc/systemd/system/sbfd.service","mode":"0644"},
   {"template":"systemd/sbfd-client.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/sbfd.service","mode":"0644"},
+  {"template":"tmpfiles/sbfd.conf.tmpl","roles":["client","relay"],"dest":"/etc/tmpfiles.d/pathfuse-sbfd.conf","mode":"0644"},
   {"template":"systemd/sbfd-ctl.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/sbfd-ctl.service","mode":"0644"},
   {"template":"systemd/udpspeeder-client.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/udpspeeder-client.service","mode":"0644"},
   {"template":"systemd/environ-ctl.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/environ-ctl.service","mode":"0644"},

@@ -76,6 +76,14 @@ PY
   run "sudo install -D -m '$mode' '$src' '$dest'"
 done
 
+# 5b) provision runtime state dirs NOW, not just at next boot. sbfd's /run/sbfd
+# is normally created by its unit's RuntimeDirectory=, but an unprivileged
+# daemon cannot recreate it if it is ever removed out from under a running
+# instance — so a deploy that disturbed it would leave every state reader blind
+# until a reboot. `systemd-tmpfiles --create` (idempotent) puts it back before
+# this deploy returns, matching the rule shipped in tmpfiles/sbfd.conf.tmpl.
+run "sudo systemd-tmpfiles --create /etc/tmpfiles.d/pathfuse-sbfd.conf"
+
 # 6) reload systemd; do NOT auto-enable/start (see README cutover order)
 run "sudo systemctl daemon-reload"
 echo "Rendered+installed. NOT auto-enabling/starting services — see deploy/README.md for the"

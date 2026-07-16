@@ -943,9 +943,27 @@ def run_once(cfg: MrConfig, now: float, sleep=time.sleep,
     # the target plus its peer — never disturb the last standing WAN.
     required = set(legs) | {w1, w2}
     for wan in sorted(required):
-        if states.get(wan) != "UP":
+        st = states.get(wan)
+        if st is None:
+            # No fresh observation AT ALL for this WAN: the state file is
+            # missing, stale, or omits it. That is an ABSENCE, not a WAN we can
+            # see is down — and the rule this whole sequencer turns on is that
+            # an absent observation must never SILENCE a page. A state path that
+            # quietly went missing is exactly how the nightly reboot no-op'd,
+            # unnoticed, night after night. Page, then skip.
+            log.warning("skipping: no fresh state for %s from %s — blind, "
+                        "refusing to reboot", wan, cfg.sbfd_state_path)
+            notify(cfg,
+                   "⚠️ Maintenance reboot skipped — WAN state unreadable",
+                   "high",
+                   f"No fresh state for {wan} from {cfg.sbfd_state_path}. The "
+                   f"nightly reboot was skipped rather than risk stranding a "
+                   f"WAN. Check that sbfd's state directory exists and the "
+                   f"daemon is publishing state.")
+            return 0
+        if st != "UP":
             log.info("skipping: %s is %s, not UP — refusing to disturb the "
-                     "last standing WAN", wan, states.get(wan))
+                     "last standing WAN", wan, st)
             return 0
 
     # Exit 1 is reserved for an OUTAGE: a WAN we took down that did not come
