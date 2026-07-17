@@ -56,7 +56,6 @@ def test_rendered_client_configs_are_valid_json_with_right_types():
     assert maint["dry_run"] is True
     assert maint["lock_path"] == "/run/sbfd-ctl/maintenance.lock"
     assert isinstance(maint["recovery_deadline_s"], int)
-    assert isinstance(maint["wan2"]["min_uptime_s"], int)
 
 
 def test_render_text_strict_missing_placeholder_raises():

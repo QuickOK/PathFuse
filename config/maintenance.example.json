@@ -10,8 +10,7 @@
   "wan2": {
     "iface": "wan2",
     "grpcurl_bin": "/usr/local/bin/grpcurl",
-    "addr": "192.0.2.1:9200",
-    "min_uptime_s": 43200
+    "addr": "192.0.2.1:9200"
   },
   "recovery_deadline_s": 600,
   "settle_s": 30,

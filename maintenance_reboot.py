@@ -91,7 +91,6 @@ class Wan2Cfg:
     iface: str
     grpcurl_bin: str
     addr: str
-    min_uptime_s: float
 
 
 @dataclass
@@ -127,8 +126,7 @@ def load_config(path: str) -> MrConfig:
         wan2=Wan2Cfg(iface=w2.get("iface", "wan2"),
                      grpcurl_bin=w2.get("grpcurl_bin",
                                         "/usr/local/bin/grpcurl"),
-                     addr=w2["addr"],
-                     min_uptime_s=float(w2.get("min_uptime_s", 43200))),
+                     addr=w2["addr"]),
         recovery_deadline_s=float(raw.get("recovery_deadline_s", 600)),
         settle_s=float(raw.get("settle_s", 30)),
         notify_bin=raw.get("notify_bin", DEFAULT_NOTIFY),
@@ -180,10 +178,6 @@ def load_config(path: str) -> MrConfig:
             raise ValueError(f"{k} must be finite")
         if v <= 0:
             raise ValueError(f"{k} must be > 0")
-    if not math.isfinite(cfg.wan2.min_uptime_s):
-        raise ValueError("wan2.min_uptime_s must be finite")
-    if cfg.wan2.min_uptime_s < 0:
-        raise ValueError("wan2.min_uptime_s must be >= 0")
     return cfg
 
 
@@ -291,8 +285,8 @@ def _as_number(v):
     float() also accepts "nan"/"inf"/"-inf"/"Infinity" and only raises on
     genuinely non-numeric strings, so a string that parses must still be
     checked for finiteness: a non-finite value is not a number this module
-    can trust, and callers (bootcount's int(n), uptime_s's threshold
-    comparisons) must never see one."""
+    can trust, and callers (bootcount's int(n), the staged-update seconds
+    comparison) must never see one."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -391,16 +385,6 @@ class DishClient:
             return None
         n = _as_number(info.get("bootcount"))
         return int(n) if n is not None else None
-
-    def uptime_s(self) -> Optional[float]:
-        st = self.status()
-        if not st:
-            return None
-        state = self._sub(st, "deviceState")
-        if not state:
-            return None
-        n = _as_number(state.get("uptimeS"))
-        return float(n) if n is not None else None
 
     def update_staged(self, st: Optional[dict] = None) -> bool:
         """A firmware update is staged and waiting for a reboot to apply it.
@@ -756,11 +740,6 @@ def reboot_wan2(cfg: MrConfig, now: float, client=None,
             f"{w2} is down and the terminal is not answering")
     if client.update_in_flight(st):
         return _leg(Outcome.SKIPPED, "skipping: firmware update in flight")
-    up = client.uptime_s()
-    if up is not None and up < cfg.wan2.min_uptime_s:
-        return _leg(Outcome.SKIPPED,
-                    f"skipping: uptime {int(up)}s < minimum "
-                    f"{int(cfg.wan2.min_uptime_s)}s — rebooted recently")
 
     # ---- the decision snapshot -----------------------------------------
     # Everything above came from ONE status read taken several seconds and

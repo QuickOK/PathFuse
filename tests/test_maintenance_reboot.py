@@ -16,7 +16,7 @@ def cfg_dict(tmp_path, **kw):
                  "watchdog_bin": "/opt/sbfd-ctl/hotspot_watchdog.py",
                  "watchdog_config": "/etc/sbfd-ctl/hotspot-watchdog.json"},
         "wan2": {"iface": "wan2", "grpcurl_bin": "/usr/local/bin/grpcurl",
-                 "addr": "192.0.2.1:9200", "min_uptime_s": 43200},
+                 "addr": "192.0.2.1:9200"},
         "recovery_deadline_s": 600,
         "settle_s": 30,
         "notify_bin": "/bin/true",
@@ -133,17 +133,6 @@ def test_load_config_rejects_non_finite_durations(tmp_path):
         p.write_text(raw)
         with pytest.raises(ValueError):
             M.load_config(str(p))
-
-
-def test_load_config_rejects_non_finite_min_uptime(tmp_path):
-    # a NaN min_uptime_s makes "uptime < minimum" False for every uptime, so the
-    # just-rebooted guard would never fire
-    import pytest
-    p = tmp_path / "nanuptime.json"
-    p.write_text(_json.dumps(cfg_dict(tmp_path)).replace(
-        '"min_uptime_s": 43200', '"min_uptime_s": NaN'))
-    with pytest.raises(ValueError):
-        M.load_config(str(p))
 
 
 def test_should_run_only_at_the_configured_hour(tmp_path):
@@ -353,16 +342,6 @@ STATUS_APPLYING = _json.dumps({"dishGetStatus": {
     "softwareUpdateState": "APPLYING",
 }})
 
-# Real observed grpcurl output: protojson renders the uint64 uptimeS field as
-# a quoted JSON string, not a plain number. bootcount and
-# secondsUntilSwupdateRebootPossible arrive as plain numbers today.
-STATUS_STRING_UPTIME = _json.dumps({"dishGetStatus": {
-    "bootcount": 1321,
-    "deviceInfo": {"bootcount": 1321},
-    "deviceState": {"uptimeS": "16610"},
-    "softwareUpdateState": "IDLE",
-    "secondsUntilSwupdateRebootPossible": -1,
-}})
 
 # A firmware could widen bootcount/secondsUntilSwupdateRebootPossible to a
 # 64-bit field too; grpcurl would then quote them exactly like uptimeS.
@@ -406,10 +385,9 @@ def test_status_none_on_grpcurl_failure(tmp_path):
     assert d.status() is None
 
 
-def test_bootcount_and_uptime(tmp_path):
-    d, _ = dish(tmp_path, [(0, STATUS_IDLE), (0, STATUS_IDLE)])
+def test_bootcount(tmp_path):
+    d, _ = dish(tmp_path, [(0, STATUS_IDLE)])
     assert d.bootcount() == 1321
-    assert d.uptime_s() == 90000
 
 
 def test_update_staged_detects_reboot_ready(tmp_path):
@@ -452,13 +430,6 @@ def test_reboot_false_on_grpcurl_failure(tmp_path):
     assert d.reboot() is False
 
 
-def test_uptime_s_accepts_protojson_string_encoded_uint64(tmp_path):
-    # CONFIRMED bug: grpcurl quotes uptimeS ("16610") since it's a uint64;
-    # this must parse to 16610.0, not silently return None on every call.
-    d, _ = dish(tmp_path, [(0, STATUS_STRING_UPTIME)])
-    assert d.uptime_s() == 16610.0
-
-
 def test_bootcount_and_seconds_tolerate_string_encoding_too(tmp_path):
     # a future firmware could widen bootcount / secondsUntilSwupdateRebootPossible
     # to a 64-bit field, quoting them exactly like uptimeS; accessors must not break
@@ -473,12 +444,6 @@ def test_bootcount_rejects_bool(tmp_path):
     # back as the reboot receipt the sequencer compares before/after
     d, _ = dish(tmp_path, [(0, STATUS_BOOL_FIELDS)])
     assert d.bootcount() is None
-
-
-def test_uptime_s_rejects_bool(tmp_path):
-    # a bool uptimeS must not be coerced into a float via bool-as-int
-    d, _ = dish(tmp_path, [(0, STATUS_BOOL_FIELDS)])
-    assert d.uptime_s() is None
 
 
 def test_update_staged_rejects_bool_seconds(tmp_path):
@@ -526,22 +491,6 @@ def test_bootcount_none_on_non_finite_float_values(tmp_path):
         assert d.bootcount() is None
 
 
-def test_uptime_s_none_on_non_finite_strings(tmp_path):
-    # CONFIRMED bug: a NaN uptime silently bypassed the min-uptime "just
-    # rebooted" guard, since nan < x and nan >= x are both False; this pins
-    # that uptime_s() returns None (never nan) so the guard cannot be skipped
-    for s in NON_FINITE_STRINGS:
-        d, _ = dish(tmp_path, [(0, _status_with_non_finite(s))])
-        assert d.uptime_s() is None
-
-
-def test_uptime_s_none_on_non_finite_float_values(tmp_path):
-    # same guard, but for the bareword-float form
-    for v in NON_FINITE_FLOATS:
-        d, _ = dish(tmp_path, [(0, _status_with_non_finite(v))])
-        assert d.uptime_s() is None
-
-
 def test_update_staged_false_on_non_finite_seconds_strings(tmp_path):
     # CONFIRMED bug: secondsUntilSwupdateRebootPossible "inf" >= 0 is True in
     # Python, so update_staged() used to wrongly report a staged update; this
@@ -571,13 +520,6 @@ def test_bootcount_none_on_non_dict_json_bodies(tmp_path):
     for body in NON_DICT_BODIES:
         d, _ = dish(tmp_path, [(0, body)])
         assert d.bootcount() is None
-
-
-def test_uptime_s_none_on_non_dict_json_bodies(tmp_path):
-    # a non-dict grpcurl body must not raise out of uptime_s()
-    for body in NON_DICT_BODIES:
-        d, _ = dish(tmp_path, [(0, body)])
-        assert d.uptime_s() is None
 
 
 def test_update_staged_false_on_non_dict_json_bodies(tmp_path):
@@ -627,13 +569,6 @@ def test_bootcount_none_on_malformed_nesting(tmp_path):
     for body in MALFORMED_NESTING:
         d, _ = dish(tmp_path, [(0, body)])
         assert d.bootcount() is None
-
-
-def test_uptime_s_none_on_malformed_nesting(tmp_path):
-    # ...and out of uptime_s(), which gates the "rebooted recently" skip
-    for body in MALFORMED_NESTING:
-        d, _ = dish(tmp_path, [(0, body)])
-        assert d.uptime_s() is None
 
 
 def test_update_flags_false_on_malformed_nesting(tmp_path):
@@ -706,11 +641,10 @@ class FakeDish:
     """Scriptable stand-in for DishClient, so the leg-2 paths can be driven
     without a device and without a real await_up sleep."""
 
-    def __init__(self, boot=1321, uptime=90000.0, staged=False,
+    def __init__(self, boot=1321, staged=False,
                  in_flight=False, st=None, reboot_ok=True, apply_ok=True,
                  reboot_bumps=True, apply_bumps=True):
         self.boot = boot
-        self._uptime = uptime
         self._staged = staged
         self._in_flight = in_flight
         self._st = {} if st is None else st
@@ -725,9 +659,6 @@ class FakeDish:
 
     def update_in_flight(self, st=None):
         return self._in_flight
-
-    def uptime_s(self):
-        return self._uptime
 
     def bootcount(self, st=None):
         return self.boot
@@ -1314,22 +1245,20 @@ def test_classify_by_link_pages_on_an_unreadable_bfd_read(tmp_path, monkeypatch)
     assert res.reason == "down reason"
 
 
-def test_wan2_guard_skips_when_uptime_too_low(tmp_path):
+def test_reboot_wan2_reboots_a_young_but_reachable_dish(tmp_path, monkeypatch):
+    # the uptime guard is gone: a dish that was power-cycled recently (the
+    # operator unplugs Starlink at building stops, so its uptime is routinely
+    # low at the maintenance hour) must still get its reboot, not be skipped
+    # for being "too young"
     cfg = write_cfg(tmp_path, dry_run=False)
-
-    class D:
-        def status(self):
-            return {"deviceState": {"uptimeS": 60}, "softwareUpdateState": "IDLE"}
-
-        def update_in_flight(self, st=None):
-            return False
-
-        def uptime_s(self):
-            return 60.0
-    res = M.reboot_wan2(cfg, now=1000.0, client=D())
-    assert res.ok is False
-    assert res.status is M.Outcome.SKIPPED
-    assert "uptime" in res.reason
+    monkeypatch.setattr(M, "read_wan_states", both_up)
+    clk = FakeClock()
+    d = FakeDish()  # reachable, IDLE, bootcount readable
+    res = M.reboot_wan2(cfg, now=1000.0, client=d,
+                        sleep=instant(clk), clock=clk)
+    assert res.ok is True
+    assert res.status is M.Outcome.RECOVERED
+    assert d.calls == ["reboot"]
 
 
 def test_reboot_wan2_skips_when_an_update_is_in_flight(tmp_path):
