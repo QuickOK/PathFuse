@@ -57,6 +57,7 @@ class FecState:
             "loss_source": None,
             "since": None,
             "wire": None,
+            "rx": None,
         }
 
     def get_enabled(self):
@@ -369,7 +370,8 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
                       loss_source=("client_push" if pushed is not None
                                    else "local_sbfd"),
                       since=since,
-                      wire=(wire_tracker.snapshot(now) if wire_tracker else None))
+                      wire=(wire_tracker.snapshot(now) if wire_tracker else None),
+                      rx=(wire_tracker.rx_snapshot(now) if wire_tracker else None))
         stop_event.wait(cfg["poll_interval_s"])
 
 

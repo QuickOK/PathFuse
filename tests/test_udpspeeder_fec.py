@@ -221,6 +221,8 @@ def test_run_publishes_wire_from_tracker(tmp_path):
     class FakeTracker:
         def snapshot(self, now):
             return {"tx_mbps": 3.8, "overhead_pct": 9.0, "sample_age_s": 4.0, "stale": False}
+        def rx_snapshot(self, now):
+            return None
 
     st = U.FecState(enabled=True)
     stop = _t.Event()
@@ -551,3 +553,14 @@ def test_fec_state_from_cfg_defaults_on_empty_cfg():
     assert st.get_desired() == (fec_control.DEFAULT_MODE,
                                 fec_control.DEFAULT_FIXED_RATIO,
                                 fec_control.DEFAULT_FLOOR_RATIO)
+
+
+def test_fec_state_snapshot_seeds_rx_none():
+    s = U.FecState()
+    assert s.snapshot()["rx"] is None
+
+
+def test_publish_rx_appears_in_snapshot():
+    s = U.FecState()
+    s.publish(rx={"delivered_per_s": 10.0})
+    assert s.snapshot()["rx"] == {"delivered_per_s": 10.0}
