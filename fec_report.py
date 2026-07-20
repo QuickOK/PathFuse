@@ -11,6 +11,25 @@ import time
 _GROUP = r"\(original:(\d+) pkt[;,](\d+) byte\) \(fec:(\d+) pkt[;,](\d+) byte\)"
 _RE = re.compile(r"client-->server:" + _GROUP + r"\s+server-->client:" + _GROUP)
 
+# RX decode outcomes, emitted by the patched speederv2 on the same --report
+# cadence. NOTE: a unit's rx line describes the decode (receive) side of the
+# OPPOSITE direction from its [report] TX counters — the client decodes
+# server->client traffic and vice versa. Consumers cross-wire accordingly.
+_RX_FIELDS = ("pkt_ok", "pkt_rec", "grp_ok", "grp_rec", "grp_fail",
+              "shard_lost", "par_waste")
+_RX_RE = re.compile(r"\[report_fec_rx\]" +
+                    " ".join(f + r":(\d+)" for f in _RX_FIELDS))
+
+
+def parse_fec_rx_line(msg):
+    """Parse a '[report_fec_rx]...' message into cumulative counters, or None."""
+    if not msg or "[report_fec_rx]" not in msg:
+        return None
+    m = _RX_RE.search(msg)
+    if not m:
+        return None
+    return dict(zip(_RX_FIELDS, (int(x) for x in m.groups())))
+
 
 def parse_report_line(msg):
     """Parse a bare '[ts][INFO][report]...' message into per-direction counters,
@@ -43,12 +62,23 @@ class FecWireTracker:
         self._prev = None      # (t, counters)
         self._wire = None      # {"tx_mbps":..,"overhead_pct":..}
         self._wire_t = None
+        self._prev_rx = None   # (t, counters)
+        self._rx = None        # rates dict
+        self._rx_totals = None
+        self._rx_t = None
+        self._avg_pkts_per_grp = None
 
     def feed(self, msg, now):
         rep = parse_report_line(msg)
-        if rep is None:
+        if rep is not None:
+            self._feed_wire(rep[self.direction], now)
             return
-        cur = rep[self.direction]
+        rx = parse_fec_rx_line(msg)
+        if rx is not None:
+            self._feed_rx(rx, now)
+
+    def _feed_wire(self, cur, now):
+        # (old feed() body from `with self._lock:` down, unchanged)
         with self._lock:
             prev = self._prev
             self._prev = (now, cur)
@@ -66,6 +96,33 @@ class FecWireTracker:
             }
             self._wire_t = now
 
+    def _feed_rx(self, cur, now):
+        with self._lock:
+            prev = self._prev_rx
+            self._prev_rx = (now, cur)
+            self._rx_totals = dict(cur)
+            if prev is None:
+                return
+            pt, pc = prev
+            dt = now - pt
+            d = {k: cur[k] - pc[k] for k in cur}
+            if dt <= 0 or any(v < 0 for v in d.values()):
+                return  # bad interval or counter reset: keep last good rates
+            grp_done = d["grp_ok"] + d["grp_rec"]
+            if grp_done > 0:
+                self._avg_pkts_per_grp = (d["pkt_ok"] + d["pkt_rec"]) / grp_done
+            if self._avg_pkts_per_grp is not None:
+                lost = d["grp_fail"] * self._avg_pkts_per_grp
+            else:
+                lost = d["shard_lost"]  # no completed group yet: shard count as floor
+            self._rx = {
+                "delivered_per_s": round(d["pkt_ok"] / dt, 1),
+                "recovered_per_s": round(d["pkt_rec"] / dt, 1),
+                "lost_pkts_est_per_s": round(lost / dt, 1),
+                "par_waste_per_s": round(d["par_waste"] / dt, 1),
+            }
+            self._rx_t = now
+
     def snapshot(self, now):
         with self._lock:
             if self._wire is None or self._wire_t is None:
@@ -75,6 +132,22 @@ class FecWireTracker:
                 return {"tx_mbps": None, "overhead_pct": None,
                         "sample_age_s": round(age, 1), "stale": True}
             return {**self._wire, "sample_age_s": round(age, 1), "stale": False}
+
+    def rx_snapshot(self, now):
+        """Decode-outcome rates + raw totals, or None before two reports.
+        Stale mirrors snapshot(): rates null out, totals stay (they are
+        cumulative facts, not rates)."""
+        with self._lock:
+            if self._rx is None or self._rx_t is None:
+                return None
+            age = now - self._rx_t
+            if age > self.stale_after_s:
+                return {"delivered_per_s": None, "recovered_per_s": None,
+                        "lost_pkts_est_per_s": None, "par_waste_per_s": None,
+                        "totals": dict(self._rx_totals),
+                        "sample_age_s": round(age, 1), "stale": True}
+            return {**self._rx, "totals": dict(self._rx_totals),
+                    "sample_age_s": round(age, 1), "stale": False}
 
 
 def start_wire_tailer(unit, tracker, stop_event=None, line_source=None):

@@ -86,3 +86,64 @@ def test_start_wire_tailer_feeds_lines_from_injected_source():
     t.join(timeout=2)
     assert not t.is_alive()
     assert calls == [C1, C2, NOISE]
+
+
+RX1 = ("[2026-07-20 10:00:00][INFO][report_fec_rx]pkt_ok:1000 pkt_rec:50 "
+       "grp_ok:120 grp_rec:10 grp_fail:2 shard_lost:9 par_waste:37")
+RX2 = ("[2026-07-20 10:00:10][INFO][report_fec_rx]pkt_ok:2000 pkt_rec:130 "
+       "grp_ok:240 grp_rec:26 grp_fail:4 shard_lost:16 par_waste:57")
+
+
+def test_parse_fec_rx_line():
+    r = R.parse_fec_rx_line(RX1)
+    assert r == {"pkt_ok": 1000, "pkt_rec": 50, "grp_ok": 120, "grp_rec": 10,
+                 "grp_fail": 2, "shard_lost": 9, "par_waste": 37}
+    assert R.parse_fec_rx_line(NOISE) is None
+    assert R.parse_fec_rx_line(C1) is None
+
+
+def test_rx_snapshot_rates_and_lost_estimate():
+    t = R.FecWireTracker("client_to_server")
+    t.feed(RX1, now=0.0)
+    assert t.rx_snapshot(now=0.0) is None      # need two reports for a rate
+    t.feed(RX2, now=10.0)
+    snap = t.rx_snapshot(now=10.0)
+    assert snap["delivered_per_s"] == 100.0    # d pkt_ok 1000 / 10s
+    assert snap["recovered_per_s"] == 8.0      # d pkt_rec 80 / 10s
+    # avg pkts/group = (1000+80)/(120+16) = 7.94; lost = d grp_fail 2 * 7.94 / 10
+    assert snap["lost_pkts_est_per_s"] == 1.6
+    assert snap["par_waste_per_s"] == 2.0
+    assert snap["totals"]["grp_fail"] == 4
+    assert snap["stale"] is False
+
+
+def test_rx_snapshot_stale_nulls_rates_keeps_totals():
+    t = R.FecWireTracker("client_to_server", stale_after_s=30.0)
+    t.feed(RX1, now=0.0)
+    t.feed(RX2, now=10.0)
+    snap = t.rx_snapshot(now=10.0 + 31)
+    assert snap["stale"] is True
+    assert snap["delivered_per_s"] is None
+    assert snap["totals"]["pkt_ok"] == 2000
+
+
+def test_rx_counter_reset_does_not_emit_negative_rates():
+    t = R.FecWireTracker("client_to_server")
+    t.feed(RX1, now=0.0)
+    t.feed(RX2, now=10.0)
+    t.feed(RX1, now=20.0)                      # counters went DOWN: process restart
+    snap = t.rx_snapshot(now=20.0)
+    assert snap["delivered_per_s"] == 100.0    # last good rate retained
+    t.feed(RX2, now=30.0)
+    snap = t.rx_snapshot(now=30.0)
+    assert snap["delivered_per_s"] == 100.0    # clean resume from new baseline
+
+
+def test_wire_and_rx_coexist_in_one_tracker():
+    t = R.FecWireTracker("client_to_server")
+    t.feed(C1, now=0.0)
+    t.feed(RX1, now=0.0)
+    t.feed(C2, now=10.0)
+    t.feed(RX2, now=10.0)
+    assert t.snapshot(now=10.0)["tx_mbps"] == 0.006
+    assert t.rx_snapshot(now=10.0)["delivered_per_s"] == 100.0
