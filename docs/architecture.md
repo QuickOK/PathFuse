@@ -100,6 +100,15 @@ Redundancy ramps with measured loss and backs off when links are clean:
 - **Two directions, independent:** client→relay is driven by `sbfd-ctl`; relay→client by
   `udpspeeder-fec`. A single operator switch can force both to `8:0` (disabled) without stopping the
   tunnel.
+- **Operator-selectable ratios:** the four modes are `off`, `fixed`, `adaptive` and `min_adaptive`
+  (the default — adaptive with an always-on floor replacing the idle `8:0` tier). Both the fixed
+  ratio and the floor are settable at runtime from the UI or `POST /api/runtime`
+  (`fec_fixed_ratio`, `fec_floor_ratio`), persist through the usual runtime overlay, and are pushed
+  to the relay so both directions run the same values.
+- **Ratio entry:** either an explicit `x:y` or a percent of overhead — parity as a share of data, so
+  `20:1` is 5%. A percent snaps to the nearest rung of `fec_control.RATIO_LADDER`
+  (`8:0, 20:1, 8:1, 8:2, 8:4, 8:6, 8:8`), ties rounding up, so no untested ratio reaches UDPspeeder.
+  Resolution happens server-side in `fec_control.resolve_ratio`; only canonical `x:y` is stored.
 - **Receiver-measured loss:** sbfd loss is RX-side, so each leg is driven by the loss the *far end*
   measures — the client leg by the relay-fetched `/state` snapshot, the relay leg by
   `client_loss_pct` pushed in the client's `POST /fec` (fallback: own-side loss when the far-end
