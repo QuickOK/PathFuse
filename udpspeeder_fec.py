@@ -326,17 +326,23 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     return rt, current_ratio
 
 
+def fec_state_from_cfg(cfg):
+    """Build a FecState seeded from cfg's boot defaults.
+
+    run() sources the mode and both ratios from state, so a state built without
+    these would silently ignore the configured values. FecState coerces the
+    ratios, so a hand-edited config can't put a raw value on the control path."""
+    return FecState(
+        mode=fec_control.normalize_mode(cfg.get("mode")),
+        fixed_ratio=cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
+        floor_ratio=cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO))
+
+
 def run(cfg, stop_event=None, state=None, wire_tracker=None):
     if stop_event is None:
         stop_event = threading.Event()
     if state is None:
-        # Seed from cfg, not the module defaults: run() now sources the floor
-        # from state, so a state built here must still honor the configured
-        # boot values or a direct run() call would silently ignore them.
-        state = FecState(
-            mode=fec_control.normalize_mode(cfg.get("mode")),
-            fixed_ratio=cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
-            floor_ratio=cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO))
+        state = fec_state_from_cfg(cfg)
     rt = fec_control.FecRuntime(0, 0, time.time())
     current_ratio = None
     since = None
@@ -376,11 +382,7 @@ def main():
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = json.loads(Path(args.config).read_text())
     stop = threading.Event()
-    initial_mode = fec_control.normalize_mode(cfg.get("mode"))
-    initial_fixed = cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO)
-    initial_floor = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
-    state = FecState(mode=initial_mode, fixed_ratio=initial_fixed,
-                     floor_ratio=initial_floor)
+    state = fec_state_from_cfg(cfg)
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     start_fec_http(cfg.get("http_listen"), state, stop)

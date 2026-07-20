@@ -538,3 +538,16 @@ def test_fec_state_coerces_garbage_seeded_from_config():
     st = U.FecState(mode="min_adaptive", fixed_ratio="junk", floor_ratio="junk")
     assert st.get_fixed_ratio() == fec_control.DEFAULT_FIXED_RATIO
     assert st.get_floor_ratio() == fec_control.DEFAULT_FLOOR_RATIO
+
+
+def test_fec_state_from_cfg_seeds_and_coerces():
+    st = U.fec_state_from_cfg({"mode": "min_adaptive", "fixed_ratio": "50%",
+                               "floor_ratio": "8:1"})
+    assert st.get_desired() == ("min_adaptive", "8:4", "8:1")
+
+
+def test_fec_state_from_cfg_defaults_on_empty_cfg():
+    st = U.fec_state_from_cfg({})
+    assert st.get_desired() == (fec_control.DEFAULT_MODE,
+                                fec_control.DEFAULT_FIXED_RATIO,
+                                fec_control.DEFAULT_FLOOR_RATIO)
