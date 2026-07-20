@@ -20,6 +20,21 @@ import fec_control
 import fec_report
 
 
+def _safe_ratio(value, fallback):
+    """Coerce a ratio to canonical 'x:y', falling back if it is unusable.
+
+    The HTTP boundary normalizes on write, but the relay's config file is
+    hand-editable and an unusable ratio reaching write_fifo would break the
+    control loop rather than a single request."""
+    if not value:
+        return fallback
+    try:
+        return fec_control.resolve_ratio(value)
+    except ValueError:
+        logging.warning("fec ratio %r unusable; falling back to %s", value, fallback)
+        return fallback
+
+
 class FecState:
     """Thread-safe holder shared between the control loop and the HTTP server.
     The loop sets the published snapshot; POST /fec sets desired mode/ratio."""
@@ -92,6 +107,23 @@ class FecState:
         with self._lock:
             return self._mode, self._fixed_ratio, self._floor_ratio
 
+    def set_desired(self, mode=None, fixed_ratio=None, floor_ratio=None,
+                    enabled=None):
+        """Apply several desired-state fields under ONE lock acquisition.
+
+        Setting them one at a time lets the control loop observe a torn triple
+        (new floor with the old mode) for a tick. Only non-None fields change."""
+        with self._lock:
+            if fixed_ratio is not None:
+                self._fixed_ratio = fixed_ratio
+            if floor_ratio is not None:
+                self._floor_ratio = floor_ratio
+            if mode is not None:
+                self._mode = fec_control.normalize_mode(mode)
+            elif enabled is not None:
+                self._mode = (fec_control.MODE_ADAPTIVE if bool(enabled)
+                              else fec_control.MODE_OFF)
+
     def set_pushed_loss(self, value, ts):
         with self._lock:
             self._pushed_loss = float(value)
@@ -111,8 +143,15 @@ class FecState:
             self._snapshot.update(fields)
 
     def snapshot(self):
+        # Overlay the live desired fields: publish() only runs once per control
+        # tick, so a POST that changed the mode/ratios would otherwise be
+        # invisible to GET /fec until the next tick.
         with self._lock:
-            return dict(self._snapshot)
+            snap = dict(self._snapshot)
+            snap.update(mode=self._mode, fixed_ratio=self._fixed_ratio,
+                        floor_ratio=self._floor_ratio,
+                        enabled=self._mode != fec_control.MODE_OFF)
+            return snap
 
 
 def start_fec_http(listen, state, stop_event=None):
@@ -172,28 +211,24 @@ def start_fec_http(listen, state, stop_event=None):
             # relay untouched, not half-applied behind a 400.
             # Same resolution rule as the client's API boundary, so percent
             # entry works when POSTing to the relay directly too.
-            ratio_updates = []
-            for key, val, setter in (
-                    ("fixed_ratio", fixed_in, state.set_fixed_ratio),
-                    ("floor_ratio", floor_in, state.set_floor_ratio)):
+            ratio_updates = {}
+            for key, val in (("fixed_ratio", fixed_in),
+                             ("floor_ratio", floor_in)):
                 if val is None:
                     continue
                 try:
-                    ratio_updates.append((setter, fec_control.resolve_ratio(val)))
+                    ratio_updates[key] = fec_control.resolve_ratio(val)
                 except ValueError as e:
                     self._json(400, {"error": f"{key}: {e}"}); return
             if loss_in is not None:
                 if (isinstance(loss_in, bool) or not isinstance(loss_in, (int, float))
                         or not (0.0 <= loss_in <= 100.0)):
                     self._json(400, {"error": "client_loss_pct must be a number 0..100"}); return
-            for setter, ratio in ratio_updates:
-                setter(ratio)
+            # One lock acquisition for the whole desired triple, so the control
+            # loop can never read a half-applied request.
+            state.set_desired(mode=mode_in, enabled=enabled_in, **ratio_updates)
             if loss_in is not None:
                 state.set_pushed_loss(loss_in, time.time())
-            if mode_in is not None:
-                state.set_mode(mode_in)
-            elif enabled_in is not None:
-                state.set_enabled(enabled_in)
             mode_now, fixed_now, floor_now = state.get_desired()
             self._json(200, {"ok": True, "mode": mode_now,
                              "fixed_ratio": fixed_now,
@@ -258,6 +293,7 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     # FecState; cfg is only the boot default, as for mode and fixed_ratio.
     if floor_ratio is None:
         floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
+    floor_ratio = _safe_ratio(floor_ratio, fec_control.DEFAULT_FLOOR_RATIO)
     if mode is None:
         mode = fec_control.MODE_ADAPTIVE if enabled else fec_control.MODE_OFF
     if fixed_ratio is None:
@@ -267,15 +303,19 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     local_worst, up = read_worst_loss(cfg["sbfd_state"])
     worst = pushed_loss if pushed_loss is not None else local_worst
     if worst is None:
-        # No fresh loss sample: still honor explicit off/fixed overrides so the
-        # operator can drive the relay without depending on sbfd state.
-        if mode in (fec_control.MODE_OFF, fec_control.MODE_FIXED):
-            forced = fec_control.OFF_RATIO if mode == fec_control.MODE_OFF else fixed_ratio
-            if current_ratio != forced:
-                if fec_control.write_fifo(cfg["fifo"], forced, logging):
-                    logging.info("fec ratio -> %s (mode=%s, no loss sample)",
-                                 forced, mode)
-                    return rt, forced
+        # No fresh loss sample: still honor the operator's mode so the relay can
+        # be driven without depending on sbfd state. Mapping the last known
+        # level through apply_mode covers every mode uniformly — including a
+        # min_adaptive floor the operator just raised, which would otherwise not
+        # take effect until a loss sample arrived.
+        forced = fec_control.apply_mode(
+            mode, fec_control.level_to_ratio(rt.current_level, table),
+            fixed_ratio=fixed_ratio, floor_ratio=floor_ratio)
+        if current_ratio != forced:
+            if fec_control.write_fifo(cfg["fifo"], forced, logging):
+                logging.info("fec ratio -> %s (mode=%s, no loss sample)",
+                             forced, mode)
+                return rt, forced
         return rt, current_ratio
     target = fec_control.loss_to_level(worst, table)
     rt, _changed = fec_control.step_level(target, rt, hyst, time.time())

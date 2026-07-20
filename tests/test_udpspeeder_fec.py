@@ -465,3 +465,59 @@ def test_post_fec_invalid_loss_leaves_ratios_unchanged():
     assert "client_loss_pct" in body["error"]
     assert st.get_floor_ratio() == "20:1"
     assert st.get_fixed_ratio() == "8:2"
+
+
+def test_set_desired_applies_the_whole_triple_atomically():
+    st = U.FecState(mode="adaptive", fixed_ratio="8:2", floor_ratio="20:1")
+    st.set_desired(mode="min_adaptive", fixed_ratio="8:4", floor_ratio="8:1")
+    assert st.get_desired() == ("min_adaptive", "8:4", "8:1")
+
+
+def test_set_desired_leaves_none_fields_untouched():
+    st = U.FecState(mode="min_adaptive", fixed_ratio="8:2", floor_ratio="20:1")
+    st.set_desired(floor_ratio="8:1")
+    assert st.get_desired() == ("min_adaptive", "8:2", "8:1")
+
+
+def test_snapshot_reflects_a_post_before_the_next_publish():
+    # GET /fec must not report a stale floor for up to a full control tick.
+    st = U.FecState(mode="min_adaptive", floor_ratio="20:1")
+    code, _ = _post_fec(st, {"floor_ratio": "8:1"})
+    assert code == 200
+    assert st.snapshot()["floor_ratio"] == "8:1"
+
+
+def test_run_once_applies_a_raised_floor_without_a_loss_sample(tmp_path):
+    # No readable sbfd state: a floor the operator just raised must still take
+    # effect, rather than waiting for a loss sample that may never arrive.
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": "/nonexistent/state.json",
+           "poll_interval_s": 0.01, "loss_table": fec_control.DEFAULT_LOSS_TABLE,
+           "ramp_up_ticks": 1, "ramp_down_hold_s": 0, "floor_ratio": "20:1"}
+    try:
+        rt = fec_control.FecRuntime(0, 0, 0.0)
+        rt, ratio = U.run_once(cfg, rt, current_ratio="20:1",
+                               mode=fec_control.MODE_MIN_ADAPTIVE,
+                               floor_ratio="8:4")
+        assert ratio == "8:4"
+        assert os.read(rfd, 64).decode() == "fec 8:4\n"
+    finally:
+        os.close(rfd)
+
+
+def test_run_once_coerces_a_hand_edited_config_floor(tmp_path):
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": "/nonexistent/state.json",
+           "poll_interval_s": 0.01, "loss_table": fec_control.DEFAULT_LOSS_TABLE,
+           "ramp_up_ticks": 1, "ramp_down_hold_s": 0, "floor_ratio": "garbage"}
+    try:
+        rt = fec_control.FecRuntime(0, 0, 0.0)
+        rt, ratio = U.run_once(cfg, rt, current_ratio=None,
+                               mode=fec_control.MODE_MIN_ADAPTIVE)
+        assert ratio == fec_control.DEFAULT_FLOOR_RATIO
+    finally:
+        os.close(rfd)
