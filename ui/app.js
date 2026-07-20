@@ -628,6 +628,14 @@ function renderFec(s){
   renderFecCard("c2r", dirs.client_to_relay, true);
   renderFecCard("r2c", dirs.relay_to_client, false);
 
+  const tNow = (typeof s.ts === "number") ? s.ts : Date.now() / 1000;
+  if (fecHistSeeded){
+    pushFecSample("c2r", tNow, (dirs.client_to_relay || {}).rx || null);
+    pushFecSample("r2c", tNow, (dirs.relay_to_client || {}).rx || null);
+  }
+  drawFecGraph("fec-c2r-graph", fecHist.c2r);
+  drawFecGraph("fec-r2c-graph", fecHist.r2c);
+
   const eff = $("#fec-effective");
   if (eff){
     if (!fec.configured){
@@ -721,6 +729,133 @@ function renderFecCard(id, d, local){
     }
   }
 }
+
+/* ---------- FEC decode-outcome graph ---------- */
+const FEC_GRAPH_WINDOW_S = 300;                 // 5-minute scroll window
+const FEC_HIST_CAP = 3600;                      // matches server retention
+const fecHist = { c2r: [], r2c: [] };
+let fecHistSeeded = false;
+const fecHover = { c2r: null, r2c: null };      // pointer x per canvas, CSS px
+
+function pushFecSample(dir, t, rx){
+  const arr = fecHist[dir];
+  if (arr.length && arr[arr.length - 1].t === t) return;   // poll faster than tick
+  arr.push({
+    t,
+    delivered: rx ? rx.delivered_per_s : null,
+    recovered: rx ? rx.recovered_per_s : null,
+    lost:      rx ? rx.lost_pkts_est_per_s : null,
+    waste:     rx ? rx.par_waste_per_s : null,
+  });
+  if (arr.length > FEC_HIST_CAP) arr.shift();
+}
+
+async function seedFecHistory(){
+  try {
+    const r = await fetch("/api/fec_history", {cache: "no-store"});
+    const j = await r.json();
+    (j.samples || []).forEach(s => {
+      pushFecSample("c2r", s.t, s.c2r && {
+        delivered_per_s: s.c2r.delivered_per_s,
+        recovered_per_s: s.c2r.recovered_per_s,
+        lost_pkts_est_per_s: s.c2r.lost_pkts_est_per_s,
+        par_waste_per_s: s.c2r.par_waste_per_s,
+      });
+      pushFecSample("r2c", s.t, s.r2c && {
+        delivered_per_s: s.r2c.delivered_per_s,
+        recovered_per_s: s.r2c.recovered_per_s,
+        lost_pkts_est_per_s: s.r2c.lost_pkts_est_per_s,
+        par_waste_per_s: s.r2c.par_waste_per_s,
+      });
+    });
+  } catch (e) { /* endpoint absent (older controller): graph starts empty */ }
+  fecHistSeeded = true;
+}
+
+function cssVar(name){
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function drawFecGraph(id, series){
+  const cv = document.getElementById(id);
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cv.clientWidth || 300, cssH = 72;
+  if (cv.width !== Math.round(cssW * dpr)) cv.width = Math.round(cssW * dpr);
+  if (cv.height !== Math.round(cssH * dpr)) cv.height = Math.round(cssH * dpr);
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const last = series.length ? series[series.length - 1] : null;
+  const t1 = last ? last.t : 0;
+  const t0 = t1 - FEC_GRAPH_WINDOW_S;
+  const pts = series.filter(p => p.t >= t0 && p.delivered != null);
+  if (!pts.length){
+    ctx.fillStyle = cssVar("--fg-dim");
+    ctx.font = "10px sans-serif";
+    ctx.fillText("no decoder data", 8, cssH / 2 + 3);
+    return;
+  }
+  let peak = 1;
+  pts.forEach(p => {
+    const tot = (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0);
+    if (tot > peak) peak = tot;
+    if ((p.waste || 0) > peak) peak = p.waste;
+  });
+  const X = t => ((t - t0) / FEC_GRAPH_WINDOW_S) * cssW;
+  const Y = v => cssH - 3 - (v / peak) * (cssH - 8);
+
+  // Stacked bands, FIXED order bottom->top: delivered, recovered, lost.
+  // Position encodes identity (CVD-safe with the 2px separators below).
+  const bands = [
+    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cssVar("--up") },
+    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cssVar("--warn") },
+    { lo: p => (p.delivered || 0) + (p.recovered || 0),
+      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cssVar("--down") },
+  ];
+  bands.forEach(b => {
+    ctx.beginPath();
+    pts.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    for (let i = pts.length - 1; i >= 0; i--) ctx.lineTo(X(pts[i].t), Y(typeof b.lo === "function" ? b.lo(pts[i]) : 0));
+    ctx.closePath();
+    ctx.globalAlpha = 0.55; ctx.fillStyle = b.color; ctx.fill();
+    ctx.globalAlpha = 1;
+    // 2px surface separator on the band's top edge
+    ctx.beginPath();
+    pts.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.lineWidth = 2; ctx.strokeStyle = cssVar("--bg-inset"); ctx.stroke();
+  });
+  // wasted parity: thin muted overlay line
+  ctx.beginPath();
+  let started = false;
+  pts.forEach(p => {
+    if (p.waste == null) { started = false; return; }
+    const x = X(p.t), y = Y(p.waste);
+    started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    started = true;
+  });
+  ctx.lineWidth = 1.5; ctx.strokeStyle = cssVar("--fg-muted"); ctx.stroke();
+
+  // hover readout
+  const dir = id.includes("c2r") ? "c2r" : "r2c";
+  const hx = fecHover[dir];
+  if (hx != null){
+    const ht = t0 + (hx / cssW) * FEC_GRAPH_WINDOW_S;
+    let best = pts[0];
+    pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
+    ctx.strokeStyle = cssVar("--border-strong"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(X(best.t), 0); ctx.lineTo(X(best.t), cssH); ctx.stroke();
+    ctx.fillStyle = cssVar("--fg");
+    ctx.font = "10px sans-serif"; ctx.textAlign = "right";
+    ctx.fillText(`ok ${fmtRate(best.delivered)} · rec ${fmtRate(best.recovered)}`
+                 + ` · lost ${fmtRate(best.lost)} · waste ${fmtRate(best.waste)} pkt/s`,
+                 cssW - 6, 12);
+    ctx.textAlign = "left";
+  }
+}
+
+function fmtRate(v){ return v == null ? "—" : (v >= 100 ? Math.round(v) : v.toFixed(1)); }
 
 /* ---------- environmental ---------- */
 function renderEnvironmental(s){
@@ -862,7 +997,21 @@ $$(FORM_SELECTOR).forEach(el => {
   el.addEventListener("input",  () => { dirtyFields.add(fieldKey(el)); });
 });
 
+["c2r", "r2c"].forEach(dir => {
+  const cv = document.getElementById(`fec-${dir}-graph`);
+  if (!cv) return;
+  cv.addEventListener("pointermove", e => {
+    fecHover[dir] = e.offsetX;
+    drawFecGraph(`fec-${dir}-graph`, fecHist[dir]);
+  });
+  cv.addEventListener("pointerleave", () => {
+    fecHover[dir] = null;
+    drawFecGraph(`fec-${dir}-graph`, fecHist[dir]);
+  });
+});
+
 fetchState();
 fetchEngarde();
+seedFecHistory();
 setInterval(fetchState,   1000);
 setInterval(fetchEngarde, 2000);

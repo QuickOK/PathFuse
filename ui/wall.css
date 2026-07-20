@@ -958,3 +958,22 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
   margin-top: 6px;
   min-height: 1em;
 }
+
+/* FEC decode-outcome graph */
+.fec-graph{
+  width:100%; height:72px; margin-top:8px; display:block;
+  background:var(--bg-inset); border:1px solid var(--border-subtle);
+  border-radius:6px;
+}
+.fec-graph-legend{
+  display:flex; gap:12px; margin-top:4px;
+  font-size:10px; color:var(--fg-muted);
+}
+.fec-graph-legend .lg{
+  display:inline-block; width:8px; height:8px; border-radius:2px;
+  margin-right:4px; vertical-align:-1px;
+}
+.fec-graph-legend .lg-del{ background:var(--up); }
+.fec-graph-legend .lg-rec{ background:var(--warn); }
+.fec-graph-legend .lg-lost{ background:var(--down); }
+.fec-graph-legend .lg-waste{ background:var(--fg-muted); height:2px; border-radius:0; }
