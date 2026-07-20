@@ -790,7 +790,8 @@ function drawFecGraph(id, series){
   const last = series.length ? series[series.length - 1] : null;
   const t1 = last ? last.t : 0;
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
-  const pts = series.filter(p => p.t >= t0 && p.delivered != null);
+  const windowed = series.filter(p => p.t >= t0);
+  const pts = windowed.filter(p => p.delivered != null);
   if (!pts.length){
     ctx.fillStyle = cssVar("--fg-dim");
     ctx.font = "10px sans-serif";
@@ -806,6 +807,27 @@ function drawFecGraph(id, series){
   const X = t => ((t - t0) / FEC_GRAPH_WINDOW_S) * cssW;
   const Y = v => cssH - 3 - (v / peak) * (cssH - 8);
 
+  // Outages must show as a visual break, not a bridged straight edge: split
+  // the window into contiguous runs, breaking whenever a sample's delivered
+  // value is null OR consecutive samples are more than 10s apart (a dead
+  // poll shouldn't bridge either). Each run gets its own closed fill/stroke.
+  const FEC_GRAPH_MAX_GAP_S = 10;
+  const runs = [];
+  let cur = [];
+  windowed.forEach(p => {
+    if (p.delivered == null){
+      if (cur.length) runs.push(cur);
+      cur = [];
+      return;
+    }
+    if (cur.length && (p.t - cur[cur.length - 1].t) > FEC_GRAPH_MAX_GAP_S){
+      runs.push(cur);
+      cur = [];
+    }
+    cur.push(p);
+  });
+  if (cur.length) runs.push(cur);
+
   // Stacked bands, FIXED order bottom->top: delivered, recovered, lost.
   // Position encodes identity (CVD-safe with the 2px separators below).
   const bands = [
@@ -815,16 +837,18 @@ function drawFecGraph(id, series){
       hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cssVar("--down") },
   ];
   bands.forEach(b => {
-    ctx.beginPath();
-    pts.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-    for (let i = pts.length - 1; i >= 0; i--) ctx.lineTo(X(pts[i].t), Y(typeof b.lo === "function" ? b.lo(pts[i]) : 0));
-    ctx.closePath();
-    ctx.globalAlpha = 0.55; ctx.fillStyle = b.color; ctx.fill();
-    ctx.globalAlpha = 1;
-    // 2px surface separator on the band's top edge
-    ctx.beginPath();
-    pts.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-    ctx.lineWidth = 2; ctx.strokeStyle = cssVar("--bg-inset"); ctx.stroke();
+    runs.forEach(run => {
+      ctx.beginPath();
+      run.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      for (let i = run.length - 1; i >= 0; i--) ctx.lineTo(X(run[i].t), Y(typeof b.lo === "function" ? b.lo(run[i]) : 0));
+      ctx.closePath();
+      ctx.globalAlpha = 0.55; ctx.fillStyle = b.color; ctx.fill();
+      ctx.globalAlpha = 1;
+      // 2px surface separator on the band's top edge, per run
+      ctx.beginPath();
+      run.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.lineWidth = 2; ctx.strokeStyle = cssVar("--bg-inset"); ctx.stroke();
+    });
   });
   // wasted parity: thin muted overlay line
   ctx.beginPath();
@@ -846,11 +870,21 @@ function drawFecGraph(id, series){
     pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
     ctx.strokeStyle = cssVar("--border-strong"); ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(X(best.t), 0); ctx.lineTo(X(best.t), cssH); ctx.stroke();
+    ctx.font = "10px sans-serif";
+    const readout = `ok ${fmtRate(best.delivered)} · rec ${fmtRate(best.recovered)}`
+                   + ` · lost ${fmtRate(best.lost)} · waste ${fmtRate(best.waste)} pkt/s`;
+    // Backdrop so the text doesn't collide with the band fills beneath it.
+    const padX = 4, boxH = 14;
+    const textW = ctx.measureText(readout).width;
+    const boxRight = cssW - 6 + padX, boxLeft = cssW - 6 - textW - padX;
+    const boxTop = 12 - boxH + 4;
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = cssVar("--bg-inset");
+    ctx.fillRect(boxLeft, boxTop, boxRight - boxLeft, boxH);
+    ctx.globalAlpha = 1;
     ctx.fillStyle = cssVar("--fg");
-    ctx.font = "10px sans-serif"; ctx.textAlign = "right";
-    ctx.fillText(`ok ${fmtRate(best.delivered)} · rec ${fmtRate(best.recovered)}`
-                 + ` · lost ${fmtRate(best.lost)} · waste ${fmtRate(best.waste)} pkt/s`,
-                 cssW - 6, 12);
+    ctx.textAlign = "right";
+    ctx.fillText(readout, cssW - 6, 12);
     ctx.textAlign = "left";
   }
 }
