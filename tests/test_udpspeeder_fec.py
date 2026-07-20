@@ -341,3 +341,114 @@ def test_fec_http_post_rejects_bad_client_loss():
         assert st.get_pushed_loss(now=time.time(), stale_after_s=90.0) is None
     finally:
         httpd.shutdown()
+
+
+def _post_fec(st, payload):
+    """POST to a freshly bound relay /fec. Returns (status, body_dict)."""
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    try:
+        port = httpd.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/fec",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+    finally:
+        httpd.shutdown()
+
+
+def test_fec_state_holds_and_returns_floor():
+    st = U.FecState(mode="min_adaptive", fixed_ratio="8:2", floor_ratio="8:1")
+    assert st.get_desired() == ("min_adaptive", "8:2", "8:1")
+    st.set_floor_ratio("20:1")
+    assert st.get_floor_ratio() == "20:1"
+
+
+def test_fec_state_defaults_floor_to_module_default():
+    st = U.FecState(mode="min_adaptive")
+    assert st.get_floor_ratio() == fec_control.DEFAULT_FLOOR_RATIO
+
+
+def test_fec_state_snapshot_exposes_floor():
+    st = U.FecState(mode="min_adaptive", floor_ratio="8:1")
+    assert st.snapshot()["floor_ratio"] == "8:1"
+
+
+def test_run_once_uses_state_floor_not_config(tmp_path):
+    # min_adaptive with zero loss idles the adaptive engine at 8:0, which
+    # apply_mode lifts to the floor. The floor passed in must win over the
+    # config value, or a pushed floor would be silently ignored.
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"sessions": {"a": {"session_id": 1,
+                                                   "state": "UP",
+                                                   "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state), "poll_interval_s": 0.01,
+           "loss_table": fec_control.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1,
+           "ramp_down_hold_s": 0, "floor_ratio": "20:1"}   # config says 20:1
+    try:
+        rt = fec_control.FecRuntime(0, 0, 0.0)
+        rt, ratio = U.run_once(cfg, rt, current_ratio=None,
+                               mode=fec_control.MODE_MIN_ADAPTIVE,
+                               floor_ratio="8:1")           # caller says 8:1
+        assert ratio == "8:1"
+        assert os.read(rfd, 64).decode() == "fec 8:1\n"
+    finally:
+        os.close(rfd)
+
+
+def test_run_once_falls_back_to_config_floor_when_none(tmp_path):
+    # floor_ratio=None must preserve today's behavior: the config value applies.
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"sessions": {"a": {"session_id": 1,
+                                                   "state": "UP",
+                                                   "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state), "poll_interval_s": 0.01,
+           "loss_table": fec_control.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1,
+           "ramp_down_hold_s": 0, "floor_ratio": "20:1"}
+    try:
+        rt = fec_control.FecRuntime(0, 0, 0.0)
+        rt, ratio = U.run_once(cfg, rt, current_ratio=None,
+                               mode=fec_control.MODE_MIN_ADAPTIVE)
+        assert ratio == "20:1"
+    finally:
+        os.close(rfd)
+
+
+def test_post_fec_accepts_floor_ratio_as_percent():
+    st = U.FecState(mode="min_adaptive")
+    code, body = _post_fec(st, {"mode": "min_adaptive", "floor_ratio": "25%"})
+    assert code == 200
+    assert body["floor_ratio"] == "8:2"
+    assert st.get_floor_ratio() == "8:2"
+
+
+def test_post_fec_rejects_bad_floor_ratio():
+    st = U.FecState(mode="min_adaptive", floor_ratio="20:1")
+    code, body = _post_fec(st, {"mode": "min_adaptive", "floor_ratio": "abc"})
+    assert code == 400
+    assert "floor_ratio" in body["error"]
+    assert st.get_floor_ratio() == "20:1"   # a rejected entry changes nothing
+
+
+def test_post_fec_without_floor_leaves_it_unchanged():
+    st = U.FecState(mode="min_adaptive", floor_ratio="8:1")
+    code, _ = _post_fec(st, {"mode": "adaptive"})
+    assert code == 200
+    assert st.get_floor_ratio() == "8:1"
+
+
+def test_post_fec_accepts_floor_only_payload():
+    st = U.FecState(mode="min_adaptive", floor_ratio="20:1")
+    code, body = _post_fec(st, {"floor_ratio": "8:1"})
+    assert code == 200
+    assert st.get_floor_ratio() == "8:1"

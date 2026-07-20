@@ -24,7 +24,8 @@ class FecState:
     """Thread-safe holder shared between the control loop and the HTTP server.
     The loop sets the published snapshot; POST /fec sets desired mode/ratio."""
 
-    def __init__(self, mode=None, fixed_ratio=None, enabled=True):
+    def __init__(self, mode=None, fixed_ratio=None, floor_ratio=None,
+                 enabled=True):
         # Back-compat: an explicit enabled=False starts the relay in MODE_OFF
         # so callers that only know the legacy boolean still get sensible
         # behavior.
@@ -34,12 +35,14 @@ class FecState:
                     else fec_control.MODE_OFF)
         self._mode = fec_control.normalize_mode(mode)
         self._fixed_ratio = fixed_ratio or fec_control.DEFAULT_FIXED_RATIO
+        self._floor_ratio = floor_ratio or fec_control.DEFAULT_FLOOR_RATIO
         self._pushed_loss = None
         self._pushed_loss_ts = 0.0
         self._snapshot = {
             "enabled": self._mode != fec_control.MODE_OFF,
             "mode": self._mode,
             "fixed_ratio": self._fixed_ratio,
+            "floor_ratio": self._floor_ratio,
             "ratio": None,
             "level": 0,
             "driving_loss_pct": None,
@@ -73,10 +76,18 @@ class FecState:
         with self._lock:
             self._fixed_ratio = ratio
 
-    def get_desired(self):
-        """Return (mode, fixed_ratio) atomically."""
+    def get_floor_ratio(self):
         with self._lock:
-            return self._mode, self._fixed_ratio
+            return self._floor_ratio
+
+    def set_floor_ratio(self, ratio):
+        with self._lock:
+            self._floor_ratio = ratio
+
+    def get_desired(self):
+        """Return (mode, fixed_ratio, floor_ratio) atomically."""
+        with self._lock:
+            return self._mode, self._fixed_ratio, self._floor_ratio
 
     def set_pushed_loss(self, value, ts):
         with self._lock:
@@ -142,24 +153,28 @@ def start_fec_http(listen, state, stop_event=None):
             mode_in = payload.get("mode")
             enabled_in = payload.get("enabled")
             fixed_in = payload.get("fixed_ratio")
+            floor_in = payload.get("floor_ratio")
             loss_in = payload.get("client_loss_pct")
-            if mode_in is None and enabled_in is None and loss_in is None:
-                self._json(400, {"error": "mode, enabled or client_loss_pct required"}); return
+            if (mode_in is None and enabled_in is None and loss_in is None
+                    and fixed_in is None and floor_in is None):
+                self._json(400, {"error": "mode, enabled, client_loss_pct, "
+                                          "fixed_ratio or floor_ratio required"}); return
             if mode_in is not None and mode_in not in fec_control.ALL_MODES:
                 self._json(400, {"error": f"mode must be one of "
                                           f"{sorted(fec_control.ALL_MODES)}"}); return
             if enabled_in is not None and not isinstance(enabled_in, bool):
                 self._json(400, {"error": "enabled must be true or false"}); return
-            if fixed_in is not None:
-                if not isinstance(fixed_in, str):
-                    self._json(400, {"error": "fixed_ratio must be a string"}); return
+            # Same resolution rule as the client's API boundary, so percent
+            # entry works when POSTing to the relay directly too.
+            for key, val, setter in (
+                    ("fixed_ratio", fixed_in, state.set_fixed_ratio),
+                    ("floor_ratio", floor_in, state.set_floor_ratio)):
+                if val is None:
+                    continue
                 try:
-                    a, b = fec_control.parse_ratio(fixed_in)
-                except (ValueError, AttributeError):
-                    self._json(400, {"error": "fixed_ratio must be 'x:y'"}); return
-                if not fec_control.validate_ratio(a, b):
-                    self._json(400, {"error": "fixed_ratio out of bounds"}); return
-                state.set_fixed_ratio(fixed_in)
+                    setter(fec_control.resolve_ratio(val))
+                except ValueError as e:
+                    self._json(400, {"error": f"{key}: {e}"}); return
             if loss_in is not None:
                 if (isinstance(loss_in, bool) or not isinstance(loss_in, (int, float))
                         or not (0.0 <= loss_in <= 100.0)):
@@ -169,9 +184,10 @@ def start_fec_http(listen, state, stop_event=None):
                 state.set_mode(mode_in)
             elif enabled_in is not None:
                 state.set_enabled(enabled_in)
-            mode_now, fixed_now = state.get_desired()
+            mode_now, fixed_now, floor_now = state.get_desired()
             self._json(200, {"ok": True, "mode": mode_now,
                              "fixed_ratio": fixed_now,
+                             "floor_ratio": floor_now,
                              "enabled": mode_now != fec_control.MODE_OFF})
 
     host_str, port_str = listen.rsplit(":", 1)
@@ -219,7 +235,7 @@ def read_worst_loss(state_path):
 
 
 def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
-             pushed_loss=None):
+             floor_ratio=None, pushed_loss=None):
     """One control tick. Returns (new_runtime, ratio_now_or_current).
     The adaptive engine always advances so the loss-tracked level stays fresh;
     apply_mode then maps it through the operator-chosen mode.
@@ -228,7 +244,10 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     this leg repairs); when present it drives the level. Relay-local sbfd loss
     (opposite direction) is only the fallback for clients that don't push."""
     table = cfg["loss_table"]
-    floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
+    # The caller (the control loop) passes the operator-settable floor from
+    # FecState; cfg is only the boot default, as for mode and fixed_ratio.
+    if floor_ratio is None:
+        floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
     if mode is None:
         mode = fec_control.MODE_ADAPTIVE if enabled else fec_control.MODE_OFF
     if fixed_ratio is None:
@@ -272,11 +291,12 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     since = None
     pushed_stale_after = float(cfg.get("pushed_loss_stale_after_s", 90.0))
     while not stop_event.is_set():
-        mode, fixed_ratio = state.get_desired()
+        mode, fixed_ratio, floor_ratio = state.get_desired()
         pushed = state.get_pushed_loss(time.time(), pushed_stale_after)
         prev = current_ratio
         rt, current_ratio = run_once(cfg, rt, current_ratio,
                                      mode=mode, fixed_ratio=fixed_ratio,
+                                     floor_ratio=floor_ratio,
                                      pushed_loss=pushed)
         if current_ratio != prev:
             since = time.time()
@@ -286,6 +306,7 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
         now = time.time()
         state.publish(enabled=mode != fec_control.MODE_OFF,
                       mode=mode, fixed_ratio=fixed_ratio,
+                      floor_ratio=floor_ratio,
                       ratio=current_ratio,
                       level=rt.current_level, driving_loss_pct=driving,
                       loss_source=("client_push" if pushed is not None
@@ -306,7 +327,9 @@ def main():
     stop = threading.Event()
     initial_mode = fec_control.normalize_mode(cfg.get("mode"))
     initial_fixed = cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO)
-    state = FecState(mode=initial_mode, fixed_ratio=initial_fixed)
+    initial_floor = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
+    state = FecState(mode=initial_mode, fixed_ratio=initial_fixed,
+                     floor_ratio=initial_floor)
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     start_fec_http(cfg.get("http_listen"), state, stop)
