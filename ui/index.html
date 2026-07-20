@@ -144,12 +144,12 @@
             <span class="tip" title="Forward error correction over the engarde tunnel. Off forces 8:0 in both directions; Fixed holds the selected ratio; Adaptive scales to measured loss; Floor + adaptive keeps the selected floor and ramps up under loss. Ratios accept x:y or a percent of overhead (20:1 is 5%).">i</span>
           </div>
           <label class="ctl-radio"><input type="radio" name="fec_mode" value="min_adaptive"><span>Floor + adaptive <em>default</em>
-            <select id="fec-floor-ratio" class="ctl-select" disabled></select>
+            <select id="fec-floor-ratio" class="ctl-select" aria-label="FEC floor ratio" disabled></select>
             <input id="fec-floor-custom" class="ctl-input ratio-custom" type="text"
                    placeholder="8:1 or 12.5%" aria-label="Custom FEC floor ratio" hidden></span></label>
           <label class="ctl-radio"><input type="radio" name="fec_mode" value="adaptive"><span>Adaptive</span></label>
           <label class="ctl-radio"><input type="radio" name="fec_mode" value="fixed"><span>Fixed
-            <select id="fec-fixed-ratio" class="ctl-select" disabled></select>
+            <select id="fec-fixed-ratio" class="ctl-select" aria-label="Fixed FEC ratio" disabled></select>
             <input id="fec-fixed-custom" class="ctl-input ratio-custom" type="text"
                    placeholder="8:1 or 12.5%" aria-label="Custom fixed FEC ratio" hidden></span></label>
           <label class="ctl-radio"><input type="radio" name="fec_mode" value="off"><span>Off <em>force 8:0</em></span></label>

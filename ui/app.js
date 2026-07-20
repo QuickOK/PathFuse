@@ -310,10 +310,15 @@ function render(s){
       setRadio("fec_mode", desiredMode);
       // Presets always render; the selected value holds while frozen.
       const presets = s.fec.ratio_presets || s.fec.fixed_ratio_presets;
+      // The select and its custom box are one control: typing in the box must
+      // freeze the pair, or a poll re-selects a preset and hides the box
+      // mid-entry.
+      const fixedFrozen = isFrozen("fec-fixed-ratio") || isFrozen("fec-fixed-custom");
+      const floorFrozen = isFrozen("fec-floor-ratio") || isFrozen("fec-floor-custom");
       syncRatioDropdown("#fec-fixed-ratio", "#fec-fixed-custom", presets,
-        isFrozen("fec-fixed-ratio") ? null : s.fec.desired_fixed_ratio);
+        fixedFrozen ? null : s.fec.desired_fixed_ratio);
       syncRatioDropdown("#fec-floor-ratio", "#fec-floor-custom", presets,
-        isFrozen("fec-floor-ratio") ? null : s.fec.floor_ratio);
+        floorFrozen ? null : s.fec.floor_ratio);
     }
     const env = s.environmental || {};
     if (env.configured) setRadio("environmental_enabled", env.enabled ? "on" : "off");

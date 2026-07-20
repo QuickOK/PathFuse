@@ -164,21 +164,28 @@ def start_fec_http(listen, state, stop_event=None):
                                           f"{sorted(fec_control.ALL_MODES)}"}); return
             if enabled_in is not None and not isinstance(enabled_in, bool):
                 self._json(400, {"error": "enabled must be true or false"}); return
+            # Resolve every field BEFORE mutating any of it. A payload that
+            # carries a good ratio and a bad client_loss_pct must leave the
+            # relay untouched, not half-applied behind a 400.
             # Same resolution rule as the client's API boundary, so percent
             # entry works when POSTing to the relay directly too.
+            ratio_updates = []
             for key, val, setter in (
                     ("fixed_ratio", fixed_in, state.set_fixed_ratio),
                     ("floor_ratio", floor_in, state.set_floor_ratio)):
                 if val is None:
                     continue
                 try:
-                    setter(fec_control.resolve_ratio(val))
+                    ratio_updates.append((setter, fec_control.resolve_ratio(val)))
                 except ValueError as e:
                     self._json(400, {"error": f"{key}: {e}"}); return
             if loss_in is not None:
                 if (isinstance(loss_in, bool) or not isinstance(loss_in, (int, float))
                         or not (0.0 <= loss_in <= 100.0)):
                     self._json(400, {"error": "client_loss_pct must be a number 0..100"}); return
+            for setter, ratio in ratio_updates:
+                setter(ratio)
+            if loss_in is not None:
                 state.set_pushed_loss(loss_in, time.time())
             if mode_in is not None:
                 state.set_mode(mode_in)
@@ -285,7 +292,13 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     if stop_event is None:
         stop_event = threading.Event()
     if state is None:
-        state = FecState(mode=fec_control.DEFAULT_MODE)
+        # Seed from cfg, not the module defaults: run() now sources the floor
+        # from state, so a state built here must still honor the configured
+        # boot values or a direct run() call would silently ignore them.
+        state = FecState(
+            mode=fec_control.normalize_mode(cfg.get("mode")),
+            fixed_ratio=cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
+            floor_ratio=cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO))
     rt = fec_control.FecRuntime(0, 0, time.time())
     current_ratio = None
     since = None

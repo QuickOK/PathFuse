@@ -359,6 +359,7 @@ def _post_fec(st, payload):
             return e.code, json.loads(e.read())
     finally:
         httpd.shutdown()
+        httpd.server_close()
 
 
 def test_fec_state_holds_and_returns_floor():
@@ -449,6 +450,18 @@ def test_post_fec_without_floor_leaves_it_unchanged():
 
 def test_post_fec_accepts_floor_only_payload():
     st = U.FecState(mode="min_adaptive", floor_ratio="20:1")
-    code, body = _post_fec(st, {"floor_ratio": "8:1"})
+    code, _ = _post_fec(st, {"floor_ratio": "8:1"})
     assert code == 200
     assert st.get_floor_ratio() == "8:1"
+
+
+def test_post_fec_invalid_loss_leaves_ratios_unchanged():
+    # A payload carrying a good floor and a bad client_loss_pct must be
+    # rejected whole: no half-applied mutation behind the 400.
+    st = U.FecState(mode="min_adaptive", fixed_ratio="8:2", floor_ratio="20:1")
+    code, body = _post_fec(st, {"floor_ratio": "8:1", "fixed_ratio": "8:4",
+                                "client_loss_pct": 999})
+    assert code == 400
+    assert "client_loss_pct" in body["error"]
+    assert st.get_floor_ratio() == "20:1"
+    assert st.get_fixed_ratio() == "8:2"

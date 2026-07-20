@@ -383,7 +383,10 @@ def cfg_with_fec(tmp_path: Path):
         published_state=str(tmp_path / "published.json"),
         fec=M.FecCfg(enabled=True, fifo=str(tmp_path / "client.fifo"),
                      loss_table=fec_control.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
-                     ramp_down_hold_s=0, full_mode_backoff_fec="8:0", full_min_up_wans=3),
+                     ramp_down_hold_s=0, full_mode_backoff_fec="8:0", full_min_up_wans=3,
+                     # distinct from fixed_ratio's default so a misordered
+                     # post_relay_fec argument list can't pass unnoticed
+                     floor_ratio="8:6"),
     )
 
 
@@ -515,7 +518,7 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
                                  "driving_loss_pct": 1.2, "since": 5.0}})
     pushed = []
     def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None):
-        pushed.append(client_loss_pct)
+        pushed.append((floor_ratio, client_loss_pct))
         return True
     monkeypatch.setattr(M, "post_relay_fec", fake_post)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
@@ -536,7 +539,9 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
     assert t2o["driver_wan"] == "wan1"    # higher-loss WAN drives the ratio
     assert t2o["loss_source"] == "relay"  # driven by relay-measured loss, not local
     assert t2o["actuator_ok"] is True
-    assert pushed and pushed[0] == 1.5    # our relay->client measurement got pushed
+    assert pushed and pushed[0][1] == 1.5  # our relay->client measurement got pushed
+    assert pushed[0][0] == "8:6"           # the effective floor reached the relay
+    assert fec["floor_ratio"] == "8:6"     # and the UI sees the same value
     o2t = fec["directions"]["relay_to_client"]
     assert o2t["ratio"] == "8:2"
     assert o2t["ok"] is True
