@@ -247,3 +247,16 @@ def test_safe_ratio_warns_only_once_per_bad_value():
     for _ in range(5):
         assert F.safe_ratio("still-garbage", "20:1", log) == "20:1"
     assert log.n == 1   # a sub-second control loop must not spam the journal
+
+
+def test_safe_ratio_survives_unhashable_garbage():
+    # A hand-edited JSON file can yield a list/dict. The fallback path must not
+    # raise from its own debounce — that would defeat the whole point.
+    class _Log:
+        def __init__(self): self.n = 0
+        def warning(self, *a, **k): self.n += 1
+    log = _Log()
+    assert F.safe_ratio(["8:2"], "20:1", log) == "20:1"
+    assert F.safe_ratio({"a": 1}, "20:1", log) == "20:1"
+    assert F.safe_ratio(17, "20:1", log) == "20:1"
+    assert log.n == 3

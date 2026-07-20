@@ -1376,14 +1376,14 @@ def effective_fec_mode(cfg: Config, ov: RuntimeOverlay) -> str:
 def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     """The ratio used by MODE_FIXED — operator override wins, else cfg default."""
     cfg_fixed = fec_control.safe_ratio(cfg.fec.fixed_ratio if cfg.fec else None,
-                            fec_control.DEFAULT_FIXED_RATIO)
+                                       fec_control.DEFAULT_FIXED_RATIO, logging)
     return fec_control.safe_ratio(ov.fec_fixed_ratio, cfg_fixed, logging)
 
 
 def effective_fec_floor_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     """The floor used by MODE_MIN_ADAPTIVE — operator override wins, else cfg."""
     cfg_floor = fec_control.safe_ratio(cfg.fec.floor_ratio if cfg.fec else None,
-                            fec_control.DEFAULT_FLOOR_RATIO)
+                                       fec_control.DEFAULT_FLOOR_RATIO, logging)
     return fec_control.safe_ratio(ov.fec_floor_ratio, cfg_floor, logging)
 
 

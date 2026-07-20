@@ -117,10 +117,15 @@ def safe_ratio(value, fallback, logger=None):
     try:
         return resolve_ratio(value)
     except ValueError:
-        if logger and value not in _warned_ratios:
-            _warned_ratios.add(value)
-            logger.warning("fec ratio %r unusable; falling back to %s",
-                           value, fallback)
+        if logger:
+            # A malformed value can be an unhashable list/dict from a
+            # hand-edited JSON file; key the debounce on its repr so the set
+            # lookup can't raise TypeError inside the fallback path itself.
+            key = value if isinstance(value, str) else repr(value)
+            if key not in _warned_ratios:
+                _warned_ratios.add(key)
+                logger.warning("fec ratio %r unusable; falling back to %s",
+                               value, fallback)
         return fallback
 
 
