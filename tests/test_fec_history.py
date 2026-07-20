@@ -42,3 +42,11 @@ def test_missing_directions_are_null_not_crash():
     h.append_from_directions(1.0, None)
     h.append_from_directions(2.5, {})
     assert h.snapshot()[0]["c2r"]["tx_mbps"] is None
+
+
+def test_backwards_time_step_resets_baseline_instead_of_stalling():
+    h = H.FecHistory()
+    h.append_from_directions(1000.0, DIRS)
+    h.append_from_directions(500.0, DIRS)    # wall-clock stepped back: accepted, baseline reset
+    h.append_from_directions(500.5, DIRS)    # within min_interval_s of new baseline: throttled
+    assert [s["t"] for s in h.snapshot()] == [1000.0, 500.0]

@@ -30,6 +30,13 @@ class FecHistory:
     def append_from_directions(self, t, directions):
         directions = directions or {}
         with self._lock:
+            if self._last_t is not None and t < self._last_t:
+                # Wall-clock stepped backwards (NTP step, clock adjustment).
+                # (t - self._last_t) would be negative here, i.e. < min_interval_s,
+                # so without this reset every subsequent append would be throttled
+                # forever against a baseline in the future. Treat it as a fresh
+                # start instead of stalling the ring.
+                self._last_t = None
             if self._last_t is not None and (t - self._last_t) < self._min_interval_s:
                 return
             self._last_t = t

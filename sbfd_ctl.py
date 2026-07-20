@@ -1779,7 +1779,7 @@ def store_tile(cache_dir, z, x, y, data, max_mb) -> None:
         evict_tiles(cache_dir, max_mb)
 
 
-def start_ui_server(cfg: Config, stop_event: threading.Event, fec_history=None):
+def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
     """Bind the UI HTTP server (returns the bound httpd; caller doesn't need it)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1867,8 +1867,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_history=None):
                 self.end_headers()
                 self.wfile.write(data.encode())
             elif self.path == "/api/fec_history":
-                self._send_json(200, {"samples": (fec_history.snapshot()
-                                                  if fec_history else [])})
+                self._send_json(200, {"samples": (fec_hist.snapshot()
+                                                  if fec_hist else [])})
             elif self.path == "/api/engarde":
                 url = cfg.engarde.admin_url or f"http://{cfg.engarde.server_ip}:8080/api/v1/get-list"
                 try:
@@ -1995,7 +1995,7 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_history=None):
 
 # -- Main controller loop ----------------------------------------------------
 
-def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_history=None):
+def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=None):
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 
     apply_nft_init(cfg)
@@ -2382,8 +2382,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_history=
                     switch=switch_event,
                     maintenance=maint_window)):
                 notifier.notify(_ev)
-        if fec_history is not None and cfg.fec:
-            fec_history.append_from_directions(
+        if fec_hist is not None and cfg.fec:
+            fec_hist.append_from_directions(
                 loop_start, snapshot["fec"]["directions"])
         publish_state(cfg, snapshot)
 
@@ -2429,7 +2429,7 @@ def main():
 
     fec_hist = fec_history.FecHistory() if cfg.fec else None
     if not args.no_ui:
-        start_ui_server(cfg, stop, fec_history=fec_hist)
+        start_ui_server(cfg, stop, fec_hist=fec_hist)
 
     try:
         wire_tracker = None
@@ -2437,7 +2437,7 @@ def main():
             wire_tracker = fec_report.FecWireTracker(
                 "client_to_server", cfg.fec.wire_stale_after_s)
             fec_report.start_wire_tailer(cfg.fec.wire_unit, wire_tracker, stop)
-        run_controller(cfg, stop, wire_tracker=wire_tracker, fec_history=fec_hist)
+        run_controller(cfg, stop, wire_tracker=wire_tracker, fec_hist=fec_hist)
     except KeyboardInterrupt:
         logging.info("shutting down")
         stop.set()

@@ -838,6 +838,20 @@ function drawFecGraph(id, series){
   ];
   bands.forEach(b => {
     runs.forEach(run => {
+      if (run.length === 1){
+        // Single-sample run: the polygon fill/stroke below degenerates to a
+        // zero-area line and draws nothing. Render a minimal visible mark
+        // instead — a 2px-wide filled rect spanning lo->hi at that x — and
+        // skip the separator stroke (there's no edge to draw it along).
+        const p = run[0];
+        const x = X(p.t);
+        const yHi = Y(b.hi(p));
+        const yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
+        ctx.globalAlpha = 0.55; ctx.fillStyle = b.color;
+        ctx.fillRect(x - 1, Math.min(yHi, yLo), 2, Math.abs(yLo - yHi));
+        ctx.globalAlpha = 1;
+        return;
+      }
       ctx.beginPath();
       run.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
       for (let i = run.length - 1; i >= 0; i--) ctx.lineTo(X(run[i].t), Y(typeof b.lo === "function" ? b.lo(run[i]) : 0));
@@ -850,14 +864,24 @@ function drawFecGraph(id, series){
       ctx.lineWidth = 2; ctx.strokeStyle = cssVar("--bg-inset"); ctx.stroke();
     });
   });
-  // wasted parity: thin muted overlay line
+  // wasted parity: thin muted overlay line. Honor the same gap/validity rules
+  // as the bands above — iterate the full window (not the delivered-filtered
+  // `pts`) and break the line on a null waste sample, a null delivered sample,
+  // or a >FEC_GRAPH_MAX_GAP_S jump, so it never bridges a gap the bands break on.
   ctx.beginPath();
   let started = false;
-  pts.forEach(p => {
-    if (p.waste == null) { started = false; return; }
+  let lastT = null;
+  windowed.forEach(p => {
+    if (p.delivered == null || p.waste == null ||
+        (lastT != null && (p.t - lastT) > FEC_GRAPH_MAX_GAP_S)){
+      started = false;
+      lastT = null;
+      return;
+    }
     const x = X(p.t), y = Y(p.waste);
     started ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
     started = true;
+    lastT = p.t;
   });
   ctx.lineWidth = 1.5; ctx.strokeStyle = cssVar("--fg-muted"); ctx.stroke();
 

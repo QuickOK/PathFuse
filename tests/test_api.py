@@ -605,7 +605,14 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
             "wan1": M.WanSample("UP", 10.0, 0.0, 100.0),
             "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state", lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
-    monkeypatch.setattr(M, "fetch_relay_fec", lambda url, t: {"ok": False, "data": None, "error": "x"})
+    # Distinctive markers for the two independent rx sources: client_to_relay's
+    # rx comes from the relay fetch (decode outcomes measured AT THE RELAY of
+    # our uplink), relay_to_client's rx comes from the local tracker (our own
+    # decoder). If sbfd_ctl.py ever swapped these two at the call site, this
+    # test must fail — see the swap experiment in the review report.
+    monkeypatch.setattr(M, "fetch_relay_fec",
+        lambda url, t: {"ok": True, "error": None,
+                        "data": {"rx": {"delivered_per_s": 111.0}}})
     monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
@@ -614,7 +621,7 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
             return {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False}
 
         def rx_snapshot(self, now):
-            return None
+            return {"delivered_per_s": 222.0}
 
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg_with_fec.sbfd_local_state).write_text("{}")
@@ -625,6 +632,10 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
     snap = json.loads(Path(cfg_with_fec.published_state).read_text())
     assert snap["fec"]["directions"]["client_to_relay"]["wire"] == \
         {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False}
+    # client_to_relay.rx: relay-fetch side (decode outcomes measured at the relay)
+    assert snap["fec"]["directions"]["client_to_relay"]["rx"]["delivered_per_s"] == 111.0
+    # relay_to_client.rx: local-tracker side (our own decoder)
+    assert snap["fec"]["directions"]["relay_to_client"]["rx"]["delivered_per_s"] == 222.0
 
 
 def test_run_controller_client_wire_none_without_tracker(cfg_with_fec, monkeypatch):
@@ -805,7 +816,7 @@ def test_api_fec_history_returns_samples(cfg):
         "relay_to_client": {"wire": None, "rx": None},
     })
     stop = threading.Event()
-    httpd = M.start_ui_server(cfg, stop, fec_history=hist)
+    httpd = M.start_ui_server(cfg, stop, fec_hist=hist)
     try:
         port = httpd.server_address[1]
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/fec_history", timeout=2) as r:
