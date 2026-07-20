@@ -33,6 +33,12 @@ DEFAULT_FIXED_RATIO = "20:1"
 OFF_RATIO = "8:0"
 FIXED_RATIO_PRESETS = ("20:1", "8:1", "8:2", "8:4", "8:6", "8:8")
 
+# Snap target for percent entry. Separate from FIXED_RATIO_PRESETS because it
+# must include the zero-parity rung (an operator may legitimately ask for 0%)
+# while the dropdown must not offer it — "off" is already its own mode.
+# Ascending overhead; resolve_ratio relies on that ordering for tie-breaking.
+RATIO_LADDER = ("8:0", "20:1", "8:1", "8:2", "8:4", "8:6", "8:8")
+
 
 def parse_ratio(s):
     a, b = s.split(":")
@@ -45,6 +51,53 @@ def format_ratio(a, b):
 
 def validate_ratio(a, b):
     return a >= 1 and b >= 0 and (a + b) <= 254
+
+
+def ratio_overhead_pct(a, b):
+    """Parity as a percentage of data. '20:1' -> 5.0, '8:8' -> 100.0."""
+    return (b / a) * 100.0
+
+
+def resolve_ratio(text):
+    """Normalize an operator entry to a canonical 'x:y' ratio.
+
+    Accepts an explicit 'x:y' (returned verbatim once validated) or a percent
+    of overhead with an optional trailing '%', snapped to the nearest rung of
+    RATIO_LADDER. Snapping rather than deriving an exact ratio keeps every
+    value that reaches UDPspeeder on a rung already exercised in production.
+
+    Raises ValueError with a message fit to return to an HTTP caller.
+    """
+    # bool is an int subclass and would otherwise stringify as 'True'.
+    if not isinstance(text, str):
+        raise ValueError("ratio must be a string like '8:2' or '5%'")
+    s = text.strip()
+    if not s:
+        raise ValueError("ratio must not be empty")
+    if ":" in s:
+        try:
+            a, b = parse_ratio(s)
+        except (ValueError, AttributeError):
+            raise ValueError(f"{s!r} is not a ratio like '8:2'")
+        if not validate_ratio(a, b):
+            raise ValueError(f"{s!r} out of bounds (a>=1, b>=0, a+b<=254)")
+        return format_ratio(a, b)
+    try:
+        pct = float(s[:-1] if s.endswith("%") else s)
+    except ValueError:
+        raise ValueError(
+            f"{s!r} is not a ratio like '8:2' or a percent like '5%'")
+    if not (0.0 <= pct <= 100.0):
+        raise ValueError(f"percent must be 0..100, got {pct:g}")
+    best_rung, best_dist = None, None
+    for rung in RATIO_LADDER:
+        dist = abs(ratio_overhead_pct(*parse_ratio(rung)) - pct)
+        # <= (not <) with an ascending ladder means an exact tie is won by the
+        # later, higher-overhead rung: an operator asking for protection must
+        # never silently get less than they typed.
+        if best_dist is None or dist <= best_dist:
+            best_rung, best_dist = rung, dist
+    return best_rung
 
 
 def loss_to_level(loss_pct, table=DEFAULT_LOSS_TABLE):

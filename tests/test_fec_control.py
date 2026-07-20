@@ -147,3 +147,56 @@ def test_normalize_mode_accepts_valid_and_falls_back():
     assert F.normalize_mode(F.MODE_FIXED) == F.MODE_FIXED
     assert F.normalize_mode("garbage") == F.DEFAULT_MODE
     assert F.normalize_mode(None) == F.DEFAULT_MODE
+
+
+def test_resolve_ratio_passes_through_explicit_ratios():
+    for text, expected in [("8:2", "8:2"), (" 8:2 ", "8:2"), ("20:1", "20:1"),
+                           ("16:3", "16:3"), ("8:0", "8:0")]:
+        assert F.resolve_ratio(text) == expected
+
+
+def test_resolve_ratio_snaps_percent_to_ladder():
+    for text, expected in [("0%", "8:0"), ("5%", "20:1"), ("5", "20:1"),
+                           ("12.5%", "8:1"), ("25%", "8:2"), ("50%", "8:4"),
+                           ("75%", "8:6"), ("100%", "8:8"), ("4%", "20:1"),
+                           ("30%", "8:2")]:
+        assert F.resolve_ratio(text) == expected, text
+
+
+def test_resolve_ratio_breaks_ties_upward():
+    # 8.75% is the exact midpoint between 20:1 (5%) and 8:1 (12.5%). An
+    # operator asking for protection must not get less than they typed.
+    assert F.resolve_ratio("8.75%") == "8:1"
+    # 2.5% is the midpoint between 8:0 (0%) and 20:1 (5%).
+    assert F.resolve_ratio("2.5%") == "20:1"
+
+
+def test_resolve_ratio_rejects_bad_input():
+    for text in ["abc", "", "   ", "-5%", "200%", "0:1", "200:200",
+                 "1:2:3", "8:", ":2", "8:x"]:
+        try:
+            F.resolve_ratio(text)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {text!r}")
+
+
+def test_resolve_ratio_rejects_non_strings():
+    for text in [None, 5, 5.0, True, ["8:2"]]:
+        try:
+            F.resolve_ratio(text)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {text!r}")
+
+
+def test_ratio_overhead_pct():
+    assert F.ratio_overhead_pct(20, 1) == 5.0
+    assert F.ratio_overhead_pct(8, 0) == 0.0
+    assert F.ratio_overhead_pct(8, 8) == 100.0
+
+
+def test_ratio_ladder_is_ascending_and_contains_off():
+    pcts = [F.ratio_overhead_pct(*F.parse_ratio(r)) for r in F.RATIO_LADDER]
+    assert pcts == sorted(pcts)
+    assert F.OFF_RATIO in F.RATIO_LADDER
