@@ -27,7 +27,7 @@ def test_fetch_relay_fec_transport_error(monkeypatch):
 
 
 def test_post_relay_fec_no_url():
-    assert M.post_relay_fec("", "adaptive", "20:1", 1.0) is False
+    assert M.post_relay_fec("", "adaptive", "20:1", "20:1", 1.0) is False
 
 
 def test_post_relay_fec_success(monkeypatch):
@@ -36,14 +36,14 @@ def test_post_relay_fec_success(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
     monkeypatch.setattr(M.urllib.request, "urlopen", lambda req, timeout=None: FakeResp())
-    assert M.post_relay_fec("http://relay/fec", "off", "20:1", 1.0) is True
+    assert M.post_relay_fec("http://relay/fec", "off", "20:1", "20:1", 1.0) is True
 
 
 def test_post_relay_fec_transport_error_returns_false(monkeypatch):
     def boom(req, timeout=None):
         raise M.urllib.error.URLError("down")
     monkeypatch.setattr(M.urllib.request, "urlopen", boom)
-    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", 1.0) is False
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is False
 
 
 def test_post_relay_fec_body_includes_mode_and_legacy_enabled(monkeypatch):
@@ -56,12 +56,12 @@ def test_post_relay_fec_body_includes_mode_and_legacy_enabled(monkeypatch):
         seen["body"] = json.loads(req.data.decode())
         return FakeResp()
     monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
-    assert M.post_relay_fec("http://relay/fec", "fixed", "20:1", 1.0) is True
+    assert M.post_relay_fec("http://relay/fec", "fixed", "20:1", "20:1", 1.0) is True
     assert seen["body"]["mode"] == "fixed"
     assert seen["body"]["fixed_ratio"] == "20:1"
     assert seen["body"]["enabled"] is True   # legacy field for older relays
     seen.clear()
-    assert M.post_relay_fec("http://relay/fec", "off", "20:1", 1.0) is True
+    assert M.post_relay_fec("http://relay/fec", "off", "20:1", "20:1", 1.0) is True
     assert seen["body"]["enabled"] is False
 
 
@@ -196,7 +196,7 @@ def test_post_relay_fec_includes_client_loss_pct(monkeypatch):
         seen["body"] = json.loads(req.data.decode())
         return FakeResp()
     monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
-    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", 1.0,
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0,
                             client_loss_pct=1.47) is True
     assert seen["body"]["client_loss_pct"] == 1.47
 
@@ -211,7 +211,7 @@ def test_post_relay_fec_omits_client_loss_when_none(monkeypatch):
         seen["body"] = json.loads(req.data.decode())
         return FakeResp()
     monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
-    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", 1.0) is True
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is True
     assert "client_loss_pct" not in seen["body"]
 
 
@@ -219,3 +219,33 @@ def test_relay_fec_direction_passes_through_loss_source():
     fetch = {"ok": True, "error": None, "data": {"ratio": "8:2", "loss_source": "client_push"}}
     d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True, last_acked=True)
     assert d["loss_source"] == "client_push"
+
+
+def test_post_relay_fec_sends_floor_ratio(monkeypatch):
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    assert M.post_relay_fec("http://relay/fec", "min_adaptive", "8:2", "8:1",
+                            1.0, client_loss_pct=1.25) is True
+    assert seen["body"]["floor_ratio"] == "8:1"
+    assert seen["body"]["fixed_ratio"] == "8:2"
+    assert seen["body"]["mode"] == "min_adaptive"
+    assert seen["body"]["enabled"] is True
+
+
+def test_relay_desired_tuple_includes_floor():
+    # A floor change must make should_post_fec see a different desired tuple,
+    # or the operator's new floor never reaches the relay.
+    last_acked = ("min_adaptive", "8:2", "20:1", 0)
+    desired    = ("min_adaptive", "8:2", "8:1", 0)
+    assert desired != last_acked
+    # last_post_ts=50, now=60, heartbeat=30 -> the heartbeat has NOT elapsed,
+    # so True here proves the floor difference alone drove the post.
+    assert M.should_post_fec(desired, last_acked, 50.0, 60.0, 30.0) is True
+    assert M.should_post_fec(desired, desired, 50.0, 60.0, 30.0) is False

@@ -1471,12 +1471,13 @@ def fetch_relay_fec(url, timeout_s) -> dict:
         return {"ok": False, "data": None, "error": f"parse: {e}"}
 
 
-def post_relay_fec(url, mode, fixed_ratio, timeout_s, client_loss_pct=None) -> bool:
-    """Best-effort POST of desired (mode, fixed_ratio) to relay /fec.
+def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
+                   client_loss_pct=None) -> bool:
+    """Best-effort POST of desired (mode, fixed_ratio, floor_ratio) to relay /fec.
 
     client_loss_pct carries our locally measured relay->client loss — the
     direction the relay's TX leg repairs but cannot see (sbfd loss is
-    RX-side). Older relays ignore the extra field. Also sends the legacy
+    RX-side). Older relays ignore the extra fields. Also sends the legacy
     `enabled` boolean so an older relay binary still honors the off/on intent
     during a rolling upgrade. Returns True iff 200."""
     if not url:
@@ -1484,6 +1485,7 @@ def post_relay_fec(url, mode, fixed_ratio, timeout_s, client_loss_pct=None) -> b
     payload = {
         "mode": mode,
         "fixed_ratio": fixed_ratio,
+        "floor_ratio": floor_ratio,
         "enabled": mode != fec_control.MODE_OFF,
     }
     if client_loss_pct is not None:
@@ -2173,12 +2175,13 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
 
         fec_mode_eff = effective_fec_mode(cfg, ov)
         fec_fixed_ratio_eff = effective_fec_fixed_ratio(cfg, ov)
+        fec_floor_ratio_eff = effective_fec_floor_ratio(cfg, ov)
         fec_desired = fec_mode_eff != fec_control.MODE_OFF
         fec_driver = None
         fec_actuator_ok = True
         fec_loss = loss
         fec_loss_source = "local"
-        relay_desired = (fec_mode_eff, fec_fixed_ratio_eff)
+        relay_desired = (fec_mode_eff, fec_fixed_ratio_eff, fec_floor_ratio_eff)
         if cfg.fec:
             # Our TX leg repairs client->relay loss, which only the relay can
             # measure — drive it from the fetched relay snapshot (local loss,
@@ -2197,13 +2200,14 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
             _fec_ratio = fec_control.apply_mode(
                 fec_mode_eff, _adaptive_ratio,
                 fixed_ratio=fec_fixed_ratio_eff,
-                floor_ratio=cfg.fec.floor_ratio)
+                floor_ratio=fec_floor_ratio_eff)
             # Push our locally measured (relay->client) loss so the relay can
             # drive ITS leg on the direction it actually repairs. Quantized to
             # a table level in relay_desired so posts fire on level changes,
             # not every EWMA wiggle.
             client_push_loss = worst_active_loss(loss, currently_active)
             relay_desired = (fec_mode_eff, fec_fixed_ratio_eff,
+                             fec_floor_ratio_eff,
                              fec_control.loss_to_level(client_push_loss,
                                                        cfg.fec.loss_table))
             if fec_mode_eff in (fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE):
@@ -2227,6 +2231,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                     fec_relay_last_post_ts, loop_start):
                 if post_relay_fec(cfg.relay.fec_url, fec_mode_eff,
                                   fec_fixed_ratio_eff,
+                                  fec_floor_ratio_eff,
                                   cfg.relay.fetch_timeout_s,
                                   client_loss_pct=client_push_loss):
                     fec_relay_last_acked = relay_desired
@@ -2303,8 +2308,12 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                 "desired_enabled": fec_desired,
                 "desired_mode": fec_mode_eff,
                 "desired_fixed_ratio": fec_fixed_ratio_eff,
-                "floor_ratio": (cfg.fec.floor_ratio if cfg.fec else None),
+                "floor_ratio": fec_floor_ratio_eff,
+                # fixed_ratio_presets is retained so a cached older page keeps
+                # working; ratio_presets is what the current UI reads for both
+                # the fixed and the floor dropdown.
                 "fixed_ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
+                "ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
                 "directions": {
                     "client_to_relay": {
                         "enabled": fec_desired,
