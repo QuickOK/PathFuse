@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import fec_control
+import fec_history
 import fec_report
 import notify
 
@@ -723,7 +724,7 @@ def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
     return (now - last_post_ts) >= heartbeat_s
 
 
-def relay_fec_direction(fetch, fetched_at, now, desired, last_acked):
+def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=None):
     """Shape the relay->client published direction dict from a fetch_relay_fec result.
 
     `desired` / `last_acked` are either the legacy enabled-boolean (during the
@@ -749,6 +750,9 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked):
         "error": fetch.get("error"),
         "reconcile_pending": (last_acked != desired),
         "wire": data.get("wire"),
+        # Decode outcomes for relay->client are measured by OUR decoder (rx is
+        # RX-side), so they come from the local tracker, not the relay fetch.
+        "rx": local_rx,
     }
 
 
@@ -1775,7 +1779,7 @@ def store_tile(cache_dir, z, x, y, data, max_mb) -> None:
         evict_tiles(cache_dir, max_mb)
 
 
-def start_ui_server(cfg: Config, stop_event: threading.Event):
+def start_ui_server(cfg: Config, stop_event: threading.Event, fec_history=None):
     """Bind the UI HTTP server (returns the bound httpd; caller doesn't need it)."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1862,6 +1866,9 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data.encode())
+            elif self.path == "/api/fec_history":
+                self._send_json(200, {"samples": (fec_history.snapshot()
+                                                  if fec_history else [])})
             elif self.path == "/api/engarde":
                 url = cfg.engarde.admin_url or f"http://{cfg.engarde.server_ip}:8080/api/v1/get-list"
                 try:
@@ -1988,7 +1995,7 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
 
 # -- Main controller loop ----------------------------------------------------
 
-def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
+def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_history=None):
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 
     apply_nft_init(cfg)
@@ -2326,10 +2333,15 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                         "since": fec_ratio_since,
                         "actuator_ok": fec_actuator_ok,
                         "wire": (wire_tracker.snapshot(loop_start) if wire_tracker else None),
+                        # client->relay decode outcomes are measured AT THE
+                        # RELAY; they ride back on the /fec fetch.
+                        "rx": ((fec_relay_last or {}).get("data") or {}).get("rx"),
                     },
                     "relay_to_client": relay_fec_direction(
                         fec_relay_last, fec_relay_last_at, loop_start,
-                        relay_desired, fec_relay_last_acked),
+                        relay_desired, fec_relay_last_acked,
+                        local_rx=(wire_tracker.rx_snapshot(loop_start)
+                                  if wire_tracker else None)),
                 },
             },
             "environmental": environmental_snapshot(
@@ -2370,6 +2382,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None):
                     switch=switch_event,
                     maintenance=maint_window)):
                 notifier.notify(_ev)
+        if fec_history is not None and cfg.fec:
+            fec_history.append_from_directions(
+                loop_start, snapshot["fec"]["directions"])
         publish_state(cfg, snapshot)
 
         elapsed = time.time() - loop_start
@@ -2412,8 +2427,9 @@ def main():
 
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
+    fec_hist = fec_history.FecHistory() if cfg.fec else None
     if not args.no_ui:
-        start_ui_server(cfg, stop)
+        start_ui_server(cfg, stop, fec_history=fec_hist)
 
     try:
         wire_tracker = None
@@ -2421,7 +2437,7 @@ def main():
             wire_tracker = fec_report.FecWireTracker(
                 "client_to_server", cfg.fec.wire_stale_after_s)
             fec_report.start_wire_tailer(cfg.fec.wire_unit, wire_tracker, stop)
-        run_controller(cfg, stop, wire_tracker=wire_tracker)
+        run_controller(cfg, stop, wire_tracker=wire_tracker, fec_history=fec_hist)
     except KeyboardInterrupt:
         logging.info("shutting down")
         stop.set()

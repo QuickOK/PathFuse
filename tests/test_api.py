@@ -613,6 +613,9 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
         def snapshot(self, now):
             return {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False}
 
+        def rx_snapshot(self, now):
+            return None
+
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg_with_fec.sbfd_local_state).write_text("{}")
     stop = _t.Event()
@@ -789,3 +792,40 @@ def test_effective_fec_ratios_survive_a_hand_edited_overlay(cfg):
 def test_effective_fec_ratios_normalize_a_hand_edited_percent(cfg):
     ov = M.RuntimeOverlay(fec_floor_ratio="25%")
     assert M.effective_fec_floor_ratio(cfg, ov) == "8:2"
+
+
+def test_api_fec_history_returns_samples(cfg):
+    import fec_history as FH
+    Path(cfg.published_state).write_text("{}")
+    hist = FH.FecHistory()
+    hist.append_from_directions(1000.0, {
+        "client_to_relay": {"wire": {"tx_mbps": 1.5, "overhead_pct": 50.0},
+                            "rx": {"delivered_per_s": 100.0, "recovered_per_s": 2.0,
+                                   "lost_pkts_est_per_s": 0.0, "par_waste_per_s": 30.0}},
+        "relay_to_client": {"wire": None, "rx": None},
+    })
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop, fec_history=hist)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/fec_history", timeout=2) as r:
+            body = json.loads(r.read())
+        assert body["samples"][0]["c2r"]["delivered_per_s"] == 100.0
+        assert body["samples"][0]["r2c"]["delivered_per_s"] is None
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_fec_history_without_history_is_empty_not_500(cfg):
+    Path(cfg.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/fec_history", timeout=2) as r:
+            body = json.loads(r.read())
+        assert body == {"samples": []}
+    finally:
+        stop.set()
+        httpd.shutdown()

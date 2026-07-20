@@ -268,3 +268,20 @@ def test_relay_fec_direction_floor_none_when_absent():
     d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5,
                               desired=True, last_acked=True)
     assert d["floor_ratio"] is None
+
+
+def test_relay_fec_direction_rx_comes_from_local_tracker_not_fetch():
+    # The relay->client direction is decoded ON THE CLIENT, so its rx block
+    # must come from the local tracker; the relay's own rx (which describes
+    # client->relay) must not leak in via the fetch.
+    fetch = {"ok": True, "data": {"ratio": "8:2", "rx": {"delivered_per_s": 1.0}}}
+    local = {"delivered_per_s": 250.0, "recovered_per_s": 3.0,
+             "lost_pkts_est_per_s": 0.0, "par_waste_per_s": 60.0}
+    d = M.relay_fec_direction(fetch, 100.0, 101.0, ("adaptive", "8:2"),
+                              ("adaptive", "8:2"), local_rx=local)
+    assert d["rx"] == local
+
+
+def test_relay_fec_direction_rx_defaults_none():
+    d = M.relay_fec_direction({"ok": True, "data": {}}, 100.0, 101.0, "a", "a")
+    assert d["rx"] is None
