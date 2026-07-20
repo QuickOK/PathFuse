@@ -521,3 +521,20 @@ def test_run_once_coerces_a_hand_edited_config_floor(tmp_path):
         assert ratio == fec_control.DEFAULT_FLOOR_RATIO
     finally:
         os.close(rfd)
+
+
+def test_set_desired_returns_the_applied_triple():
+    st = U.FecState(mode="adaptive", fixed_ratio="8:2", floor_ratio="20:1")
+    assert st.set_desired(mode="min_adaptive", floor_ratio="8:1") == \
+        ("min_adaptive", "8:2", "8:1")
+
+
+def test_fec_state_coerces_a_percent_seeded_from_config():
+    st = U.FecState(mode="min_adaptive", fixed_ratio="50%", floor_ratio="25%")
+    assert st.get_desired() == ("min_adaptive", "8:4", "8:2")
+
+
+def test_fec_state_coerces_garbage_seeded_from_config():
+    st = U.FecState(mode="min_adaptive", fixed_ratio="junk", floor_ratio="junk")
+    assert st.get_fixed_ratio() == fec_control.DEFAULT_FIXED_RATIO
+    assert st.get_floor_ratio() == fec_control.DEFAULT_FLOOR_RATIO

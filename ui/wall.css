@@ -515,6 +515,10 @@ body[data-layout="wall"] .panel.control { display: none; }
   font-size: 12px;
 }
 
+/* Set when the relay reports a different FEC floor than we do — a rolling
+   upgrade left the two directions disagreeing. */
+.fec-effective.warn { color: var(--warn); }
+
 /* Manual ratio entry, revealed when its dropdown is set to Custom…. Matches
    .ctl-select so the pair reads as one control. */
 .ctl-input {

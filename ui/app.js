@@ -641,7 +641,16 @@ function renderFec(s){
         : (desiredMode === "min_adaptive"
             ? `${modeLabel} (floor ${fec.floor_ratio || "?"})`
             : modeLabel);
-      eff.textContent = `effective: ${effDesc} · ${relayTxt}`;
+      // The relay reports the floor it is actually running. During a rolling
+      // upgrade an older relay omits it (undefined — not a mismatch); a
+      // genuinely different value means the two directions disagree, which is
+      // worth showing rather than hiding behind our local value.
+      const relayFloor = o.floor_ratio;
+      const floorMismatch = desiredMode === "min_adaptive"
+        && relayFloor && fec.floor_ratio && relayFloor !== fec.floor_ratio;
+      eff.textContent = `effective: ${effDesc} · ${relayTxt}`
+        + (floorMismatch ? ` · relay floor ${relayFloor}` : "");
+      eff.classList.toggle("warn", !!floorMismatch);
     }
   }
   // Radios & dropdown availability follow whether FEC is configured at all,

@@ -37,10 +37,11 @@ class FecState:
             mode = (fec_control.MODE_ADAPTIVE if enabled
                     else fec_control.MODE_OFF)
         self._mode = fec_control.normalize_mode(mode)
-        self._fixed_ratio = fixed_ratio or fec_control.DEFAULT_FIXED_RATIO
-        # Coerce here too: main() seeds this straight from the hand-editable
+        # Coerce both: main() seeds these straight from the hand-editable
         # config, and an uncoerced value would show up in GET /fec even though
         # run_once resolves it before the FIFO ever sees it.
+        self._fixed_ratio = fec_control.safe_ratio(
+            fixed_ratio, fec_control.DEFAULT_FIXED_RATIO, logging)
         self._floor_ratio = fec_control.safe_ratio(
             floor_ratio, fec_control.DEFAULT_FLOOR_RATIO, logging)
         self._pushed_loss = None
@@ -112,6 +113,10 @@ class FecState:
             elif enabled is not None:
                 self._mode = (fec_control.MODE_ADAPTIVE if bool(enabled)
                               else fec_control.MODE_OFF)
+            # Return what we just applied, under the same lock: a follow-up
+            # get_desired() could observe a concurrent request's values and
+            # report back something this caller never set.
+            return self._mode, self._fixed_ratio, self._floor_ratio
 
     def set_pushed_loss(self, value, ts):
         with self._lock:
@@ -215,10 +220,10 @@ def start_fec_http(listen, state, stop_event=None):
                     self._json(400, {"error": "client_loss_pct must be a number 0..100"}); return
             # One lock acquisition for the whole desired triple, so the control
             # loop can never read a half-applied request.
-            state.set_desired(mode=mode_in, enabled=enabled_in, **ratio_updates)
+            mode_now, fixed_now, floor_now = state.set_desired(
+                mode=mode_in, enabled=enabled_in, **ratio_updates)
             if loss_in is not None:
                 state.set_pushed_loss(loss_in, time.time())
-            mode_now, fixed_now, floor_now = state.get_desired()
             self._json(200, {"ok": True, "mode": mode_now,
                              "fixed_ratio": fixed_now,
                              "floor_ratio": floor_now,
@@ -282,11 +287,12 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     # FecState; cfg is only the boot default, as for mode and fixed_ratio.
     if floor_ratio is None:
         floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
-    floor_ratio = fec_control.safe_ratio(floor_ratio, fec_control.DEFAULT_FLOOR_RATIO, logging)
+    floor_ratio = fec_control.safe_ratio(
+        floor_ratio, fec_control.DEFAULT_FLOOR_RATIO, logging)
+    fixed_ratio = fec_control.safe_ratio(
+        fixed_ratio, fec_control.DEFAULT_FIXED_RATIO, logging)
     if mode is None:
         mode = fec_control.MODE_ADAPTIVE if enabled else fec_control.MODE_OFF
-    if fixed_ratio is None:
-        fixed_ratio = fec_control.DEFAULT_FIXED_RATIO
 
     hyst = fec_control.FecHysteresis(cfg["ramp_up_ticks"], cfg["ramp_down_hold_s"])
     local_worst, up = read_worst_loss(cfg["sbfd_state"])
