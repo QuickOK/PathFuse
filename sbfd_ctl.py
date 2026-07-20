@@ -1202,6 +1202,7 @@ class RuntimeOverlay:
     fec_enabled: Optional[bool] = None  # deprecated; kept for backward-compat reads
     fec_mode: Optional[str] = None
     fec_fixed_ratio: Optional[str] = None
+    fec_floor_ratio: Optional[str] = None
     environmental_enabled: Optional[bool] = None
     # First integer overlay field. Note hour 0 (midnight) is falsy and real, so
     # every read/write path here must test for None, never for truthiness.
@@ -1233,6 +1234,7 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_enabled=legacy_enabled,
                 fec_mode=loaded_fec_mode,
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
+                fec_floor_ratio=raw.get("fec_floor_ratio"),
                 environmental_enabled=raw.get("environmental_enabled"),
                 maintenance_enabled=raw.get("maintenance_enabled"),
                 maintenance_hour=raw.get("maintenance_hour"),
@@ -1263,6 +1265,7 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
         "fec_enabled": ov.fec_enabled,
         "fec_mode": ov.fec_mode,
         "fec_fixed_ratio": ov.fec_fixed_ratio,
+        "fec_floor_ratio": ov.fec_floor_ratio,
         "environmental_enabled": ov.environmental_enabled,
         "maintenance_enabled": ov.maintenance_enabled,
         "maintenance_hour": ov.maintenance_hour,
@@ -1374,6 +1377,15 @@ def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     if cfg.fec:
         return cfg.fec.fixed_ratio
     return fec_control.DEFAULT_FIXED_RATIO
+
+
+def effective_fec_floor_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
+    """The floor used by MODE_MIN_ADAPTIVE — operator override wins, else cfg."""
+    if ov.fec_floor_ratio:
+        return ov.fec_floor_ratio
+    if cfg.fec:
+        return cfg.fec.floor_ratio
+    return fec_control.DEFAULT_FLOOR_RATIO
 
 
 def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
@@ -1529,16 +1541,15 @@ def validate_runtime_payload(payload: dict, wan_names: set):
         return False, "fec_enabled must be true or false"
     if "fec_mode" in payload and payload["fec_mode"] not in fec_control.ALL_MODES:
         return False, f"fec_mode must be one of {sorted(fec_control.ALL_MODES)}"
-    if "fec_fixed_ratio" in payload:
-        r = payload["fec_fixed_ratio"]
-        if not isinstance(r, str):
-            return False, "fec_fixed_ratio must be a string like 'x:y'"
-        try:
-            a, b = fec_control.parse_ratio(r)
-        except (ValueError, AttributeError):
-            return False, "fec_fixed_ratio must be 'x:y' with integers"
-        if not fec_control.validate_ratio(a, b):
-            return False, "fec_fixed_ratio out of bounds (a>=1, b>=0, a+b<=254)"
+    # Normalize ratio entries in place so the apply block stores the canonical
+    # 'x:y'. Resolving here and only here keeps the percent rule in one place —
+    # the runtime and persist files never hold a percent string.
+    for _key in ("fec_fixed_ratio", "fec_floor_ratio"):
+        if _key in payload:
+            try:
+                payload[_key] = fec_control.resolve_ratio(payload[_key])
+            except ValueError as e:
+                return False, f"{_key}: {e}"
     if "environmental_enabled" in payload and not isinstance(payload["environmental_enabled"], bool):
         return False, "environmental_enabled must be true or false"
     if ("maintenance_enabled" in payload
@@ -1950,6 +1961,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event):
                 ov.fec_enabled = (payload["fec_mode"] != fec_control.MODE_OFF)
             if "fec_fixed_ratio" in payload:
                 ov.fec_fixed_ratio = payload["fec_fixed_ratio"]
+            if "fec_floor_ratio" in payload:
+                ov.fec_floor_ratio = payload["fec_floor_ratio"]
             if "environmental_enabled" in payload:
                 ov.environmental_enabled = payload["environmental_enabled"]
             # `in payload`, never `payload.get(k) or default`: hour 0 is midnight

@@ -705,3 +705,67 @@ def test_post_runtime_omitting_maintenance_keys_leaves_them_alone(cfg):
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_overlay_round_trips_fec_floor_ratio(cfg):
+    ov = M.RuntimeOverlay(fec_floor_ratio="8:1", persist=True)
+    M.save_runtime_overlay(cfg, ov)
+    assert M.load_runtime_overlay(cfg).fec_floor_ratio == "8:1"
+
+
+def test_overlay_missing_fec_floor_ratio_reads_as_none(cfg):
+    # Pre-existing persist files have no such key; absence must not fault and
+    # must fall back to config, preserving today's behavior.
+    Path(cfg.runtime_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.runtime_state).write_text(json.dumps({"mode": "master_backup"}))
+    assert M.load_runtime_overlay(cfg).fec_floor_ratio is None
+
+
+def test_effective_fec_floor_ratio_overlay_wins(cfg):
+    ov = M.RuntimeOverlay(fec_floor_ratio="8:2")
+    assert M.effective_fec_floor_ratio(cfg, ov) == "8:2"
+
+
+def test_effective_fec_floor_ratio_falls_back_when_unconfigured(cfg):
+    # The cfg fixture passes no fec= block, so cfg.fec is None and the module
+    # default is the last fallback.
+    assert cfg.fec is None
+    assert M.effective_fec_floor_ratio(cfg, M.RuntimeOverlay()) == \
+        fec_control.DEFAULT_FLOOR_RATIO
+
+
+def test_validate_normalizes_fec_ratios_in_place():
+    payload = {"fec_fixed_ratio": "5%", "fec_floor_ratio": "25%"}
+    ok, err = M.validate_runtime_payload(payload, {"wan1", "wan2"})
+    assert (ok, err) == (True, None)
+    assert payload["fec_fixed_ratio"] == "20:1"
+    assert payload["fec_floor_ratio"] == "8:2"
+
+
+def test_validate_accepts_explicit_floor_ratio():
+    payload = {"fec_floor_ratio": "8:1"}
+    ok, err = M.validate_runtime_payload(payload, {"wan1"})
+    assert (ok, err) == (True, None)
+    assert payload["fec_floor_ratio"] == "8:1"
+
+
+def test_validate_rejects_bad_floor_ratio():
+    for bad in ["abc", "200%", "0:1", "", 5, None]:
+        ok, err = M.validate_runtime_payload({"fec_floor_ratio": bad}, {"wan1"})
+        assert ok is False, bad
+        assert "fec_floor_ratio" in err
+
+
+def test_validate_rejects_bad_fixed_ratio():
+    for bad in ["abc", "200%", "0:1", "", 5, None]:
+        ok, err = M.validate_runtime_payload({"fec_fixed_ratio": bad}, {"wan1"})
+        assert ok is False, bad
+        assert "fec_fixed_ratio" in err
+
+
+def test_validate_leaves_absent_ratio_keys_absent():
+    payload = {"mode": "master_backup"}
+    ok, _ = M.validate_runtime_payload(payload, {"wan1"})
+    assert ok is True
+    assert "fec_floor_ratio" not in payload
+    assert "fec_fixed_ratio" not in payload
