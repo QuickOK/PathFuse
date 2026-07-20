@@ -106,13 +106,20 @@ class FecWireTracker:
             pt, pc = prev
             dt = now - pt
             d = {k: cur[k] - pc[k] for k in cur}
-            if dt <= 0 or any(v < 0 for v in d.values()):
-                return  # bad interval or counter reset: keep last good rates
+            if any(v < 0 for v in d.values()):
+                # counter reset (process restart): the pre-reset average no longer
+                # describes post-reset groups, so drop it. Keep last good rates.
+                self._avg_pkts_per_grp = None
+                return
+            if dt <= 0:
+                return  # bad/zero interval: keep last good rates, average untouched
             grp_done = d["grp_ok"] + d["grp_rec"]
             if grp_done > 0:
                 self._avg_pkts_per_grp = (d["pkt_ok"] + d["pkt_rec"]) / grp_done
             if self._avg_pkts_per_grp is not None:
-                lost = d["grp_fail"] * self._avg_pkts_per_grp
+                # The group-based estimate must never report less than the known
+                # missing-shard floor.
+                lost = max(d["grp_fail"] * self._avg_pkts_per_grp, d["shard_lost"])
             else:
                 lost = d["shard_lost"]  # no completed group yet: shard count as floor
             self._rx = {

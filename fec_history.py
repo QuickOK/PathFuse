@@ -11,14 +11,14 @@ class FecHistory:
     """Thread-safe ring of {t, c2r, r2c}. The 0.5 s controller tick outpaces
     the 1/s graph resolution, so appends are throttled by min_interval_s."""
 
-    def __init__(self, maxlen=3600, min_interval_s=1.0):
+    def __init__(self, maxlen=3600, min_interval_s=1.0) -> None:
         self._lock = threading.Lock()
         self._buf = deque(maxlen=maxlen)
         self._min_interval_s = min_interval_s
         self._last_t = None
 
     @staticmethod
-    def _side(d):
+    def _side(d) -> dict:
         d = d or {}
         wire = d.get("wire") or {}
         rx = d.get("rx") or {}
@@ -48,4 +48,5 @@ class FecHistory:
 
     def snapshot(self):
         with self._lock:
-            return list(self._buf)
+            return [{"t": s["t"], "c2r": dict(s["c2r"]), "r2c": dict(s["r2c"])}
+                    for s in self._buf]

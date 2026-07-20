@@ -787,13 +787,20 @@ function drawFecGraph(id, series){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
 
+  // Read each CSS var once; getComputedStyle is not free and this function
+  // runs per-frame per-graph.
+  const cUp = cssVar("--up"), cWarn = cssVar("--warn"), cDown = cssVar("--down"),
+        cInset = cssVar("--bg-inset"), cMuted = cssVar("--fg-muted"),
+        cBorderStrong = cssVar("--border-strong"), cFg = cssVar("--fg"),
+        cFgDim = cssVar("--fg-dim");
+
   const last = series.length ? series[series.length - 1] : null;
   const t1 = last ? last.t : 0;
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
   const windowed = series.filter(p => p.t >= t0);
   const pts = windowed.filter(p => p.delivered != null);
   if (!pts.length){
-    ctx.fillStyle = cssVar("--fg-dim");
+    ctx.fillStyle = cFgDim;
     ctx.font = "10px sans-serif";
     ctx.fillText("no decoder data", 8, cssH / 2 + 3);
     return;
@@ -831,10 +838,10 @@ function drawFecGraph(id, series){
   // Stacked bands, FIXED order bottom->top: delivered, recovered, lost.
   // Position encodes identity (CVD-safe with the 2px separators below).
   const bands = [
-    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cssVar("--up") },
-    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cssVar("--warn") },
+    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cUp },
+    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cWarn },
     { lo: p => (p.delivered || 0) + (p.recovered || 0),
-      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cssVar("--down") },
+      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cDown },
   ];
   bands.forEach(b => {
     runs.forEach(run => {
@@ -861,7 +868,7 @@ function drawFecGraph(id, series){
       // 2px surface separator on the band's top edge, per run
       ctx.beginPath();
       run.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-      ctx.lineWidth = 2; ctx.strokeStyle = cssVar("--bg-inset"); ctx.stroke();
+      ctx.lineWidth = 2; ctx.strokeStyle = cInset; ctx.stroke();
     });
   });
   // wasted parity: thin muted overlay line. Honor the same gap/validity rules
@@ -883,7 +890,7 @@ function drawFecGraph(id, series){
     started = true;
     lastT = p.t;
   });
-  ctx.lineWidth = 1.5; ctx.strokeStyle = cssVar("--fg-muted"); ctx.stroke();
+  ctx.lineWidth = 1.5; ctx.strokeStyle = cMuted; ctx.stroke();
 
   // hover readout
   const dir = id.includes("c2r") ? "c2r" : "r2c";
@@ -892,7 +899,7 @@ function drawFecGraph(id, series){
     const ht = t0 + (hx / cssW) * FEC_GRAPH_WINDOW_S;
     let best = pts[0];
     pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
-    ctx.strokeStyle = cssVar("--border-strong"); ctx.lineWidth = 1;
+    ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(X(best.t), 0); ctx.lineTo(X(best.t), cssH); ctx.stroke();
     ctx.font = "10px sans-serif";
     const readout = `ok ${fmtRate(best.delivered)} · rec ${fmtRate(best.recovered)}`
@@ -903,10 +910,10 @@ function drawFecGraph(id, series){
     const boxRight = cssW - 6 + padX, boxLeft = cssW - 6 - textW - padX;
     const boxTop = 12 - boxH + 4;
     ctx.globalAlpha = 0.9;
-    ctx.fillStyle = cssVar("--bg-inset");
+    ctx.fillStyle = cInset;
     ctx.fillRect(boxLeft, boxTop, boxRight - boxLeft, boxH);
     ctx.globalAlpha = 1;
-    ctx.fillStyle = cssVar("--fg");
+    ctx.fillStyle = cFg;
     ctx.textAlign = "right";
     ctx.fillText(readout, cssW - 6, 12);
     ctx.textAlign = "left";

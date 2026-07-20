@@ -139,6 +139,38 @@ def test_rx_counter_reset_does_not_emit_negative_rates():
     assert snap["delivered_per_s"] == 100.0    # clean resume from new baseline
 
 
+def test_rx_lost_estimate_clamps_to_shard_floor():
+    t = R.FecWireTracker("client_to_server")
+    rx_a = ("[2026-07-20 10:00:00][INFO][report_fec_rx]pkt_ok:1000 pkt_rec:50 "
+            "grp_ok:120 grp_rec:10 grp_fail:2 shard_lost:9 par_waste:37")
+    rx_b = ("[2026-07-20 10:00:10][INFO][report_fec_rx]pkt_ok:1010 pkt_rec:52 "
+            "grp_ok:121 grp_rec:10 grp_fail:3 shard_lost:50 par_waste:40")
+    t.feed(rx_a, now=0.0)
+    t.feed(rx_b, now=10.0)
+    snap = t.rx_snapshot(now=10.0)
+    # avg pkts/group = d(pkt_ok+pkt_rec) 12 / d grp_done 1 = 12/group
+    # group-based estimate = d grp_fail 1 * 12 = 12
+    # shard floor = d shard_lost 41, which exceeds the group estimate -> clamp wins
+    assert snap["lost_pkts_est_per_s"] == 4.1
+
+
+def test_rx_counter_reset_clears_stale_average_uses_shard_floor():
+    t = R.FecWireTracker("client_to_server")
+    t.feed(RX1, now=0.0)
+    t.feed(RX2, now=10.0)   # establishes _avg_pkts_per_grp ~= 7.94 pkts/group
+    rx_low = ("[2026-07-20 10:00:20][INFO][report_fec_rx]pkt_ok:100 pkt_rec:5 "
+              "grp_ok:10 grp_rec:1 grp_fail:1 shard_lost:3 par_waste:2")
+    t.feed(rx_low, now=20.0)   # counters dropped: reset path clears the average
+    rx_low2 = ("[2026-07-20 10:00:30][INFO][report_fec_rx]pkt_ok:105 pkt_rec:5 "
+               "grp_ok:10 grp_rec:1 grp_fail:2 shard_lost:8 par_waste:3")
+    t.feed(rx_low2, now=30.0)  # zero completed groups this interval, grp_fail>0
+    snap = t.rx_snapshot(now=30.0)
+    # No completed groups since the reset -> must fall back to the shard_lost
+    # floor (d shard_lost 5), NOT the pre-reset average (~7.94), which would
+    # have produced d grp_fail 1 * 7.94 = 7.94.
+    assert snap["lost_pkts_est_per_s"] == 0.5
+
+
 def test_wire_and_rx_coexist_in_one_tracker():
     t = R.FecWireTracker("client_to_server")
     t.feed(C1, now=0.0)

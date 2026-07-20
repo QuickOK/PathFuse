@@ -44,6 +44,15 @@ def test_missing_directions_are_null_not_crash():
     assert h.snapshot()[0]["c2r"]["tx_mbps"] is None
 
 
+def test_snapshot_returns_deep_copies_not_shared_dicts():
+    h = H.FecHistory()
+    h.append_from_directions(1000.0, DIRS)
+    s = h.snapshot()
+    s[0]["c2r"]["delivered_per_s"] = 999.0   # mutate the returned copy
+    fresh = h.snapshot()
+    assert fresh[0]["c2r"]["delivered_per_s"] == 100.0
+
+
 def test_backwards_time_step_resets_baseline_instead_of_stalling():
     h = H.FecHistory()
     h.append_from_directions(1000.0, DIRS)
