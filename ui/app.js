@@ -27,7 +27,7 @@ const dirtyFields = new Set();
 let lastState = null;
 let lastEngarde = null;
 
-const FORM_SELECTOR = 'input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, input[name="environmental_enabled"], input[name="maintenance_enabled"], #maintenance-hour, #master-wan, #persist';
+const FORM_SELECTOR = 'input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #fec-fixed-custom, #fec-floor-ratio, #fec-floor-custom, input[name="environmental_enabled"], input[name="maintenance_enabled"], #maintenance-hour, #master-wan, #persist';
 
 /* A control's identity for dirty/focus tracking: radios share a name, the
    rest are unique ids. */
@@ -43,26 +43,43 @@ function focusedField(){
    restart can't re-post a stale value as deliberate intent. */
 function isFrozen(key){ return dirtyFields.has(key) || focusedField() === key; }
 
-const FEC_FIXED_FALLBACK_PRESETS = ["20:1", "8:1", "8:2", "8:4", "8:6", "8:8"];
-let fecFixedPresetsRendered = "";
+const FEC_RATIO_FALLBACK_PRESETS = ["20:1", "8:1", "8:2", "8:4", "8:6", "8:8"];
+const FEC_CUSTOM = "__custom__";
+const ratioPresetsRendered = {};
 
-function syncFecFixedDropdown(presets, desired){
-  const sel = $("#fec-fixed-ratio");
+/* Render presets + a Custom… option into `selId`. When the effective value is
+   not a preset (the operator typed a percent that resolved off-list), select
+   Custom… and put the canonical ratio in the box, so a reload round-trips
+   instead of snapping back to a preset. The server does the resolving; this
+   only ever displays what it sent back. */
+function syncRatioDropdown(selId, customId, presets, desired){
+  const sel = $(selId);
   if (!sel) return;
-  const list = Array.isArray(presets) && presets.length ? presets : FEC_FIXED_FALLBACK_PRESETS;
+  const list = Array.isArray(presets) && presets.length ? presets : FEC_RATIO_FALLBACK_PRESETS;
   const key = list.join("|");
-  if (key !== fecFixedPresetsRendered){
+  if (key !== ratioPresetsRendered[selId]){
     sel.innerHTML = "";
     list.forEach(r => {
       const o = document.createElement("option");
       o.value = r; o.textContent = r;
       sel.appendChild(o);
     });
-    fecFixedPresetsRendered = key;
+    const c = document.createElement("option");
+    c.value = FEC_CUSTOM; c.textContent = "Custom…";
+    sel.appendChild(c);
+    ratioPresetsRendered[selId] = key;
   }
-  if (desired && Array.from(sel.options).some(o => o.value === desired)){
-    if (sel.value !== desired) sel.value = desired;
+  const custom = $(customId);
+  if (desired){
+    if (list.includes(desired)){
+      if (sel.value !== desired) sel.value = desired;
+      if (custom && !isFrozen(customId.slice(1))) custom.value = "";
+    } else {
+      sel.value = FEC_CUSTOM;
+      if (custom && !isFrozen(customId.slice(1))) custom.value = desired;
+    }
   }
+  if (custom) custom.hidden = sel.value !== FEC_CUSTOM;
 }
 
 function pad(n, w=2){ return String(n).padStart(w, "0"); }
@@ -292,8 +309,11 @@ function render(s){
         || (s.fec.desired_enabled ? "adaptive" : "off");
       setRadio("fec_mode", desiredMode);
       // Presets always render; the selected value holds while frozen.
-      syncFecFixedDropdown(s.fec.fixed_ratio_presets,
+      const presets = s.fec.ratio_presets || s.fec.fixed_ratio_presets;
+      syncRatioDropdown("#fec-fixed-ratio", "#fec-fixed-custom", presets,
         isFrozen("fec-fixed-ratio") ? null : s.fec.desired_fixed_ratio);
+      syncRatioDropdown("#fec-floor-ratio", "#fec-floor-custom", presets,
+        isFrozen("fec-floor-ratio") ? null : s.fec.floor_ratio);
     }
     const env = s.environmental || {};
     if (env.configured) setRadio("environmental_enabled", env.enabled ? "on" : "off");
@@ -613,16 +633,24 @@ function renderFec(s){
                    : (o.reconcile_pending ? "syncing relay…" : "relay synced");
       const effDesc = desiredMode === "fixed"
         ? `fixed ${fec.desired_fixed_ratio || ""}`.trim()
-        : modeLabel;
+        : (desiredMode === "min_adaptive"
+            ? `${modeLabel} (floor ${fec.floor_ratio || "?"})`
+            : modeLabel);
       eff.textContent = `effective: ${effDesc} · ${relayTxt}`;
     }
   }
   // Radios & dropdown availability follow whether FEC is configured at all,
   // plus the dropdown is only meaningful while Fixed mode is selected.
   $$('input[name="fec_mode"]').forEach(r => r.disabled = !fec.configured);
+  const checkedMode = document.querySelector('input[name="fec_mode"]:checked')?.value;
   const fixedSel = $("#fec-fixed-ratio");
-  const fixedChecked = document.querySelector('input[name="fec_mode"]:checked')?.value === "fixed";
-  if (fixedSel) fixedSel.disabled = !fec.configured || !fixedChecked;
+  const floorSel = $("#fec-floor-ratio");
+  if (fixedSel) fixedSel.disabled = !fec.configured || checkedMode !== "fixed";
+  if (floorSel) floorSel.disabled = !fec.configured || checkedMode !== "min_adaptive";
+  const fixedCustom = $("#fec-fixed-custom");
+  const floorCustom = $("#fec-floor-custom");
+  if (fixedCustom) fixedCustom.disabled = fixedSel ? fixedSel.disabled : true;
+  if (floorCustom) floorCustom.disabled = floorSel ? floorSel.disabled : true;
 }
 
 function renderFecCard(id, d, local){
@@ -724,7 +752,15 @@ async function apply(){
   const egressMode = document.querySelector('input[name="egress_mode"]:checked')?.value;
   const persist   = $("#persist").checked;
   const fecMode = document.querySelector('input[name="fec_mode"]:checked')?.value;
-  const fecFixed = $("#fec-fixed-ratio")?.value;
+  /* Send the raw entry; the server resolves x:y or percent and echoes back the
+     canonical ratio. The browser deliberately does no arithmetic here. */
+  const ratioOf = (selId, customId) => {
+    const sel = $(selId);
+    if (!sel) return null;
+    return sel.value === FEC_CUSTOM ? ($(customId)?.value || "").trim() : sel.value;
+  };
+  const fecFixed = ratioOf("#fec-fixed-ratio", "#fec-fixed-custom");
+  const fecFloor = ratioOf("#fec-floor-ratio", "#fec-floor-custom");
   const envSel = document.querySelector('input[name="environmental_enabled"]:checked')?.value;
   const maintSel = document.querySelector('input[name="maintenance_enabled"]:checked')?.value;
   const maintHour = $("#maintenance-hour")?.value;
@@ -739,6 +775,7 @@ async function apply(){
     const fecPayload = {};
     if (fecMode) fecPayload.fec_mode = fecMode;
     if (fecMode === "fixed" && fecFixed) fecPayload.fec_fixed_ratio = fecFixed;
+    if (fecMode === "min_adaptive" && fecFloor) fecPayload.fec_floor_ratio = fecFloor;
     const r = await fetch("/api/runtime", {
       method:"POST",
       headers:{"Content-Type":"application/json"},
@@ -787,7 +824,21 @@ $$(FORM_SELECTOR).forEach(el => {
     dirtyFields.add(fieldKey(el));
     if (el.name === "fec_mode"){
       const fixedSel = $("#fec-fixed-ratio");
+      const floorSel = $("#fec-floor-ratio");
       if (fixedSel) fixedSel.disabled = el.value !== "fixed";
+      if (floorSel) floorSel.disabled = el.value !== "min_adaptive";
+      const fixedCustom = $("#fec-fixed-custom");
+      const floorCustom = $("#fec-floor-custom");
+      if (fixedCustom) fixedCustom.disabled = fixedSel ? fixedSel.disabled : true;
+      if (floorCustom) floorCustom.disabled = floorSel ? floorSel.disabled : true;
+    }
+    if (el.id === "fec-fixed-ratio" || el.id === "fec-floor-ratio"){
+      const custom = $(el.id === "fec-fixed-ratio" ? "#fec-fixed-custom"
+                                                   : "#fec-floor-custom");
+      if (custom){
+        custom.hidden = el.value !== FEC_CUSTOM;
+        if (!custom.hidden) custom.focus();
+      }
     }
     if (el.name === "maintenance_enabled"){
       const hs = $("#maintenance-hour");

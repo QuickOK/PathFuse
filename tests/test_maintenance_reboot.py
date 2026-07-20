@@ -1247,9 +1247,9 @@ def test_classify_by_link_pages_on_an_unreadable_bfd_read(tmp_path, monkeypatch)
 
 def test_reboot_wan2_reboots_a_young_but_reachable_dish(tmp_path, monkeypatch):
     # the uptime guard is gone: a dish that was power-cycled recently (the
-    # operator unplugs Starlink at building stops, so its uptime is routinely
-    # low at the maintenance hour) must still get its reboot, not be skipped
-    # for being "too young"
+    # operator unplugs the satellite terminal during stops, so its uptime is
+    # routinely low at the maintenance hour) must still get its reboot, not be
+    # skipped for being "too young"
     cfg = write_cfg(tmp_path, dry_run=False)
     monkeypatch.setattr(M, "read_wan_states", both_up)
     clk = FakeClock()

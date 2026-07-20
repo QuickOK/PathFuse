@@ -515,6 +515,23 @@ body[data-layout="wall"] .panel.control { display: none; }
   font-size: 12px;
 }
 
+/* Manual ratio entry, revealed when its dropdown is set to Custom…. Matches
+   .ctl-select so the pair reads as one control. */
+.ctl-input {
+  margin-left: 6px;
+  background: var(--bg-base);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.ctl-input.ratio-custom { width: 9ch; }
+
+.ctl-input[hidden] { display: none; }
+
 .ctl-actions {
   display: flex;
   align-items: center;
