@@ -24,8 +24,11 @@ class FecState:
     """Thread-safe holder shared between the control loop and the HTTP server.
     The loop sets the published snapshot; POST /fec sets desired mode/ratio."""
 
-    def __init__(self, mode=None, fixed_ratio=None, floor_ratio=None,
-                 enabled=True):
+    # floor_ratio is keyword-only: it was added after `enabled`, and slotting a
+    # new positional in front of a legacy back-compat arg would silently
+    # reinterpret any existing FecState(mode, fixed, True) call.
+    def __init__(self, mode=None, fixed_ratio=None, enabled=True, *,
+                 floor_ratio=None):
         # Back-compat: an explicit enabled=False starts the relay in MODE_OFF
         # so callers that only know the legacy boolean still get sensible
         # behavior.
@@ -242,7 +245,7 @@ def read_worst_loss(state_path):
 
 
 def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
-             floor_ratio=None, pushed_loss=None):
+             pushed_loss=None, *, floor_ratio=None):
     """One control tick. Returns (new_runtime, ratio_now_or_current).
     The adaptive engine always advances so the loss-tracked level stays fresh;
     apply_mode then maps it through the operator-chosen mode.

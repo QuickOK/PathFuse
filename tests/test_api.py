@@ -385,8 +385,10 @@ def cfg_with_fec(tmp_path: Path):
                      loss_table=fec_control.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
                      ramp_down_hold_s=0, full_mode_backoff_fec="8:0", full_min_up_wans=3,
                      # distinct from fixed_ratio's default so a misordered
-                     # post_relay_fec argument list can't pass unnoticed
-                     floor_ratio="8:6"),
+                     # post_relay_fec argument list can't pass unnoticed, and
+                     # below the adaptive tier this test asserts so the floor
+                     # doesn't mask what the loss table chose
+                     floor_ratio="8:1"),
     )
 
 
@@ -540,8 +542,8 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
     assert t2o["loss_source"] == "relay"  # driven by relay-measured loss, not local
     assert t2o["actuator_ok"] is True
     assert pushed and pushed[0][1] == 1.5  # our relay->client measurement got pushed
-    assert pushed[0][0] == "8:6"           # the effective floor reached the relay
-    assert fec["floor_ratio"] == "8:6"     # and the UI sees the same value
+    assert pushed[0][0] == "8:1"           # the effective floor reached the relay
+    assert fec["floor_ratio"] == "8:1"     # and the UI sees the same value
     o2t = fec["directions"]["relay_to_client"]
     assert o2t["ratio"] == "8:2"
     assert o2t["ok"] is True
@@ -774,3 +776,16 @@ def test_validate_leaves_absent_ratio_keys_absent():
     assert ok is True
     assert "fec_floor_ratio" not in payload
     assert "fec_fixed_ratio" not in payload
+
+
+def test_effective_fec_ratios_survive_a_hand_edited_overlay(cfg):
+    # /var/lib and /etc are hand-editable. A junk ratio must degrade to the
+    # fallback, not reach write_fifo and break the 0.5s control loop.
+    ov = M.RuntimeOverlay(fec_floor_ratio="garbage", fec_fixed_ratio="9:")
+    assert M.effective_fec_floor_ratio(cfg, ov) == fec_control.DEFAULT_FLOOR_RATIO
+    assert M.effective_fec_fixed_ratio(cfg, ov) == fec_control.DEFAULT_FIXED_RATIO
+
+
+def test_effective_fec_ratios_normalize_a_hand_edited_percent(cfg):
+    ov = M.RuntimeOverlay(fec_floor_ratio="25%")
+    assert M.effective_fec_floor_ratio(cfg, ov) == "8:2"

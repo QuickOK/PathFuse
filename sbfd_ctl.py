@@ -1370,22 +1370,33 @@ def effective_fec_mode(cfg: Config, ov: RuntimeOverlay) -> str:
     return cfg.fec.mode
 
 
+def _safe_ratio(value: Optional[str], fallback: str) -> str:
+    """Coerce a ratio to canonical 'x:y', falling back if it is unusable.
+
+    The API normalizes on write, so stored values are already canonical — but
+    /var/lib and /etc are hand-editable, and an unusable ratio reaching
+    write_fifo would break the control loop rather than one request."""
+    if not value:
+        return fallback
+    try:
+        return fec_control.resolve_ratio(value)
+    except ValueError:
+        logging.warning("fec ratio %r unusable; falling back to %s", value, fallback)
+        return fallback
+
+
 def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     """The ratio used by MODE_FIXED — operator override wins, else cfg default."""
-    if ov.fec_fixed_ratio:
-        return ov.fec_fixed_ratio
-    if cfg.fec:
-        return cfg.fec.fixed_ratio
-    return fec_control.DEFAULT_FIXED_RATIO
+    cfg_fixed = _safe_ratio(cfg.fec.fixed_ratio if cfg.fec else None,
+                            fec_control.DEFAULT_FIXED_RATIO)
+    return _safe_ratio(ov.fec_fixed_ratio, cfg_fixed)
 
 
 def effective_fec_floor_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     """The floor used by MODE_MIN_ADAPTIVE — operator override wins, else cfg."""
-    if ov.fec_floor_ratio:
-        return ov.fec_floor_ratio
-    if cfg.fec:
-        return cfg.fec.floor_ratio
-    return fec_control.DEFAULT_FLOOR_RATIO
+    cfg_floor = _safe_ratio(cfg.fec.floor_ratio if cfg.fec else None,
+                            fec_control.DEFAULT_FLOOR_RATIO)
+    return _safe_ratio(ov.fec_floor_ratio, cfg_floor)
 
 
 def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:

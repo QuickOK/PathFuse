@@ -104,7 +104,10 @@ Redundancy ramps with measured loss and backs off when links are clean:
   (the default — adaptive with an always-on floor replacing the idle `8:0` tier). Both the fixed
   ratio and the floor are settable at runtime from the UI or `POST /api/runtime`
   (`fec_fixed_ratio`, `fec_floor_ratio`), persist through the usual runtime overlay, and are pushed
-  to the relay so both directions run the same values.
+  to the relay so both directions run the same *configured* values. Their *effective* adaptive
+  ratios can still differ: each direction is driven by its own loss measurement (see below), so one
+  leg may sit at a higher tier than the other. In `min_adaptive` the floor applies to every tier
+  below it, not just the idle `8:0`.
 - **Ratio entry:** either an explicit `x:y` or a percent of overhead — parity as a share of data, so
   `20:1` is 5%. A percent snaps to the nearest rung of `fec_control.RATIO_LADDER`
   (`8:0, 20:1, 8:1, 8:2, 8:4, 8:6, 8:8`), ties rounding up, so no untested ratio reaches UDPspeeder.

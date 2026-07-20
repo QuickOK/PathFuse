@@ -200,3 +200,31 @@ def test_ratio_ladder_is_ascending_and_contains_off():
     pcts = [F.ratio_overhead_pct(*F.parse_ratio(r)) for r in F.RATIO_LADDER]
     assert pcts == sorted(pcts)
     assert F.OFF_RATIO in F.RATIO_LADDER
+
+
+def test_min_adaptive_floor_holds_against_every_lower_tier():
+    # The bug this guards: apply_mode used to lift only the 8:0 idle tier, so a
+    # floor above the lowest non-off rung was silently ignored.
+    assert F.apply_mode("min_adaptive", "8:2", floor_ratio="8:4") == "8:4"
+    assert F.apply_mode("min_adaptive", "8:0", floor_ratio="8:4") == "8:4"
+    assert F.apply_mode("min_adaptive", "20:1", floor_ratio="8:1") == "8:1"
+
+
+def test_min_adaptive_keeps_adaptive_when_already_above_floor():
+    assert F.apply_mode("min_adaptive", "8:6", floor_ratio="8:2") == "8:6"
+    assert F.apply_mode("min_adaptive", "8:8", floor_ratio="20:1") == "8:8"
+
+
+def test_min_adaptive_equal_overhead_keeps_adaptive():
+    assert F.apply_mode("min_adaptive", "8:2", floor_ratio="8:2") == "8:2"
+
+
+def test_min_adaptive_survives_a_malformed_floor():
+    # A hand-edited overlay must not take down the control loop.
+    assert F.apply_mode("min_adaptive", "8:4", floor_ratio="garbage") == "8:4"
+
+
+def test_other_modes_ignore_the_floor():
+    assert F.apply_mode("off", "8:4", floor_ratio="8:8") == "8:0"
+    assert F.apply_mode("fixed", "8:4", fixed_ratio="8:1", floor_ratio="8:8") == "8:1"
+    assert F.apply_mode("adaptive", "8:0", floor_ratio="8:8") == "8:0"

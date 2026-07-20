@@ -170,8 +170,18 @@ def apply_mode(mode, adaptive_ratio, fixed_ratio=DEFAULT_FIXED_RATIO,
         return OFF_RATIO
     if mode == MODE_FIXED:
         return fixed_ratio
-    if mode == MODE_MIN_ADAPTIVE and adaptive_ratio == OFF_RATIO:
-        return floor_ratio
+    if mode == MODE_MIN_ADAPTIVE:
+        # A floor must hold against EVERY tier below it, not just the 8:0 idle
+        # tier. While the floor was hardcoded to 20:1 (5%) this never mattered —
+        # 5% sits below the lowest non-off rung (8:2 = 25%) — but an operator
+        # who sets a floor of 8:4 would otherwise see adaptive 8:2 sail under it.
+        try:
+            adaptive_pct = ratio_overhead_pct(*parse_ratio(adaptive_ratio))
+            floor_pct = ratio_overhead_pct(*parse_ratio(floor_ratio))
+        except (ValueError, AttributeError, ZeroDivisionError):
+            return adaptive_ratio
+        if adaptive_pct < floor_pct:
+            return floor_ratio
     return adaptive_ratio
 
 
