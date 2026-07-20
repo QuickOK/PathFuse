@@ -228,3 +228,22 @@ def test_other_modes_ignore_the_floor():
     assert F.apply_mode("off", "8:4", floor_ratio="8:8") == "8:0"
     assert F.apply_mode("fixed", "8:4", fixed_ratio="8:1", floor_ratio="8:8") == "8:1"
     assert F.apply_mode("adaptive", "8:0", floor_ratio="8:8") == "8:0"
+
+
+def test_safe_ratio_coerces_normalizes_and_falls_back():
+    assert F.safe_ratio("25%", "20:1") == "8:2"
+    assert F.safe_ratio("8:2", "20:1") == "8:2"
+    assert F.safe_ratio("garbage", "20:1") == "20:1"
+    assert F.safe_ratio(None, "20:1") == "20:1"
+    assert F.safe_ratio("", "20:1") == "20:1"
+
+
+def test_safe_ratio_warns_only_once_per_bad_value():
+    class _Log:
+        def __init__(self): self.n = 0
+        def warning(self, *a, **k): self.n += 1
+    log = _Log()
+    F._warned_ratios.discard("still-garbage")
+    for _ in range(5):
+        assert F.safe_ratio("still-garbage", "20:1", log) == "20:1"
+    assert log.n == 1   # a sub-second control loop must not spam the journal

@@ -20,21 +20,6 @@ import fec_control
 import fec_report
 
 
-def _safe_ratio(value, fallback):
-    """Coerce a ratio to canonical 'x:y', falling back if it is unusable.
-
-    The HTTP boundary normalizes on write, but the relay's config file is
-    hand-editable and an unusable ratio reaching write_fifo would break the
-    control loop rather than a single request."""
-    if not value:
-        return fallback
-    try:
-        return fec_control.resolve_ratio(value)
-    except ValueError:
-        logging.warning("fec ratio %r unusable; falling back to %s", value, fallback)
-        return fallback
-
-
 class FecState:
     """Thread-safe holder shared between the control loop and the HTTP server.
     The loop sets the published snapshot; POST /fec sets desired mode/ratio."""
@@ -53,7 +38,11 @@ class FecState:
                     else fec_control.MODE_OFF)
         self._mode = fec_control.normalize_mode(mode)
         self._fixed_ratio = fixed_ratio or fec_control.DEFAULT_FIXED_RATIO
-        self._floor_ratio = floor_ratio or fec_control.DEFAULT_FLOOR_RATIO
+        # Coerce here too: main() seeds this straight from the hand-editable
+        # config, and an uncoerced value would show up in GET /fec even though
+        # run_once resolves it before the FIFO ever sees it.
+        self._floor_ratio = fec_control.safe_ratio(
+            floor_ratio, fec_control.DEFAULT_FLOOR_RATIO, logging)
         self._pushed_loss = None
         self._pushed_loss_ts = 0.0
         self._snapshot = {
@@ -293,7 +282,7 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     # FecState; cfg is only the boot default, as for mode and fixed_ratio.
     if floor_ratio is None:
         floor_ratio = cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO)
-    floor_ratio = _safe_ratio(floor_ratio, fec_control.DEFAULT_FLOOR_RATIO)
+    floor_ratio = fec_control.safe_ratio(floor_ratio, fec_control.DEFAULT_FLOOR_RATIO, logging)
     if mode is None:
         mode = fec_control.MODE_ADAPTIVE if enabled else fec_control.MODE_OFF
     if fixed_ratio is None:

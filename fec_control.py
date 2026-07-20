@@ -100,6 +100,30 @@ def resolve_ratio(text):
     return best_rung
 
 
+_warned_ratios = set()
+
+
+def safe_ratio(value, fallback, logger=None):
+    """Coerce a ratio to canonical 'x:y', falling back if it is unusable.
+
+    The API boundary normalizes on write, so stored values are canonical — but
+    config and overlay files are hand-editable, and an unusable ratio reaching
+    write_fifo would break the control loop rather than a single request.
+
+    Warns once per distinct bad value: the callers run in a sub-second loop, so
+    an unconditional warning would spam the journal forever."""
+    if not value:
+        return fallback
+    try:
+        return resolve_ratio(value)
+    except ValueError:
+        if logger and value not in _warned_ratios:
+            _warned_ratios.add(value)
+            logger.warning("fec ratio %r unusable; falling back to %s",
+                           value, fallback)
+        return fallback
+
+
 def loss_to_level(loss_pct, table=DEFAULT_LOSS_TABLE):
     for i, row in enumerate(table):
         if loss_pct <= row["max_loss_pct"]:

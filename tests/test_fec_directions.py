@@ -249,3 +249,22 @@ def test_relay_desired_tuple_includes_floor():
     # so True here proves the floor difference alone drove the post.
     assert M.should_post_fec(desired, last_acked, 50.0, 60.0, 30.0) is True
     assert M.should_post_fec(desired, desired, 50.0, 60.0, 30.0) is False
+
+
+def test_relay_fec_direction_passes_through_floor_ratio():
+    # The relay publishes its own floor; the UI needs it to surface a
+    # mid-upgrade mismatch instead of hiding it.
+    fetch = {"ok": True, "error": None,
+             "data": {"enabled": True, "ratio": "8:2", "level": 1,
+                      "fixed_ratio": "8:4", "floor_ratio": "8:1"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5,
+                              desired=True, last_acked=True)
+    assert d["floor_ratio"] == "8:1"
+
+
+def test_relay_fec_direction_floor_none_when_absent():
+    # An older relay that doesn't publish a floor must not fault.
+    fetch = {"ok": True, "error": None, "data": {"ratio": "8:0"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5,
+                              desired=True, last_acked=True)
+    assert d["floor_ratio"] is None

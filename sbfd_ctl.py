@@ -736,6 +736,9 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked):
         "enabled": data.get("enabled"),
         "mode": data.get("mode"),
         "fixed_ratio": data.get("fixed_ratio"),
+        # The relay's own floor, so the UI can show a mid-upgrade mismatch
+        # rather than hiding it behind our locally-computed value.
+        "floor_ratio": data.get("floor_ratio"),
         "ratio": data.get("ratio"),
         "level": data.get("level"),
         "driving_loss_pct": data.get("driving_loss_pct"),
@@ -1370,33 +1373,18 @@ def effective_fec_mode(cfg: Config, ov: RuntimeOverlay) -> str:
     return cfg.fec.mode
 
 
-def _safe_ratio(value: Optional[str], fallback: str) -> str:
-    """Coerce a ratio to canonical 'x:y', falling back if it is unusable.
-
-    The API normalizes on write, so stored values are already canonical — but
-    /var/lib and /etc are hand-editable, and an unusable ratio reaching
-    write_fifo would break the control loop rather than one request."""
-    if not value:
-        return fallback
-    try:
-        return fec_control.resolve_ratio(value)
-    except ValueError:
-        logging.warning("fec ratio %r unusable; falling back to %s", value, fallback)
-        return fallback
-
-
 def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     """The ratio used by MODE_FIXED — operator override wins, else cfg default."""
-    cfg_fixed = _safe_ratio(cfg.fec.fixed_ratio if cfg.fec else None,
+    cfg_fixed = fec_control.safe_ratio(cfg.fec.fixed_ratio if cfg.fec else None,
                             fec_control.DEFAULT_FIXED_RATIO)
-    return _safe_ratio(ov.fec_fixed_ratio, cfg_fixed)
+    return fec_control.safe_ratio(ov.fec_fixed_ratio, cfg_fixed, logging)
 
 
 def effective_fec_floor_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     """The floor used by MODE_MIN_ADAPTIVE — operator override wins, else cfg."""
-    cfg_floor = _safe_ratio(cfg.fec.floor_ratio if cfg.fec else None,
+    cfg_floor = fec_control.safe_ratio(cfg.fec.floor_ratio if cfg.fec else None,
                             fec_control.DEFAULT_FLOOR_RATIO)
-    return _safe_ratio(ov.fec_floor_ratio, cfg_floor)
+    return fec_control.safe_ratio(ov.fec_floor_ratio, cfg_floor, logging)
 
 
 def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
