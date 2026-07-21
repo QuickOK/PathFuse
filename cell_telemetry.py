@@ -109,3 +109,72 @@ def load_config(path):
     if cfg.login_backoff_s < 0:
         raise ValueError("login_backoff_s must be >= 0")
     return cfg
+
+
+def read_signal(client):
+    """One fetch+extract. None when unreachable or NO metric was found —
+    all-None means an unauthenticated (or wrong-shape) response, and is the
+    trigger for the login fallback."""
+    model = client.fetch_model()
+    if model is None:
+        return None
+    reading = extract_signal(model)
+    return reading if any(v is not None for v in reading.values()) else None
+
+
+def _read_secret(path):
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except OSError as e:
+        log.warning("admin secret unreadable (%s): %s", path, e)
+        return None
+
+
+def poll_once(client, cfg, now, last_login_ts):
+    """One poll. Writes the state file on success (only then — a stale file is
+    the downstream failure signal). Falls back to an admin login at most once
+    per login_backoff_s when the unauthenticated read carries no signal."""
+    reading = read_signal(client)
+    if reading is None and cfg.secret_path and (
+            last_login_ts is None or now - last_login_ts >= cfg.login_backoff_s):
+        last_login_ts = now
+        password = _read_secret(cfg.secret_path)
+        if password and client.login(password):
+            reading = read_signal(client)
+        else:
+            log.warning("login fallback failed; will retry after backoff")
+    if reading is not None:
+        atomic_write_json(cfg.state_path, {**reading, "set_ts": now})
+    return reading, last_login_ts
+
+
+def run(cfg, stop_event=None):
+    if stop_event is None:
+        stop_event = threading.Event()
+    client = netgear_api.NetgearClient(cfg.admin_url, cfg.iface, cfg.cookie_jar)
+    last_login_ts = None
+    while not stop_event.is_set():
+        try:
+            _, last_login_ts = poll_once(client, cfg, time.time(), last_login_ts)
+        except Exception:  # noqa: BLE001 — a poll must never kill the daemon
+            log.exception("poll failed")
+        stop_event.wait(cfg.poll_interval_s)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="modem signal telemetry collector")
+    ap.add_argument("-c", "--config", required=True)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_config(args.config)
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    run(cfg, stop)
+
+
+if __name__ == "__main__":
+    main()

@@ -44,3 +44,66 @@ def test_load_config_defaults(tmp_path):
     assert cfg.state_path == "/run/sbfd-ctl/cell_telemetry.json"
     assert cfg.secret_path is None
     assert cfg.login_backoff_s == 60.0
+
+
+class FakeClient:
+    def __init__(self, models, login_ok=True):
+        self.models = list(models)      # one per fetch_model() call
+        self.login_ok = login_ok
+        self.login_calls = 0
+
+    def fetch_model(self):
+        return self.models.pop(0) if self.models else None
+
+    def login(self, password):
+        self.login_calls += 1
+        return self.login_ok
+
+
+def _cfg(tmp_path, **kw):
+    kw.setdefault("admin_url", "http://192.0.2.1")
+    kw.setdefault("state_path", str(tmp_path / "cell.json"))
+    return CT.CtCfg(**kw)
+
+
+def test_read_signal_none_when_all_metrics_absent():
+    assert CT.read_signal(FakeClient([{"session": {}}])) is None
+    assert CT.read_signal(FakeClient([None])) is None
+
+
+def test_poll_once_writes_state_with_set_ts(tmp_path):
+    cfg = _cfg(tmp_path)
+    reading, ts = CT.poll_once(FakeClient([MODEL]), cfg, now=1000.0,
+                               last_login_ts=None)
+    assert reading["rsrp"] == -98.0
+    on_disk = json.loads((tmp_path / "cell.json").read_text())
+    assert on_disk["set_ts"] == 1000.0 and on_disk["rsrq"] == -11.0
+    assert ts is None                    # no login was needed
+
+
+def test_poll_once_failure_leaves_state_untouched(tmp_path):
+    cfg = _cfg(tmp_path)
+    CT.poll_once(FakeClient([MODEL]), cfg, now=1000.0, last_login_ts=None)
+    CT.poll_once(FakeClient([None]), cfg, now=1010.0, last_login_ts=None)
+    assert json.loads((tmp_path / "cell.json").read_text())["set_ts"] == 1000.0
+
+
+def test_poll_once_login_fallback(tmp_path):
+    secret = tmp_path / "secret"
+    secret.write_text("hunter2\n")
+    cfg = _cfg(tmp_path, secret_path=str(secret))
+    # unauthenticated model lacks signal; post-login model has it
+    client = FakeClient([{"session": {}}, MODEL])
+    reading, ts = CT.poll_once(client, cfg, now=1000.0, last_login_ts=None)
+    assert client.login_calls == 1
+    assert reading["rsrp"] == -98.0 and ts == 1000.0
+
+
+def test_poll_once_login_backoff(tmp_path):
+    secret = tmp_path / "secret"
+    secret.write_text("hunter2")
+    cfg = _cfg(tmp_path, secret_path=str(secret))
+    client = FakeClient([{}, {}], login_ok=False)
+    _, ts = CT.poll_once(client, cfg, now=1000.0, last_login_ts=990.0)
+    assert client.login_calls == 0       # inside backoff window
+    assert ts == 990.0
