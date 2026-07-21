@@ -688,9 +688,13 @@ function renderCellSignal(s){
     `SINR ${fmt(c.sinr, ' dB')}`,
   ];
   if (c.band) parts.push(c.band);
+  const fec = s.fec || {};
+  const prof = fec.profile && fec.profile.name && fec.profile.name !== 'default'
+    ? ` · profile ${fec.profile.name}` : '';
+  const floor = fec.signal_floor_active ? ' · signal floor' : '';
   const stale = c.stale ? ' (stale)' : '';
   $('#fec-cell-readout').textContent =
-    `${(c.wan || 'wan1')} signal: ${parts.join(' · ')}${stale}`;
+    `${(c.wan || 'wan1')} signal: ${parts.join(' · ')}${stale}${prof}${floor}`;
 }
 
 function renderFecCard(id, d, local){
