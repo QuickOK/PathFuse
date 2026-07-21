@@ -35,7 +35,9 @@ sudo install -D -m0644 fec_report.py      /opt/sbfd-ctl/fec_report.py
 sudo install -D -m0755 environ_ctl.py     /opt/sbfd-ctl/environ_ctl.py   # optional: environmental redundancy (precip+smoke), needs gpsd reachable
 sudo install -d /opt/sbfd-ctl/ui && sudo install -m0644 ui/* /opt/sbfd-ctl/ui/
 sudo install -D -m0644 notify.py             /opt/sbfd-ctl/notify.py             # required by sbfd-ctl and hotspot_watchdog
+sudo install -D -m0644 netgear_api.py        /opt/sbfd-ctl/netgear_api.py        # required by hotspot_watchdog and cell_telemetry
 sudo install -D -m0755 hotspot_watchdog.py   /opt/sbfd-ctl/hotspot_watchdog.py   # optional: wan1 auto-reboot watchdog
+sudo install -D -m0755 cell_telemetry.py     /opt/sbfd-ctl/cell_telemetry.py     # optional: wan1 modem signal telemetry (feeds the FEC signal floor)
 sudo install -D -m0755 maintenance_reboot.py /opt/sbfd-ctl/maintenance_reboot.py # optional: daily maintenance reboot
 sudo install -D -m0755 deploy/ntfy-control/ntfy-dispatch /usr/local/sbin/ntfy-dispatch # optional: ntfy reboot-trigger dispatcher
 ```
