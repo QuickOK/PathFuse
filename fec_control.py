@@ -198,6 +198,51 @@ def step_level(target_level, rt, hyst, now):
     return FecRuntime(cur, 0, rt.last_change_ts), False
 
 
+@dataclass
+class SignalThresholds:
+    """RSRQ is primary with an explicit hysteresis pair; RSRP is consulted
+    ONLY when RSRQ is absent (some firmwares omit it), with its own 2 dB band."""
+    rsrq_degrade_db: float = -12.0
+    rsrq_recover_db: float = -10.0
+    rsrp_degrade_dbm: float = -110.0
+    rsrp_recover_dbm: float = -108.0
+
+
+class SignalFloor:
+    """Hysteretic radio-degradation latch. update() is called once per control
+    tick with the freshest telemetry (None = unavailable); callers gate
+    freshness — a stale sample must be passed as (None, None), which
+    disengages: measured loss stays the ground truth (fail-open)."""
+
+    def __init__(self, thresholds=None):
+        self.th = thresholds or SignalThresholds()
+        self.engaged = False
+
+    def update(self, rsrq, rsrp):
+        if rsrq is not None:
+            if rsrq < self.th.rsrq_degrade_db:
+                self.engaged = True
+            elif rsrq >= self.th.rsrq_recover_db:
+                self.engaged = False
+        elif rsrp is not None:
+            if rsrp < self.th.rsrp_degrade_dbm:
+                self.engaged = True
+            elif rsrp >= self.th.rsrp_recover_dbm:
+                self.engaged = False
+        else:
+            self.engaged = False
+        return self.engaged
+
+
+def apply_signal_floor(level, engaged, table, floor_fec=DEFAULT_SIGNAL_FLOOR_FEC):
+    """Lift the loss-driven level to the signal-floor rung while degraded.
+    ratio_to_level returns 0 for a ratio not in the table, making the floor a
+    no-op there — a profile/table mismatch must weaken, never break."""
+    if not engaged:
+        return level
+    return max(level, ratio_to_level(floor_fec, table))
+
+
 def apply_mode(mode, adaptive_ratio, fixed_ratio=DEFAULT_FIXED_RATIO,
                floor_ratio=DEFAULT_FLOOR_RATIO):
     """Map (mode, adaptive_ratio) → the ratio actually sent to UDPspeeder.

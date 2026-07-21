@@ -286,3 +286,38 @@ def test_cell_loss_table_tiers():
     assert F.level_to_ratio(F.loss_to_level(1.0, t), t) == "20:1"
     assert F.level_to_ratio(F.loss_to_level(3.0, t), t) == "12:1"
     assert F.level_to_ratio(F.loss_to_level(50.0, t), t) == "8:1"   # cap
+
+
+# ---------- hysteretic signal floor ----------
+
+def test_signal_floor_rsrq_hysteresis():
+    sf = F.SignalFloor()
+    assert sf.update(rsrq=-11.0, rsrp=None) is False   # above degrade
+    assert sf.update(rsrq=-12.5, rsrp=None) is True    # < -12 -> engage
+    assert sf.update(rsrq=-11.0, rsrp=None) is True    # in band -> hold
+    assert sf.update(rsrq=-9.5, rsrp=None) is False    # >= -10 -> release
+
+
+def test_signal_floor_rsrp_only_when_rsrq_absent():
+    sf = F.SignalFloor()
+    assert sf.update(rsrq=None, rsrp=-115.0) is True   # secondary engages
+    assert sf.update(rsrq=-9.0, rsrp=-115.0) is False  # rsrq present: it rules
+    sf2 = F.SignalFloor()
+    assert sf2.update(rsrq=None, rsrp=-115.0) is True
+    assert sf2.update(rsrq=None, rsrp=-109.0) is True   # in band -> hold
+    assert sf2.update(rsrq=None, rsrp=-107.0) is False  # >= -108 -> release
+
+
+def test_signal_floor_no_data_disengages():
+    sf = F.SignalFloor()
+    sf.update(rsrq=-13.0, rsrp=None)
+    assert sf.update(rsrq=None, rsrp=None) is False    # fail-open
+
+
+def test_apply_signal_floor_lifts_to_12_1_rung():
+    t = F.DEFAULT_CELL_LOSS_TABLE
+    assert F.apply_signal_floor(0, True, t) == 2       # 8:0 -> 12:1 rung
+    assert F.apply_signal_floor(3, True, t) == 3       # never lowers
+    assert F.apply_signal_floor(0, False, t) == 0
+    # floor ratio absent from the table -> no-op, never raises
+    assert F.apply_signal_floor(1, True, F.DEFAULT_LOSS_TABLE) == 1
