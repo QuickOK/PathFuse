@@ -133,3 +133,26 @@ def test_fec_explicit_mode_off_overrides_enabled_true():
     cfg = M.load_config(_write(d))
     assert cfg.fec.mode == F.MODE_OFF
     assert M.effective_fec_mode(cfg, M.RuntimeOverlay()) == F.MODE_OFF
+
+
+# ---------- per-WAN FEC profiles ----------
+
+def test_wan_profiles_parsed_with_cell_defaults():
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo",
+                "wan_profiles": {"wan1": {}}}
+    cfg = M.load_config(_write(d))
+    p = cfg.fec.wan_profiles["wan1"]
+    assert p.name == "wan1"
+    assert [r["fec"] for r in p.loss_table] == ["8:0", "20:1", "12:1", "8:1"]
+    assert p.ramp_up_ticks == 1
+    assert p.ramp_down_hold_s == 60.0
+    assert p.floor_ratio == "8:0"
+    assert p.signal_floor_fec == "12:1"
+
+
+def test_wan_profiles_absent_is_empty():
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo"}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.wan_profiles == {}

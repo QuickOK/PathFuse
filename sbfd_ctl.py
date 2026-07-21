@@ -74,6 +74,19 @@ class PolicyCfg:
 
 
 @dataclass
+class WanProfileCfg:
+    """Per-WAN FEC policy: table + hysteresis + floor applied while this WAN
+    is the fec driver. Defaults are the cellular spec values — a bare
+    `"wan1": {}` profile is the intended common case."""
+    name: str
+    loss_table: list
+    ramp_up_ticks: int
+    ramp_down_hold_s: float
+    floor_ratio: str
+    signal_floor_fec: str
+
+
+@dataclass
 class FecCfg:
     enabled: bool
     fifo: str
@@ -87,6 +100,7 @@ class FecCfg:
     mode: str = fec_control.DEFAULT_MODE
     fixed_ratio: str = fec_control.DEFAULT_FIXED_RATIO
     floor_ratio: str = fec_control.DEFAULT_FLOOR_RATIO
+    wan_profiles: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -706,14 +720,16 @@ def fec_loss_map(local, remote, remote_fresh, wans):
     return loss, source
 
 
-def compute_fec_target(fec_cfg, mode, eff, loss, active_wans):
+def compute_fec_target(fec_cfg, mode, eff, loss, active_wans, loss_table=None):
     """Pure: map mode/effective-state/loss to a FEC table level (the
     pre-fec-mode-override adaptive choice). Loss = worst among the WANs
-    actually carrying traffic."""
+    actually carrying traffic. loss_table overrides fec_cfg's (per-WAN
+    profiles); None keeps the global table."""
+    table = loss_table if loss_table is not None else fec_cfg.loss_table
     up_count = sum(1 for w, st in eff.items() if st == "UP")
     active_loss = worst_active_loss(loss, active_wans)
     return fec_control.mode_aware_level(
-        mode, up_count, active_loss, fec_cfg.loss_table,
+        mode, up_count, active_loss, table,
         fec_cfg.full_min_up_wans, fec_cfg.full_mode_backoff_fec)
 
 
@@ -724,6 +740,21 @@ def fec_driver_wan(loss, active_wans):
     if not active:
         return None
     return max(active, key=lambda w: loss.get(w, 0.0))
+
+
+def resolve_fec_profile(fec_cfg, driver_wan):
+    """(name, loss_table, hysteresis, profile_floor, signal_floor_fec) for the
+    current fec driver WAN. profile_floor is None for the default profile so
+    effective_fec_floor_ratio falls through to the config default."""
+    p = fec_cfg.wan_profiles.get(driver_wan) if driver_wan else None
+    if p is None:
+        return ("default", fec_cfg.loss_table,
+                fec_control.FecHysteresis(fec_cfg.ramp_up_ticks,
+                                          fec_cfg.ramp_down_hold_s),
+                None, fec_control.DEFAULT_SIGNAL_FLOOR_FEC)
+    return (p.name, p.loss_table,
+            fec_control.FecHysteresis(p.ramp_up_ticks, p.ramp_down_hold_s),
+            p.floor_ratio, p.signal_floor_fec)
 
 
 def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
@@ -1083,6 +1114,17 @@ def load_config(path: str) -> Config:
                             else fec_control.MODE_OFF)
             else:
                 cfg_mode = fec_control.DEFAULT_MODE
+            profiles = {}
+            for wname, praw in (raw_fec.get("wan_profiles") or {}).items():
+                profiles[wname] = WanProfileCfg(
+                    name=wname,
+                    loss_table=praw.get("loss_table",
+                                        fec_control.DEFAULT_CELL_LOSS_TABLE),
+                    ramp_up_ticks=int(praw.get("ramp_up_ticks", 1)),
+                    ramp_down_hold_s=float(praw.get("ramp_down_hold_s", 60.0)),
+                    floor_ratio=praw.get("floor_ratio", "8:0"),
+                    signal_floor_fec=praw.get(
+                        "signal_floor_fec", fec_control.DEFAULT_SIGNAL_FLOOR_FEC))
             fec_cfg = FecCfg(
                 # Derive `enabled` from the resolved mode so an explicit `mode`
                 # always wins over the deprecated `enabled` bool. Leaving a
@@ -1100,6 +1142,7 @@ def load_config(path: str) -> Config:
                 mode=cfg_mode,
                 fixed_ratio=raw_fec.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
                 floor_ratio=raw_fec.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO),
+                wan_profiles=profiles,
             )
 
         raw_env = raw.get("environmental")
@@ -1451,11 +1494,16 @@ def effective_fec_fixed_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
     return fec_control.safe_ratio(ov.fec_fixed_ratio, cfg_fixed, logging)
 
 
-def effective_fec_floor_ratio(cfg: Config, ov: RuntimeOverlay) -> str:
-    """The floor used by MODE_MIN_ADAPTIVE — operator override wins, else cfg."""
+def effective_fec_floor_ratio(cfg: Config, ov: RuntimeOverlay,
+                              profile_floor: Optional[str] = None) -> str:
+    """Floor precedence: operator runtime override > active WAN profile >
+    config default. The profile slot lets the cellular profile drop the
+    min_adaptive floor to 8:0 (true zero) without a mode change."""
     cfg_floor = fec_control.safe_ratio(cfg.fec.floor_ratio if cfg.fec else None,
                                        fec_control.DEFAULT_FLOOR_RATIO, logging)
-    return fec_control.safe_ratio(ov.fec_floor_ratio, cfg_floor, logging)
+    base = fec_control.safe_ratio(profile_floor, cfg_floor, logging) \
+        if profile_floor is not None else cfg_floor
+    return fec_control.safe_ratio(ov.fec_floor_ratio, base, logging)
 
 
 def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
