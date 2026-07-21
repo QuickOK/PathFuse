@@ -8,3 +8,4 @@ state.json
 deploy/values.json
 deploy/out/
 docs/superpowers/
+*.pdf
