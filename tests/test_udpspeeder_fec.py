@@ -641,3 +641,25 @@ def test_post_unknown_wan_profile_rejected():
         assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == ("wan1", True)
     finally:
         httpd.shutdown()
+
+
+def test_lone_signal_floor_accepted_but_inert_by_design():
+    # C7 (ratified design decision, do NOT change the code): signal_floor is
+    # part of the profile contract, not a standalone toggle — pushing it
+    # without a wan_profile EVER pushed for this link is a no-op on the base
+    # table anyway, so it 200s but get_pushed_link still reports (None,
+    # False). This pins that behavior against an accidental "fix" later.
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+    try:
+        host, port = httpd.server_address[:2]
+        body = json.dumps({"signal_floor": True}).encode()
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == (None, False)
+    finally:
+        httpd.shutdown()
