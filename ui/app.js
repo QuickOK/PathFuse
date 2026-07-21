@@ -678,6 +678,7 @@ function renderFec(s){
 
 function renderCellSignal(s){
   const line = $('#fec-cell-line');
+  if (!line) return;
   const c = s.cell;
   if (!c || !c.configured){ line.hidden = true; return; }
   line.hidden = false;
