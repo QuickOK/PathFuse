@@ -342,6 +342,7 @@ function render(s){
   renderDynamic(s);
   renderFailback(s);
   renderFec(s);
+  renderCellSignal(s);
   renderEnvironmental(s);
   renderMaintenance(s);
 
@@ -673,6 +674,23 @@ function renderFec(s){
   const floorCustom = $("#fec-floor-custom");
   if (fixedCustom) fixedCustom.disabled = fixedSel ? fixedSel.disabled : true;
   if (floorCustom) floorCustom.disabled = floorSel ? floorSel.disabled : true;
+}
+
+function renderCellSignal(s){
+  const line = $('#fec-cell-line');
+  const c = s.cell;
+  if (!c || !c.configured){ line.hidden = true; return; }
+  line.hidden = false;
+  const fmt = (v, unit) => (v == null ? '—' : `${v}${unit}`);
+  const parts = [
+    `RSRQ ${fmt(c.rsrq, ' dB')}`,
+    `RSRP ${fmt(c.rsrp, ' dBm')}`,
+    `SINR ${fmt(c.sinr, ' dB')}`,
+  ];
+  if (c.band) parts.push(c.band);
+  const stale = c.stale ? ' (stale)' : '';
+  $('#fec-cell-readout').textContent =
+    `${(c.wan || 'wan1')} signal: ${parts.join(' · ')}${stale}`;
 }
 
 function renderFecCard(id, d, local){
