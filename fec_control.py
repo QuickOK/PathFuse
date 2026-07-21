@@ -159,6 +159,16 @@ def ratio_to_level(ratio, table=DEFAULT_LOSS_TABLE):
     return 0
 
 
+def is_level_at_max(level, table=DEFAULT_LOSS_TABLE):
+    """True once the adaptive engine has climbed to the top row of the
+    ACTIVE profile's table. Callers must pass the profile table actually
+    driving the level (e.g. resolve_fec_profile's prof_table) — comparing
+    against a different table (like the base cfg.fec.loss_table while a
+    shorter cellular profile table is active) under- or over-counts the
+    max index and silently breaks the fec-at-max notification."""
+    return level >= len(table) - 1
+
+
 def mode_aware_level(mode, up_count, loss_pct, table=DEFAULT_LOSS_TABLE,
                      full_min_up_wans=2, backoff_ratio="8:0"):
     """In full-redundancy with enough healthy links, engarde already

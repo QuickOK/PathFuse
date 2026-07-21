@@ -41,6 +41,18 @@ def test_ratio_to_level():
     assert F.ratio_to_level("nonsense") == 0   # unknown -> 0 (safe/off)
 
 
+def test_is_level_at_max_uses_the_given_table_not_a_fixed_length():
+    # Default (5-row) table: max index is 4.
+    assert F.is_level_at_max(3) is False
+    assert F.is_level_at_max(4) is True
+    # A shorter (4-row) cellular-style profile table: max index is 3, so a
+    # level of 3 must already read as "at max" against THAT table, even
+    # though it would read as "not at max" against the 5-row default table.
+    short_table = F.DEFAULT_LOSS_TABLE[:4]
+    assert F.is_level_at_max(3, short_table) is True
+    assert F.is_level_at_max(2, short_table) is False
+
+
 def test_mode_aware_backoff_in_full_with_two_up():
     assert F.mode_aware_level("full", up_count=2, loss_pct=9.0) == 0
 

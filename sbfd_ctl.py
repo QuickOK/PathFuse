@@ -2577,7 +2577,13 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     pass
                 if fec_mode_eff in (fec_control.MODE_ADAPTIVE,
                                     fec_control.MODE_MIN_ADAPTIVE):
-                    fec_at_max = fec_rt.current_level >= len(cfg.fec.loss_table) - 1
+                    # Compare against the ACTIVE profile's table, not the
+                    # base cfg.fec.loss_table — a shorter cellular-profile
+                    # table (e.g. 4 rows, max index 3) means current_level
+                    # never reaches len(cfg.fec.loss_table) - 1, permanently
+                    # suppressing the fec-at-max notification.
+                    fec_at_max = fec_control.is_level_at_max(
+                        fec_rt.current_level, prof_table)
             for _ev in detector.observe(notify.Observation(
                     wan_states={w: eff.get(w, "UNKNOWN") for w in cfg.wans},
                     wan_labels={w: cfg.wans[w].label for w in cfg.wans},
