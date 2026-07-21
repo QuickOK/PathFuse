@@ -87,8 +87,11 @@ class NetgearClient:
         as a success, which then credits a reboot that never happened."""
         try:
             Path(self.cookie_jar).unlink()
-        except OSError:
-            pass                          # absent (the normal case) or unremovable
+        except FileNotFoundError:
+            pass                          # absent — the normal case
+        except OSError as e:
+            log.warning("cookie jar %s not removable: %s — login may read "
+                        "back a stale session", self.cookie_jar, e)
 
     def fetch_model(self):
         out = self._curl(["-L", f"{self.admin_url}/api/model.json?internalapi=1"])

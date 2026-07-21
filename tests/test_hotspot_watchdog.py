@@ -261,6 +261,27 @@ def test_login_starts_from_a_fresh_cookie_jar(tmp_path):
     assert not jar.exists()                          # dropped before the attempt
 
 
+def test_reset_cookies_warns_but_does_not_raise_on_unexpected_oserror(tmp_path, monkeypatch, caplog):
+    # C5: FileNotFoundError (jar absent) is the normal, silent case; any
+    # OTHER OSError (e.g. the jar is unremovable — permissions, read-only fs)
+    # must be logged, not silently swallowed, since login would then read
+    # back a stale session — but it must still not raise and block login.
+    import netgear_api
+
+    jar = tmp_path / "jar.txt"
+    jar.write_text("stale")
+
+    def _boom(self):
+        raise PermissionError("nope")
+    monkeypatch.setattr(netgear_api.Path, "unlink", _boom)
+
+    r = FakeRunner([FIXTURE, "", FIXTURE])
+    c = W.NetgearClient("http://192.0.2.1", "wan1", str(jar), runner=r)
+    with caplog.at_level("WARNING"):
+        assert c.login("wrong") is False   # does not raise
+    assert any("not removable" in rec.message for rec in caplog.records)
+
+
 def test_login_rejected_when_hotspot_redirects_to_error():
     # login posts err_redirect=/error.json, so an error Location is conclusive.
     admin = FIXTURE.replace('"Guest"', '"Admin"')
