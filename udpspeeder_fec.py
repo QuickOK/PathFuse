@@ -312,6 +312,28 @@ def read_worst_loss(state_path):
     return (max(losses) if losses else 0.0), up
 
 
+_warned_profile_values = set()
+
+
+def _coerce_profile_field(value, fallback, field, caster):
+    """Coerce a per-profile numeric field (ramp_up_ticks/ramp_down_hold_s)
+    from the hand-editable relay config, falling back to the cellular
+    default on anything caster can't handle. This runs every tick inside
+    run_once, so a bad value (e.g. "garbage") must never raise and kill the
+    daemon — but it also must not warn every tick forever, so it's debounced
+    once per distinct (field, value), mirroring fec_control.safe_ratio's
+    debounce."""
+    try:
+        return caster(value)
+    except (TypeError, ValueError):
+        key = (field, repr(value))
+        if key not in _warned_profile_values:
+            _warned_profile_values.add(key)
+            logging.warning("wan_profile.%s=%r unusable; falling back to %r",
+                            field, value, fallback)
+        return fallback
+
+
 def resolve_relay_profile(cfg, name):
     """(loss_table, hysteresis, signal_floor_fec) for a pushed profile name.
     None/'default'/unknown all resolve to the base config — the relay must
@@ -327,9 +349,12 @@ def resolve_relay_profile(cfg, name):
                 fec_control.FecHysteresis(cfg["ramp_up_ticks"],
                                           cfg["ramp_down_hold_s"]),
                 fec_control.DEFAULT_SIGNAL_FLOOR_FEC)
+    ramp_up_ticks = _coerce_profile_field(
+        p.get("ramp_up_ticks", 1), 1, "ramp_up_ticks", int)
+    ramp_down_hold_s = _coerce_profile_field(
+        p.get("ramp_down_hold_s", 60.0), 60.0, "ramp_down_hold_s", float)
     return (p.get("loss_table", fec_control.DEFAULT_CELL_LOSS_TABLE),
-            fec_control.FecHysteresis(int(p.get("ramp_up_ticks", 1)),
-                                      float(p.get("ramp_down_hold_s", 60.0))),
+            fec_control.FecHysteresis(ramp_up_ticks, ramp_down_hold_s),
             p.get("signal_floor_fec", fec_control.DEFAULT_SIGNAL_FLOOR_FEC))
 
 

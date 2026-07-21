@@ -595,6 +595,26 @@ def test_resolve_relay_profile_default_and_named():
     assert table is cfg["loss_table"]
 
 
+def test_resolve_relay_profile_coerces_garbage_ramp_fields(monkeypatch):
+    # C10: the relay config is hand-editable JSON and this runs per-tick
+    # inside run_once (which has no broad except) — a bad ramp_up_ticks must
+    # fall back to the cellular default (1) rather than raising and killing
+    # the daemon.
+    warnings = []
+    monkeypatch.setattr(U.logging, "warning", lambda *a, **k: warnings.append((a, k)))
+    U._warned_profile_values.clear()
+    cfg = {"loss_table": F.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 2,
+           "ramp_down_hold_s": 20.0,
+           "wan_profiles": {"wan1": {"ramp_up_ticks": "garbage"}}}
+    table, hyst, sf = U.resolve_relay_profile(cfg, "wan1")
+    assert hyst.ramp_up_ticks == 1          # fell back to the cellular default
+    assert hyst.ramp_down_hold_s == 60.0    # untouched field still defaults normally
+    assert len(warnings) == 1
+    # A second call with the SAME bad value must not warn again.
+    U.resolve_relay_profile(cfg, "wan1")
+    assert len(warnings) == 1
+
+
 def test_run_once_uses_pushed_profile_and_signal_floor(tmp_path):
     fifo = tmp_path / "fifo"; os.mkfifo(fifo)
     fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)   # give the fifo a reader
