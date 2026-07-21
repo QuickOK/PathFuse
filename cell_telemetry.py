@@ -145,7 +145,10 @@ def poll_once(client, cfg, now, last_login_ts):
         else:
             log.warning("login fallback failed; will retry after backoff")
     if reading is not None:
-        atomic_write_json(cfg.state_path, {**reading, "set_ts": now})
+        try:
+            atomic_write_json(cfg.state_path, {**reading, "set_ts": now})
+        except OSError as e:
+            log.warning("state write failed (%s): %s", cfg.state_path, e)
     return reading, last_login_ts
 
 

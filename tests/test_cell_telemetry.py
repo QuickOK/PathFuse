@@ -107,3 +107,19 @@ def test_poll_once_login_backoff(tmp_path):
     _, ts = CT.poll_once(client, cfg, now=1000.0, last_login_ts=990.0)
     assert client.login_calls == 0       # inside backoff window
     assert ts == 990.0
+
+
+def test_poll_once_state_write_failure_preserves_login_backoff(tmp_path):
+    """A failed state-file persist (e.g. state dir missing) must not look
+    like a failed poll: the reading is still returned and last_login_ts
+    still advances, so the caller's backoff bookkeeping survives and the
+    next poll doesn't hammer the modem's admin login endpoint again."""
+    secret = tmp_path / "secret"
+    secret.write_text("hunter2")
+    unwritable_state_path = str(tmp_path / "nosuchdir" / "cell.json")
+    cfg = _cfg(tmp_path, secret_path=str(secret), state_path=unwritable_state_path)
+    client = FakeClient([{"session": {}}, MODEL])
+    reading, ts = CT.poll_once(client, cfg, now=1000.0, last_login_ts=None)
+    assert reading["rsrp"] == -98.0
+    assert ts == 1000.0
+    assert client.login_calls == 1
