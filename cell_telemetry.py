@@ -57,6 +57,18 @@ def _num(v):
     return None
 
 
+def _text(v):
+    """Coerce a metric to a plain identity string: bool and anything that
+    isn't str/int/float (dicts, lists, ...) is junk — a wrong-shape or
+    unauthenticated model.json can nest an object/array where a scalar cell
+    ID or band is expected, and str()'ing that would publish garbage AND
+    make the reading count as 'signal present', blocking the login
+    fallback in read_signal."""
+    if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+        return None
+    return str(v).strip() or None
+
+
 def extract_signal(model):
     """Best-effort pull of the five metrics. Keys always present; values None
     when absent/unparseable. Never raises."""
@@ -67,7 +79,7 @@ def extract_signal(model):
             raw = _dig(model, path)
             if raw is None:
                 continue
-            val = _num(raw) if metric in ("rsrp", "rsrq", "sinr") else str(raw)
+            val = _num(raw) if metric in ("rsrp", "rsrq", "sinr") else _text(raw)
             if val is not None:
                 break
         out[metric] = val

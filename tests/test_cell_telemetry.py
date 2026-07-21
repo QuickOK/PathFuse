@@ -27,6 +27,17 @@ def test_extract_signal_handles_non_dict():
                                        "cell_id": None, "band": None}
 
 
+def test_extract_signal_rejects_malformed_identity_fields():
+    # cellId/curBand nested as dict/list (wrong-shape or unauthenticated
+    # model.json) must not be str()'d into garbage, and must not count as
+    # "signal present" for read_signal's login-fallback trigger.
+    m = {"wwanadv": {"cellId": {"a": 1}, "curBand": ["x"]}}
+    r = CT.extract_signal(m)
+    assert r == {"rsrp": None, "rsrq": None, "sinr": None,
+                 "cell_id": None, "band": None}
+    assert CT.read_signal(FakeClient([m])) is None
+
+
 def test_atomic_write_json(tmp_path):
     p = tmp_path / "out.json"
     CT.atomic_write_json(str(p), {"a": 1})
