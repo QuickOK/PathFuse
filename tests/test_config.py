@@ -4,6 +4,8 @@ from pathlib import Path
 
 import sbfd_ctl
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 SAMPLE = {
     "wans": {
@@ -295,6 +297,8 @@ def test_cell_telemetry_config_parsed(tmp_path: Path):
     assert cfg.cell.wan == "wan1"
     assert cfg.cell.stale_after_s == 10.0
     assert cfg.cell.rsrq_degrade_db == -12.0
+    assert cfg.cell.rsrp_degrade_dbm == -110.0
+    assert cfg.cell.rsrp_recover_dbm == -108.0
 
 
 def test_cell_telemetry_absent_is_none(tmp_path: Path):
@@ -314,6 +318,29 @@ def test_cell_telemetry_recover_must_exceed_degrade(tmp_path: Path):
         sbfd_ctl.load_config(str(p))
 
 
+def test_cell_telemetry_rsrp_recover_must_exceed_degrade(tmp_path: Path):
+    # C9: rsrp_recover_dbm is now operator-configurable alongside
+    # rsrp_degrade_dbm — mirror the RSRQ hysteresis validation.
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "rsrp_degrade_dbm": -108,
+                              "rsrp_recover_dbm": -110}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="rsrp_recover_dbm"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_cell_telemetry_rsrp_recover_dbm_configurable(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "rsrp_degrade_dbm": -112,
+                              "rsrp_recover_dbm": -105}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(cfgd))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.cell.rsrp_degrade_dbm == -112.0
+    assert cfg.cell.rsrp_recover_dbm == -105.0
+
+
 def test_cell_telemetry_rejects_zero_stale_after_s(tmp_path: Path):
     cfgd = dict(SAMPLE)
     cfgd["cell_telemetry"] = {"state_path": "/x", "stale_after_s": 0}
@@ -321,3 +348,33 @@ def test_cell_telemetry_rejects_zero_stale_after_s(tmp_path: Path):
     p.write_text(json.dumps(cfgd))
     with pytest.raises(ValueError, match="stale_after_s"):
         sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_rejects_cell_telemetry_wan_not_in_wans(tmp_path: Path):
+    # C11: a hand-edited cell_telemetry.wan referencing a WAN that doesn't
+    # exist must fail fast at boot, not silently never match any driver.
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "wan": "wan9"}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="cell_telemetry.wan"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_rejects_fec_wan_profiles_key_not_in_wans(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["fec"] = {"fifo": "/tmp/none.fifo",
+                   "wan_profiles": {"wan9": {}}}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="fec.wan_profiles"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_shipped_example_config_still_loads_with_new_wan_reference_checks():
+    # C11's new validations (cell_telemetry.wan / fec.wan_profiles keys must
+    # be in wans) must not break the shipped example — its keys are all
+    # wan1, which is valid.
+    cfg = sbfd_ctl.load_config(str(ROOT / "config" / "sbfd-ctl.example.json"))
+    assert cfg.cell.wan in cfg.wans
+    assert all(w in cfg.wans for w in cfg.fec.wan_profiles)

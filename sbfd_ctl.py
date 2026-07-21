@@ -120,6 +120,7 @@ class CellTelemetryCfg:
     rsrq_degrade_db: float = -12.0
     rsrq_recover_db: float = -10.0
     rsrp_degrade_dbm: float = -110.0
+    rsrp_recover_dbm: float = -108.0
 
 
 @dataclass
@@ -1185,7 +1186,8 @@ def load_config(path: str) -> Config:
                 stale_after_s=float(raw_cell.get("stale_after_s", 10.0)),
                 rsrq_degrade_db=float(raw_cell.get("rsrq_degrade_db", -12.0)),
                 rsrq_recover_db=float(raw_cell.get("rsrq_recover_db", -10.0)),
-                rsrp_degrade_dbm=float(raw_cell.get("rsrp_degrade_dbm", -110.0)))
+                rsrp_degrade_dbm=float(raw_cell.get("rsrp_degrade_dbm", -110.0)),
+                rsrp_recover_dbm=float(raw_cell.get("rsrp_recover_dbm", -108.0)))
 
         raw_notif = raw.get("notifications")
         notif_cfg = None
@@ -1251,6 +1253,16 @@ def load_config(path: str) -> Config:
             raise ValueError("cell_telemetry.stale_after_s must be > 0")
         if cell_cfg.rsrq_recover_db <= cell_cfg.rsrq_degrade_db:
             raise ValueError("cell_telemetry.rsrq_recover_db must be > rsrq_degrade_db")
+        if cell_cfg.rsrp_recover_dbm <= cell_cfg.rsrp_degrade_dbm:
+            raise ValueError("cell_telemetry.rsrp_recover_dbm must be > rsrp_degrade_dbm")
+        if cell_cfg.wan not in wans:
+            raise ValueError(
+                f"cell_telemetry.wan {cell_cfg.wan!r} not in wans={list(wans)}")
+    if fec_cfg is not None:
+        for wname in fec_cfg.wan_profiles:
+            if wname not in wans:
+                raise ValueError(
+                    f"fec.wan_profiles key {wname!r} not in wans={list(wans)}")
     if cfg.notifications is not None:
         if not cfg.notifications.topic:
             raise ValueError("notifications.topic must be a non-empty string")
@@ -2166,7 +2178,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     fec_signal_floor = fec_control.SignalFloor(fec_control.SignalThresholds(
         rsrq_degrade_db=cfg.cell.rsrq_degrade_db,
         rsrq_recover_db=cfg.cell.rsrq_recover_db,
-        rsrp_degrade_dbm=cfg.cell.rsrp_degrade_dbm)
+        rsrp_degrade_dbm=cfg.cell.rsrp_degrade_dbm,
+        rsrp_recover_dbm=cfg.cell.rsrp_recover_dbm)
         if cfg.cell else None)
     fec_signal_engaged = False
     fec_signal_floor_applied = False
