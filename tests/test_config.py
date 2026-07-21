@@ -283,3 +283,41 @@ def test_maintenance_hour_bool_rejected(tmp_path: Path):
     # int(True) == 1: a boolean hour must not read as 1am.
     with pytest.raises(ValueError, match="maintenance_reboot.hour"):
         _cfg_with_maint(tmp_path, {"enabled": True, "hour": True})
+
+
+def test_cell_telemetry_config_parsed(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/run/sbfd-ctl/cell_telemetry.json"}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(cfgd))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.cell.state_path == "/run/sbfd-ctl/cell_telemetry.json"
+    assert cfg.cell.wan == "wan1"
+    assert cfg.cell.stale_after_s == 10.0
+    assert cfg.cell.rsrq_degrade_db == -12.0
+
+
+def test_cell_telemetry_absent_is_none(tmp_path: Path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(SAMPLE))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.cell is None
+
+
+def test_cell_telemetry_recover_must_exceed_degrade(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "rsrq_degrade_db": -10,
+                              "rsrq_recover_db": -12}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="rsrq_recover_db"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_cell_telemetry_rejects_zero_stale_after_s(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "stale_after_s": 0}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="stale_after_s"):
+        sbfd_ctl.load_config(str(p))

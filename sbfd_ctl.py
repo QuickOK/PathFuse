@@ -97,6 +97,18 @@ class EnvironmentalCfg:
 
 
 @dataclass
+class CellTelemetryCfg:
+    """Reader side of cell_telemetry.py's state file. Thresholds live here
+    (not in the collector) because the FEC controller is the one consumer."""
+    state_path: str
+    wan: str = "wan1"
+    stale_after_s: float = 10.0
+    rsrq_degrade_db: float = -12.0
+    rsrq_recover_db: float = -10.0
+    rsrp_degrade_dbm: float = -110.0
+
+
+@dataclass
 class MaintenanceCfg:
     """Nightly one-at-a-time WAN reboot. `enabled`/`hour` here are boot-time
     DEFAULTS only — the operator's runtime overlay wins in either direction.
@@ -123,6 +135,7 @@ class Config:
     fec: Optional[FecCfg] = None
     environmental: Optional[EnvironmentalCfg] = None
     maintenance: Optional[MaintenanceCfg] = None
+    cell: Optional[CellTelemetryCfg] = None
     notifications: Optional["notify.NotifyCfg"] = None
     map: object = None                 # raw `map` config section (dict | None)
 
@@ -1116,6 +1129,17 @@ def load_config(path: str) -> Config:
                     "path", "/run/sbfd-ctl/maintenance_window.json"),
             )
 
+        raw_cell = raw.get("cell_telemetry")
+        cell_cfg = None
+        if raw_cell is not None:
+            cell_cfg = CellTelemetryCfg(
+                state_path=raw_cell["state_path"],
+                wan=str(raw_cell.get("wan", "wan1")),
+                stale_after_s=float(raw_cell.get("stale_after_s", 10.0)),
+                rsrq_degrade_db=float(raw_cell.get("rsrq_degrade_db", -12.0)),
+                rsrq_recover_db=float(raw_cell.get("rsrq_recover_db", -10.0)),
+                rsrp_degrade_dbm=float(raw_cell.get("rsrp_degrade_dbm", -110.0)))
+
         raw_notif = raw.get("notifications")
         notif_cfg = None
         if raw_notif is not None:
@@ -1144,6 +1168,7 @@ def load_config(path: str) -> Config:
             fec=fec_cfg,
             environmental=env_cfg,
             maintenance=maint_cfg,
+            cell=cell_cfg,
             notifications=notif_cfg,
             map=raw.get("map"),
         )
@@ -1174,6 +1199,11 @@ def load_config(path: str) -> Config:
     if maint_cfg is not None and not 0 <= maint_cfg.hour <= 23:
         raise ValueError(
             f"maintenance_reboot.hour must be 0..23, got {maint_cfg.hour}")
+    if cell_cfg is not None:
+        if cell_cfg.stale_after_s <= 0:
+            raise ValueError("cell_telemetry.stale_after_s must be > 0")
+        if cell_cfg.rsrq_recover_db <= cell_cfg.rsrq_degrade_db:
+            raise ValueError("cell_telemetry.rsrq_recover_db must be > rsrq_degrade_db")
     if cfg.notifications is not None:
         if not cfg.notifications.topic:
             raise ValueError("notifications.topic must be a non-empty string")
@@ -1346,6 +1376,43 @@ def load_maintenance_window(cfg: Config, now: float) -> Optional[dict]:
     if now >= until:
         return None
     return raw
+
+
+def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
+    """Last modem telemetry reading — validated/coerced but NOT staleness-
+    filtered: the UI wants last-known + a stale flag, and the FEC signal
+    floor does its own freshness gate. Fail-open like load_auto_override."""
+    if cfg.cell is None:
+        return None
+    try:
+        raw = _json.loads(Path(cfg.cell.state_path).read_text())
+        set_ts = float(raw["set_ts"])
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+        return None
+    out = {"set_ts": set_ts}
+    for k in ("rsrp", "rsrq", "sinr"):
+        v = raw.get(k)
+        out[k] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    for k in ("cell_id", "band"):
+        v = raw.get(k)
+        out[k] = str(v) if v is not None else None
+    return out
+
+
+def cell_snapshot(cfg: Config, sample: Optional[dict], now: float) -> dict:
+    """Published `cell` block. Absent sample still publishes configured=true
+    so the UI can show 'no telemetry' instead of hiding the panel."""
+    if cfg.cell is None:
+        return {"configured": False}
+    if sample is None:
+        return {"configured": True, "wan": cfg.cell.wan, "rsrp": None,
+                "rsrq": None, "sinr": None, "cell_id": None, "band": None,
+                "age_s": None, "stale": True}
+    age = max(0.0, now - sample["set_ts"])
+    return {"configured": True, "wan": cfg.cell.wan, "rsrp": sample["rsrp"],
+            "rsrq": sample["rsrq"], "sinr": sample["sinr"],
+            "cell_id": sample["cell_id"], "band": sample["band"],
+            "age_s": round(age, 1), "stale": age > cfg.cell.stale_after_s}
 
 
 def effective_policy(cfg: Config, ov: RuntimeOverlay) -> tuple:
@@ -2051,6 +2118,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         ov = load_runtime_overlay(cfg)
         mode, policy, master_wan, egress_mode = effective_policy(cfg, ov)
         env_auto = load_auto_override(cfg, loop_start)
+        cell_sample = load_cell_sample(cfg, loop_start)
         env_enabled = effective_environmental_enabled(cfg, ov)
         mode, env_active = apply_auto_override(mode, env_enabled, env_auto)
         maint_enabled = effective_maintenance_enabled(cfg, ov)
@@ -2348,6 +2416,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 configured=cfg.environmental is not None,
                 env_enabled=env_enabled, active=env_active,
                 auto=env_auto, now=loop_start),
+            "cell": cell_snapshot(cfg, cell_sample, loop_start),
             # The resolved schedule, published so maintenance_reboot.py reads it
             # rather than re-deriving the config-vs-overlay precedence. (Its
             # read_published() also demands the snapshot's fresh "ts" above.)

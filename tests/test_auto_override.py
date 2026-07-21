@@ -496,3 +496,64 @@ def test_published_snapshot_maintenance_unconfigured(tmp_path, monkeypatch):
     snap = json.loads(Path(cfg.published_state).read_text())
     assert snap["maintenance"]["configured"] is False
     assert snap["maintenance"]["enabled"] is False
+
+
+# -- cell telemetry reader / snapshot ----------------------------------------
+
+def _cell_cfg(tmp_path):
+    cfg = base_cfg()
+    cfg.cell = M.CellTelemetryCfg(state_path=str(tmp_path / "cell.json"))
+    return cfg
+
+
+def test_load_cell_sample_missing_file_is_none(tmp_path):
+    assert M.load_cell_sample(_cell_cfg(tmp_path), now=1000.0) is None
+
+
+def test_load_cell_sample_unconfigured_is_none():
+    assert M.load_cell_sample(base_cfg(), now=1000.0) is None
+
+
+def test_load_cell_sample_reads_and_coerces(tmp_path):
+    cfg = _cell_cfg(tmp_path)
+    (tmp_path / "cell.json").write_text(json.dumps(
+        {"set_ts": 990.0, "rsrp": -98, "rsrq": -11.0, "sinr": None,
+         "cell_id": 1234567, "band": "LTE B2"}))
+    s = M.load_cell_sample(cfg, now=1000.0)
+    assert s["rsrp"] == -98.0 and s["cell_id"] == "1234567"
+    assert s["sinr"] is None
+    snap = M.cell_snapshot(cfg, s, now=1000.0)
+    assert snap["configured"] is True and snap["stale"] is False
+    assert snap["age_s"] == 10.0
+    snap_old = M.cell_snapshot(cfg, s, now=1010.1)
+    assert snap_old["stale"] is True     # > stale_after_s (10)
+
+
+def test_load_cell_sample_malformed_json_is_none(tmp_path):
+    cfg = _cell_cfg(tmp_path)
+    Path(cfg.cell.state_path).write_text("not json")
+    assert M.load_cell_sample(cfg, now=1000.0) is None
+
+
+def test_load_cell_sample_missing_set_ts_is_none(tmp_path):
+    cfg = _cell_cfg(tmp_path)
+    Path(cfg.cell.state_path).write_text(json.dumps({"rsrp": -98}))
+    assert M.load_cell_sample(cfg, now=1000.0) is None
+
+
+def test_load_cell_sample_bool_metrics_coerced_to_none(tmp_path):
+    # bool is an int subclass; rsrp/rsrq/sinr: true must not read as 1.0.
+    cfg = _cell_cfg(tmp_path)
+    Path(cfg.cell.state_path).write_text(json.dumps(
+        {"set_ts": 990.0, "rsrp": True, "rsrq": False, "sinr": 5}))
+    s = M.load_cell_sample(cfg, now=1000.0)
+    assert s["rsrp"] is None and s["rsrq"] is None and s["sinr"] == 5.0
+
+
+def test_cell_snapshot_unconfigured_and_absent(tmp_path):
+    cfg = base_cfg()
+    assert M.cell_snapshot(cfg, None, 0.0) == {"configured": False}
+    cfg2 = _cell_cfg(tmp_path)
+    snap = M.cell_snapshot(cfg2, None, 0.0)
+    assert snap["configured"] is True and snap["stale"] is True
+    assert snap["rsrp"] is None
