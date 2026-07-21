@@ -298,6 +298,27 @@ def test_post_relay_fec_includes_profile_and_signal(monkeypatch):
     assert seen["body"]["signal_floor"] is True
 
 
+def test_post_relay_fec_serializes_explicit_false_signal_floor(monkeypatch):
+    # signal_floor=False (explicitly passed, e.g. the floor just released)
+    # must be distinguished from signal_floor=None (never engaged/omitted) —
+    # both are falsy in Python but only the former belongs in the payload.
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    ok = M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                          "8:0", 1.0, client_loss_pct=0.4,
+                          wan_profile="wan1", signal_floor=False)
+    assert ok
+    assert "signal_floor" in seen["body"]
+    assert seen["body"]["signal_floor"] is False
+
+
 def test_post_relay_fec_omits_absent_profile(monkeypatch):
     seen = {}
     class FakeResp:

@@ -551,6 +551,82 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
     assert o2t["reconcile_pending"] is False
 
 
+def test_run_controller_pushes_wan_profile_and_signal_floor_to_relay(tmp_path, monkeypatch):
+    """C2/C3 (CodeRabbit): the fake_post used by
+    test_run_controller_publishes_per_direction_fec discards wan_profile and
+    signal_floor entirely, so a run_controller-level regression in either
+    field would pass unnoticed. Configure a real wan1 profile + cell
+    telemetry so the signal floor actually engages, and assert both fields
+    reach the relay POST."""
+    import threading as _t
+    cell_state = tmp_path / "cell.json"
+    cfg = M.Config(
+        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+              "wan2": M.WanCfg("wan2", 2, "Satellite")},
+        relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
+        engarde=M.EngardeCfg("198.51.100.10", 59402),
+        nft=M.NftCfg(),
+        policy=M.PolicyCfg(default_mode="full"),
+        ui_listen="127.0.0.1:0",
+        sbfd_local_state=str(tmp_path / "sbfd-state.json"),
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "published.json"),
+        fec=M.FecCfg(enabled=True, fifo=str(tmp_path / "client.fifo"),
+                     loss_table=fec_control.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
+                     ramp_down_hold_s=0, full_mode_backoff_fec="8:0",
+                     full_min_up_wans=3, floor_ratio="8:1",
+                     wan_profiles={"wan1": M.WanProfileCfg(
+                         name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+                         ramp_up_ticks=1, ramp_down_hold_s=0,
+                         floor_ratio="8:0", signal_floor_fec="12:1")}),
+        cell=M.CellTelemetryCfg(state_path=str(cell_state), wan="wan1",
+                                stale_after_s=30.0, rsrq_degrade_db=-12.0,
+                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0),
+    )
+    # RSRQ well past the degrade threshold -> signal floor engages this tick.
+    cell_state.write_text(json.dumps({"rsrq": -13.0, "rsrp": None,
+                                      "set_ts": __import__("time").time()}))
+
+    monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda c: set())
+    monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda a: None)
+    monkeypatch.setattr(M, "read_engarde_table_default", lambda table: {"via": None, "dev": "wg0"})
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+        lambda p, m: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 1.5, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 4.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_relay_fec",
+        lambda url, t: {"ok": True, "error": None,
+                        "data": {"enabled": True, "ratio": "8:2", "level": 1,
+                                 "driving_loss_pct": 1.2, "since": 5.0}})
+    pushed = []
+    def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
+                  wan_profile=None, signal_floor=None):
+        pushed.append({"wan_profile": wan_profile, "signal_floor": signal_floor})
+        return True
+    monkeypatch.setattr(M, "post_relay_fec", fake_post)
+    monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
+
+    Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).write_text("{}")
+
+    stop = _t.Event()
+    _t.Thread(target=lambda: (__import__("time").sleep(0.6), stop.set()), daemon=True).start()
+    M.run_controller(cfg, stop_event=stop)
+
+    assert pushed, "expected at least one relay POST"
+    # wan1 is the driver (higher loss) -> its profile must be named on push.
+    assert all(p["wan_profile"] == "wan1" for p in pushed)
+    # RSRQ collapse -> the engaged signal floor must propagate too.
+    assert all(p["signal_floor"] is True for p in pushed)
+
+
 def test_run_controller_disabled_and_relay_unreachable(cfg_with_fec, monkeypatch):
     import threading as _t
     # Operator has disabled FEC via the runtime overlay.
