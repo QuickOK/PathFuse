@@ -564,3 +564,80 @@ def test_publish_rx_appears_in_snapshot():
     s = U.FecState()
     s.publish(rx={"delivered_per_s": 10.0})
     assert s.snapshot()["rx"] == {"delivered_per_s": 10.0}
+
+
+# ---------------------------------------------------------------------------
+# Task 11: relay-side per-WAN profile + signal floor
+# ---------------------------------------------------------------------------
+import fec_control as F
+
+
+def test_pushed_link_staleness():
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    st.set_pushed_link("wan1", True, ts=100.0)
+    assert st.get_pushed_link(now=105.0, stale_after_s=90.0) == ("wan1", True)
+    assert st.get_pushed_link(now=300.0, stale_after_s=90.0) == (None, False)
+    st2 = U.FecState()
+    assert st2.get_pushed_link(now=0.0, stale_after_s=90.0) == (None, False)
+
+
+def test_resolve_relay_profile_default_and_named():
+    cfg = {"loss_table": F.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 2,
+           "ramp_down_hold_s": 20.0,
+           "wan_profiles": {"wan1": {"ramp_up_ticks": 1}}}
+    table, hyst, sf = U.resolve_relay_profile(cfg, None)
+    assert table is cfg["loss_table"] and hyst.ramp_up_ticks == 2
+    table, hyst, sf = U.resolve_relay_profile(cfg, "wan1")
+    assert [r["fec"] for r in table] == ["8:0", "20:1", "12:1", "8:1"]
+    assert hyst.ramp_up_ticks == 1 and hyst.ramp_down_hold_s == 60.0
+    assert sf == "12:1"
+    table, _, _ = U.resolve_relay_profile(cfg, "default")
+    assert table is cfg["loss_table"]
+
+
+def test_run_once_uses_pushed_profile_and_signal_floor(tmp_path):
+    fifo = tmp_path / "fifo"; os.mkfifo(fifo)
+    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)   # give the fifo a reader
+    try:
+        cfg = {"loss_table": F.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1,
+               "ramp_down_hold_s": 20.0, "fifo": str(fifo),
+               "sbfd_state": str(tmp_path / "none.json"),
+               "wan_profiles": {"wan1": {}}}
+        rt = F.FecRuntime(0, 0, 0.0)
+        # zero pushed loss but signal floor on -> 12:1 from the cell table
+        rt, ratio = U.run_once(cfg, rt, None, mode="min_adaptive",
+                               fixed_ratio="20:1", floor_ratio="8:0",
+                               pushed_loss=0.0, pushed_profile="wan1",
+                               pushed_signal_floor=True)
+        assert ratio == "12:1"
+    finally:
+        os.close(fd)
+
+
+def test_post_unknown_wan_profile_rejected():
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+    try:
+        host, port = httpd.server_address[:2]
+        body = json.dumps({"wan_profile": "nope"}).encode()
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("expected HTTP 400")
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+        # rejection must leave the pushed state untouched
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == (None, False)
+        # and a VALID profile round-trips
+        ok_body = json.dumps({"wan_profile": "wan1", "signal_floor": True}).encode()
+        ok_req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=ok_body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(ok_req, timeout=5) as resp:
+            assert resp.status == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == ("wan1", True)
+    finally:
+        httpd.shutdown()

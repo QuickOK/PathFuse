@@ -28,7 +28,7 @@ class FecState:
     # new positional in front of a legacy back-compat arg would silently
     # reinterpret any existing FecState(mode, fixed, True) call.
     def __init__(self, mode=None, fixed_ratio=None, enabled=True, *,
-                 floor_ratio=None):
+                 floor_ratio=None, profile_names=frozenset({"default"})):
         # Back-compat: an explicit enabled=False starts the relay in MODE_OFF
         # so callers that only know the legacy boolean still get sensible
         # behavior.
@@ -46,6 +46,10 @@ class FecState:
             floor_ratio, fec_control.DEFAULT_FLOOR_RATIO, logging)
         self._pushed_loss = None
         self._pushed_loss_ts = 0.0
+        self.profile_names = frozenset(profile_names) | {"default"}
+        self._pushed_profile = None
+        self._pushed_signal_floor = False
+        self._pushed_link_ts = 0.0
         self._snapshot = {
             "enabled": self._mode != fec_control.MODE_OFF,
             "mode": self._mode,
@@ -58,6 +62,9 @@ class FecState:
             "since": None,
             "wire": None,
             "rx": None,
+            "profile": "default",
+            "profile_source": "default",
+            "signal_floor_active": False,
         }
 
     def get_enabled(self):
@@ -133,6 +140,24 @@ class FecState:
                 return None
             return self._pushed_loss
 
+    def set_pushed_link(self, profile, signal_floor, ts):
+        """Per-WAN policy pushed by the client; one timestamp for the pair."""
+        with self._lock:
+            if profile is not None:
+                self._pushed_profile = profile
+            if signal_floor is not None:
+                self._pushed_signal_floor = bool(signal_floor)
+            self._pushed_link_ts = ts
+
+    def get_pushed_link(self, now, stale_after_s):
+        """(profile, signal_floor), or (None, False) when never pushed or
+        stale — stale MUST also drop the signal floor, not just the table."""
+        with self._lock:
+            if self._pushed_profile is None or \
+                    (now - self._pushed_link_ts) > stale_after_s:
+                return None, False
+            return self._pushed_profile, self._pushed_signal_floor
+
     def publish(self, **fields):
         with self._lock:
             self._snapshot.update(fields)
@@ -192,15 +217,26 @@ def start_fec_http(listen, state, stop_event=None):
             fixed_in = payload.get("fixed_ratio")
             floor_in = payload.get("floor_ratio")
             loss_in = payload.get("client_loss_pct")
+            profile_in = payload.get("wan_profile")
+            signal_in = payload.get("signal_floor")
             if (mode_in is None and enabled_in is None and loss_in is None
-                    and fixed_in is None and floor_in is None):
+                    and fixed_in is None and floor_in is None
+                    and profile_in is None and signal_in is None):
                 self._json(400, {"error": "mode, enabled, client_loss_pct, "
-                                          "fixed_ratio or floor_ratio required"}); return
+                                          "fixed_ratio, floor_ratio, wan_profile "
+                                          "or signal_floor required"}); return
             if mode_in is not None and mode_in not in fec_control.ALL_MODES:
                 self._json(400, {"error": f"mode must be one of "
                                           f"{sorted(fec_control.ALL_MODES)}"}); return
             if enabled_in is not None and not isinstance(enabled_in, bool):
                 self._json(400, {"error": "enabled must be true or false"}); return
+            if profile_in is not None and (
+                    not isinstance(profile_in, str)
+                    or profile_in not in state.profile_names):
+                self._json(400, {"error": f"wan_profile must be one of "
+                                          f"{sorted(state.profile_names)}"}); return
+            if signal_in is not None and not isinstance(signal_in, bool):
+                self._json(400, {"error": "signal_floor must be true or false"}); return
             # Resolve every field BEFORE mutating any of it. A payload that
             # carries a good ratio and a bad client_loss_pct must leave the
             # relay untouched, not half-applied behind a 400.
@@ -225,6 +261,8 @@ def start_fec_http(listen, state, stop_event=None):
                 mode=mode_in, enabled=enabled_in, **ratio_updates)
             if loss_in is not None:
                 state.set_pushed_loss(loss_in, time.time())
+            if profile_in is not None or signal_in is not None:
+                state.set_pushed_link(profile_in, signal_in, time.time())
             self._json(200, {"ok": True, "mode": mode_now,
                              "fixed_ratio": fixed_now,
                              "floor_ratio": floor_now,
@@ -274,8 +312,30 @@ def read_worst_loss(state_path):
     return (max(losses) if losses else 0.0), up
 
 
+def resolve_relay_profile(cfg, name):
+    """(loss_table, hysteresis, signal_floor_fec) for a pushed profile name.
+    None/'default'/unknown all resolve to the base config — the relay must
+    degrade to today's behavior whenever the push is absent or stale. A
+    profile that IS registered (even as an empty override dict) falls back to
+    the cellular defaults per-field, not the base config — an operator who
+    lists a WAN name has opted that link into cellular-aware defaults. The
+    floor is NOT profile-resolved here: it rides the existing pushed
+    floor_ratio, which the client already computes profile-aware."""
+    p = (cfg.get("wan_profiles") or {}).get(name) if name else None
+    if p is None:
+        return (cfg["loss_table"],
+                fec_control.FecHysteresis(cfg["ramp_up_ticks"],
+                                          cfg["ramp_down_hold_s"]),
+                fec_control.DEFAULT_SIGNAL_FLOOR_FEC)
+    return (p.get("loss_table", fec_control.DEFAULT_CELL_LOSS_TABLE),
+            fec_control.FecHysteresis(int(p.get("ramp_up_ticks", 1)),
+                                      float(p.get("ramp_down_hold_s", 60.0))),
+            p.get("signal_floor_fec", fec_control.DEFAULT_SIGNAL_FLOOR_FEC))
+
+
 def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
-             pushed_loss=None, *, floor_ratio=None):
+             pushed_loss=None, *, floor_ratio=None, pushed_profile=None,
+             pushed_signal_floor=False):
     """One control tick. Returns (new_runtime, ratio_now_or_current).
     The adaptive engine always advances so the loss-tracked level stays fresh;
     apply_mode then maps it through the operator-chosen mode.
@@ -283,7 +343,7 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     pushed_loss is the fresh client-measured relay->client loss (the direction
     this leg repairs); when present it drives the level. Relay-local sbfd loss
     (opposite direction) is only the fallback for clients that don't push."""
-    table = cfg["loss_table"]
+    table, hyst, sf_fec = resolve_relay_profile(cfg, pushed_profile)
     # The caller (the control loop) passes the operator-settable floor from
     # FecState; cfg is only the boot default, as for mode and fixed_ratio.
     if floor_ratio is None:
@@ -295,7 +355,6 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     if mode is None:
         mode = fec_control.MODE_ADAPTIVE if enabled else fec_control.MODE_OFF
 
-    hyst = fec_control.FecHysteresis(cfg["ramp_up_ticks"], cfg["ramp_down_hold_s"])
     local_worst, up = read_worst_loss(cfg["sbfd_state"])
     worst = pushed_loss if pushed_loss is not None else local_worst
     if worst is None:
@@ -303,9 +362,13 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
         # be driven without depending on sbfd state. Mapping the last known
         # level through apply_mode covers every mode uniformly — including a
         # min_adaptive floor the operator just raised, which would otherwise not
-        # take effect until a loss sample arrived.
+        # take effect until a loss sample arrived. The signal floor must still
+        # lift the level here too, or a degraded radio with no fresh loss
+        # sample would silently lose its floor.
+        level = fec_control.apply_signal_floor(
+            rt.current_level, pushed_signal_floor, table, sf_fec)
         forced = fec_control.apply_mode(
-            mode, fec_control.level_to_ratio(rt.current_level, table),
+            mode, fec_control.level_to_ratio(level, table),
             fixed_ratio=fixed_ratio, floor_ratio=floor_ratio)
         if current_ratio != forced:
             if fec_control.write_fifo(cfg["fifo"], forced, logging):
@@ -315,7 +378,9 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
         return rt, current_ratio
     target = fec_control.loss_to_level(worst, table)
     rt, _changed = fec_control.step_level(target, rt, hyst, time.time())
-    adaptive_ratio = fec_control.level_to_ratio(rt.current_level, table)
+    level = fec_control.apply_signal_floor(
+        rt.current_level, pushed_signal_floor, table, sf_fec)
+    adaptive_ratio = fec_control.level_to_ratio(level, table)
     ratio = fec_control.apply_mode(mode, adaptive_ratio,
                                    fixed_ratio=fixed_ratio,
                                    floor_ratio=floor_ratio)
@@ -336,7 +401,9 @@ def fec_state_from_cfg(cfg):
     return FecState(
         mode=fec_control.normalize_mode(cfg.get("mode")),
         fixed_ratio=cfg.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
-        floor_ratio=cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO))
+        floor_ratio=cfg.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO),
+        profile_names=frozenset((cfg.get("wan_profiles") or {}).keys())
+        | {"default"})
 
 
 def run(cfg, stop_event=None, state=None, wire_tracker=None):
@@ -347,15 +414,33 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     rt = fec_control.FecRuntime(0, 0, time.time())
     current_ratio = None
     since = None
+    last_profile = "default"
     pushed_stale_after = float(cfg.get("pushed_loss_stale_after_s", 90.0))
     while not stop_event.is_set():
         mode, fixed_ratio, floor_ratio = state.get_desired()
         pushed = state.get_pushed_loss(time.time(), pushed_stale_after)
+        pushed_profile, pushed_sf = state.get_pushed_link(
+            time.time(), pushed_stale_after)
+        profile_name = pushed_profile or "default"
+        if profile_name != last_profile:
+            # Translate the runtime's level across the profile switch: the OLD
+            # level index means something different on the NEW table (e.g.
+            # level 2 is 8:4 on the base table but 12:1 on the cell table), so
+            # re-derive it from the ratio actually on the wire rather than
+            # carrying the raw index forward.
+            new_table, _, _ = resolve_relay_profile(cfg, profile_name)
+            rt = fec_control.FecRuntime(
+                fec_control.ratio_to_level(current_ratio or "8:0", new_table),
+                0, time.time())
+            logging.info("fec profile -> %s", profile_name)
+            last_profile = profile_name
         prev = current_ratio
         rt, current_ratio = run_once(cfg, rt, current_ratio,
                                      mode=mode, fixed_ratio=fixed_ratio,
                                      floor_ratio=floor_ratio,
-                                     pushed_loss=pushed)
+                                     pushed_loss=pushed,
+                                     pushed_profile=pushed_profile,
+                                     pushed_signal_floor=pushed_sf)
         if current_ratio != prev:
             since = time.time()
         driving = pushed
@@ -370,6 +455,9 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
                       loss_source=("client_push" if pushed is not None
                                    else "local_sbfd"),
                       since=since,
+                      profile=profile_name,
+                      profile_source=("pushed" if pushed_profile else "default"),
+                      signal_floor_active=pushed_sf,
                       wire=(wire_tracker.snapshot(now) if wire_tracker else None),
                       rx=(wire_tracker.rx_snapshot(now) if wire_tracker else None))
         stop_event.wait(cfg["poll_interval_s"])
