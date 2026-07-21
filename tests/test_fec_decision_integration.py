@@ -73,3 +73,37 @@ def test_compute_fec_target_accepts_table_override():
     lvl = M.compute_fec_target(fc, "master_backup", eff, loss, {"wan1"},
                                loss_table=F.DEFAULT_CELL_LOSS_TABLE)
     assert F.level_to_ratio(lvl, F.DEFAULT_CELL_LOSS_TABLE) == "12:1"
+
+
+def test_cell_profile_pipeline_signal_floor_lifts_zero_parity():
+    fc = _fec_cfg_with_profile()
+    name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
+    sfl = F.SignalFloor()
+    # good signal, no loss -> 8:0
+    target = M.compute_fec_target(fc, "master_backup",
+                                  {"wan1": "UP", "wan2": "UP"},
+                                  {"wan1": 0.0, "wan2": 0.0}, {"wan1"},
+                                  loss_table=table)
+    rt = F.FecRuntime(0, 0, 0.0)
+    rt, _ = F.step_level(target, rt, hyst, now=1.0)
+    engaged = sfl.update(rsrq=-9.0, rsrp=None)
+    lvl = F.apply_signal_floor(rt.current_level, engaged, table, sf_fec)
+    assert F.level_to_ratio(lvl, table) == "8:0"
+    # RSRQ collapses with zero measured loss -> floor to 12:1 in ONE tick
+    engaged = sfl.update(rsrq=-13.0, rsrp=None)
+    lvl = F.apply_signal_floor(rt.current_level, engaged, table, sf_fec)
+    assert F.level_to_ratio(lvl, table) == "12:1"
+    # loss also rises -> table wins over the floor when higher
+    target = M.compute_fec_target(fc, "master_backup",
+                                  {"wan1": "UP", "wan2": "UP"},
+                                  {"wan1": 8.0, "wan2": 0.0}, {"wan1"},
+                                  loss_table=table)
+    rt, _ = F.step_level(target, rt, hyst, now=2.0)   # ramp_up_ticks=1
+    lvl = F.apply_signal_floor(rt.current_level, engaged, table, sf_fec)
+    assert F.level_to_ratio(lvl, table) == "8:1"      # capped ladder
+
+
+def test_profile_switch_translates_level():
+    # ratio carried across a table swap: 8:2 exists only in the default table
+    assert F.ratio_to_level("8:2", F.DEFAULT_CELL_LOSS_TABLE) == 0  # unknown -> 0
+    assert F.ratio_to_level("20:1", F.DEFAULT_CELL_LOSS_TABLE) == 1

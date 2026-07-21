@@ -239,6 +239,41 @@ def test_post_relay_fec_sends_floor_ratio(monkeypatch):
     assert seen["body"]["enabled"] is True
 
 
+def test_post_relay_fec_includes_profile_and_signal(monkeypatch):
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    ok = M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                          "8:0", 1.0, client_loss_pct=0.4,
+                          wan_profile="wan1", signal_floor=True)
+    assert ok
+    assert seen["body"]["wan_profile"] == "wan1"
+    assert seen["body"]["signal_floor"] is True
+
+
+def test_post_relay_fec_omits_absent_profile(monkeypatch):
+    seen = {}
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def fake_urlopen(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return FakeResp()
+    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    assert M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                            "20:1", 1.0, client_loss_pct=0.4)
+    # Omitted keys must stay omitted so older relays see an unchanged payload.
+    assert "wan_profile" not in seen["body"]
+    assert "signal_floor" not in seen["body"]
+
+
 def test_relay_desired_tuple_includes_floor():
     # A floor change must make should_post_fec see a different desired tuple,
     # or the operator's new floor never reaches the relay.

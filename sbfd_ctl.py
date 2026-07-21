@@ -1590,12 +1590,14 @@ def fetch_relay_fec(url, timeout_s) -> dict:
 
 
 def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
-                   client_loss_pct=None) -> bool:
+                   client_loss_pct=None, wan_profile=None,
+                   signal_floor=None) -> bool:
     """Best-effort POST of desired (mode, fixed_ratio, floor_ratio) to relay /fec.
 
     client_loss_pct carries our locally measured relay->client loss — the
     direction the relay's TX leg repairs but cannot see (sbfd loss is
-    RX-side). Older relays ignore the extra fields. Also sends the legacy
+    RX-side). wan_profile/signal_floor carry the per-WAN policy selection to
+    the relay leg; older relays ignore unknown keys. Also sends the legacy
     `enabled` boolean so an older relay binary still honors the off/on intent
     during a rolling upgrade. Returns True iff 200."""
     if not url:
@@ -1608,6 +1610,10 @@ def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
     }
     if client_loss_pct is not None:
         payload["client_loss_pct"] = round(client_loss_pct, 2)
+    if wan_profile is not None:
+        payload["wan_profile"] = wan_profile
+    if signal_floor is not None:
+        payload["signal_floor"] = bool(signal_floor)
     body = _json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST")
@@ -2130,8 +2136,13 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     remote_interval = max(0.5, cfg.relay.fetch_interval_s)
 
     fec_rt = fec_control.FecRuntime(current_level=0, up_streak=0, last_change_ts=time.time())
-    fec_hyst = (fec_control.FecHysteresis(cfg.fec.ramp_up_ticks, cfg.fec.ramp_down_hold_s)
-                if cfg.fec else None)
+    fec_profile_active = "default"
+    fec_signal_floor = fec_control.SignalFloor(fec_control.SignalThresholds(
+        rsrq_degrade_db=cfg.cell.rsrq_degrade_db,
+        rsrq_recover_db=cfg.cell.rsrq_recover_db,
+        rsrp_degrade_dbm=cfg.cell.rsrp_degrade_dbm)
+        if cfg.cell else None)
+    fec_signal_engaged = False
     fec_current_ratio = None
     fec_ratio_since: Optional[float] = None
     fec_relay_last = {"ok": False, "data": None, "error": "not yet fetched"}
@@ -2300,6 +2311,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         fec_floor_ratio_eff = effective_fec_floor_ratio(cfg, ov)
         fec_desired = fec_mode_eff != fec_control.MODE_OFF
         fec_driver = None
+        fec_driver_display = None
         fec_actuator_ok = True
         fec_loss = loss
         fec_loss_source = "local"
@@ -2312,13 +2324,54 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 loop_start - last_remote_at) <= max(3 * remote_interval, 10.0)
             fec_loss, fec_loss_source = fec_loss_map(
                 local, last_remote, remote_fresh, cfg.wans)
+            # Profile first: the driver WAN picks table/hysteresis/floor, so it
+            # must be known before the adaptive engine steps.
+            fec_driver = fec_driver_wan(fec_loss, currently_active)
+            # The client_to_relay direction's driver_wan/driving_loss_pct
+            # predate profiles and only mean something in a mode where the
+            # adaptive engine actually picks the ratio — off/fixed ignore
+            # loss entirely, so keep publishing None there (unchanged
+            # contract), even though fec_driver itself must now resolve
+            # every tick to feed the profile machinery below.
+            fec_driver_display = (fec_driver if fec_mode_eff in
+                                  (fec_control.MODE_ADAPTIVE,
+                                   fec_control.MODE_MIN_ADAPTIVE) else None)
+            (prof_name, prof_table, prof_hyst,
+             prof_floor, prof_sf_fec) = resolve_fec_profile(cfg.fec, fec_driver)
+            if prof_name != fec_profile_active:
+                # Carry the current ratio into the new table's level space;
+                # unknown ratios land at 0 and re-ramp (1 tick on cellular).
+                fec_rt = fec_control.FecRuntime(
+                    fec_control.ratio_to_level(fec_current_ratio or "8:0",
+                                               prof_table), 0, loop_start)
+                logging.info("fec profile -> %s (driver=%s)", prof_name, fec_driver)
+                fec_profile_active = prof_name
+            fec_floor_ratio_eff = effective_fec_floor_ratio(
+                cfg, ov, profile_floor=prof_floor)
+            # Signal floor: only for a profiled driver that IS the telemetry
+            # WAN, and only on a fresh sample — anything else disengages
+            # (fail-open; measured loss remains the ground truth).
+            rsrq = rsrp = None
+            if (prof_name != "default" and cfg.cell is not None
+                    and fec_driver == cfg.cell.wan and cell_sample is not None
+                    and (loop_start - cell_sample["set_ts"]) <= cfg.cell.stale_after_s):
+                rsrq, rsrp = cell_sample.get("rsrq"), cell_sample.get("rsrp")
+            prev_engaged = fec_signal_engaged
+            fec_signal_engaged = fec_signal_floor.update(rsrq, rsrp)
+            if fec_signal_engaged != prev_engaged:
+                logging.info("fec signal floor %s (rsrq=%s rsrp=%s)",
+                             "engaged" if fec_signal_engaged else "released",
+                             rsrq, rsrp)
             # The adaptive engine always runs so the loss-tracked level stays
             # fresh; apply_mode then maps it to the actual ratio per mode.
-            _fec_target = compute_fec_target(cfg.fec, mode, eff, fec_loss, currently_active)
+            _fec_target = compute_fec_target(cfg.fec, mode, eff, fec_loss,
+                                             currently_active,
+                                             loss_table=prof_table)
             fec_rt, _fec_changed = fec_control.step_level(
-                _fec_target, fec_rt, fec_hyst, loop_start)
-            _adaptive_ratio = fec_control.level_to_ratio(
-                fec_rt.current_level, cfg.fec.loss_table)
+                _fec_target, fec_rt, prof_hyst, loop_start)
+            _fec_level = fec_control.apply_signal_floor(
+                fec_rt.current_level, fec_signal_engaged, prof_table, prof_sf_fec)
+            _adaptive_ratio = fec_control.level_to_ratio(_fec_level, prof_table)
             _fec_ratio = fec_control.apply_mode(
                 fec_mode_eff, _adaptive_ratio,
                 fixed_ratio=fec_fixed_ratio_eff,
@@ -2331,9 +2384,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             relay_desired = (fec_mode_eff, fec_fixed_ratio_eff,
                              fec_floor_ratio_eff,
                              fec_control.loss_to_level(client_push_loss,
-                                                       cfg.fec.loss_table))
-            if fec_mode_eff in (fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE):
-                fec_driver = fec_driver_wan(fec_loss, currently_active)
+                                                       prof_table),
+                             prof_name, fec_signal_engaged)
             if _fec_ratio != fec_current_ratio:
                 fec_actuator_ok = fec_control.write_fifo(
                     cfg.fec.fifo, _fec_ratio, logging)
@@ -2355,7 +2407,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                                   fec_fixed_ratio_eff,
                                   fec_floor_ratio_eff,
                                   cfg.relay.fetch_timeout_s,
-                                  client_loss_pct=client_push_loss):
+                                  client_loss_pct=client_push_loss,
+                                  wan_profile=prof_name,
+                                  signal_floor=fec_signal_engaged):
                     fec_relay_last_acked = relay_desired
                 fec_relay_last_post_ts = loop_start
 
@@ -2436,6 +2490,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 # the fixed and the floor dropdown.
                 "fixed_ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
                 "ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
+                "profile": {"name": fec_profile_active, "driver_wan": fec_driver},
+                "signal_floor_active": fec_signal_engaged,
                 "directions": {
                     "client_to_relay": {
                         "enabled": fec_desired,
@@ -2443,8 +2499,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                         "fixed_ratio": fec_fixed_ratio_eff,
                         "ratio": fec_current_ratio,
                         "level": fec_rt.current_level,
-                        "driving_loss_pct": (fec_loss.get(fec_driver) if fec_driver else None),
-                        "driver_wan": fec_driver,
+                        "driving_loss_pct": (fec_loss.get(fec_driver_display) if fec_driver_display else None),
+                        "driver_wan": fec_driver_display,
                         "loss_source": fec_loss_source,
                         "since": fec_ratio_since,
                         "actuator_ok": fec_actuator_ok,
