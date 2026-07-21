@@ -694,8 +694,9 @@ function renderCellSignal(s){
     ? ` · profile ${fec.profile.name}` : '';
   const floor = fec.signal_floor_active ? ' · signal floor' : '';
   const stale = c.stale ? ' (stale)' : '';
+  const cellLabel = c.wan ? ((s.wan_labels && s.wan_labels[c.wan]) || c.wan) : 'cell';
   $('#fec-cell-readout').textContent =
-    `${(c.wan || 'wan1')} signal: ${parts.join(' · ')}${stale}${prof}${floor}`;
+    `${cellLabel} signal: ${parts.join(' · ')}${stale}${prof}${floor}`;
 }
 
 function renderFecCard(id, d, local){
