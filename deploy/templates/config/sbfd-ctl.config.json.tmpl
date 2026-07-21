@@ -60,6 +60,14 @@
     "enabled": true,
     "auto_override": { "path": "/run/sbfd-ctl/auto_override.json", "ttl_s": 180 }
   },
+  "cell_telemetry": {
+    "state_path": "/run/sbfd-ctl/cell_telemetry.json",
+    "wan": "wan1",
+    "stale_after_s": 10,
+    "rsrq_degrade_db": -12,
+    "rsrq_recover_db": -10,
+    "rsrp_degrade_dbm": -110
+  },
   "maintenance_reboot": {
     "enabled": $maintenance_enabled,
     "hour": $maintenance_hour,

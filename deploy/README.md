@@ -137,6 +137,9 @@ sudo systemctl enable --now udpspeeder-client
 sudo systemctl enable --now sbfd sbfd-ctl
 # optional: wan1 hotspot auto-reboot watchdog
 sudo systemctl enable --now hotspot-watchdog
+# optional: wan1 modem signal telemetry (feeds the FEC signal floor); needs
+# cell-telemetry.json alongside hotspot-watchdog's admin secret (see above)
+sudo systemctl enable --now cell-telemetry
 # optional: daily maintenance reboot (enable the TIMER, not the service; needs
 # hotspot-watchdog above for its wan1 leg)
 sudo systemctl enable --now maintenance-reboot.timer
