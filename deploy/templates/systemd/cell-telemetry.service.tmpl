@@ -1,0 +1,27 @@
+[Unit]
+Description=Modem signal telemetry collector (wan1 Nighthawk M6 Pro)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$paths_sbfdctl_opt/cell_telemetry.py -c $paths_sbfdctl_etc/cell-telemetry.json
+# Cookie jar lives here; survives restarts like hotspot-watchdog's.
+RuntimeDirectory=cell-telemetry
+RuntimeDirectoryPreserve=restart
+Restart=always
+RestartSec=10
+# Root like hotspot-watchdog: needs the 0600 admin secret. Filesystem is
+# read-only outside the two paths it writes.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+# /run/sbfd-ctl is owned by sbfd-ctl.service; the "-" tolerates it being
+# absent at unit start (sbfd-ctl not yet up) instead of failing the sandbox.
+ReadWritePaths=/run/cell-telemetry -/run/sbfd-ctl
+
+[Install]
+WantedBy=multi-user.target

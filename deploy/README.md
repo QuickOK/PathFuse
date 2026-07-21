@@ -106,6 +106,19 @@ Two pieces remain manual, on-box, hand steps — nothing in this repo creates th
   is secret-adjacent, chosen per box). Use the **same** topic as
   `maintenance.control_topic` in your `values.json` (above). Then `systemctl daemon-reload`.
 
+### Hand-placed config files
+
+These config files are **not** templated — they reference host secrets or configuration that
+should not be committed to the repo. `install.sh` does not manage them; you place them by hand.
+
+- `hotspot-watchdog.json` (hand-placed, not templated — references the admin secret):
+  `{"admin_url": "http://192.0.2.1", "secret_path": "/etc/sbfd-ctl/hotspot-admin.secret"}`.
+  All other keys have defaults (`poll_interval_s` 5 s, dry_run true, etc.).
+- `cell-telemetry.json` (hand-placed, not templated — references the admin
+  secret): `{"admin_url": "http://192.0.2.1", "secret_path":
+  "/etc/sbfd-ctl/hotspot-admin.secret"}`. All other keys have defaults
+  (`iface` wan1, 2 s poll, state to /run/sbfd-ctl/cell_telemetry.json).
+
 ## 5. Start services — order matters
 
 **Relay:**
