@@ -735,11 +735,15 @@ def compute_fec_target(fec_cfg, mode, eff, loss, active_wans, loss_table=None):
 
 def fec_driver_wan(loss, active_wans):
     """The active WAN whose loss feeds compute_fec_target (the max-loss one).
-    Uses the same active fallback as compute_fec_target. None if no candidates."""
+    Uses the same active fallback as compute_fec_target. None if no candidates.
+    active_wans is a set, so its iteration order is hash-dependent; sort it
+    first so a tie (e.g. both WANs at 0.0 loss) resolves deterministically
+    instead of depending on set hash order — the driver now selects FEC
+    policy, so nondeterminism here would make profile selection flaky."""
     active = active_wans or set(loss.keys())
     if not active:
         return None
-    return max(active, key=lambda w: loss.get(w, 0.0))
+    return max(sorted(active), key=lambda w: loss.get(w, 0.0))
 
 
 def resolve_fec_profile(fec_cfg, driver_wan):
@@ -771,10 +775,10 @@ def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
 def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=None):
     """Shape the relay->client published direction dict from a fetch_relay_fec result.
 
-    `desired` / `last_acked` are either the legacy enabled-boolean (during the
-    pre-tri-state transition) or a (mode, fixed_ratio) tuple. We just compare
-    them for equality to drive reconcile_pending — the relay echoes back what
-    it actually applied."""
+    `desired` / `last_acked` are the 6-tuple
+    (mode, fixed_ratio, floor_ratio, loss_level, profile_name, signal_floor).
+    We just compare them for equality to drive reconcile_pending — the relay
+    echoes back what it actually applied."""
     fetch = fetch or {}
     data = fetch.get("data") or {}
     return {
@@ -1589,6 +1593,9 @@ def fetch_relay_fec(url, timeout_s) -> dict:
         return {"ok": False, "data": None, "error": f"parse: {e}"}
 
 
+_post_relay_fec_last_warned = None
+
+
 def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
                    client_loss_pct=None, wan_profile=None,
                    signal_floor=None) -> bool:
@@ -1599,7 +1606,15 @@ def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
     RX-side). wan_profile/signal_floor carry the per-WAN policy selection to
     the relay leg; older relays ignore unknown keys. Also sends the legacy
     `enabled` boolean so an older relay binary still honors the off/on intent
-    during a rolling upgrade. Returns True iff 200."""
+    during a rolling upgrade. Returns True iff 200.
+
+    A non-200 HTTP response (e.g. 400 from an unknown wan_profile, which
+    would otherwise 400 forever and invisibly on every reconcile tick) is
+    distinguished from a transport failure and logged at WARNING with the
+    status code and a truncated body. Debounced on (code, body) so a
+    persistent failure warns once, not every tick — mirrors
+    fec_control.safe_ratio's debounce spirit."""
+    global _post_relay_fec_last_warned
     if not url:
         return False
     payload = {
@@ -1620,6 +1635,17 @@ def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return resp.status == 200
+    except urllib.error.HTTPError as e:
+        try:
+            resp_body = e.read().decode("utf-8", "replace")
+        except Exception:
+            resp_body = ""
+        signature = (e.code, resp_body[:200])
+        if signature != _post_relay_fec_last_warned:
+            _post_relay_fec_last_warned = signature
+            logging.warning("post relay fec rejected: HTTP %s: %s",
+                            e.code, resp_body[:200])
+        return False
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
 
@@ -2143,6 +2169,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         rsrp_degrade_dbm=cfg.cell.rsrp_degrade_dbm)
         if cfg.cell else None)
     fec_signal_engaged = False
+    fec_signal_floor_applied = False
     fec_current_ratio = None
     fec_ratio_since: Optional[float] = None
     fec_relay_last = {"ok": False, "data": None, "error": "not yet fetched"}
@@ -2362,6 +2389,15 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 logging.info("fec signal floor %s (rsrq=%s rsrp=%s)",
                              "engaged" if fec_signal_engaged else "released",
                              rsrq, rsrp)
+            # Full-redundancy backoff wins over the signal floor: engarde is
+            # already duplicating over both WANs, so parity must never stack
+            # on top of that duplication. Mirrors mode_aware_level's up-count
+            # semantics exactly (sum over `eff`, not the active set).
+            fec_full_backoff = (
+                mode == "full"
+                and sum(1 for st in eff.values() if st == "UP")
+                >= cfg.fec.full_min_up_wans)
+            fec_signal_floor_applied = fec_signal_engaged and not fec_full_backoff
             # The adaptive engine always runs so the loss-tracked level stays
             # fresh; apply_mode then maps it to the actual ratio per mode.
             _fec_target = compute_fec_target(cfg.fec, mode, eff, fec_loss,
@@ -2370,7 +2406,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             fec_rt, _fec_changed = fec_control.step_level(
                 _fec_target, fec_rt, prof_hyst, loop_start)
             _fec_level = fec_control.apply_signal_floor(
-                fec_rt.current_level, fec_signal_engaged, prof_table, prof_sf_fec)
+                fec_rt.current_level, fec_signal_floor_applied, prof_table, prof_sf_fec)
             _adaptive_ratio = fec_control.level_to_ratio(_fec_level, prof_table)
             _fec_ratio = fec_control.apply_mode(
                 fec_mode_eff, _adaptive_ratio,
@@ -2385,7 +2421,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                              fec_floor_ratio_eff,
                              fec_control.loss_to_level(client_push_loss,
                                                        prof_table),
-                             prof_name, fec_signal_engaged)
+                             prof_name, fec_signal_floor_applied)
             if _fec_ratio != fec_current_ratio:
                 fec_actuator_ok = fec_control.write_fifo(
                     cfg.fec.fifo, _fec_ratio, logging)
@@ -2409,7 +2445,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                                   cfg.relay.fetch_timeout_s,
                                   client_loss_pct=client_push_loss,
                                   wan_profile=prof_name,
-                                  signal_floor=fec_signal_engaged):
+                                  signal_floor=fec_signal_floor_applied):
                     fec_relay_last_acked = relay_desired
                 fec_relay_last_post_ts = loop_start
 
@@ -2491,7 +2527,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 "fixed_ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
                 "ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
                 "profile": {"name": fec_profile_active, "driver_wan": fec_driver},
-                "signal_floor_active": fec_signal_engaged,
+                "signal_floor_active": fec_signal_floor_applied,
                 "directions": {
                     "client_to_relay": {
                         "enabled": fec_desired,

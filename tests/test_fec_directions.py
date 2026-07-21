@@ -69,6 +69,16 @@ def test_fec_driver_wan_picks_max_loss():
     assert M.fec_driver_wan({"wan1": 5.0, "wan2": 1.0}, {"wan1", "wan2"}) == "wan1"
 
 
+def test_fec_driver_wan_tie_is_deterministic_alphabetically_first():
+    # Equal loss (the common clean case, both 0.0) must not depend on set
+    # hash order — sorting active_wans before max() makes the tie-break
+    # deterministic. max() keeps the first item achieving the maximum, so
+    # over a sorted input the alphabetically first WAN wins.
+    loss = {"wan1": 0.0, "wan2": 0.0}
+    assert M.fec_driver_wan(loss, {"wan1", "wan2"}) == "wan1"
+    assert M.fec_driver_wan(loss, {"wan2", "wan1"}) == "wan1"
+
+
 def test_fec_driver_wan_falls_back_to_loss_keys_when_no_active():
     # mirrors compute_fec_target's `active = active_wans or set(loss.keys())`
     assert M.fec_driver_wan({"wan1": 2.0}, set()) == "wan1"
@@ -213,6 +223,37 @@ def test_post_relay_fec_omits_client_loss_when_none(monkeypatch):
     monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
     assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is True
     assert "client_loss_pct" not in seen["body"]
+
+
+def test_post_relay_fec_http_error_returns_false_and_warns_once(monkeypatch, caplog):
+    import io
+
+    def raiser(req, timeout=None):
+        raise M.urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {},
+            io.BytesIO(b'{"error": "unknown wan_profile"}'))
+    monkeypatch.setattr(M.urllib.request, "urlopen", raiser)
+    monkeypatch.setattr(M, "_post_relay_fec_last_warned", None)
+    caplog.set_level("WARNING")
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0,
+                            wan_profile="bogus") is False
+    # A persistent 400 (e.g. a relay whose config lacks wan_profiles) must
+    # not spam a warning on every reconcile tick.
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0,
+                            wan_profile="bogus") is False
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "400" in warnings[0].getMessage()
+
+
+def test_post_relay_fec_transport_error_does_not_warn(monkeypatch, caplog):
+    def boom(req, timeout=None):
+        raise M.urllib.error.URLError("down")
+    monkeypatch.setattr(M.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(M, "_post_relay_fec_last_warned", None)
+    caplog.set_level("WARNING")
+    assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is False
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 def test_relay_fec_direction_passes_through_loss_source():

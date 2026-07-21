@@ -107,3 +107,46 @@ def test_profile_switch_translates_level():
     # ratio carried across a table swap: 8:2 exists only in the default table
     assert F.ratio_to_level("8:2", F.DEFAULT_CELL_LOSS_TABLE) == 0  # unknown -> 0
     assert F.ratio_to_level("20:1", F.DEFAULT_CELL_LOSS_TABLE) == 1
+
+
+# ---------- full-mode backoff must win over the signal floor ----------
+# (engarde is already duplicating in full mode with >=2 WANs up; parity must
+# never stack on top of that duplication — the signal floor is suppressed.)
+
+def _gated_ratio(mode, fc, table, hyst, sf_fec, engaged):
+    """Mirror the tick's fec_full_backoff / fec_signal_floor_applied gate,
+    then run compute_fec_target -> step_level -> apply_signal_floor exactly
+    like the run_loop's cellular-profile pipeline does."""
+    eff = {"wan1": "UP", "wan2": "UP"}
+    loss = {"wan1": 0.0, "wan2": 0.0}
+    active = {"wan1", "wan2"}
+    target = M.compute_fec_target(fc, mode, eff, loss, active, loss_table=table)
+    rt = F.FecRuntime(0, 0, 0.0)
+    rt, _ = F.step_level(target, rt, hyst, now=1.0)
+    fec_full_backoff = (mode == "full" and
+                        sum(1 for st in eff.values() if st == "UP")
+                        >= fc.full_min_up_wans)
+    applied = engaged and not fec_full_backoff
+    lvl = F.apply_signal_floor(rt.current_level, applied, table, sf_fec)
+    return F.level_to_ratio(lvl, table)
+
+
+def test_full_mode_backoff_suppresses_signal_floor_stacking():
+    fc = _fec_cfg_with_profile()
+    name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
+    sfl = F.SignalFloor()
+    engaged = sfl.update(rsrq=-13.0, rsrp=None)   # engage the floor
+    assert engaged is True
+    # full mode, 2 WANs UP: full-mode backoff (8:0) wins, floor must not stack
+    assert _gated_ratio("full", fc, table, hyst, sf_fec, engaged) == "8:0"
+
+
+def test_master_backup_signal_floor_still_applies():
+    fc = _fec_cfg_with_profile()
+    name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
+    sfl = F.SignalFloor()
+    engaged = sfl.update(rsrq=-13.0, rsrp=None)   # engage the floor
+    assert engaged is True
+    # same telemetry/loss, but master_backup: the gate is full-mode-specific,
+    # so the signal floor still lifts the level to 12:1.
+    assert _gated_ratio("master_backup", fc, table, hyst, sf_fec, engaged) == "12:1"
