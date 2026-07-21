@@ -16,6 +16,16 @@ DEFAULT_LOSS_TABLE = [
     {"max_loss_pct": 100.0, "fec": "8:8"},
 ]
 
+# Cellular-specific ladder: caps at 8:1 (12.5%). HARQ/RLC below IP already
+# repairs random loss; ratios past 8:1 mostly buy metered overhead without
+# recovering the correlated (handoff) loss bursts block FEC can't cover.
+DEFAULT_CELL_LOSS_TABLE = [
+    {"max_loss_pct": 0.5,   "fec": "8:0"},
+    {"max_loss_pct": 2.0,   "fec": "20:1"},
+    {"max_loss_pct": 5.0,   "fec": "12:1"},
+    {"max_loss_pct": 100.0, "fec": "8:1"},
+]
+
 # Operator-selectable FEC modes.
 #   off          - force the off tier (8:0), independent of loss
 #   fixed        - hold a single operator-chosen ratio
@@ -31,13 +41,14 @@ DEFAULT_MODE = MODE_MIN_ADAPTIVE
 DEFAULT_FLOOR_RATIO = "20:1"
 DEFAULT_FIXED_RATIO = "20:1"
 OFF_RATIO = "8:0"
-FIXED_RATIO_PRESETS = ("20:1", "8:1", "8:2", "8:4", "8:6", "8:8")
+FIXED_RATIO_PRESETS = ("20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8")
+DEFAULT_SIGNAL_FLOOR_FEC = "12:1"
 
 # Snap target for percent entry. Separate from FIXED_RATIO_PRESETS because it
 # must include the zero-parity rung (an operator may legitimately ask for 0%)
 # while the dropdown must not offer it — "off" is already its own mode.
 # Ascending overhead; resolve_ratio relies on that ordering for tie-breaking.
-RATIO_LADDER = ("8:0", "20:1", "8:1", "8:2", "8:4", "8:6", "8:8")
+RATIO_LADDER = ("8:0", "20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8")
 
 
 def parse_ratio(s):

@@ -164,9 +164,10 @@ def test_resolve_ratio_snaps_percent_to_ladder():
 
 
 def test_resolve_ratio_breaks_ties_upward():
-    # 8.75% is the exact midpoint between 20:1 (5%) and 8:1 (12.5%). An
-    # operator asking for protection must not get less than they typed.
-    assert F.resolve_ratio("8.75%") == "8:1"
+    # 8.75% is closer to 12:1 (8.33%) than to 8:1 (12.5%), so it snaps to 12:1.
+    # The tie-breaking rule (<=) ensures an operator asking for protection never
+    # gets less than they typed (when there's a true tie, prefer higher overhead).
+    assert F.resolve_ratio("8.75%") == "12:1"
     # 2.5% is the midpoint between 8:0 (0%) and 20:1 (5%).
     assert F.resolve_ratio("2.5%") == "20:1"
 
@@ -260,3 +261,28 @@ def test_safe_ratio_survives_unhashable_garbage():
     assert F.safe_ratio({"a": 1}, "20:1", log) == "20:1"
     assert F.safe_ratio(17, "20:1", log) == "20:1"
     assert log.n == 3
+
+
+def test_ratio_ladder_has_12_1_in_ascending_overhead_order():
+    overheads = [F.ratio_overhead_pct(*F.parse_ratio(r)) for r in F.RATIO_LADDER]
+    assert overheads == sorted(overheads)
+    assert "12:1" in F.RATIO_LADDER
+
+
+def test_resolve_ratio_percent_snaps_to_12_1():
+    assert F.resolve_ratio("8.3%") == "12:1"   # 12:1 ≈ 8.33%
+    assert F.resolve_ratio("12:1") == "12:1"
+
+
+def test_fixed_presets_offer_12_1():
+    assert "12:1" in F.FIXED_RATIO_PRESETS
+    assert "8:0" not in F.FIXED_RATIO_PRESETS  # off stays a mode, not a preset
+
+
+def test_cell_loss_table_tiers():
+    t = F.DEFAULT_CELL_LOSS_TABLE
+    assert [r["fec"] for r in t] == ["8:0", "20:1", "12:1", "8:1"]
+    assert F.level_to_ratio(F.loss_to_level(0.2, t), t) == "8:0"
+    assert F.level_to_ratio(F.loss_to_level(1.0, t), t) == "20:1"
+    assert F.level_to_ratio(F.loss_to_level(3.0, t), t) == "12:1"
+    assert F.level_to_ratio(F.loss_to_level(50.0, t), t) == "8:1"   # cap
