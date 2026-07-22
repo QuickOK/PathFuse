@@ -734,10 +734,13 @@ def test_run_controller_handoff_window_forces_full_and_publishes(tmp_path, monke
                      loss_table=fec_control.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
                      ramp_down_hold_s=0, full_mode_backoff_fec="8:0",
                      full_min_up_wans=2, floor_ratio="8:0",
-                     # MODE_ADAPTIVE, not the module default MODE_MIN_ADAPTIVE:
-                     # min_adaptive's floor_ratio is a hard floor that would
-                     # otherwise lift the full-mode-backoff ratio right back
-                     # up, muddying this test's actual target (the backoff).
+                     # floor_ratio="8:0" is the operative guard: set equal to
+                     # full_mode_backoff_fec, so even under the module default
+                     # MODE_MIN_ADAPTIVE its hard floor couldn't lift the
+                     # ratio back up and muddy this test's actual target (the
+                     # backoff). mode=MODE_ADAPTIVE is belt-and-suspenders --
+                     # it sidesteps the min_adaptive floor path entirely
+                     # rather than relying on it to be a no-op.
                      mode=fec_control.MODE_ADAPTIVE),
         cell=M.CellTelemetryCfg(state_path=str(cell_state), wan="wan1",
                                 stale_after_s=30.0, rsrq_degrade_db=-12.0,
