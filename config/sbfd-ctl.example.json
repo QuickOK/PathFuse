@@ -96,7 +96,9 @@
     "rsrq_degrade_db": -12,
     "rsrq_recover_db": -10,
     "rsrp_degrade_dbm": -110,
-    "rsrp_recover_dbm": -108
+    "rsrp_recover_dbm": -108,
+    "handoff_path": "/run/sbfd-ctl/cell_handoff.json",
+    "handoff_ttl_s": 30
   },
   "maintenance_reboot": {
     "enabled": false,

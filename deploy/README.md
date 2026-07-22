@@ -119,7 +119,7 @@ should not be committed to the repo. `install.sh` does not manage them; you plac
 - `cell-telemetry.json` (hand-placed, not templated — references the admin
   secret): `{"admin_url": "http://192.0.2.1", "secret_path":
   "/etc/sbfd-ctl/hotspot-admin.secret"}`. All other keys have defaults
-  (`iface` wan1, 2 s poll, state to /run/sbfd-ctl/cell_telemetry.json).
+  (`iface` wan1, 2 s poll, state to /run/sbfd-ctl/cell_telemetry.json); the optional `handoff` sub-object (4 s window, 15 s rate limit) can be disabled with `"handoff": {"enabled": false}`.
 
 ## 5. Start services — order matters
 
