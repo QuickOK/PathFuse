@@ -1,4 +1,7 @@
 import json
+import os
+import time
+
 import cell_telemetry as CT
 
 
@@ -215,7 +218,7 @@ def test_read_wan_loss_fail_open(tmp_path):
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"timestamp": 1000.0,
                              "sessions": {"wan1": _sbfd_session(loss_pct=1.5)}}))
-    assert CT.read_wan_loss(str(p)) == 1.5
+    assert CT.read_wan_loss(str(p), now=1005.0) == 1.5
 
 
 def test_read_wan_loss_matches_via_iface_when_name_differs(tmp_path):
@@ -224,7 +227,7 @@ def test_read_wan_loss_matches_via_iface_when_name_differs(tmp_path):
     p = tmp_path / "s.json"
     p.write_text(json.dumps({"timestamp": 1000.0, "sessions": {
         "primary-cell": _sbfd_session(loss_pct=2.5, iface="wan1")}}))
-    assert CT.read_wan_loss(str(p), wan="wan1") == 2.5
+    assert CT.read_wan_loss(str(p), wan="wan1", now=1005.0) == 2.5
 
 
 def test_read_wan_loss_malformed_root_fails_open(tmp_path):
@@ -234,6 +237,37 @@ def test_read_wan_loss_malformed_root_fails_open(tmp_path):
     p = tmp_path / "bad.json"
     p.write_text(json.dumps([1, 2, 3]))
     assert CT.read_wan_loss(str(p)) is None
+
+
+def test_read_wan_loss_gates_on_stale_timestamp(tmp_path):
+    # CodeRabbit PR#5 CR2: a frozen sbfd state file (sbfd died mid-spike)
+    # would otherwise keep reporting its last loss_pct forever. sbfd.py's
+    # write_state_file publishes a top-level "timestamp" refreshed every
+    # tick (see sbfd.py write_state_file ~line 306) -- gate on it.
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"timestamp": 1000.0,
+                             "sessions": {"wan1": _sbfd_session(loss_pct=9.0)}}))
+    assert CT.read_wan_loss(str(p), now=1000.0 + 10.1) is None   # just over max_age_s
+    assert CT.read_wan_loss(str(p), now=1000.0 + 9.9) == 9.0     # just under
+
+
+def test_read_wan_loss_max_age_none_disables_gate(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"timestamp": 1000.0,
+                             "sessions": {"wan1": _sbfd_session(loss_pct=9.0)}}))
+    assert CT.read_wan_loss(str(p), max_age_s=None, now=1000.0 + 3600.0) == 9.0
+
+
+def test_read_wan_loss_falls_back_to_mtime_when_timestamp_missing(tmp_path):
+    # A payload with no usable top-level "timestamp" (schema drift, or an
+    # older writer) still gets a staleness gate via the file's own mtime.
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"sessions": {"wan1": _sbfd_session(loss_pct=4.0)}}))
+    old = time.time() - 3600
+    os.utime(p, (old, old))
+    assert CT.read_wan_loss(str(p)) is None
+    os.utime(p, None)   # refresh mtime to now
+    assert CT.read_wan_loss(str(p)) == 4.0
 
 
 def test_poll_once_writes_handoff_file(tmp_path):

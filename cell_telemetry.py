@@ -195,7 +195,7 @@ def poll_once(client, cfg, now, last_login_ts, *, detector=None, wan_loss=None):
     return reading, last_login_ts
 
 
-def read_wan_loss(state_path, wan="wan1"):
+def read_wan_loss(state_path, wan="wan1", max_age_s=10.0, now=None):
     """wan's loss_pct from the local sbfd state file, or None (fail-open).
     RX-side loss (relay->client), used only as the REACTIVE handoff fallback —
     a burst big enough to matter shows up here within a second.
@@ -203,14 +203,31 @@ def read_wan_loss(state_path, wan="wan1"):
     sbfd.py's write_state_file keys "sessions" by session NAME, not by a
     "wan" field -- there is no such field. Match the session name against
     `wan` first (the common case: sessions named after their wan), and fall
-    back to the session's "iface" field for one named something else."""
+    back to the session's "iface" field for one named something else.
+
+    Staleness gate (CodeRabbit PR#5 CR2): a frozen sbfd state file (sbfd died
+    mid-spike, or the write path wedged) would otherwise keep reporting its
+    last loss_pct forever, opening a duplication window every poll while the
+    gated WAN stays "active". sbfd.py's write_state_file publishes a
+    top-level "timestamp" (now_s()) refreshed on every tick — gate on THAT
+    real schema field, not a guessed one. Fall back to the file's own mtime
+    only if the payload doesn't carry a usable timestamp (missing/wrong
+    type/non-dict root). max_age_s=None disables the gate entirely."""
+    now = time.time() if now is None else now
     try:
-        raw = json.loads(open(state_path).read())
+        with open(state_path) as f:
+            raw = json.load(f)
+        if max_age_s is not None:
+            ts = raw.get("timestamp") if isinstance(raw, dict) else None
+            if not (isinstance(ts, (int, float)) and not isinstance(ts, bool)):
+                ts = os.stat(state_path).st_mtime
+            if now - ts > max_age_s:
+                return None
         for name, s in (raw.get("sessions") or {}).items():
             if isinstance(s, dict) and (name == wan or s.get("iface") == wan):
-                l = s.get("loss_pct")
-                if isinstance(l, (int, float)) and not isinstance(l, bool):
-                    return float(l)
+                loss = s.get("loss_pct")
+                if isinstance(loss, (int, float)) and not isinstance(loss, bool):
+                    return float(loss)
     except (OSError, ValueError, TypeError, AttributeError):
         # TypeError/AttributeError: a non-dict JSON root (list, string,
         # number, null...) has no .get/.items -- fail open rather than
@@ -291,7 +308,7 @@ def run(cfg, stop_event=None):
     while not stop_event.is_set():
         try:
             now = time.time()
-            wan_loss = read_wan_loss(cfg.sbfd_state_path, cfg.iface)
+            wan_loss = read_wan_loss(cfg.sbfd_state_path, cfg.iface, now=now)
             _, last_login_ts = poll_once(client, cfg, now, last_login_ts,
                                          detector=detector, wan_loss=wan_loss)
         except Exception:  # noqa: BLE001 — a poll must never kill the daemon
