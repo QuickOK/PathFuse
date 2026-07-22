@@ -695,7 +695,7 @@ function renderCellSignal(s){
   const floor = fec.signal_floor_active ? ' · signal floor' : '';
   const dup = s.duplication || {};
   const dupBadge = dup.active
-    ? ` · DUPLICATING (${dup.reason || 'handoff'})`
+    ? ` · DUPLICATING (${dup.last_reason || 'handoff'})`
     : (dup.count ? ` · ${dup.count} handoff window${dup.count === 1 ? '' : 's'}` : '');
   const stale = c.stale ? ' (stale)' : '';
   const cellLabel = c.wan ? ((s.wan_labels && s.wan_labels[c.wan]) || c.wan) : 'cell';
