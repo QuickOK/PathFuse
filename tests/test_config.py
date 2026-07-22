@@ -373,6 +373,27 @@ def test_cell_telemetry_rejects_zero_handoff_ttl_s(tmp_path: Path):
         sbfd_ctl.load_config(str(p))
 
 
+def test_cell_telemetry_rejects_nan_handoff_ttl_s(tmp_path: Path):
+    # CodeRabbit PR#5 CR1: json.loads accepts the bareword NaN, and NaN
+    # comparisons are always False, so a NaN handoff_ttl_s would sail
+    # through the `<= 0` check and make load_cell_handoff's sanity TTL inert.
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "handoff_ttl_s": float("nan")}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="handoff_ttl_s must be a finite number"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_cell_telemetry_rejects_infinite_stale_after_s(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "stale_after_s": float("inf")}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="stale_after_s must be a finite number"):
+        sbfd_ctl.load_config(str(p))
+
+
 def test_load_config_rejects_cell_telemetry_wan_not_in_wans(tmp_path: Path):
     # C11: a hand-edited cell_telemetry.wan referencing a WAN that doesn't
     # exist must fail fast at boot, not silently never match any driver.

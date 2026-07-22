@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 import threading
 from collections import deque
@@ -1253,6 +1254,17 @@ def load_config(path: str) -> Config:
         raise ValueError(
             f"maintenance_reboot.hour must be 0..23, got {maint_cfg.hour}")
     if cell_cfg is not None:
+        # Finiteness FIRST: json.loads accepts the barewords NaN/Infinity, and
+        # every comparison against NaN is False (see hotspot_watchdog.load_config's
+        # own comment on this) -- so e.g. a NaN handoff_ttl_s sails straight
+        # through the `<= 0` check below and makes the sanity TTL in
+        # load_cell_handoff inert, letting a wedged handoff file hold forced
+        # duplication open forever. Reject all cell numeric fields up front.
+        for k in ("stale_after_s", "rsrq_degrade_db", "rsrq_recover_db",
+                  "rsrp_degrade_dbm", "rsrp_recover_dbm", "handoff_ttl_s"):
+            v = getattr(cell_cfg, k)
+            if not math.isfinite(v):
+                raise ValueError(f"cell_telemetry.{k} must be a finite number, got {v!r}")
         if cell_cfg.stale_after_s <= 0:
             raise ValueError("cell_telemetry.stale_after_s must be > 0")
         if cell_cfg.rsrq_recover_db <= cell_cfg.rsrq_degrade_db:
@@ -1474,7 +1486,16 @@ class HandoffWindow:
 def load_cell_handoff(cfg: Config, now: float) -> Optional[HandoffWindow]:
     """The open duplication window, or None. Fail-open like load_auto_override.
     Two clocks gate it: until_ts (the window itself) and a sanity TTL on
-    set_ts — a wedged/ancient file must never hold full mode open."""
+    set_ts — a wedged/ancient file must never hold full mode open.
+
+    Finiteness FIRST (CodeRabbit PR#5 CR1): json.loads accepts the barewords
+    NaN/Infinity (see hotspot_watchdog.load_config's own comment on this), and
+    both gates below are comparisons that a non-finite value defeats — an
+    until_ts of Infinity satisfies `now < until_ts` forever, holding forced
+    full-mode duplication on the metered link open with no expiry. Reject
+    non-finite set_ts/until_ts, and a set_ts from the future beyond a small
+    clock-skew guard band (a forged/corrupt far-future pair must not ride
+    under the sanity-TTL age check), before trusting either clock."""
     if cfg.cell is None:
         return None
     try:
@@ -1482,6 +1503,10 @@ def load_cell_handoff(cfg: Config, now: float) -> Optional[HandoffWindow]:
         set_ts = float(raw["set_ts"])
         until_ts = float(raw["until_ts"])
     except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+        return None
+    if not (math.isfinite(set_ts) and math.isfinite(until_ts)):
+        return None
+    if set_ts > now + 5.0:
         return None
     if now >= until_ts:
         return None

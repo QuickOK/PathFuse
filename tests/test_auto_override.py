@@ -586,3 +586,33 @@ def test_load_cell_handoff_fail_open_and_expiry(tmp_path):
 
 def test_load_cell_handoff_unconfigured_is_none():
     assert M.load_cell_handoff(base_cfg(), now=1000.0) is None
+
+
+def test_load_cell_handoff_rejects_infinite_until_ts(tmp_path):
+    # CodeRabbit PR#5 CR1: json.loads accepts the bareword Infinity, and
+    # `now >= until_ts` is False forever against it -- a corrupt/crafted
+    # handoff file could hold forced full-mode duplication open forever.
+    cfg = _handoff_cfg(tmp_path)
+    (tmp_path / "handoff.json").write_text(json.dumps(
+        {"set_ts": 1000.0, "until_ts": float("inf"), "reason": "x"}))
+    assert M.load_cell_handoff(cfg, now=1000.0) is None
+    assert M.load_cell_handoff(cfg, now=10_000_000.0) is None
+
+
+def test_load_cell_handoff_rejects_nan_set_ts(tmp_path):
+    # A NaN set_ts would make `now - set_ts > handoff_ttl_s` False forever too,
+    # making the sanity TTL inert.
+    cfg = _handoff_cfg(tmp_path)
+    (tmp_path / "handoff.json").write_text(json.dumps(
+        {"set_ts": float("nan"), "until_ts": 1004.0, "reason": "x"}))
+    assert M.load_cell_handoff(cfg, now=1002.0) is None
+
+
+def test_load_cell_handoff_rejects_future_set_ts(tmp_path):
+    # Clock-skew guard: a forged/corrupt pair with set_ts far in the future
+    # must not ride under the sanity-TTL age check (now - set_ts would be
+    # negative, always <= handoff_ttl_s).
+    cfg = _handoff_cfg(tmp_path)
+    (tmp_path / "handoff.json").write_text(json.dumps(
+        {"set_ts": 100_000.0, "until_ts": 100_004.0, "reason": "x"}))
+    assert M.load_cell_handoff(cfg, now=1000.0) is None
