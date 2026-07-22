@@ -120,6 +120,7 @@ should not be committed to the repo. `install.sh` does not manage them; you plac
   secret): `{"admin_url": "http://192.0.2.1", "secret_path":
   "/etc/sbfd-ctl/hotspot-admin.secret"}`. All other keys have defaults
   (`iface` wan1, 2 s poll, state to /run/sbfd-ctl/cell_telemetry.json); the optional `handoff` sub-object (4 s window, 15 s rate limit) can be disabled with `"handoff": {"enabled": false}`.
+  Cross-config coupling: the collector's `handoff.window_s` must stay ≤ the controller's `cell_telemetry.handoff_ttl_s` (default 30 s) or the sanity TTL will truncate windows before they finish.
 
 ## 5. Start services — order matters
 
