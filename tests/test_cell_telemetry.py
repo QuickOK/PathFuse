@@ -261,3 +261,24 @@ def test_handoff_config_parse_and_validation(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         CT.load_config(str(p))
+
+
+def test_handoff_config_rejects_non_positive_rsrq_drop_db(tmp_path):
+    # A zero/negative rsrq_drop_db makes every fresh pair a trigger -- a
+    # permanent duplication duty cycle silently burning the data cap.
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"admin_url": "http://192.0.2.1",
+                             "handoff": {"rsrq_drop_db": 0}}))
+    import pytest
+    with pytest.raises(ValueError):
+        CT.load_config(str(p))
+
+
+def test_handoff_config_rejects_non_positive_loss_spike_pct(tmp_path):
+    # Same failure mode as rsrq_drop_db, via the loss-spike fallback trigger.
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"admin_url": "http://192.0.2.1",
+                             "handoff": {"loss_spike_pct": -1}}))
+    import pytest
+    with pytest.raises(ValueError):
+        CT.load_config(str(p))

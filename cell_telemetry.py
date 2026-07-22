@@ -139,6 +139,10 @@ def load_config(path):
         raise ValueError("handoff.window_s must be > 0")
     if cfg.handoff_min_interval_s < cfg.handoff_window_s:
         raise ValueError("handoff.min_interval_s must be >= window_s")
+    if cfg.handoff_rsrq_drop_db <= 0:
+        raise ValueError("handoff.rsrq_drop_db must be > 0")
+    if cfg.handoff_loss_spike_pct <= 0:
+        raise ValueError("handoff.loss_spike_pct must be > 0")
     return cfg
 
 
