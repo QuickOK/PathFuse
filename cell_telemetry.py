@@ -202,13 +202,16 @@ def read_wan_loss(state_path, wan="wan1"):
     back to the session's "iface" field for one named something else."""
     try:
         raw = json.loads(open(state_path).read())
-    except (OSError, ValueError):
+        for name, s in (raw.get("sessions") or {}).items():
+            if isinstance(s, dict) and (name == wan or s.get("iface") == wan):
+                l = s.get("loss_pct")
+                if isinstance(l, (int, float)) and not isinstance(l, bool):
+                    return float(l)
+    except (OSError, ValueError, TypeError, AttributeError):
+        # TypeError/AttributeError: a non-dict JSON root (list, string,
+        # number, null...) has no .get/.items -- fail open rather than
+        # escape to the poll loop's log.exception spam.
         return None
-    for name, s in (raw.get("sessions") or {}).items():
-        if isinstance(s, dict) and (name == wan or s.get("iface") == wan):
-            l = s.get("loss_pct")
-            if isinstance(l, (int, float)) and not isinstance(l, bool):
-                return float(l)
     return None
 
 

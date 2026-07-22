@@ -227,6 +227,15 @@ def test_read_wan_loss_matches_via_iface_when_name_differs(tmp_path):
     assert CT.read_wan_loss(str(p), wan="wan1") == 2.5
 
 
+def test_read_wan_loss_malformed_root_fails_open(tmp_path):
+    # A non-dict JSON root (list, string, number, null...) must fail open,
+    # not raise AttributeError/TypeError out to the poll loop's
+    # log.exception spam.
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps([1, 2, 3]))
+    assert CT.read_wan_loss(str(p)) is None
+
+
 def test_poll_once_writes_handoff_file(tmp_path):
     cfg, det = _det(tmp_path)
     client = FakeClient([MODEL, dict(MODEL, wwanadv={"cellId": 777,
