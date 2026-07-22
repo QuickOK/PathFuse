@@ -52,13 +52,21 @@ const ratioPresetsRendered = {};
    Custom… and put the canonical ratio in the box, so a reload round-trips
    instead of snapping back to a preset. The server does the resolving; this
    only ever displays what it sent back. */
-function syncRatioDropdown(selId, customId, presets, desired){
+function syncRatioDropdown(selId, customId, presets, desired, withAuto){
   const sel = $(selId);
   if (!sel) return;
   const list = Array.isArray(presets) && presets.length ? presets : FEC_RATIO_FALLBACK_PRESETS;
-  const key = list.join("|");
+  // Fold the auto flag into the cache key so switching it rebuilds the
+  // option list instead of reusing one missing (or wrongly holding) the
+  // auto option.
+  const key = (withAuto ? "auto|" : "") + list.join("|");
   if (key !== ratioPresetsRendered[selId]){
     sel.innerHTML = "";
+    if (withAuto){
+      const a = document.createElement("option");
+      a.value = "auto"; a.textContent = "auto (per-WAN profile)";
+      sel.appendChild(a);
+    }
     list.forEach(r => {
       const o = document.createElement("option");
       o.value = r; o.textContent = r;
@@ -71,7 +79,10 @@ function syncRatioDropdown(selId, customId, presets, desired){
   }
   const custom = $(customId);
   if (desired){
-    if (list.includes(desired)){
+    if (desired === "auto" && withAuto){
+      if (sel.value !== "auto") sel.value = "auto";
+      if (custom && !isFrozen(customId.slice(1))) custom.value = "";
+    } else if (list.includes(desired)){
       if (sel.value !== desired) sel.value = desired;
       if (custom && !isFrozen(customId.slice(1))) custom.value = "";
     } else {
@@ -318,7 +329,10 @@ function render(s){
       syncRatioDropdown("#fec-fixed-ratio", "#fec-fixed-custom", presets,
         fixedFrozen ? null : s.fec.desired_fixed_ratio);
       syncRatioDropdown("#fec-floor-ratio", "#fec-floor-custom", presets,
-        floorFrozen ? null : s.fec.floor_ratio);
+        floorFrozen ? null : (("floor_override" in (s.fec || {}))
+          ? (s.fec.floor_override === null ? "auto" : s.fec.floor_override)
+          : s.fec.floor_ratio),
+        true);
     }
     const env = s.environmental || {};
     if (env.configured) setRadio("environmental_enabled", env.enabled ? "on" : "off");
@@ -1017,7 +1031,8 @@ async function apply(){
     const fecPayload = {};
     if (fecMode) fecPayload.fec_mode = fecMode;
     if (fecMode === "fixed" && fecFixed) fecPayload.fec_fixed_ratio = fecFixed;
-    if (fecMode === "min_adaptive" && fecFloor) fecPayload.fec_floor_ratio = fecFloor;
+    if (fecMode === "min_adaptive" && fecFloor)
+      fecPayload.fec_floor_ratio = fecFloor === "auto" ? null : fecFloor;
     const r = await fetch("/api/runtime", {
       method:"POST",
       headers:{"Content-Type":"application/json"},

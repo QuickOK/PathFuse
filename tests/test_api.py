@@ -467,6 +467,50 @@ def test_post_runtime_applies_fec_mode_and_fixed_ratio(cfg):
         stop.set(); httpd.shutdown()
 
 
+def test_runtime_post_null_floor_clears_override(cfg_with_fec):
+    # cfg_with_fec configures floor_ratio="8:1" as the config default; the
+    # posted override "8:2" is deliberately different so the two are never
+    # confused. The snapshot's fec.floor_override is ov.fec_floor_ratio
+    # (str or None) and fec.floor_ratio stays the effective floor, per the
+    # sbfd_ctl "fec" snapshot dict — verified here through the same
+    # load_runtime_overlay/effective_fec_floor_ratio helpers that build it.
+    Path(cfg_with_fec.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+
+        def post(body):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/runtime",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                return r.status
+
+        status = post({
+            "mode": "full", "master_policy": "static_primary", "master_wan": "wan2",
+            "egress_mode": "relay_vpn", "fec_mode": "min_adaptive",
+            "fec_floor_ratio": "8:2", "persist": False,
+        })
+        assert status == 200
+        ov = M.load_runtime_overlay(cfg_with_fec)
+        assert ov.fec_floor_ratio == "8:2"  # snapshot fec.floor_override == "8:2"
+
+        status = post({
+            "mode": "full", "master_policy": "static_primary", "master_wan": "wan2",
+            "egress_mode": "relay_vpn", "fec_mode": "min_adaptive",
+            "fec_floor_ratio": None, "persist": False,
+        })
+        assert status == 200
+        ov = M.load_runtime_overlay(cfg_with_fec)
+        assert ov.fec_floor_ratio is None  # snapshot fec.floor_override is None
+        assert M.effective_fec_floor_ratio(cfg_with_fec, ov) == \
+            cfg_with_fec.fec.floor_ratio  # fec.floor_ratio == config-resolved effective floor
+    finally:
+        stop.set(); httpd.shutdown()
+
+
 def test_effective_fec_enabled_overlay_false_wins(cfg_with_fec):
     assert M.effective_fec_enabled(cfg_with_fec, M.RuntimeOverlay(fec_enabled=False)) is False
 
@@ -1046,17 +1090,29 @@ def test_validate_accepts_explicit_floor_ratio():
 
 
 def test_validate_rejects_bad_floor_ratio():
-    for bad in ["abc", "200%", "0:1", "", 5, None]:
+    # None is deliberately excluded: it is the "auto" sentinel that clears the
+    # operator override (see test_validate_runtime_null_ratios_clear), not a
+    # bad value.
+    for bad in ["abc", "200%", "0:1", "", 5]:
         ok, err = M.validate_runtime_payload({"fec_floor_ratio": bad}, {"wan1"})
         assert ok is False, bad
         assert "fec_floor_ratio" in err
 
 
 def test_validate_rejects_bad_fixed_ratio():
-    for bad in ["abc", "200%", "0:1", "", 5, None]:
+    for bad in ["abc", "200%", "0:1", "", 5]:
         ok, err = M.validate_runtime_payload({"fec_fixed_ratio": bad}, {"wan1"})
         assert ok is False, bad
         assert "fec_fixed_ratio" in err
+
+
+def test_validate_runtime_null_ratios_clear():
+    ok, err = M.validate_runtime_payload({"fec_floor_ratio": None}, {"wan1", "wan2"})
+    assert ok and err is None
+    ok, _ = M.validate_runtime_payload({"fec_fixed_ratio": None}, {"wan1", "wan2"})
+    assert ok
+    ok, err = M.validate_runtime_payload({"fec_floor_ratio": 5}, {"wan1", "wan2"})
+    assert not ok and "fec_floor_ratio" in err
 
 
 def test_validate_leaves_absent_ratio_keys_absent():

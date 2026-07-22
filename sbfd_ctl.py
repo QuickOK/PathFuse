@@ -1784,6 +1784,11 @@ def validate_runtime_payload(payload: dict, wan_names: set):
     # the runtime and persist files never hold a percent string.
     for _key in ("fec_fixed_ratio", "fec_floor_ratio"):
         if _key in payload:
+            if payload[_key] is None:
+                # Explicit null = clear the operator override; the effective_*
+                # helpers fall through to profile/config. Distinct from an
+                # absent key, which leaves the stored override untouched.
+                continue
             try:
                 payload[_key] = fec_control.resolve_ratio(payload[_key])
             except ValueError as e:
@@ -2627,6 +2632,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 "desired_mode": fec_mode_eff,
                 "desired_fixed_ratio": fec_fixed_ratio_eff,
                 "floor_ratio": fec_floor_ratio_eff,
+                "floor_override": ov.fec_floor_ratio,
                 # fixed_ratio_presets is retained so a cached older page keeps
                 # working; ratio_presets is what the current UI reads for both
                 # the fixed and the floor dropdown.
