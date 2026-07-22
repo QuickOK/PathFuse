@@ -627,6 +627,201 @@ def test_run_controller_pushes_wan_profile_and_signal_floor_to_relay(tmp_path, m
     assert all(p["signal_floor"] is True for p in pushed)
 
 
+def test_run_controller_suppresses_signal_floor_when_full_mode_backoff_gate_closed(tmp_path, monkeypatch):
+    """Twin of test_run_controller_pushes_wan_profile_and_signal_floor_to_relay
+    (P2 review's deferred gap): same RSRQ collapse, but full_min_up_wans=2
+    with both WANs UP closes the full-mode-backoff gate. fec_full_backoff
+    wins over the raw signal-floor engagement (sbfd_ctl.py's
+    fec_signal_floor_applied = fec_signal_engaged and not fec_full_backoff),
+    so every relay post and the published signal_floor_active must both be
+    False even though the radio is degraded."""
+    import threading as _t
+    cell_state = tmp_path / "cell.json"
+    cfg = M.Config(
+        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+              "wan2": M.WanCfg("wan2", 2, "Satellite")},
+        relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
+        engarde=M.EngardeCfg("198.51.100.10", 59402),
+        nft=M.NftCfg(),
+        policy=M.PolicyCfg(default_mode="full"),
+        ui_listen="127.0.0.1:0",
+        sbfd_local_state=str(tmp_path / "sbfd-state.json"),
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "published.json"),
+        fec=M.FecCfg(enabled=True, fifo=str(tmp_path / "client.fifo"),
+                     loss_table=fec_control.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
+                     ramp_down_hold_s=0, full_mode_backoff_fec="8:0",
+                     full_min_up_wans=2, floor_ratio="8:1",
+                     wan_profiles={"wan1": M.WanProfileCfg(
+                         name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+                         ramp_up_ticks=1, ramp_down_hold_s=0,
+                         floor_ratio="8:0", signal_floor_fec="12:1")}),
+        cell=M.CellTelemetryCfg(state_path=str(cell_state), wan="wan1",
+                                stale_after_s=30.0, rsrq_degrade_db=-12.0,
+                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0),
+    )
+    # RSRQ well past the degrade threshold -> would engage the signal floor
+    # if not for the full-mode-backoff gate below.
+    cell_state.write_text(json.dumps({"rsrq": -13.0, "rsrp": None,
+                                      "set_ts": __import__("time").time()}))
+
+    monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda c: set())
+    monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda a: None)
+    monkeypatch.setattr(M, "read_engarde_table_default", lambda table: {"via": None, "dev": "wg0"})
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+        lambda p, m: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 1.5, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 4.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_relay_fec",
+        lambda url, t: {"ok": True, "error": None,
+                        "data": {"enabled": True, "ratio": "8:2", "level": 1,
+                                 "driving_loss_pct": 1.2, "since": 5.0}})
+    pushed = []
+    def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
+                  wan_profile=None, signal_floor=None):
+        pushed.append({"wan_profile": wan_profile, "signal_floor": signal_floor})
+        return True
+    monkeypatch.setattr(M, "post_relay_fec", fake_post)
+    monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
+
+    Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).write_text("{}")
+
+    stop = _t.Event()
+    _t.Thread(target=lambda: (__import__("time").sleep(0.6), stop.set()), daemon=True).start()
+    M.run_controller(cfg, stop_event=stop)
+
+    assert pushed, "expected at least one relay POST"
+    # Gate closed (2 WANs UP >= full_min_up_wans=2) -> backoff wins, signal
+    # floor must never reach the relay despite the RSRQ collapse.
+    assert all(p["signal_floor"] is False for p in pushed)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["fec"]["signal_floor_active"] is False
+
+
+def test_run_controller_handoff_window_forces_full_and_publishes(tmp_path, monkeypatch):
+    """Loop-level pin for the Task 1/2 seam: a live duplication window
+    (cell_handoff.json) must force mode 'full' end-to-end through
+    run_controller, publish the duplication block, and back FEC off to the
+    full-mode ratio -- then release everything cleanly once the window
+    expires, without losing the lifetime duplication counter."""
+    import threading as _t
+    import time as _time
+    cell_state = tmp_path / "cell.json"
+    handoff_path = tmp_path / "cell_handoff.json"
+    cfg = M.Config(
+        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+              "wan2": M.WanCfg("wan2", 2, "Satellite")},
+        relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
+        engarde=M.EngardeCfg("198.51.100.10", 59402),
+        nft=M.NftCfg(),
+        policy=M.PolicyCfg(default_mode="master_backup",
+                           default_master_policy="static_primary",
+                           default_master_wan="wan1"),
+        ui_listen="127.0.0.1:0",
+        sbfd_local_state=str(tmp_path / "sbfd-state.json"),
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "published.json"),
+        fec=M.FecCfg(enabled=True, fifo=str(tmp_path / "client.fifo"),
+                     loss_table=fec_control.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
+                     ramp_down_hold_s=0, full_mode_backoff_fec="8:0",
+                     full_min_up_wans=2, floor_ratio="8:0",
+                     # MODE_ADAPTIVE, not the module default MODE_MIN_ADAPTIVE:
+                     # min_adaptive's floor_ratio is a hard floor that would
+                     # otherwise lift the full-mode-backoff ratio right back
+                     # up, muddying this test's actual target (the backoff).
+                     mode=fec_control.MODE_ADAPTIVE),
+        cell=M.CellTelemetryCfg(state_path=str(cell_state), wan="wan1",
+                                stale_after_s=30.0, rsrq_degrade_db=-12.0,
+                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0,
+                                handoff_path=str(handoff_path), handoff_ttl_s=30.0),
+    )
+    # No radio degradation in play here -- this test pins the handoff window
+    # seam, not the signal floor.
+    cell_state.write_text(json.dumps({"rsrq": -8.0, "rsrp": None,
+                                      "set_ts": _time.time()}))
+    now = _time.time()
+    handoff_path.write_text(json.dumps({
+        "set_ts": now, "until_ts": now + 4.0, "reason": "cell_change:1->2"}))
+
+    monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda c: set())
+    monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda a: None)
+    monkeypatch.setattr(M, "read_engarde_table_default", lambda table: {"via": None, "dev": "wg0"})
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+        lambda p, m: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 0.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 0.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_relay_fec",
+        lambda url, t: {"ok": True, "error": None,
+                        "data": {"enabled": True, "ratio": "8:0", "level": 0,
+                                 "driving_loss_pct": 0.0, "since": 5.0}})
+    monkeypatch.setattr(M, "post_relay_fec",
+        lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
+               wan_profile=None, signal_floor=None: True)
+    monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
+
+    Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).write_text("{}")
+
+    def read_published():
+        return json.loads(Path(cfg.published_state).read_text())
+
+    mid = {}
+    stop = _t.Event()
+
+    def driver():
+        # A couple of 0.5s ticks -> the window must already be forcing full.
+        _time.sleep(0.6)
+        mid["snap"] = read_published()
+        # Age the file out from under the controller instead of sleeping the
+        # full 4s until_ts -- the loop must react to the rewrite on its very
+        # next tick, so this keeps the test's wall-clock budget under ~1.5s.
+        handoff_path.write_text(json.dumps({
+            "set_ts": now, "until_ts": _time.time() - 1.0,
+            "reason": "cell_change:1->2"}))
+        # A couple more ticks -> the loop must have re-checked the (now
+        # expired) window and reverted.
+        _time.sleep(0.6)
+        stop.set()
+
+    t = _t.Thread(target=driver, daemon=True)
+    t.start()
+    M.run_controller(cfg, stop_event=stop)
+    t.join(timeout=2)
+
+    assert "snap" in mid, "expected a published snapshot while the window was open"
+    dup_mid = mid["snap"]["duplication"]
+    # Window open -> mode forced to 'full', duplication published active,
+    # and FEC backed off (2 WANs UP >= full_min_up_wans -> full-mode ratio).
+    assert mid["snap"]["mode"] == "full"
+    assert dup_mid["active"] is True
+    assert dup_mid["count"] == 1
+    assert dup_mid["last_reason"] == "cell_change:1->2"
+    assert mid["snap"]["fec"]["directions"]["client_to_relay"]["ratio"] == "8:0"
+
+    final = read_published()
+    dup_final = final["duplication"]
+    # Window expired -> mode reverts to the configured default, duplication
+    # reports inactive, but the lifetime count is never decremented.
+    assert final["mode"] == "master_backup"
+    assert dup_final["active"] is False
+    assert dup_final["count"] == 1
+
+
 def test_run_controller_disabled_and_relay_unreachable(cfg_with_fec, monkeypatch):
     import threading as _t
     # Operator has disabled FEC via the runtime overlay.

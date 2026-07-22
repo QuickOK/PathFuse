@@ -299,6 +299,20 @@ def test_cell_telemetry_config_parsed(tmp_path: Path):
     assert cfg.cell.rsrq_degrade_db == -12.0
     assert cfg.cell.rsrp_degrade_dbm == -110.0
     assert cfg.cell.rsrp_recover_dbm == -108.0
+    assert cfg.cell.handoff_path == "/run/sbfd-ctl/cell_handoff.json"
+    assert cfg.cell.handoff_ttl_s == 30.0
+
+
+def test_cell_telemetry_handoff_configurable(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x",
+                              "handoff_path": "/run/sbfd-ctl/handoff.json",
+                              "handoff_ttl_s": 5.0}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(cfgd))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.cell.handoff_path == "/run/sbfd-ctl/handoff.json"
+    assert cfg.cell.handoff_ttl_s == 5.0
 
 
 def test_cell_telemetry_absent_is_none(tmp_path: Path):
@@ -347,6 +361,15 @@ def test_cell_telemetry_rejects_zero_stale_after_s(tmp_path: Path):
     p = tmp_path / "bad.json"
     p.write_text(json.dumps(cfgd))
     with pytest.raises(ValueError, match="stale_after_s"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_cell_telemetry_rejects_zero_handoff_ttl_s(tmp_path: Path):
+    cfgd = dict(SAMPLE)
+    cfgd["cell_telemetry"] = {"state_path": "/x", "handoff_ttl_s": 0}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(cfgd))
+    with pytest.raises(ValueError, match="handoff_ttl_s"):
         sbfd_ctl.load_config(str(p))
 
 
