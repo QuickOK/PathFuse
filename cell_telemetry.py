@@ -194,13 +194,18 @@ def poll_once(client, cfg, now, last_login_ts, *, detector=None, wan_loss=None):
 def read_wan_loss(state_path, wan="wan1"):
     """wan's loss_pct from the local sbfd state file, or None (fail-open).
     RX-side loss (relay->client), used only as the REACTIVE handoff fallback —
-    a burst big enough to matter shows up here within a second."""
+    a burst big enough to matter shows up here within a second.
+
+    sbfd.py's write_state_file keys "sessions" by session NAME, not by a
+    "wan" field -- there is no such field. Match the session name against
+    `wan` first (the common case: sessions named after their wan), and fall
+    back to the session's "iface" field for one named something else."""
     try:
         raw = json.loads(open(state_path).read())
     except (OSError, ValueError):
         return None
-    for s in (raw.get("sessions") or {}).values():
-        if isinstance(s, dict) and s.get("wan") == wan:
+    for name, s in (raw.get("sessions") or {}).items():
+        if isinstance(s, dict) and (name == wan or s.get("iface") == wan):
             l = s.get("loss_pct")
             if isinstance(l, (int, float)) and not isinstance(l, bool):
                 return float(l)

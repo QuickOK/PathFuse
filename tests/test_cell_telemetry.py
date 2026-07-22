@@ -197,12 +197,34 @@ def test_handoff_disabled_never_fires(tmp_path):
     assert det.update(_reading("200"), 5.0, now=1002.0) is None
 
 
+def _sbfd_session(**kw):
+    """A session entry shaped like sbfd.py's write_state_file actually emits
+    it (sessions keyed by session NAME, no "wan" field — see sbfd.py
+    write_state_file ~line 311)."""
+    base = {"session_id": 1, "state": "UP", "state_since": 900.0,
+            "uptime_s": 100.0, "tx_seq": 5, "last_rx_seq": 5,
+            "last_rx_age_s": 0.2, "consecutive_miss": 0, "consecutive_hit": 5,
+            "rtt_ms": 30.0, "loss_pct": 1.5, "peer": "203.0.113.1:5000",
+            "iface": "wan1"}
+    base.update(kw)
+    return base
+
+
 def test_read_wan_loss_fail_open(tmp_path):
     assert CT.read_wan_loss(str(tmp_path / "missing.json")) is None
     p = tmp_path / "s.json"
-    p.write_text(json.dumps({"sessions": {"1": {"wan": "wan1", "state": "UP",
-                                                "loss_pct": 1.5}}}))
+    p.write_text(json.dumps({"timestamp": 1000.0,
+                             "sessions": {"wan1": _sbfd_session(loss_pct=1.5)}}))
     assert CT.read_wan_loss(str(p)) == 1.5
+
+
+def test_read_wan_loss_matches_via_iface_when_name_differs(tmp_path):
+    # Session named after the tunnel/peer, not the wan id -- must still match
+    # by its "iface" field.
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"timestamp": 1000.0, "sessions": {
+        "primary-cell": _sbfd_session(loss_pct=2.5, iface="wan1")}}))
+    assert CT.read_wan_loss(str(p), wan="wan1") == 2.5
 
 
 def test_poll_once_writes_handoff_file(tmp_path):
