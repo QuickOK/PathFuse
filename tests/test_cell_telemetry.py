@@ -134,3 +134,99 @@ def test_poll_once_state_write_failure_preserves_login_backoff(tmp_path):
     assert reading["rsrp"] == -98.0
     assert ts == 1000.0
     assert client.login_calls == 1
+
+
+def _det(tmp_path, **kw):
+    kw.setdefault("admin_url", "http://192.0.2.1")
+    kw.setdefault("state_path", str(tmp_path / "cell.json"))
+    kw.setdefault("handoff_path", str(tmp_path / "handoff.json"))
+    cfg = CT.CtCfg(**kw)
+    return cfg, CT.HandoffDetector(cfg)
+
+
+def _reading(cell_id="100", rsrq=-9.0):
+    return {"rsrp": -90.0, "rsrq": rsrq, "sinr": 10.0,
+            "cell_id": cell_id, "band": "LTE B2"}
+
+
+def test_handoff_cell_change_fires_once_and_rate_limits(tmp_path):
+    cfg, det = _det(tmp_path)
+    assert det.update(_reading("100"), None, now=1000.0) is None   # first sample: no pair
+    assert det.update(_reading("100"), None, now=1002.0) is None   # same cell
+    r = det.update(_reading("200"), None, now=1004.0)
+    assert r == "cell_change:100->200"
+    # inside the open window AND inside min_interval: ignored, not extended
+    assert det.update(_reading("300"), None, now=1006.0) is None
+    # after the window but still inside min_interval (15 s from open): still
+    # ignored — keep the 2 s poll cadence so every pair stays fresh
+    for t in (1008.0, 1010.0, 1012.0, 1014.0, 1016.0, 1018.0):
+        assert det.update(_reading("400"), None, now=t) is None
+    # past min_interval (1020 - 1004 >= 15) with a fresh pair: a NEW change fires
+    assert det.update(_reading("500"), None, now=1020.0) == "cell_change:400->500"
+
+
+def test_handoff_rsrq_drop_needs_consecutive_fresh_pair(tmp_path):
+    cfg, det = _det(tmp_path)
+    det.update(_reading(rsrq=-8.0), None, now=1000.0)
+    r = det.update(_reading(rsrq=-12.5), None, now=1002.0)   # 4.5 dB drop
+    assert r == "rsrq_drop:-8.0->-12.5"
+    det2 = CT.HandoffDetector(cfg)
+    det2.update(_reading(rsrq=-8.0), None, now=1000.0)
+    # 4.5 dB drop but the pair spans a 20 s gap (> 2 * poll_interval_s): invalid
+    assert det2.update(_reading(rsrq=-12.5), None, now=1020.0) is None
+
+
+def test_handoff_gap_does_not_fire_cell_change(tmp_path):
+    # hotspot reboot: samples stop, then resume with a new cell id -> must NOT fire
+    cfg, det = _det(tmp_path)
+    det.update(_reading("100"), None, now=1000.0)
+    assert det.update(_reading("999"), None, now=1060.0) is None
+
+
+def test_handoff_loss_spike_reactive_fallback(tmp_path):
+    cfg, det = _det(tmp_path)
+    det.update(_reading(), 0.0, now=1000.0)
+    r = det.update(None, 3.5, now=1002.0)      # modem unreadable, loss spiking
+    assert r == "loss_spike:3.5"
+    assert det.update(None, 0.1, now=1020.0) is None   # below threshold
+
+
+def test_handoff_disabled_never_fires(tmp_path):
+    cfg, det = _det(tmp_path, handoff_enabled=False)
+    det.update(_reading("100"), None, now=1000.0)
+    assert det.update(_reading("200"), 5.0, now=1002.0) is None
+
+
+def test_read_wan_loss_fail_open(tmp_path):
+    assert CT.read_wan_loss(str(tmp_path / "missing.json")) is None
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"sessions": {"1": {"wan": "wan1", "state": "UP",
+                                                "loss_pct": 1.5}}}))
+    assert CT.read_wan_loss(str(p)) == 1.5
+
+
+def test_poll_once_writes_handoff_file(tmp_path):
+    cfg, det = _det(tmp_path)
+    client = FakeClient([MODEL, dict(MODEL, wwanadv={"cellId": 777,
+                                                     "curBand": "LTE B2"})])
+    CT.poll_once(client, cfg, now=1000.0, last_login_ts=None, detector=det,
+                 wan_loss=None)
+    CT.poll_once(client, cfg, now=1002.0, last_login_ts=None, detector=det,
+                 wan_loss=None)
+    h = json.loads((tmp_path / "handoff.json").read_text())
+    assert h["set_ts"] == 1002.0 and h["until_ts"] == 1006.0
+    assert h["reason"].startswith("cell_change:")
+
+
+def test_handoff_config_parse_and_validation(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"admin_url": "http://192.0.2.1",
+                             "handoff": {"window_s": 5, "min_interval_s": 30}}))
+    cfg = CT.load_config(str(p))
+    assert cfg.handoff_window_s == 5.0 and cfg.handoff_min_interval_s == 30.0
+    assert cfg.handoff_enabled is True
+    p.write_text(json.dumps({"admin_url": "http://192.0.2.1",
+                             "handoff": {"window_s": 20, "min_interval_s": 15}}))
+    import pytest
+    with pytest.raises(ValueError):
+        CT.load_config(str(p))

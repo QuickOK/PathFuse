@@ -102,11 +102,19 @@ class CtCfg:
     state_path: str = "/run/sbfd-ctl/cell_telemetry.json"
     poll_interval_s: float = 2.0
     login_backoff_s: float = 60.0
+    handoff_path: str = "/run/sbfd-ctl/cell_handoff.json"
+    handoff_window_s: float = 4.0
+    handoff_min_interval_s: float = 15.0
+    handoff_rsrq_drop_db: float = 4.0
+    handoff_loss_spike_pct: float = 2.0
+    sbfd_state_path: str = "/run/sbfd/state.json"
+    handoff_enabled: bool = True
 
 
 def load_config(path):
     with open(path) as f:
         raw = json.load(f)
+    h = raw.get("handoff") or {}
     cfg = CtCfg(
         admin_url=raw["admin_url"],
         iface=raw.get("iface", "wan1"),
@@ -115,11 +123,22 @@ def load_config(path):
         state_path=raw.get("state_path", "/run/sbfd-ctl/cell_telemetry.json"),
         poll_interval_s=float(raw.get("poll_interval_s", 2.0)),
         login_backoff_s=float(raw.get("login_backoff_s", 60.0)),
+        handoff_enabled=bool(h.get("enabled", True)),
+        handoff_path=h.get("path", "/run/sbfd-ctl/cell_handoff.json"),
+        handoff_window_s=float(h.get("window_s", 4.0)),
+        handoff_min_interval_s=float(h.get("min_interval_s", 15.0)),
+        handoff_rsrq_drop_db=float(h.get("rsrq_drop_db", 4.0)),
+        handoff_loss_spike_pct=float(h.get("loss_spike_pct", 2.0)),
+        sbfd_state_path=h.get("sbfd_state_path", "/run/sbfd/state.json"),
     )
     if cfg.poll_interval_s <= 0:
         raise ValueError("poll_interval_s must be > 0")
     if cfg.login_backoff_s < 0:
         raise ValueError("login_backoff_s must be >= 0")
+    if cfg.handoff_window_s <= 0:
+        raise ValueError("handoff.window_s must be > 0")
+    if cfg.handoff_min_interval_s < cfg.handoff_window_s:
+        raise ValueError("handoff.min_interval_s must be >= window_s")
     return cfg
 
 
@@ -143,7 +162,7 @@ def _read_secret(path):
         return None
 
 
-def poll_once(client, cfg, now, last_login_ts):
+def poll_once(client, cfg, now, last_login_ts, *, detector=None, wan_loss=None):
     """One poll. Writes the state file on success (only then — a stale file is
     the downstream failure signal). Falls back to an admin login at most once
     per login_backoff_s when the unauthenticated read carries no signal."""
@@ -161,7 +180,94 @@ def poll_once(client, cfg, now, last_login_ts):
             atomic_write_json(cfg.state_path, {**reading, "set_ts": now})
         except OSError as e:
             log.warning("state write failed (%s): %s", cfg.state_path, e)
+    if detector is not None:
+        reason = detector.update(reading, wan_loss, now)
+        if reason is not None:
+            try:
+                write_handoff(cfg.handoff_path, now, cfg.handoff_window_s, reason)
+                log.info("handoff window opened (%s)", reason)
+            except OSError as e:
+                log.warning("handoff write failed (%s): %s", cfg.handoff_path, e)
     return reading, last_login_ts
+
+
+def read_wan_loss(state_path, wan="wan1"):
+    """wan's loss_pct from the local sbfd state file, or None (fail-open).
+    RX-side loss (relay->client), used only as the REACTIVE handoff fallback —
+    a burst big enough to matter shows up here within a second."""
+    try:
+        raw = json.loads(open(state_path).read())
+    except (OSError, ValueError):
+        return None
+    for s in (raw.get("sessions") or {}).values():
+        if isinstance(s, dict) and s.get("wan") == wan:
+            l = s.get("loss_pct")
+            if isinstance(l, (int, float)) and not isinstance(l, bool):
+                return float(l)
+    return None
+
+
+class HandoffDetector:
+    """Detects an imminent/in-progress tower handoff from consecutive telemetry
+    samples and opens rate-limited duplication windows.
+
+    Pair validity: cell-change and RSRQ-delta triggers compare CONSECUTIVE
+    successful polls only — a gap longer than 2x the poll interval (modem
+    reboot, nightly maintenance) invalidates the pair, so waking up on a new
+    tower after an outage never opens a window. The loss-spike fallback needs
+    no pair (it is already a smoothed measurement).
+
+    Rate limit: at most one window per min_interval_s, measured open-to-open;
+    triggers inside an open window are ignored, never extended (spec §5)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._prev = None            # (ts, cell_id, rsrq)
+        self._last_open_ts = None
+        self._until_ts = 0.0
+
+    def _rate_limited(self, now):
+        if now < self._until_ts:
+            return True              # window still open: ignore, don't extend
+        return (self._last_open_ts is not None
+                and now - self._last_open_ts < self.cfg.handoff_min_interval_s)
+
+    def _open(self, now):
+        self._last_open_ts = now
+        self._until_ts = now + self.cfg.handoff_window_s
+
+    def update(self, reading, wan_loss, now):
+        """One tick. Returns a reason string when a duplication window should
+        open, else None. reading may be None (modem unreachable) — the loss
+        fallback still runs."""
+        if not self.cfg.handoff_enabled:
+            self._prev = None
+            return None
+        prev = self._prev
+        reason = None
+        if reading is not None:
+            cell, rsrq = reading.get("cell_id"), reading.get("rsrq")
+            fresh_pair = (prev is not None and
+                          now - prev[0] <= 2 * self.cfg.poll_interval_s)
+            if fresh_pair and cell is not None and prev[1] is not None \
+                    and cell != prev[1]:
+                reason = f"cell_change:{prev[1]}->{cell}"
+            elif fresh_pair and rsrq is not None and prev[2] is not None \
+                    and (prev[2] - rsrq) > self.cfg.handoff_rsrq_drop_db:
+                reason = f"rsrq_drop:{prev[2]}->{rsrq}"
+            self._prev = (now, cell, rsrq)
+        if reason is None and wan_loss is not None \
+                and wan_loss >= self.cfg.handoff_loss_spike_pct:
+            reason = f"loss_spike:{wan_loss}"
+        if reason is None or self._rate_limited(now):
+            return None
+        self._open(now)
+        return reason
+
+
+def write_handoff(path, now, window_s, reason):
+    atomic_write_json(path, {"set_ts": now, "until_ts": now + window_s,
+                             "reason": reason})
 
 
 def run(cfg, stop_event=None):
@@ -169,9 +275,13 @@ def run(cfg, stop_event=None):
         stop_event = threading.Event()
     client = netgear_api.NetgearClient(cfg.admin_url, cfg.iface, cfg.cookie_jar)
     last_login_ts = None
+    detector = HandoffDetector(cfg)
     while not stop_event.is_set():
         try:
-            _, last_login_ts = poll_once(client, cfg, time.time(), last_login_ts)
+            now = time.time()
+            wan_loss = read_wan_loss(cfg.sbfd_state_path, cfg.iface)
+            _, last_login_ts = poll_once(client, cfg, now, last_login_ts,
+                                         detector=detector, wan_loss=wan_loss)
         except Exception:  # noqa: BLE001 — a poll must never kill the daemon
             log.exception("poll failed")
         stop_event.wait(cfg.poll_interval_s)
