@@ -693,10 +693,14 @@ function renderCellSignal(s){
   const prof = fec.profile && fec.profile.name && fec.profile.name !== 'default'
     ? ` · profile ${fec.profile.name}` : '';
   const floor = fec.signal_floor_active ? ' · signal floor' : '';
+  const dup = s.duplication || {};
+  const dupBadge = dup.active
+    ? ` · DUPLICATING (${dup.reason || 'handoff'})`
+    : (dup.count ? ` · ${dup.count} handoff window${dup.count === 1 ? '' : 's'}` : '');
   const stale = c.stale ? ' (stale)' : '';
   const cellLabel = c.wan ? ((s.wan_labels && s.wan_labels[c.wan]) || c.wan) : 'cell';
   $('#fec-cell-readout').textContent =
-    `${cellLabel} signal: ${parts.join(' · ')}${stale}${prof}${floor}`;
+    `${cellLabel} signal: ${parts.join(' · ')}${stale}${prof}${floor}${dupBadge}`;
 }
 
 function renderFecCard(id, d, local){
