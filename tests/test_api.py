@@ -508,7 +508,53 @@ def test_runtime_post_null_floor_clears_override(cfg_with_fec):
         assert M.effective_fec_floor_ratio(cfg_with_fec, ov) == \
             cfg_with_fec.fec.floor_ratio  # fec.floor_ratio == config-resolved effective floor
     finally:
-        stop.set(); httpd.shutdown()
+        stop.set()
+        httpd.shutdown()
+
+
+def test_runtime_post_null_fixed_clears_override(cfg_with_fec):
+    # cfg_with_fec configures fixed_ratio="20:1" as the config default; the
+    # posted override "12:4" is deliberately different so the two are never
+    # confused. The snapshot's fec.fixed_override is ov.fec_fixed_ratio
+    # (str or None) and fec.fixed_ratio stays the effective fixed ratio, per the
+    # sbfd_ctl "fec" snapshot dict — verified here through the same
+    # load_runtime_overlay/effective_fec_fixed_ratio helpers that build it.
+    Path(cfg_with_fec.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+
+        def post(body):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/runtime",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=2) as r:
+                return r.status
+
+        status = post({
+            "mode": "full", "master_policy": "static_primary", "master_wan": "wan2",
+            "egress_mode": "relay_vpn", "fec_mode": "fixed",
+            "fec_fixed_ratio": "12:4", "persist": False,
+        })
+        assert status == 200
+        ov = M.load_runtime_overlay(cfg_with_fec)
+        assert ov.fec_fixed_ratio == "12:4"  # snapshot fec.fixed_override == "12:4"
+
+        status = post({
+            "mode": "full", "master_policy": "static_primary", "master_wan": "wan2",
+            "egress_mode": "relay_vpn", "fec_mode": "fixed",
+            "fec_fixed_ratio": None, "persist": False,
+        })
+        assert status == 200
+        ov = M.load_runtime_overlay(cfg_with_fec)
+        assert ov.fec_fixed_ratio is None  # snapshot fec.fixed_override is None
+        assert M.effective_fec_fixed_ratio(cfg_with_fec, ov) == \
+            cfg_with_fec.fec.fixed_ratio  # fec.fixed_ratio == config-resolved effective fixed
+    finally:
+        stop.set()
+        httpd.shutdown()
 
 
 def test_effective_fec_enabled_overlay_false_wins(cfg_with_fec):
