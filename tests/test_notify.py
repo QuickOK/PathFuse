@@ -373,6 +373,44 @@ def test_redundancy_mode_edges():
     assert kinds(evs) == ["redundancy"]
 
 
+def test_redundancy_mode_edge_suppressed_when_handoff_window_caused_it():
+    # Enter: the window forces master_backup -> full on the SAME tick as
+    # handoff_active flips on.
+    d = seeded()
+    evs = d.observe(obs(mode="full", handoff_active=True))
+    assert evs == []
+    # Leave: the window closes on the same tick the mode reverts. The new
+    # observation's own handoff_active is already False here -- only the
+    # PREVIOUS observation's flag (still True going in) proves the window
+    # caused this transition too.
+    evs = d.observe(obs(mode="master_backup", handoff_active=False))
+    assert evs == []
+
+
+def test_redundancy_mode_edge_still_fires_for_operator_cause():
+    d = seeded()
+    evs = d.observe(obs(mode="full"))
+    assert kinds(evs) == ["redundancy"]
+    assert "operator" in evs[0].message
+
+
+def test_redundancy_mode_edge_unsticks_after_window_truly_clears():
+    # window-full -> operator-holds-full -> window-clears must not fire on
+    # the clear (mode never actually changes, since the operator already
+    # wants full on their own) -- but the handoff_active flag must not get
+    # stuck true forever: a LATER, genuinely operator-caused transition with
+    # no window involved must still fire.
+    d = seeded()
+    evs = d.observe(obs(mode="full", handoff_active=True))      # window-full
+    assert evs == []
+    evs = d.observe(obs(mode="full", handoff_active=True))      # operator-holds-full
+    assert evs == []
+    evs = d.observe(obs(mode="full", handoff_active=False))     # window-clears
+    assert evs == []
+    evs = d.observe(obs(mode="master_backup", handoff_active=False))
+    assert kinds(evs) == ["redundancy"]                         # genuine, later
+
+
 def test_env_override_engage_and_clear():
     d = seeded()
     evs = d.observe(obs(mode="full", env_active=True, env_reason="high wind"))

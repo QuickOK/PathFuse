@@ -2686,7 +2686,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     relay_polled=relay_polled,
                     relay_ok=last_remote.ok,
                     switch=switch_event,
-                    maintenance=maint_window)):
+                    maintenance=maint_window,
+                    handoff_active=handoff_was_active)):
                 notifier.notify(_ev)
         if fec_hist is not None and cfg.fec:
             fec_hist.append_from_directions(

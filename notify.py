@@ -224,6 +224,11 @@ class Observation:
     # expired window suppresses nothing: the failure mode of this feature must
     # be a spurious page, never a missed one.
     maintenance: Optional[dict] = None
+    # True while a cellular handoff duplication window is forcing full mode.
+    # Suppresses the mode-transition event (never the window's own INFO logs
+    # or the published duplication block) so routine fringe ping-pong doesn't
+    # misattribute a window-caused switch to "operator/policy" and page on it.
+    handoff_active: bool = False
 
 
 class EventDetector:
@@ -266,6 +271,7 @@ class EventDetector:
         self._all_down_since = None
         self._all_down_alerted = False
         self._mode = None
+        self._handoff_active = False
         self._env_active = False
         self._fec_engaged = False
         self._fec_at_max = False
@@ -286,6 +292,7 @@ class EventDetector:
             self._seed(obs)
         self._wan_states = dict(obs.wan_states)
         self._mode = obs.mode
+        self._handoff_active = obs.handoff_active
         self._env_active = obs.env_active
         self._fec_engaged = obs.fec_engaged
         self._fec_at_max = obs.fec_at_max
@@ -485,6 +492,16 @@ class EventDetector:
         was_full = self._mode == "full"
         is_full = obs.mode == "full"
         if not (was_full or is_full):
+            return []
+        if self._handoff_active or obs.handoff_active:
+            # A duplication window forcing (or just having forced) full mode
+            # is not an operator/policy event -- either end of the window
+            # touching this transition means the window caused it, not a
+            # human, and the window's own INFO logs + duplication block are
+            # the observability for it. Checking BOTH the previous and the
+            # new observation's flag catches the transition landing on the
+            # window's open tick, its close tick, or (rate-limit permitting)
+            # both in the same tick.
             return []
         cause = (f"environmental override: {obs.env_reason}"
                  if obs.env_active else "operator/policy")
