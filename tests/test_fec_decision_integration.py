@@ -150,3 +150,19 @@ def test_master_backup_signal_floor_still_applies():
     # same telemetry/loss, but master_backup: the gate is full-mode-specific,
     # so the signal floor still lifts the level to 12:1.
     assert _gated_ratio("master_backup", fc, table, hyst, sf_fec, engaged) == "12:1"
+
+
+def test_apply_handoff_window_guards():
+    w = M.HandoffWindow(reason="cell_change:1->2", set_ts=0.0, until_ts=4.0)
+    assert M.apply_handoff_window("master_backup", w, "wan1", {"wan1"}) == ("full", w)
+    # wan1 not active -> inert
+    assert M.apply_handoff_window("master_backup", w, "wan1", {"wan2"}) == \
+        ("master_backup", None)
+    # already full -> inert (no stacking, no bookkeeping)
+    assert M.apply_handoff_window("full", w, "wan1", {"wan1"}) == ("full", None)
+    # no window -> passthrough
+    assert M.apply_handoff_window("master_backup", None, "wan1", {"wan1"}) == \
+        ("master_backup", None)
+    # no cell wan configured -> inert
+    assert M.apply_handoff_window("master_backup", w, None, {"wan1"}) == \
+        ("master_backup", None)

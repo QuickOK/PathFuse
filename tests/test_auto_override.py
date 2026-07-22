@@ -557,3 +557,32 @@ def test_cell_snapshot_unconfigured_and_absent(tmp_path):
     snap = M.cell_snapshot(cfg2, None, 0.0)
     assert snap["configured"] is True and snap["stale"] is True
     assert snap["rsrp"] is None
+
+
+# -- cell handoff duplication window -----------------------------------------
+
+def _handoff_cfg(tmp_path):
+    cfg = base_cfg()
+    cfg.cell = M.CellTelemetryCfg(state_path=str(tmp_path / "cell.json"),
+                                  handoff_path=str(tmp_path / "handoff.json"))
+    return cfg
+
+
+def test_load_cell_handoff_fail_open_and_expiry(tmp_path):
+    cfg = _handoff_cfg(tmp_path)
+    assert M.load_cell_handoff(cfg, now=1000.0) is None          # missing
+    (tmp_path / "handoff.json").write_text(json.dumps(
+        {"set_ts": 1000.0, "until_ts": 1004.0, "reason": "cell_change:1->2"}))
+    w = M.load_cell_handoff(cfg, now=1002.0)
+    assert w.reason == "cell_change:1->2" and w.until_ts == 1004.0
+    assert M.load_cell_handoff(cfg, now=1004.0) is None          # expired (>=)
+    (tmp_path / "handoff.json").write_text("not json")
+    assert M.load_cell_handoff(cfg, now=1002.0) is None          # malformed
+    # stale set_ts beyond the sanity TTL (e.g. daemon clock skew): ignored
+    (tmp_path / "handoff.json").write_text(json.dumps(
+        {"set_ts": 900.0, "until_ts": 99999.0, "reason": "x"}))
+    assert M.load_cell_handoff(cfg, now=1000.0) is None
+
+
+def test_load_cell_handoff_unconfigured_is_none():
+    assert M.load_cell_handoff(base_cfg(), now=1000.0) is None

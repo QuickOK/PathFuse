@@ -121,6 +121,8 @@ class CellTelemetryCfg:
     rsrq_recover_db: float = -10.0
     rsrp_degrade_dbm: float = -110.0
     rsrp_recover_dbm: float = -108.0
+    handoff_path: str = "/run/sbfd-ctl/cell_handoff.json"
+    handoff_ttl_s: float = 30.0
 
 
 @dataclass
@@ -1187,7 +1189,9 @@ def load_config(path: str) -> Config:
                 rsrq_degrade_db=float(raw_cell.get("rsrq_degrade_db", -12.0)),
                 rsrq_recover_db=float(raw_cell.get("rsrq_recover_db", -10.0)),
                 rsrp_degrade_dbm=float(raw_cell.get("rsrp_degrade_dbm", -110.0)),
-                rsrp_recover_dbm=float(raw_cell.get("rsrp_recover_dbm", -108.0)))
+                rsrp_recover_dbm=float(raw_cell.get("rsrp_recover_dbm", -108.0)),
+                handoff_path=raw_cell.get("handoff_path", "/run/sbfd-ctl/cell_handoff.json"),
+                handoff_ttl_s=float(raw_cell.get("handoff_ttl_s", 30.0)))
 
         raw_notif = raw.get("notifications")
         notif_cfg = None
@@ -1258,6 +1262,8 @@ def load_config(path: str) -> Config:
         if cell_cfg.wan not in wans:
             raise ValueError(
                 f"cell_telemetry.wan {cell_cfg.wan!r} not in wans={list(wans)}")
+        if cell_cfg.handoff_ttl_s <= 0:
+            raise ValueError("cell_telemetry.handoff_ttl_s must be > 0")
     if fec_cfg is not None:
         for wname in fec_cfg.wan_profiles:
             if wname not in wans:
@@ -1458,6 +1464,33 @@ def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
     return out
 
 
+@dataclass
+class HandoffWindow:
+    reason: str
+    set_ts: float
+    until_ts: float
+
+
+def load_cell_handoff(cfg: Config, now: float) -> Optional[HandoffWindow]:
+    """The open duplication window, or None. Fail-open like load_auto_override.
+    Two clocks gate it: until_ts (the window itself) and a sanity TTL on
+    set_ts — a wedged/ancient file must never hold full mode open."""
+    if cfg.cell is None:
+        return None
+    try:
+        raw = _json.loads(Path(cfg.cell.handoff_path).read_text())
+        set_ts = float(raw["set_ts"])
+        until_ts = float(raw["until_ts"])
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+        return None
+    if now >= until_ts:
+        return None
+    if now - set_ts > cfg.cell.handoff_ttl_s:
+        return None
+    return HandoffWindow(reason=str(raw.get("reason", "")),
+                         set_ts=set_ts, until_ts=until_ts)
+
+
 def cell_snapshot(cfg: Config, sample: Optional[dict], now: float) -> dict:
     """Published `cell` block. Absent sample still publishes configured=true
     so the UI can show 'no telemetry' instead of hiding the panel."""
@@ -1571,6 +1604,22 @@ def apply_auto_override(mode: str, env_enabled: bool,
     if active:
         return "full", auto
     return mode, None
+
+
+def apply_handoff_window(mode: str, window: Optional[HandoffWindow],
+                         cell_wan: Optional[str],
+                         active_wans: set) -> tuple:
+    """Fold the duplication window into the effective mode. Only raises to
+    'full', and only while the telemetry WAN is actually carrying traffic —
+    a handoff on an idle backup WAN needs no duplication. Returns
+    (effective_mode, active_window_or_None); an already-full mode reports the
+    window as inactive so the cap accounting counts only windows that DID
+    something."""
+    if window is None or cell_wan is None:
+        return mode, None
+    if mode == "full" or cell_wan not in active_wans:
+        return mode, None
+    return "full", window
 
 
 def environmental_snapshot(configured: bool, env_enabled: bool,
@@ -2190,6 +2239,11 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     fec_relay_last_acked = None
     fec_relay_last_post_ts = None
 
+    handoff_was_active = False
+    duplication_count = 0
+    duplication_last_ts = None
+    duplication_last_reason = None
+
     notifier = None
     detector = None
     if cfg.notifications is not None:
@@ -2220,6 +2274,20 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         cell_sample = load_cell_sample(cfg, loop_start)
         env_enabled = effective_environmental_enabled(cfg, ov)
         mode, env_active = apply_auto_override(mode, env_enabled, env_auto)
+        handoff_win = load_cell_handoff(cfg, loop_start)
+        mode, handoff_active = apply_handoff_window(
+            mode, handoff_win, cfg.cell.wan if cfg.cell else None,
+            currently_active)
+        if handoff_active and not handoff_was_active:
+            duplication_count += 1
+            duplication_last_ts = loop_start
+            duplication_last_reason = handoff_active.reason
+            logging.info("duplication window OPEN (%s, until %.1fs)",
+                         handoff_active.reason,
+                         handoff_active.until_ts - loop_start)
+        elif handoff_was_active and not handoff_active:
+            logging.info("duplication window closed")
+        handoff_was_active = bool(handoff_active)
         maint_enabled = effective_maintenance_enabled(cfg, ov)
         maint_hour = effective_maintenance_hour(cfg, ov)
         # loop_start is time.time() — a wall clock, which is what the window's
@@ -2570,6 +2638,16 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 env_enabled=env_enabled, active=env_active,
                 auto=env_auto, now=loop_start),
             "cell": cell_snapshot(cfg, cell_sample, loop_start),
+            "duplication": {
+                "configured": cfg.cell is not None,
+                "active": handoff_was_active,
+                "reason": (handoff_active.reason if handoff_active else None),
+                "remaining_s": (round(handoff_active.until_ts - loop_start, 1)
+                                if handoff_active else 0.0),
+                "count": duplication_count,
+                "last_ts": duplication_last_ts,
+                "last_reason": duplication_last_reason,
+            },
             # The resolved schedule, published so maintenance_reboot.py reads it
             # rather than re-deriving the config-vs-overlay precedence. (Its
             # read_published() also demands the snapshot's fresh "ts" above.)
