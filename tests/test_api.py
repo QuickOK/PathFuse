@@ -1224,6 +1224,12 @@ def test_api_engarde_includes_wan_ifaces(cfg):
     # config-excluded non-WAN like the LAN bridge (hide) by payload alone:
     # engarde reports both with status "excluded" and no dstAddress. The proxy
     # knows the managed WAN set, so it annotates the response with it.
+    # WAN keys deliberately differ from iface names (and sort differently)
+    # so the assertion catches returning sorted keys instead of ifaces.
+    cfg.wans = {
+        "cell": M.WanCfg("wwan0", 1, "Cell"),
+        "sat": M.WanCfg("eth9", 2, "Satellite"),
+    }
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     class Stub(BaseHTTPRequestHandler):
@@ -1249,7 +1255,7 @@ def test_api_engarde_includes_wan_ifaces(cfg):
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/engarde", timeout=2) as r:
             body = json.loads(r.read())
         assert body["ok"] is True
-        assert body["wan_ifaces"] == ["wan1", "wan2"]
+        assert body["wan_ifaces"] == ["eth9", "wwan0"]
     finally:
         stop.set()
         httpd.shutdown()
