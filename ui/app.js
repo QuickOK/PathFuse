@@ -400,9 +400,11 @@ function renderWanList(s, wans, active, masterWan, dyn){
 
     const tags = [];
     if (isMaster) tags.push(`<span class="tag master">master</span>`);
+    // "hot standby" only when the link is actually UP — a DOWN backup is
+    // muted *and* unusable, so it just reads "standby".
     tags.push(isActive
       ? `<span class="tag active">active</span>`
-      : `<span class="tag dropped">nft-dropped</span>`);
+      : `<span class="tag dropped">${eff === "UP" ? "hot standby" : "standby"}</span>`);
     if (dyn.candidate === w && dyn.master !== w) {
       tags.push(`<span class="tag candidate">dyn-candidate</span>`);
     }
@@ -574,17 +576,21 @@ function renderConsist(e){
 
   // engarde-client returns `interfaces` (uplink list); engarde-server returns `sockets` (connected peers).
   // Normalize both to a uniform row shape.
+  const wanIfaces = new Set(e.wan_ifaces || []);
   let rows = [];
   if (Array.isArray(d.interfaces) && d.interfaces.length) {
     rows = d.interfaces
-      // Hide engarde's intermediate functional-block (ifb-*) interfaces — they're
-      // back-pressure shaper devices, not real uplinks. Real WAN uplinks have a
-      // populated senderAddress; ifb-* report empty.
-      .filter(i => i.status !== "excluded" && i.senderAddress)
+      // Non-excluded rows: require a senderAddress to hide engarde's ifb-*
+      // shaper devices, which aren't real uplinks. Excluded rows: engarde
+      // reports a runtime-excluded WAN and a config-excluded non-WAN (LAN,
+      // tunnels) identically, so keep only managed WANs — the proxy's
+      // wan_ifaces — and show them as "standby": in master_backup mode
+      // sbfd-ctl excludes the backup WAN on purpose while SBFD keeps probing.
+      .filter(i => i.status === "excluded" ? wanIfaces.has(i.name) : i.senderAddress)
       .map(i => ({
         label: i.name + (i.dstAddress ? ` → ${i.dstAddress}` : ""),
         last: typeof i.last === "number" ? i.last : null,
-        status: i.status,  // "active" | "idle"
+        status: i.status === "excluded" ? "standby" : i.status,  // "active" | "idle" | "standby"
       }));
   } else if (Array.isArray(d.sockets) && d.sockets.length) {
     rows = d.sockets.map(s => {
@@ -598,7 +604,7 @@ function renderConsist(e){
   if (!rows.length){
     tbody.innerHTML = "";
     empty.textContent = (d.interfaces && d.interfaces.length)
-      ? "All uplinks excluded"
+      ? "No real uplinks reported"
       : "Standby — no peers bound";
     empty.hidden = false;
     return;
