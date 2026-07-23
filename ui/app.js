@@ -401,10 +401,11 @@ function renderWanList(s, wans, active, masterWan, dyn){
     const tags = [];
     if (isMaster) tags.push(`<span class="tag master">master</span>`);
     // "hot standby" only when the link is actually UP — a DOWN backup is
-    // muted *and* unusable, so it just reads "standby".
+    // muted *and* unusable, so it reads "standby"; an unprobed link mustn't
+    // masquerade as a known-good or known-bad backup (Greptile PR#7 P2).
     tags.push(isActive
       ? `<span class="tag active">active</span>`
-      : `<span class="tag dropped">${eff === "UP" ? "hot standby" : "standby"}</span>`);
+      : `<span class="tag dropped">${eff === "UP" ? "hot standby" : eff === "DOWN" ? "standby" : "unknown"}</span>`);
     if (dyn.candidate === w && dyn.master !== w) {
       tags.push(`<span class="tag candidate">dyn-candidate</span>`);
     }
