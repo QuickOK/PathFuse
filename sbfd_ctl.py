@@ -2113,7 +2113,13 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                     with urllib.request.urlopen(url, timeout=1.5) as resp:
                         body = resp.read()
                     payload = _json.loads(body.decode())
-                    self._send_json(200, {"ok": True, "data": payload})
+                    # wan_ifaces lets the UI tell a runtime-excluded WAN
+                    # (standby) from a config-excluded non-WAN (hidden):
+                    # engarde reports both identically in get-list.
+                    self._send_json(200, {
+                        "ok": True, "data": payload,
+                        "wan_ifaces": sorted(w.iface for w in cfg.wans.values()),
+                    })
                 except urllib.error.HTTPError as e:
                     self._send_json(200, {"ok": False, "error": f"HTTP {e.code}: {e.reason}"})
                 except (urllib.error.URLError, TimeoutError, OSError) as e:

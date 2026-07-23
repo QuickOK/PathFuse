@@ -1217,3 +1217,40 @@ def test_api_fec_history_without_history_is_empty_not_500(cfg):
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_api_engarde_includes_wan_ifaces(cfg):
+    # The UI can't tell a runtime-excluded WAN (show as standby) from a
+    # config-excluded non-WAN like the LAN bridge (hide) by payload alone:
+    # engarde reports both with status "excluded" and no dstAddress. The proxy
+    # knows the managed WAN set, so it annotates the response with it.
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"type": "client", "interfaces": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # keep test output quiet
+            pass
+
+    stub = HTTPServer(("127.0.0.1", 0), Stub)
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+    cfg.engarde.admin_url = f"http://127.0.0.1:{stub.server_address[1]}/api/v1/get-list"
+    Path(cfg.published_state).write_text("{}")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/engarde", timeout=2) as r:
+            body = json.loads(r.read())
+        assert body["ok"] is True
+        assert body["wan_ifaces"] == ["wan1", "wan2"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+        stub.shutdown()
