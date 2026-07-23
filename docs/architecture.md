@@ -96,7 +96,10 @@ Redundancy ramps with measured loss and backs off when links are clean:
 - **Hysteresis:** raise only after N consecutive higher targets; lower only after a hold time —
   avoids flapping the ratio.
 - **Mode-aware backoff:** in full-redundancy with enough UP links, engarde already duplicates, so
-  FEC drops to the off tier (`8:0`).
+  the loss-driven component drops to the off tier (`8:0`) and the signal floor disengages. The
+  `min_adaptive` floor still applies on top of the duplication — full mode marks
+  reliability-critical moments, and floor parity covers packets lost on both links at once (see
+  design-notes).
 - **Two directions, independent:** client→relay is driven by `sbfd-ctl`; relay→client by
   `udpspeeder-fec`. A single operator switch can force both to `8:0` (disabled) without stopping the
   tunnel.

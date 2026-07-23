@@ -172,7 +172,13 @@ def is_level_at_max(level, table=DEFAULT_LOSS_TABLE):
 def mode_aware_level(mode, up_count, loss_pct, table=DEFAULT_LOSS_TABLE,
                      full_min_up_wans=2, backoff_ratio="8:0"):
     """In full-redundancy with enough healthy links, engarde already
-    duplicates, so FEC backs off. Otherwise scale FEC to measured loss."""
+    duplicates, so the loss-driven level backs off to backoff_ratio.
+    Otherwise scale FEC to measured loss.
+
+    This bounds only the ADAPTIVE input to apply_mode: in min_adaptive the
+    floor re-raises anything below it, so a configured floor keeps its
+    parity on top of full-mode duplication (deliberate — see
+    docs/design-notes.md "Mode-aware backoff")."""
     if mode == "full" and up_count >= full_min_up_wans:
         return ratio_to_level(backoff_ratio, table)
     return loss_to_level(loss_pct, table)

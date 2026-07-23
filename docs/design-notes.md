@@ -26,7 +26,13 @@ and recovered at the **decoder**, so each direction is controlled independently 
 sender.
 
 **Mode-aware backoff:** in full-redundancy with enough healthy links, engarde already duplicates
-every packet, so adding FEC on top is pure waste — the controller drops FEC to the off tier there.
+every packet, so the *loss-driven* component backs off to the off tier (`full_mode_backoff_fec`)
+and the pre-emptive *signal* floor disengages. The `min_adaptive` profile/config **floor is
+deliberately kept** on top of duplication: full mode engages at reliability-critical moments
+(environmental hazard, cell-handoff windows, both-WANs-down fallback), and duplication only saves a
+packet lost on *one* link — floor parity is what recovers packets dropped on both at once, for
+~8–12% overhead on an already-doubled stream. Net effect: with a floor configured,
+`full_mode_backoff_fec` bounds only the adaptive component and cannot undercut the floor.
 
 **Why "off" is `8:0`, not `1:0`:** in UDPspeeder mode 0 the data count caps how many segments a
 packet may split into; `1:0` disables the splitter, so any datagram larger than the FEC MTU is

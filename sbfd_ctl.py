@@ -2500,10 +2500,17 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 logging.info("fec signal floor %s (rsrq=%s rsrp=%s)",
                              "engaged" if fec_signal_engaged else "released",
                              rsrq, rsrp)
-            # Full-redundancy backoff wins over the signal floor: engarde is
-            # already duplicating over both WANs, so parity must never stack
-            # on top of that duplication. Mirrors mode_aware_level's up-count
-            # semantics exactly (sum over `eff`, not the active set).
+            # Full-redundancy backoff suppresses only the SIGNAL floor (the
+            # expensive pre-emptive tier): engarde is already duplicating over
+            # both WANs, so RSRQ-triggered parity would be waste. The
+            # min_adaptive profile/config floor is deliberately KEPT — full
+            # mode engages at reliability-critical moments (hazard override,
+            # handoff windows, both-down fallback), and floor parity is what
+            # recovers packets dropped on both links at once, which
+            # duplication alone cannot. So apply_mode's floor re-raises the
+            # backed-off adaptive level; full_mode_backoff_fec cannot
+            # undercut a configured floor. Mirrors mode_aware_level's
+            # up-count semantics exactly (sum over `eff`, not the active set).
             fec_full_backoff = (
                 mode == "full"
                 and sum(1 for st in eff.values() if st == "UP")
