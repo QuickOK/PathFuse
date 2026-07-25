@@ -58,6 +58,36 @@ def test_rendered_client_configs_are_valid_json_with_right_types():
     assert isinstance(maint["recovery_deadline_s"], int)
 
 
+def test_relay_nft_dropin_exempts_overlay_ssh_ahead_of_any_rate_limit():
+    """A hardened relay commonly rate-limits new connections to port 22.
+
+    That limit applies to the management overlay too, so an operator retrying
+    SSH sustains their own lockout (SYNs are dropped -- it presents as a silent
+    hang, not a refusal). The drop-in must therefore exempt overlay SSH, and it
+    must use `insert` rather than `add`: an APPENDED accept lands after the
+    rate-limited rule and is never reached once the limit trips, which would
+    make the exemption silently useless.
+    """
+    import tempfile
+    r = _render()
+    values = json.loads((ROOT / "deploy" / "values.example.json").read_text())
+    values["role"] = "relay"
+    with tempfile.TemporaryDirectory() as td:
+        r.render_all(values, td)
+        nft = (Path(td) / "etc/nftables.d/pathfuse.nft").read_text()
+
+    iface = values["overlay_iface"]
+    ssh = [l for l in nft.splitlines()
+           if "dport 22" in l and not l.lstrip().startswith("#")]
+    assert len(ssh) == 1, f"expected exactly one port-22 rule, got {ssh}"
+    line = ssh[0]
+    assert line.split()[0] == "insert", (
+        f"must be `insert` so it precedes any rate-limited rule, got: {line}")
+    assert f'iifname "{iface}"' in line, (
+        f"must be scoped to the management overlay, got: {line}")
+    assert line.rstrip().endswith("accept")
+
+
 def test_render_text_strict_missing_placeholder_raises():
     r = _render()
     with pytest.raises(KeyError):

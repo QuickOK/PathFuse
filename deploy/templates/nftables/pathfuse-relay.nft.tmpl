@@ -1,6 +1,19 @@
 # PathFuse relay — allow management-overlay control ports + data ports.
 # Loaded as a drop-in; install.sh MERGES these into the existing inet filter input
 # chain (it does not flush the ruleset).
+#
+# Note these APPEND, so re-running the drop-in duplicates them. Harmless (they are
+# all `accept`), but prune before re-applying if you care about a tidy chain.
+
+# SSH over the management overlay, exempt from any rate limit on port 22.
+# `insert` (head of chain), NOT `add`: a hardened relay typically carries
+# something like `tcp dport 22 ct state new limit rate 10/minute accept`, and an
+# APPENDED accept sits after it — so once the limit trips, new SYNs fall through
+# to the chain's drop policy and the exemption never applies. Silent hang, not a
+# refusal, and retrying only sustains it. Public port 22 keeps its rate limit;
+# this exempts the trusted overlay only.
+insert rule inet filter input iifname "$overlay_iface" tcp dport 22 accept
+
 add rule inet filter input iifname "$overlay_iface" tcp dport $ports_sbfd_state accept
 add rule inet filter input iifname "$overlay_iface" tcp dport $ports_fec_http accept
 add rule inet filter input udp dport $ports_engarde accept

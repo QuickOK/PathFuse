@@ -61,7 +61,10 @@ class SessionConfig:
     peer_port: int
     tx_interval_ms: int = 500
     detect_mult: int = 3
-    up_threshold: int = 6
+    # No up_threshold here on purpose: a "consecutive hits before UP" knob was
+    # parsed but never read by any transition, so setting it did nothing. Flap
+    # damping lives in sbfd-ctl (policy.failback_hold_s, dynamic hysteresis).
+    # load_config ignores the key if a deployed config still carries it.
 
 @dataclass
 class DaemonConfig:
@@ -531,7 +534,6 @@ def load_config(path: str) -> DaemonConfig:
             peer_port=s["peer_port"],
             tx_interval_ms=s.get("tx_interval_ms", 500),
             detect_mult=s.get("detect_mult", 3),
-            up_threshold=s.get("up_threshold", 6),
         ))
     return DaemonConfig(
         bind_host=raw.get("bind_host", "0.0.0.0"),
