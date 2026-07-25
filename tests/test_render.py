@@ -77,8 +77,10 @@ def test_relay_nft_dropin_exempts_overlay_ssh_ahead_of_any_rate_limit():
         nft = (Path(td) / "etc/nftables.d/pathfuse.nft").read_text()
 
     iface = values["overlay_iface"]
-    ssh = [l for l in nft.splitlines()
-           if "dport 22" in l and not l.lstrip().startswith("#")]
+    # `tcp dport 22`, not just `dport 22`: a udp rule would satisfy the looser
+    # match while leaving SSH -- the whole point of the exemption -- throttled.
+    ssh = [rule for rule in nft.splitlines()
+           if "tcp dport 22" in rule and not rule.lstrip().startswith("#")]
     assert len(ssh) == 1, f"expected exactly one port-22 rule, got {ssh}"
     line = ssh[0]
     assert line.split()[0] == "insert", (
