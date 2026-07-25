@@ -12,6 +12,14 @@
 # to the chain's drop policy and the exemption never applies. Silent hang, not a
 # refusal, and retrying only sustains it. Public port 22 keeps its rate limit;
 # this exempts the trusted overlay only.
+#
+# Caveat of `insert`: it lands at the HEAD of the chain, so it also precedes any
+# `ct state invalid drop` you have -- invalid-state packets to port 22 on the
+# overlay are accepted. Scoped to a trusted interface, so the exposure is small,
+# and a drop-in cannot do better without knowing your rule handles. If you want
+# it after the invalid-state drop, place it by hand instead:
+#   nft insert rule inet filter input handle <handle-of-your-port-22-rule> \
+#       iifname "$overlay_iface" tcp dport 22 accept
 insert rule inet filter input iifname "$overlay_iface" tcp dport 22 accept
 
 add rule inet filter input iifname "$overlay_iface" tcp dport $ports_sbfd_state accept
