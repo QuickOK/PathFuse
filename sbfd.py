@@ -369,6 +369,26 @@ def start_state_listener(cfg: DaemonConfig):
     state_path = Path(cfg.state_file)
 
     class Handler(BaseHTTPRequestHandler):
+        # sbfd-ctl polls this once per second across the management overlay. On
+        # HTTP/1.0 every poll paid a TCP handshake and teardown -- more bytes
+        # than the sub-1KB body itself over a metered link, plus an extra RTT
+        # of staleness in a failover input. Keep-alive needs an accurate
+        # Content-Length on every response: do_GET sets one, and send_error
+        # sets its own plus `Connection: close`.
+        protocol_version = "HTTP/1.1"
+        # ThreadingHTTPServer holds a thread for a connection's whole life and
+        # the default timeout is None (unbounded blocking read), so an
+        # abandoned connection would pin one forever. handle_one_request turns
+        # this timeout into a close.
+        timeout = 30
+        # Required for keep-alive to actually be faster. The handler writes
+        # headers and body as two separate small writes; with Nagle on, the
+        # second waits for an ACK while the client (http.client sets
+        # TCP_NODELAY) sits on its 40ms delayed-ACK timer. The HTTP/1.0 close
+        # used to flush it -- on a persistent connection every response would
+        # pay ~40ms, measurably slower than the handshake it replaced.
+        disable_nagle_algorithm = True
+
         def log_message(self, fmt, *args):
             logging.debug("state-http %s - %s", self.address_string(), fmt % args)
 
@@ -384,6 +404,17 @@ def start_state_listener(cfg: DaemonConfig):
             except OSError as e:
                 self.send_error(500, f"read error: {e}")
                 return
+            # The on-disk file is indent=2 so an operator can read
+            # /run/sbfd/state.json directly; the wire copy is compacted. About
+            # 30% of the pretty payload is whitespace, and sbfd-ctl fetches
+            # this once per second across the management overlay -- which in a
+            # real deployment rides the metered WAN links. Fall back to the raw
+            # bytes if it will not parse, so a malformed file is still served
+            # verbatim (unchanged behavior) instead of becoming a 500.
+            try:
+                data = json.dumps(json.loads(data), separators=(",", ":")).encode()
+            except (ValueError, UnicodeDecodeError):
+                pass
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))

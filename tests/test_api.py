@@ -347,6 +347,55 @@ def test_run_controller_calls_engarde_actuator_with_relay_vpn_action(cfg, monkey
     assert seen[0]["table"] == "engarde"
 
 
+def test_run_controller_closes_pooled_relay_connections_on_exit(cfg, monkeypatch):
+    """A stopped controller must not leave a relay connection pooled.
+
+    The keep-alive pool is process-global, so anything left behind outlives the
+    loop that opened it and would be handed to whatever runs next.
+    """
+    import threading as _t
+
+    class FakeConn:
+        def __init__(self): self.closed = False
+        def close(self): self.closed = True
+
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda action: None)
+    monkeypatch.setattr(M, "read_engarde_table_default", lambda table: None)
+    monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda c: [])
+    monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+        lambda p, m: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 0.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
+    monkeypatch.setattr(M, "read_managed_default", lambda metric=50: None)
+    monkeypatch.setattr(M, "read_wan_gateway", lambda iface: "192.0.2.1")
+    monkeypatch.setattr(M, "apply_route_action", lambda action, metric=50: None)
+
+    Path(cfg.runtime_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).write_text("{}")
+
+    pooled = FakeConn()
+    M._relay_conns[("http", "198.51.100.10", 9275)] = pooled
+    try:
+        stop = _t.Event()
+        _t.Thread(target=lambda: (__import__("time").sleep(0.6), stop.set()),
+                  daemon=True).start()
+        M.run_controller(cfg, stop_event=stop)
+        # Observed before the teardown below, or the teardown would be what
+        # satisfies the assertion instead of the controller.
+        closed_by_controller = pooled.closed
+        pool_after_exit = dict(M._relay_conns)
+    finally:
+        M.close_relay_conns()
+
+    assert closed_by_controller is True, "pooled relay connection was never closed"
+    assert not pool_after_exit, f"pool not emptied on exit: {pool_after_exit}"
+
+
 def test_runtime_overlay_roundtrip_preserves_fec_enabled(cfg):
     ov = M.RuntimeOverlay(persist=True, set_by="test", set_ts=1.0, fec_enabled=False)
     M.save_runtime_overlay(cfg, ov)

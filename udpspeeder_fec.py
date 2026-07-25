@@ -183,6 +183,21 @@ def start_fec_http(listen, state, stop_event=None):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
+        # sbfd-ctl GETs this once per second across the management overlay (and
+        # POSTs on change); keep-alive spares each poll a handshake+teardown.
+        # Safe because every response carries a Content-Length -- _json sets
+        # one, and send_error sets its own plus `Connection: close`, which is
+        # what keeps the 404/413 paths that answer WITHOUT reading the request
+        # body from leaving it to be parsed as the next request.
+        protocol_version = "HTTP/1.1"
+        # Bounds the thread an abandoned connection would otherwise hold
+        # forever (default timeout is an unbounded blocking read).
+        timeout = 30
+        # Without this, every keep-alive response pays ~40ms: the handler's
+        # header and body writes are separate, Nagle holds the second, and the
+        # client sits on its delayed-ACK timer. See sbfd.py's state listener.
+        disable_nagle_algorithm = True
+
         def log_message(self, fmt, *args):
             logging.debug("fec-http %s - %s", self.address_string(), fmt % args)
 
