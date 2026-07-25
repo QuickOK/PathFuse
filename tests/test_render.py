@@ -1,4 +1,4 @@
-import importlib.util, json, subprocess, sys
+import importlib.util, json, re, subprocess, sys
 from pathlib import Path
 import pytest
 
@@ -77,10 +77,13 @@ def test_relay_nft_dropin_exempts_overlay_ssh_ahead_of_any_rate_limit():
         nft = (Path(td) / "etc/nftables.d/pathfuse.nft").read_text()
 
     iface = values["overlay_iface"]
-    # `tcp dport 22`, not just `dport 22`: a udp rule would satisfy the looser
-    # match while leaving SSH -- the whole point of the exemption -- throttled.
+    # Matched as a whole token, and tcp-specific: a substring test for
+    # "dport 22" also accepts `udp dport 22` and `tcp dport 220`, either of
+    # which would satisfy a guard whose entire purpose is confirming that TCP
+    # port 22 in particular is exempt.
     ssh = [rule for rule in nft.splitlines()
-           if "tcp dport 22" in rule and not rule.lstrip().startswith("#")]
+           if re.search(r"\btcp dport 22\b", rule)
+           and not rule.lstrip().startswith("#")]
     assert len(ssh) == 1, f"expected exactly one port-22 rule, got {ssh}"
     line = ssh[0]
     assert line.split()[0] == "insert", (
