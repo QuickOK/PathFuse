@@ -2,27 +2,35 @@
 # Loaded as a drop-in; install.sh MERGES these into the existing inet filter input
 # chain (it does not flush the ruleset).
 #
-# None of the rules below are idempotent: re-running the drop-in duplicates every
-# one of them (`add` appends, `insert` prepends — neither checks for an existing
-# copy). Harmless, since all of them are `accept`, but prune before re-applying if
-# you care about a tidy chain.
+# The rules below are not idempotent: `add` appends without checking for an
+# existing copy, so re-running the drop-in duplicates them. Harmless, since all
+# of them are `accept`, but prune before re-applying if you want a tidy chain.
 
-# SSH over the management overlay, exempt from any rate limit on port 22.
-# `insert` (head of chain), NOT `add`: a hardened relay typically carries
-# something like `tcp dport 22 ct state new limit rate 10/minute accept`, and an
-# APPENDED accept sits after it — so once the limit trips, new SYNs fall through
-# to the chain's drop policy and the exemption never applies. Silent hang, not a
-# refusal, and retrying only sustains it. Public port 22 keeps its rate limit;
-# this exempts the trusted overlay only.
+# ── OPTIONAL, BY HAND: exempt overlay SSH from a port-22 rate limit ──────────
+# Deliberately NOT applied here. Read this before you get locked out.
 #
-# Caveat of `insert`: it lands at the HEAD of the chain, so it also precedes any
-# `ct state invalid drop` you have -- invalid-state packets to port 22 on the
-# overlay are accepted. Scoped to a trusted interface, so the exposure is small,
-# and a drop-in cannot do better without knowing your rule handles. If you want
-# it after the invalid-state drop, place it by hand instead:
-#   nft insert rule inet filter input handle <handle-of-your-port-22-rule> \
-#       iifname "$overlay_iface" tcp dport 22 accept
-insert rule inet filter input iifname "$overlay_iface" tcp dport 22 accept
+# A hardened relay commonly carries something like
+#     tcp dport 22 ct state new limit rate 10/minute accept
+# and that limit applies to the management overlay too. Exceed it and new SYNs
+# fall through to the chain's drop policy, so it presents as a SILENT HANG, not
+# a refusal — and retrying is what sustains it, because every attempt re-empties
+# the bucket. Everything else on the box stays reachable, which makes it look
+# like a host fault rather than a firewall rule.
+#
+# Why this file does not just add the rule: an exemption has to sit BEFORE the
+# rate limiter (or it is never reached once the limit trips) and AFTER any
+# access controls you have — e.g. `ip saddr != <admin> tcp dport 22 drop`. This
+# drop-in cannot know where either of those lives, and an unconditional accept
+# at the head of the chain would precede ALL of them, letting any overlay host
+# reach sshd and defeating your source restriction.
+#
+# So place it yourself, by handle, after your own controls:
+#     nft -a list chain inet filter input        # find your port-22 rule handle
+#     nft insert rule inet filter input handle <that-handle> \
+#         iifname "$overlay_iface" tcp dport 22 accept
+# Then persist it in whatever file owns your ruleset. Public port 22 keeps its
+# rate limit; only the trusted overlay is exempt.
+# ────────────────────────────────────────────────────────────────────────────
 
 add rule inet filter input iifname "$overlay_iface" tcp dport $ports_sbfd_state accept
 add rule inet filter input iifname "$overlay_iface" tcp dport $ports_fec_http accept

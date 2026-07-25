@@ -58,39 +58,64 @@ def test_rendered_client_configs_are_valid_json_with_right_types():
     assert isinstance(maint["recovery_deadline_s"], int)
 
 
-def test_relay_nft_dropin_exempts_overlay_ssh_ahead_of_any_rate_limit():
-    """A hardened relay commonly rate-limits new connections to port 22.
-
-    That limit applies to the management overlay too, so an operator retrying
-    SSH sustains their own lockout (SYNs are dropped -- it presents as a silent
-    hang, not a refusal). The drop-in must therefore exempt overlay SSH, and it
-    must use `insert` rather than `add`: an APPENDED accept lands after the
-    rate-limited rule and is never reached once the limit trips, which would
-    make the exemption silently useless.
-    """
+def _rendered_relay_nft():
     import tempfile
     r = _render()
     values = json.loads((ROOT / "deploy" / "values.example.json").read_text())
     values["role"] = "relay"
     with tempfile.TemporaryDirectory() as td:
         r.render_all(values, td)
-        nft = (Path(td) / "etc/nftables.d/pathfuse.nft").read_text()
+        return (Path(td) / "etc/nftables.d/pathfuse.nft").read_text(), values
 
-    iface = values["overlay_iface"]
+
+def test_relay_nft_dropin_never_auto_inserts_an_ssh_accept():
+    """The drop-in must not weaken an operator-managed chain it cannot read.
+
+    An overlay SSH exemption has to sit BEFORE the port-22 rate limiter (or it
+    is never reached once the limit trips) but AFTER any access controls -- a
+    source-address restriction like `ip saddr != <admin> tcp dport 22 drop`. A
+    drop-in knows neither position, and `insert` puts the rule at the absolute
+    head, ahead of every control: an unconditional accept there lets ANY overlay
+    host reach sshd, defeating the operator's restriction.
+
+    Since correct placement is operator-specific, the drop-in ships the guidance
+    and no active rule. Greptile flagged the bypass on PR #9; T-Rex reproduced
+    it against a chain with a source restriction.
+    """
+    nft, _values = _rendered_relay_nft()
+
     # Matched as a whole token, and tcp-specific: a substring test for
-    # "dport 22" also accepts `udp dport 22` and `tcp dport 220`, either of
-    # which would satisfy a guard whose entire purpose is confirming that TCP
-    # port 22 in particular is exempt.
-    ssh = [rule for rule in nft.splitlines()
-           if re.search(r"\btcp dport 22\b", rule)
-           and not rule.lstrip().startswith("#")]
-    assert len(ssh) == 1, f"expected exactly one port-22 rule, got {ssh}"
-    line = ssh[0]
-    assert line.split()[0] == "insert", (
-        f"must be `insert` so it precedes any rate-limited rule, got: {line}")
-    assert f'iifname "{iface}"' in line, (
-        f"must be scoped to the management overlay, got: {line}")
-    assert line.rstrip().endswith("accept")
+    # "dport 22" also catches `udp dport 22` and `tcp dport 220`.
+    active = [rule for rule in nft.splitlines()
+              if re.search(r"\btcp dport 22\b", rule)
+              and not rule.lstrip().startswith("#")]
+
+    assert active == [], (
+        "drop-in must not auto-insert a port-22 rule -- it cannot know where "
+        f"the operator's access controls sit. Got: {active}")
+
+
+def test_relay_nft_dropin_documents_the_ssh_rate_limit_lockout():
+    """Removing the rule must not lose the knowledge that cost us the incident.
+
+    An operator hitting the lockout sees a silent hang, not a refusal, and
+    retrying sustains it -- so the drop-in has to explain the failure mode and
+    give the handle-based command that places the rule correctly.
+    """
+    nft, values = _rendered_relay_nft()
+    iface = values["overlay_iface"]
+
+    assert "rate" in nft, "lockout rationale is missing"
+    # Join shell continuations and strip comment markers before searching: the
+    # recipe legitimately spans lines, and the test should not dictate wrapping.
+    prose = re.sub(r"\\\s*\n\s*#?\s*", " ", nft)
+    prose = re.sub(r"^\s*#\s?", "", prose, flags=re.MULTILINE)
+
+    recipe = [line for line in prose.splitlines()
+              if "handle" in line and re.search(r"\btcp dport 22\b", line)]
+    assert recipe, "no handle-based placement command documented"
+    assert any(f'iifname "{iface}"' in r for r in recipe), (
+        f"documented command should be scoped to the overlay iface {iface!r}")
 
 
 def test_render_text_strict_missing_placeholder_raises():
