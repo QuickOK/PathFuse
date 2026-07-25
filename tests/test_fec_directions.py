@@ -2,28 +2,61 @@ import json
 import sbfd_ctl as M
 
 
+# Every relay control-plane request goes through M._relay_request, which pools
+# the keep-alive connection and returns (status, reason, body_bytes). Patching
+# that seam keeps these tests about the payload and the error handling rather
+# than about the transport underneath.
+
+def fake_relay(monkeypatch, status=200, reason="OK", resp_body=b"{}", raises=None):
+    """Patch the relay transport; return a dict recording what was sent."""
+    seen = {}
+
+    def fake(url, method="GET", body=None, headers=None, timeout_s=2.0):
+        seen["url"] = url
+        seen["method"] = method
+        seen["headers"] = headers or {}
+        seen["body"] = json.loads(body.decode()) if body else None
+        if raises is not None:
+            raise raises
+        return status, reason, resp_body
+
+    monkeypatch.setattr(M, "_relay_request", fake)
+    return seen
+
+
 def test_fetch_relay_fec_no_url():
     r = M.fetch_relay_fec("", 1.0)
     assert r["ok"] is False and "fec_url" in r["error"]
 
 
 def test_fetch_relay_fec_success(monkeypatch):
-    class FakeResp:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def read(self): return json.dumps({"ratio": "8:4", "enabled": True}).encode()
-    monkeypatch.setattr(M.urllib.request, "urlopen", lambda url, timeout=None: FakeResp())
+    fake_relay(monkeypatch,
+               resp_body=json.dumps({"ratio": "8:4", "enabled": True}).encode())
     r = M.fetch_relay_fec("http://relay/fec", 1.0)
     assert r["ok"] is True
     assert r["data"]["ratio"] == "8:4"
 
 
 def test_fetch_relay_fec_transport_error(monkeypatch):
-    def boom(url, timeout=None):
-        raise M.urllib.error.URLError("down")
-    monkeypatch.setattr(M.urllib.request, "urlopen", boom)
+    fake_relay(monkeypatch, raises=OSError("down"))
     r = M.fetch_relay_fec("http://relay/fec", 1.0)
     assert r["ok"] is False and r["data"] is None and "transport" in r["error"]
+
+
+def test_fetch_relay_fec_non_200_is_not_a_parse_error(monkeypatch):
+    # A relay that answers 503 must be reported as an HTTP status, not silently
+    # folded into a parse failure against the error page's body.
+    fake_relay(monkeypatch, status=503, reason="Service Unavailable",
+               resp_body=b"<html>nope</html>")
+    r = M.fetch_relay_fec("http://relay/fec", 1.0)
+    assert r["ok"] is False and r["data"] is None
+    assert "503" in r["error"]
+
+
+def test_fetch_relay_fec_unparseable_body_is_a_parse_error(monkeypatch):
+    fake_relay(monkeypatch, resp_body=b"{ not json")
+    r = M.fetch_relay_fec("http://relay/fec", 1.0)
+    assert r["ok"] is False and r["error"].startswith("parse:")
 
 
 def test_post_relay_fec_no_url():
@@ -31,31 +64,19 @@ def test_post_relay_fec_no_url():
 
 
 def test_post_relay_fec_success(monkeypatch):
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    monkeypatch.setattr(M.urllib.request, "urlopen", lambda req, timeout=None: FakeResp())
+    seen = fake_relay(monkeypatch)
     assert M.post_relay_fec("http://relay/fec", "off", "20:1", "20:1", 1.0) is True
+    assert seen["method"] == "POST"
+    assert seen["headers"].get("Content-Type") == "application/json"
 
 
 def test_post_relay_fec_transport_error_returns_false(monkeypatch):
-    def boom(req, timeout=None):
-        raise M.urllib.error.URLError("down")
-    monkeypatch.setattr(M.urllib.request, "urlopen", boom)
+    fake_relay(monkeypatch, raises=OSError("down"))
     assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is False
 
 
 def test_post_relay_fec_body_includes_mode_and_legacy_enabled(monkeypatch):
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     assert M.post_relay_fec("http://relay/fec", "fixed", "20:1", "20:1", 1.0) is True
     assert seen["body"]["mode"] == "fixed"
     assert seen["body"]["fixed_ratio"] == "20:1"
@@ -197,42 +218,21 @@ def test_worst_active_loss_empty():
 
 
 def test_post_relay_fec_includes_client_loss_pct(monkeypatch):
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0,
                             client_loss_pct=1.47) is True
     assert seen["body"]["client_loss_pct"] == 1.47
 
 
 def test_post_relay_fec_omits_client_loss_when_none(monkeypatch):
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is True
     assert "client_loss_pct" not in seen["body"]
 
 
 def test_post_relay_fec_http_error_returns_false_and_warns_once(monkeypatch, caplog):
-    import io
-
-    def raiser(req, timeout=None):
-        raise M.urllib.error.HTTPError(
-            req.full_url, 400, "Bad Request", {},
-            io.BytesIO(b'{"error": "unknown wan_profile"}'))
-    monkeypatch.setattr(M.urllib.request, "urlopen", raiser)
+    fake_relay(monkeypatch, status=400, reason="Bad Request",
+               resp_body=b'{"error": "unknown wan_profile"}')
     monkeypatch.setattr(M, "_post_relay_fec_last_warned", None)
     caplog.set_level("WARNING")
     assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0,
@@ -247,9 +247,7 @@ def test_post_relay_fec_http_error_returns_false_and_warns_once(monkeypatch, cap
 
 
 def test_post_relay_fec_transport_error_does_not_warn(monkeypatch, caplog):
-    def boom(req, timeout=None):
-        raise M.urllib.error.URLError("down")
-    monkeypatch.setattr(M.urllib.request, "urlopen", boom)
+    fake_relay(monkeypatch, raises=OSError("down"))
     monkeypatch.setattr(M, "_post_relay_fec_last_warned", None)
     caplog.set_level("WARNING")
     assert M.post_relay_fec("http://relay/fec", "adaptive", "20:1", "20:1", 1.0) is False
@@ -263,15 +261,7 @@ def test_relay_fec_direction_passes_through_loss_source():
 
 
 def test_post_relay_fec_sends_floor_ratio(monkeypatch):
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     assert M.post_relay_fec("http://relay/fec", "min_adaptive", "8:2", "8:1",
                             1.0, client_loss_pct=1.25) is True
     assert seen["body"]["floor_ratio"] == "8:1"
@@ -281,15 +271,7 @@ def test_post_relay_fec_sends_floor_ratio(monkeypatch):
 
 
 def test_post_relay_fec_includes_profile_and_signal(monkeypatch):
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     ok = M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
                           "8:0", 1.0, client_loss_pct=0.4,
                           wan_profile="wan1", signal_floor=True)
@@ -302,15 +284,7 @@ def test_post_relay_fec_serializes_explicit_false_signal_floor(monkeypatch):
     # signal_floor=False (explicitly passed, e.g. the floor just released)
     # must be distinguished from signal_floor=None (never engaged/omitted) —
     # both are falsy in Python but only the former belongs in the payload.
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     ok = M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
                           "8:0", 1.0, client_loss_pct=0.4,
                           wan_profile="wan1", signal_floor=False)
@@ -320,15 +294,7 @@ def test_post_relay_fec_serializes_explicit_false_signal_floor(monkeypatch):
 
 
 def test_post_relay_fec_omits_absent_profile(monkeypatch):
-    seen = {}
-    class FakeResp:
-        status = 200
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def fake_urlopen(req, timeout=None):
-        seen["body"] = json.loads(req.data.decode())
-        return FakeResp()
-    monkeypatch.setattr(M.urllib.request, "urlopen", fake_urlopen)
+    seen = fake_relay(monkeypatch)
     assert M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
                             "20:1", 1.0, client_loss_pct=0.4)
     # Omitted keys must stay omitted so older relays see an unchanged payload.

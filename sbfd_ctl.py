@@ -388,6 +388,8 @@ import os
 import re
 import time
 import json as _json
+import http.client
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -457,19 +459,116 @@ def read_local_sbfd_state(path: str,
     )
 
 
+# -- Relay control-plane transport -------------------------------------------
+
+# The controller loop GETs the relay's /state and /fec once per second across
+# the management overlay, which in a real deployment rides the metered WAN
+# links. urllib opens a fresh TCP connection per call, and for these sub-1KB
+# payloads the handshake and teardown outweigh the data itself -- besides adding
+# an RTT of staleness to a failover input. So connections are pooled per
+# (scheme, host, port) and reused.
+#
+# A connection is checked OUT of the pool for the duration of a request and
+# returned on success, so two callers can never interleave writes on one
+# http.client connection and no lock is held across network I/O.
+_relay_conns: dict = {}
+_relay_conns_lock = threading.Lock()
+
+
+def close_relay_conns():
+    """Drop every pooled relay connection. Safe to call at any time."""
+    with _relay_conns_lock:
+        conns = list(_relay_conns.values())
+        _relay_conns.clear()
+    for conn in conns:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _relay_request(url, method="GET", body=None, headers=None, timeout_s=2.0):
+    """Request `url` over a pooled keep-alive connection.
+
+    Returns (status, reason, body_bytes), and raises OSError / http.client
+    exceptions on transport failure so callers keep their fail-open handling.
+
+    A pooled socket the peer has already closed -- reaped by an idle timeout, or
+    dropped when the relay daemon restarted -- still looks usable from this side
+    and only fails on first write or read. That case is retried once on a fresh
+    connection. A connection that was ALREADY fresh is never retried: the relay
+    is simply unreachable, and a second attempt would silently double the
+    caller's timeout budget inside a 0.5s control loop.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme {parts.scheme!r} in {url!r}")
+    if not parts.hostname:
+        raise ValueError(f"no host in URL {url!r}")
+    target = parts.path or "/"
+    if parts.query:
+        target = f"{target}?{parts.query}"
+    key = (parts.scheme, parts.hostname, parts.port)
+
+    retried = False
+    while True:
+        with _relay_conns_lock:
+            conn = _relay_conns.pop(key, None)
+        was_pooled = conn is not None
+        if not was_pooled:
+            cls = (http.client.HTTPSConnection if parts.scheme == "https"
+                   else http.client.HTTPConnection)
+            conn = cls(parts.hostname, parts.port, timeout=timeout_s)
+
+        try:
+            if was_pooled:
+                # A pooled connection carries the timeout it was built with; the
+                # live socket needs the current one applied directly. Inside the
+                # try because a socket the peer already closed raises EBADF
+                # here, which is exactly the stale case the retry exists for.
+                conn.timeout = timeout_s
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout_s)
+            conn.request(method, target, body=body, headers=dict(headers or {}))
+            resp = conn.getresponse()
+            data = resp.read()
+            will_close = resp.will_close
+        except (http.client.HTTPException, OSError):
+            try:
+                conn.close()
+            except OSError:
+                pass
+            if not was_pooled or retried:
+                raise
+            retried = True
+            continue
+
+        if will_close:
+            # Peer declined keep-alive (an older HTTP/1.0 relay mid-upgrade, or
+            # a proxy): don't pool a connection it has already dropped.
+            try:
+                conn.close()
+            except OSError:
+                pass
+        else:
+            with _relay_conns_lock:
+                if key in _relay_conns:
+                    conn.close()  # another caller pooled one while in flight
+                else:
+                    _relay_conns[key] = conn
+        return resp.status, resp.reason, data
+
+
 def fetch_remote_sbfd_state(url: str,
                             timeout_s: float,
                             session_id_to_wan: dict) -> StateSnapshot:
     """HTTP GET the relay /state endpoint. Fail-open on any error."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
-            body = resp.read()
-    except urllib.error.HTTPError as e:
-        return StateSnapshot(ok=False, per_wan={}, error=f"HTTP {e.code}: {e.reason}")
-    except urllib.error.URLError as e:
-        return StateSnapshot(ok=False, per_wan={}, error=f"URL error: {e.reason}")
-    except (TimeoutError, OSError) as e:
+        status, reason, body = _relay_request(url, timeout_s=timeout_s)
+    except (http.client.HTTPException, OSError, ValueError) as e:
         return StateSnapshot(ok=False, per_wan={}, error=f"transport: {e}")
+    if status != 200:
+        return StateSnapshot(ok=False, per_wan={}, error=f"HTTP {status}: {reason}")
 
     try:
         raw = _json.loads(body.decode())
@@ -1670,12 +1769,14 @@ def fetch_relay_fec(url, timeout_s) -> dict:
     if not url:
         return {"ok": False, "data": None, "error": "no fec_url configured"}
     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
-            data = _json.loads(resp.read().decode())
-        return {"ok": True, "data": data, "error": None}
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        status, reason, body = _relay_request(url, timeout_s=timeout_s)
+    except (http.client.HTTPException, OSError, ValueError) as e:
         return {"ok": False, "data": None, "error": f"transport: {e}"}
-    except ValueError as e:
+    if status != 200:
+        return {"ok": False, "data": None, "error": f"HTTP {status}: {reason}"}
+    try:
+        return {"ok": True, "data": _json.loads(body.decode()), "error": None}
+    except (ValueError, UnicodeDecodeError) as e:
         return {"ok": False, "data": None, "error": f"parse: {e}"}
 
 
@@ -1716,24 +1817,20 @@ def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
     if signal_floor is not None:
         payload["signal_floor"] = bool(signal_floor)
     body = _json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return resp.status == 200
-    except urllib.error.HTTPError as e:
-        try:
-            resp_body = e.read().decode("utf-8", "replace")
-        except Exception:
-            resp_body = ""
-        signature = (e.code, resp_body[:200])
-        if signature != _post_relay_fec_last_warned:
-            _post_relay_fec_last_warned = signature
-            logging.warning("post relay fec rejected: HTTP %s: %s",
-                            e.code, resp_body[:200])
+        status, _reason, resp_body = _relay_request(
+            url, method="POST", body=body,
+            headers={"Content-Type": "application/json"}, timeout_s=timeout_s)
+    except (http.client.HTTPException, OSError, ValueError):
         return False
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return False
+    if status == 200:
+        return True
+    text = resp_body.decode("utf-8", "replace")
+    signature = (status, text[:200])
+    if signature != _post_relay_fec_last_warned:
+        _post_relay_fec_last_warned = signature
+        logging.warning("post relay fec rejected: HTTP %s: %s", status, text[:200])
+    return False
 
 
 # -- Helpers -----------------------------------------------------------------
@@ -2030,6 +2127,27 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
     map_cfg = resolve_map_cfg(cfg.map)
 
     class Handler(BaseHTTPRequestHandler):
+        # The status page polls /api/state at 1 Hz and /api/engarde at 0.5 Hz
+        # for as long as it is open, and the map page adds /api/map at 3s. On
+        # HTTP/1.0 each of those was a fresh TCP connection. Keep-alive is safe
+        # here because every response path sets an accurate Content-Length
+        # (_send_json, _send_static, _serve_tile, the inline /api/state write),
+        # and send_error sets its own plus `Connection: close` -- which is what
+        # stops the 404/413 paths that answer a POST WITHOUT reading its body
+        # from leaving that body to be parsed as the next request.
+        protocol_version = "HTTP/1.1"
+        # A browser holds several connections open; each costs a thread for its
+        # whole life under ThreadingHTTPServer. The default timeout is None (an
+        # unbounded blocking read), so a client that vanishes without a FIN --
+        # laptop off Wi-Fi -- would pin one forever. handle_one_request turns
+        # this timeout into a close.
+        timeout = 30
+        # Without this, every keep-alive response pays ~40ms: the handler's
+        # header and body writes are separate, Nagle holds the second, and the
+        # browser sits on its delayed-ACK timer -- so a 1 Hz poller would be
+        # slower than it was on HTTP/1.0. See sbfd.py's state listener.
+        disable_nagle_algorithm = True
+
         def log_message(self, fmt, *args):
             logging.debug("ui %s - %s", self.address_string(), fmt % args)
 
@@ -2743,6 +2861,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
 
     if notifier is not None:
         notifier.stop()
+    # The keep-alive pool is process-global; don't leave a relay socket behind
+    # for whatever runs after this loop.
+    close_relay_conns()
 
 
 def withdraw_managed_default(cfg: Config):
