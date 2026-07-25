@@ -11,11 +11,18 @@
 #
 # A hardened relay commonly carries something like
 #     tcp dport 22 ct state new limit rate 10/minute accept
-# and that limit applies to the management overlay too. Exceed it and new SYNs
-# fall through to the chain's drop policy, so it presents as a SILENT HANG, not
-# a refusal — and retrying is what sustains it, because every attempt re-empties
-# the bucket. Everything else on the box stays reachable, which makes it look
-# like a host fault rather than a firewall rule.
+# and that limit applies to the management overlay too. Once the token bucket is
+# empty a new SYN no longer MATCHES that rule, so it falls through to the chain's
+# drop policy: a SILENT HANG, not a refusal. Everything else on the box stays
+# reachable, which makes it look like a host fault rather than a firewall rule.
+#
+# Retrying is what sustains it, though not by "using up" the bucket — an
+# over-limit packet matches nothing and consumes no token. The trap is that
+# tokens replenish slowly (10/minute is one per 6s) while each retry consumes
+# whatever has accrued, and a single ssh attempt emits several SYN
+# retransmissions, each its own `ct state new` packet. Retry faster than the
+# refill rate and the bucket never gets far enough ahead to carry a handshake.
+# Observed: a 20s-spaced loop never recovered. Stop retrying and wait it out.
 #
 # Why this file does not just add the rule: an exemption has to sit BEFORE the
 # rate limiter (or it is never reached once the limit trips) and AFTER any

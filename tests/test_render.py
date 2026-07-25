@@ -105,17 +105,25 @@ def test_relay_nft_dropin_documents_the_ssh_rate_limit_lockout():
     nft, values = _rendered_relay_nft()
     iface = values["overlay_iface"]
 
-    assert "rate" in nft, "lockout rationale is missing"
-    # Join shell continuations and strip comment markers before searching: the
-    # recipe legitimately spans lines, and the test should not dictate wrapping.
+    # Join shell continuations and strip comment markers first: the recipe
+    # legitimately spans lines, and the test should not dictate wrapping.
     prose = re.sub(r"\\\s*\n\s*#?\s*", " ", nft)
     prose = re.sub(r"^\s*#\s?", "", prose, flags=re.MULTILINE)
 
-    recipe = [line for line in prose.splitlines()
-              if "handle" in line and re.search(r"\btcp dport 22\b", line)]
-    assert recipe, "no handle-based placement command documented"
-    assert any(f'iifname "{iface}"' in r for r in recipe), (
-        f"documented command should be scoped to the overlay iface {iface!r}")
+    # Pin the two load-bearing concepts, not the prose: the rule form an
+    # operator greps for, and the symptom that makes this hard to recognise.
+    # A bare `"rate" in nft` would survive deleting the whole rationale.
+    assert re.search(r"\blimit rate\b", prose), (
+        "should name the actual rule form (`limit rate`) so it is greppable")
+    assert re.search(r"silent hang", prose, re.I), (
+        "should name the symptom -- it presents as a hang, not a refusal")
+
+    # And the command itself, by shape: a bare `handle`+`dport 22` match would
+    # accept prose that merely mentions both without giving a usable command.
+    assert re.search(
+        r"nft insert rule\b[^\n]*\bhandle\b[^\n]*"
+        rf'iifname "{re.escape(iface)}"[^\n]*\btcp dport 22\b[^\n]*\baccept\b',
+        prose), "no usable handle-based `nft insert rule` command documented"
 
 
 def test_render_text_strict_missing_placeholder_raises():
