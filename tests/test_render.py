@@ -1,4 +1,4 @@
-import importlib.util, json, subprocess, sys
+import importlib.util, json, re, subprocess, sys
 from pathlib import Path
 import pytest
 
@@ -56,6 +56,74 @@ def test_rendered_client_configs_are_valid_json_with_right_types():
     assert maint["dry_run"] is True
     assert maint["lock_path"] == "/run/sbfd-ctl/maintenance.lock"
     assert isinstance(maint["recovery_deadline_s"], int)
+
+
+def _rendered_relay_nft():
+    import tempfile
+    r = _render()
+    values = json.loads((ROOT / "deploy" / "values.example.json").read_text())
+    values["role"] = "relay"
+    with tempfile.TemporaryDirectory() as td:
+        r.render_all(values, td)
+        return (Path(td) / "etc/nftables.d/pathfuse.nft").read_text(), values
+
+
+def test_relay_nft_dropin_never_auto_inserts_an_ssh_accept():
+    """The drop-in must not weaken an operator-managed chain it cannot read.
+
+    An overlay SSH exemption has to sit BEFORE the port-22 rate limiter (or it
+    is never reached once the limit trips) but AFTER any access controls -- a
+    source-address restriction like `ip saddr != <admin> tcp dport 22 drop`. A
+    drop-in knows neither position, and `insert` puts the rule at the absolute
+    head, ahead of every control: an unconditional accept there lets ANY overlay
+    host reach sshd, defeating the operator's restriction.
+
+    Since correct placement is operator-specific, the drop-in ships the guidance
+    and no active rule. Greptile flagged the bypass on PR #9; T-Rex reproduced
+    it against a chain with a source restriction.
+    """
+    nft, _values = _rendered_relay_nft()
+
+    # Matched as a whole token, and tcp-specific: a substring test for
+    # "dport 22" also catches `udp dport 22` and `tcp dport 220`.
+    active = [rule for rule in nft.splitlines()
+              if re.search(r"\btcp dport 22\b", rule)
+              and not rule.lstrip().startswith("#")]
+
+    assert active == [], (
+        "drop-in must not auto-insert a port-22 rule -- it cannot know where "
+        f"the operator's access controls sit. Got: {active}")
+
+
+def test_relay_nft_dropin_documents_the_ssh_rate_limit_lockout():
+    """Removing the rule must not lose the knowledge that cost us the incident.
+
+    An operator hitting the lockout sees a silent hang, not a refusal, and
+    retrying sustains it -- so the drop-in has to explain the failure mode and
+    give the handle-based command that places the rule correctly.
+    """
+    nft, values = _rendered_relay_nft()
+    iface = values["overlay_iface"]
+
+    # Join shell continuations and strip comment markers first: the recipe
+    # legitimately spans lines, and the test should not dictate wrapping.
+    prose = re.sub(r"\\\s*\n\s*#?\s*", " ", nft)
+    prose = re.sub(r"^\s*#\s?", "", prose, flags=re.MULTILINE)
+
+    # Pin the two load-bearing concepts, not the prose: the rule form an
+    # operator greps for, and the symptom that makes this hard to recognise.
+    # A bare `"rate" in nft` would survive deleting the whole rationale.
+    assert re.search(r"\blimit rate\b", prose), (
+        "should name the actual rule form (`limit rate`) so it is greppable")
+    assert re.search(r"silent hang", prose, re.I), (
+        "should name the symptom -- it presents as a hang, not a refusal")
+
+    # And the command itself, by shape: a bare `handle`+`dport 22` match would
+    # accept prose that merely mentions both without giving a usable command.
+    assert re.search(
+        r"nft insert rule\b[^\n]*\bhandle\b[^\n]*"
+        rf'iifname "{re.escape(iface)}"[^\n]*\btcp dport 22\b[^\n]*\baccept\b',
+        prose), "no usable handle-based `nft insert rule` command documented"
 
 
 def test_render_text_strict_missing_placeholder_raises():
