@@ -31,6 +31,17 @@
   --warn:           #FBBF24;
   --unk:            #94A3B8;
 
+  /* FEC graph series. Deliberately NOT the status tokens: --up/--warn/--down
+     put green next to amber, which validates at only dE 7.3 under protanopia
+     -- the two middle series of a stacked chart, i.e. the pair an operator most
+     needs to separate. Swapping the middle to violet lifts that to dE 20.6 and
+     passes every check, while green/red keep their good/bad meaning at the
+     extremes. Waste is an intentional neutral, not a categorical hue. */
+  --fec-delivered:  #4ADE80;
+  --fec-recovered:  #C084FC;
+  --fec-lost:       #F87171;
+  --fec-waste:      #9097A8;
+
   --font-display:   "Bricolage Grotesque", ui-sans-serif, sans-serif;
   --font-body:      "Geist", ui-sans-serif, sans-serif;
   --font-mono:      "Geist Mono", ui-monospace, "JetBrains Mono", monospace;
@@ -961,7 +972,7 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 
 /* FEC decode-outcome graph */
 .fec-graph{
-  width:100%; height:72px; margin-top:8px; display:block;
+  width:100%; height:170px; margin-top:8px; display:block;
   background:var(--bg-inset); border:1px solid var(--border-subtle);
   border-radius:6px;
 }
@@ -973,7 +984,7 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
   display:inline-block; width:8px; height:8px; border-radius:2px;
   margin-right:4px; vertical-align:-1px;
 }
-.fec-graph-legend .lg-del{ background:var(--up); }
-.fec-graph-legend .lg-rec{ background:var(--warn); }
-.fec-graph-legend .lg-lost{ background:var(--down); }
-.fec-graph-legend .lg-waste{ background:var(--fg-muted); height:2px; border-radius:0; }
+.fec-graph-legend .lg-del{ background:var(--fec-delivered); }
+.fec-graph-legend .lg-rec{ background:var(--fec-recovered); }
+.fec-graph-legend .lg-lost{ background:var(--fec-lost); }
+.fec-graph-legend .lg-waste{ background:var(--fec-waste); height:2px; border-radius:0; }

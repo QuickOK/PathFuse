@@ -781,6 +781,7 @@ function renderFecCard(id, d, local){
 
 /* ---------- FEC decode-outcome graph ---------- */
 const FEC_GRAPH_WINDOW_S = 300;                 // 5-minute scroll window
+const FEC_GRAPH_H = 170;                        // tall enough for axes + tick labels
 const FEC_HIST_CAP = 3600;                      // matches server retention
 const fecHist = { c2r: [], r2c: [] };
 let fecHistSeeded = false;
@@ -825,11 +826,20 @@ function cssVar(name){
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// Round a peak up to a "nice" axis maximum (1/2/5 x 10^n) so gridline labels
+// land on readable numbers instead of whatever the busiest sample happened to be.
+function niceCeil(v){
+  if (!(v > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+
 function drawFecGraph(id, series){
   const cv = document.getElementById(id);
   if (!cv) return;
   const dpr = window.devicePixelRatio || 1;
-  const cssW = cv.clientWidth || 300, cssH = 72;
+  const cssW = cv.clientWidth || 300, cssH = FEC_GRAPH_H;
   if (cv.width !== Math.round(cssW * dpr)) cv.width = Math.round(cssW * dpr);
   if (cv.height !== Math.round(cssH * dpr)) cv.height = Math.round(cssH * dpr);
   const ctx = cv.getContext("2d");
@@ -838,30 +848,77 @@ function drawFecGraph(id, series){
 
   // Read each CSS var once; getComputedStyle is not free and this function
   // runs per-frame per-graph.
-  const cUp = cssVar("--up"), cWarn = cssVar("--warn"), cDown = cssVar("--down"),
-        cInset = cssVar("--bg-inset"), cMuted = cssVar("--fg-muted"),
+  const cDelivered = cssVar("--fec-delivered"), cRecovered = cssVar("--fec-recovered"),
+        cLost = cssVar("--fec-lost"),
+        cInset = cssVar("--bg-inset"), cWaste = cssVar("--fec-waste"),
         cBorderStrong = cssVar("--border-strong"), cFg = cssVar("--fg"),
-        cFgDim = cssVar("--fg-dim");
+        cFgDim = cssVar("--fg-dim"), cGrid = cssVar("--border-subtle"),
+        cAxis = cssVar("--border"), cSurface = cssVar("--bg-elevated");
+
+  // Plot frame: room on the left for y labels and below for time ticks. The
+  // axes are what this borrows from the PepVPN chart -- the old sparkline had
+  // no scale at all, so a spike's magnitude was unreadable.
+  const ML = 44, MR = 10, MT = 10, MB = 20;
+  const plotL = ML, plotR = cssW - MR, plotT = MT, plotB = cssH - MB;
+  const plotW = Math.max(1, plotR - plotL), plotH = Math.max(1, plotB - plotT);
 
   const last = series.length ? series[series.length - 1] : null;
   const t1 = last ? last.t : 0;
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
   const windowed = series.filter(p => p.t >= t0);
   const pts = windowed.filter(p => p.delivered != null);
-  if (!pts.length){
-    ctx.fillStyle = cFgDim;
-    ctx.font = "10px sans-serif";
-    ctx.fillText("no decoder data", 8, cssH / 2 + 3);
-    return;
-  }
+
+  const X = t => plotL + ((t - t0) / FEC_GRAPH_WINDOW_S) * plotW;
+
+  // Axes and gridlines draw even with no data, so an empty graph still reads as
+  // a chart with a scale rather than a blank box.
   let peak = 1;
   pts.forEach(p => {
     const tot = (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0);
     if (tot > peak) peak = tot;
     if ((p.waste || 0) > peak) peak = p.waste;
   });
-  const X = t => ((t - t0) / FEC_GRAPH_WINDOW_S) * cssW;
-  const Y = v => cssH - 3 - (v / peak) * (cssH - 8);
+  const axisMax = niceCeil(peak);
+  const Y = v => plotB - (v / axisMax) * plotH;
+
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+
+  // horizontal gridlines + y labels (pkt/s)
+  const Y_TICKS = 4;
+  ctx.textAlign = "right";
+  for (let i = 0; i <= Y_TICKS; i++){
+    const val = (axisMax / Y_TICKS) * i;
+    const y = Math.round(Y(val)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(plotL, y); ctx.lineTo(plotR, y);
+    ctx.lineWidth = 1; ctx.strokeStyle = i === 0 ? cAxis : cGrid; ctx.stroke();
+    ctx.fillStyle = cFgDim;
+    ctx.fillText(fmtRate(val), plotL - 6, y);
+  }
+  // vertical gridlines + time labels, one per minute of the window
+  ctx.textAlign = "center";
+  const STEP_S = 60;
+  for (let s = 0; s <= FEC_GRAPH_WINDOW_S; s += STEP_S){
+    const x = Math.round(plotL + (s / FEC_GRAPH_WINDOW_S) * plotW) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, plotT); ctx.lineTo(x, plotB);
+    ctx.lineWidth = 1; ctx.strokeStyle = cGrid; ctx.stroke();
+    const mins = (FEC_GRAPH_WINDOW_S - s) / 60;
+    ctx.fillStyle = cFgDim;
+    ctx.fillText(mins === 0 ? "now" : `-${mins}m`, x, plotB + 10);
+  }
+  // y-axis line
+  ctx.beginPath();
+  ctx.moveTo(Math.round(plotL) + 0.5, plotT); ctx.lineTo(Math.round(plotL) + 0.5, plotB);
+  ctx.lineWidth = 1; ctx.strokeStyle = cAxis; ctx.stroke();
+  ctx.textBaseline = "alphabetic";
+
+  if (!pts.length){
+    ctx.fillStyle = cFgDim;
+    ctx.textAlign = "center";
+    ctx.fillText("no decoder data", plotL + plotW / 2, plotT + plotH / 2);
+    ctx.textAlign = "left";
+    return;
+  }
 
   // Outages must show as a visual break, not a bridged straight edge: split
   // the window into contiguous runs, breaking whenever a sample's delivered
@@ -887,10 +944,10 @@ function drawFecGraph(id, series){
   // Stacked bands, FIXED order bottom->top: delivered, recovered, lost.
   // Position encodes identity (CVD-safe with the 2px separators below).
   const bands = [
-    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cUp },
-    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cWarn },
+    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cDelivered },
+    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cRecovered },
     { lo: p => (p.delivered || 0) + (p.recovered || 0),
-      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cDown },
+      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cLost },
   ];
   bands.forEach(b => {
     runs.forEach(run => {
@@ -939,34 +996,69 @@ function drawFecGraph(id, series){
     started = true;
     lastT = p.t;
   });
-  ctx.lineWidth = 1.5; ctx.strokeStyle = cMuted; ctx.stroke();
+  ctx.lineWidth = 1.5; ctx.strokeStyle = cWaste; ctx.stroke();
 
-  // hover readout
+  // Crosshair + shared tooltip, the other thing borrowed from the PepVPN chart:
+  // one vertical rule at the hovered sample and every series' value at that
+  // instant, rather than a single line of text jammed in the corner.
   const dir = id.includes("c2r") ? "c2r" : "r2c";
   const hx = fecHover[dir];
-  if (hx != null){
-    const ht = t0 + (hx / cssW) * FEC_GRAPH_WINDOW_S;
-    let best = pts[0];
-    pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
-    ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(X(best.t), 0); ctx.lineTo(X(best.t), cssH); ctx.stroke();
-    ctx.font = "10px sans-serif";
-    const readout = `ok ${fmtRate(best.delivered)} · rec ${fmtRate(best.recovered)}`
-                   + ` · lost ${fmtRate(best.lost)} · waste ${fmtRate(best.waste)} pkt/s`;
-    // Backdrop so the text doesn't collide with the band fills beneath it.
-    const padX = 4, boxH = 14;
-    const textW = ctx.measureText(readout).width;
-    const boxRight = cssW - 6 + padX, boxLeft = cssW - 6 - textW - padX;
-    const boxTop = 12 - boxH + 4;
-    ctx.globalAlpha = 0.9;
-    ctx.fillStyle = cInset;
-    ctx.fillRect(boxLeft, boxTop, boxRight - boxLeft, boxH);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = cFg;
-    ctx.textAlign = "right";
-    ctx.fillText(readout, cssW - 6, 12);
-    ctx.textAlign = "left";
-  }
+  if (hx == null) return;
+  // Ignore hovers in the axis gutters -- there is no sample under them.
+  if (hx < plotL || hx > plotR) return;
+
+  const ht = t0 + ((hx - plotL) / plotW) * FEC_GRAPH_WINDOW_S;
+  let best = pts[0];
+  pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
+  const bx = X(best.t);
+
+  ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(Math.round(bx) + 0.5, plotT); ctx.lineTo(Math.round(bx) + 0.5, plotB);
+  ctx.stroke();
+
+  const rows = [
+    { label: "delivered", val: best.delivered, color: cDelivered },
+    { label: "recovered", val: best.recovered, color: cRecovered },
+    { label: "lost",      val: best.lost,      color: cLost },
+    // Same wording as the legend below the canvas -- two names for one series
+    // is a reader's problem, not a layout saving.
+    { label: "parity wasted", val: best.waste,  color: cWaste },
+  ];
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  const rowH = 13, padX = 8, padY = 6, sw = 7, gap = 6;
+  let labelW = 0, valW = 0;
+  rows.forEach(r => {
+    labelW = Math.max(labelW, ctx.measureText(r.label).width);
+    valW = Math.max(valW, ctx.measureText(fmtRate(r.val)).width);
+  });
+  const boxW = padX * 2 + sw + gap + labelW + 10 + valW;
+  const boxH = padY * 2 + rows.length * rowH;
+  // Flip to the other side of the crosshair rather than overflow the plot.
+  let boxX = bx + 10;
+  if (boxX + boxW > plotR) boxX = bx - 10 - boxW;
+  boxX = Math.max(plotL + 2, Math.min(boxX, plotR - boxW - 2));
+  const boxY = Math.max(plotT + 2, Math.min(plotT + 6, plotB - boxH - 2));
+
+  ctx.globalAlpha = 0.96;
+  ctx.fillStyle = cSurface;
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = cAxis; ctx.lineWidth = 1;
+  ctx.strokeRect(Math.round(boxX) + 0.5, Math.round(boxY) + 0.5, boxW, boxH);
+
+  ctx.textBaseline = "middle";
+  rows.forEach((r, i) => {
+    const y = boxY + padY + rowH * i + rowH / 2;
+    ctx.fillStyle = r.color;
+    ctx.fillRect(boxX + padX, y - sw / 2, sw, sw);
+    ctx.fillStyle = cFgDim; ctx.textAlign = "left";
+    ctx.fillText(r.label, boxX + padX + sw + gap, y);
+    ctx.fillStyle = cFg; ctx.textAlign = "right";
+    ctx.fillText(fmtRate(r.val), boxX + boxW - padX, y);
+  });
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
 }
 
 function fmtRate(v){ return v == null ? "—" : (v >= 100 ? Math.round(v) : v.toFixed(1)); }
