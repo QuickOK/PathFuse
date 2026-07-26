@@ -156,6 +156,14 @@ async function fetchState(){
     setTickStatus("ok", "all systems nominal");
   } catch (e){
     setTickStatus("bad", `state error · ${e}`);
+    // Keep the FEC graphs advancing even while the feed is down. Their window
+    // is anchored to wall-clock now, but only a redraw applies that -- and the
+    // success path is the only thing that redraws. Without this the canvas
+    // freezes with the last sample still sitting under the "now" tick, which is
+    // precisely the false-currency the wall-clock anchor exists to prevent:
+    // the feed being dead is exactly when it misleads. Redrawing here ages the
+    // data off the right edge instead, from the history we already hold.
+    ["c2r", "r2c"].forEach(dir => drawFecGraph(`fec-${dir}-graph`, fecHist[dir]));
   }
 }
 async function fetchEngarde(){
@@ -781,6 +789,7 @@ function renderFecCard(id, d, local){
 
 /* ---------- FEC decode-outcome graph ---------- */
 const FEC_GRAPH_WINDOW_S = 300;                 // 5-minute scroll window
+const FEC_GRAPH_H = 170;                        // tall enough for axes + tick labels
 const FEC_HIST_CAP = 3600;                      // matches server retention
 const fecHist = { c2r: [], r2c: [] };
 let fecHistSeeded = false;
@@ -825,11 +834,23 @@ function cssVar(name){
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+// Round a peak up to a "nice" axis maximum (1/2/5 x 10^n) so gridline labels
+// land on readable numbers instead of whatever the busiest sample happened to be.
+function niceCeil(v){
+  if (!(v > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+
 function drawFecGraph(id, series){
   const cv = document.getElementById(id);
   if (!cv) return;
   const dpr = window.devicePixelRatio || 1;
-  const cssW = cv.clientWidth || 300, cssH = 72;
+  // Both dimensions come from the laid-out box, so CSS stays the single source
+  // of truth. Sizing the backing store from a JS constant while the box is
+  // sized by CSS stretches the whole chart the moment the two drift.
+  const cssW = cv.clientWidth || 300, cssH = cv.clientHeight || FEC_GRAPH_H;
   if (cv.width !== Math.round(cssW * dpr)) cv.width = Math.round(cssW * dpr);
   if (cv.height !== Math.round(cssH * dpr)) cv.height = Math.round(cssH * dpr);
   const ctx = cv.getContext("2d");
@@ -838,30 +859,84 @@ function drawFecGraph(id, series){
 
   // Read each CSS var once; getComputedStyle is not free and this function
   // runs per-frame per-graph.
-  const cUp = cssVar("--up"), cWarn = cssVar("--warn"), cDown = cssVar("--down"),
-        cInset = cssVar("--bg-inset"), cMuted = cssVar("--fg-muted"),
+  const cDelivered = cssVar("--fec-delivered"), cRecovered = cssVar("--fec-recovered"),
+        cLost = cssVar("--fec-lost"),
+        cInset = cssVar("--bg-inset"), cWaste = cssVar("--fec-waste"),
         cBorderStrong = cssVar("--border-strong"), cFg = cssVar("--fg"),
-        cFgDim = cssVar("--fg-dim");
+        cFgDim = cssVar("--fg-dim"), cGrid = cssVar("--border-subtle"),
+        cAxis = cssVar("--border"), cSurface = cssVar("--bg-elevated");
 
+  // Plot frame: room on the left for y labels and below for time ticks. The
+  // axes are what this borrows from the PepVPN chart -- the old sparkline had
+  // no scale at all, so a spike's magnitude was unreadable.
+  const ML = 44, MR = 10, MT = 10, MB = 20;
+  const plotL = ML, plotR = cssW - MR, plotT = MT, plotB = cssH - MB;
+  const plotW = Math.max(1, plotR - plotL), plotH = Math.max(1, plotB - plotT);
+
+  // Anchor the window to wall-clock now, NOT to the newest sample. Anchored to
+  // the sample, a stalled feed (controller restarting, relay poll failing, tab
+  // throttled in the background) keeps its last reading pinned under the "now"
+  // tick, so minutes-old decoder history reads as current. Anchored to the
+  // clock, stale data visibly slides left and leaves a growing empty gutter --
+  // which is the honest picture. Falls back to the newest sample if the browser
+  // clock sits behind the server's, so skew cannot blank the chart.
   const last = series.length ? series[series.length - 1] : null;
-  const t1 = last ? last.t : 0;
+  const t1 = Math.max(Date.now() / 1000, last ? last.t : 0);
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
   const windowed = series.filter(p => p.t >= t0);
   const pts = windowed.filter(p => p.delivered != null);
-  if (!pts.length){
-    ctx.fillStyle = cFgDim;
-    ctx.font = "10px sans-serif";
-    ctx.fillText("no decoder data", 8, cssH / 2 + 3);
-    return;
-  }
+
+  const X = t => plotL + ((t - t0) / FEC_GRAPH_WINDOW_S) * plotW;
+
+  // Axes and gridlines draw even with no data, so an empty graph still reads as
+  // a chart with a scale rather than a blank box.
   let peak = 1;
   pts.forEach(p => {
     const tot = (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0);
     if (tot > peak) peak = tot;
     if ((p.waste || 0) > peak) peak = p.waste;
   });
-  const X = t => ((t - t0) / FEC_GRAPH_WINDOW_S) * cssW;
-  const Y = v => cssH - 3 - (v / peak) * (cssH - 8);
+  const axisMax = niceCeil(peak);
+  const Y = v => plotB - (v / axisMax) * plotH;
+
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+
+  // horizontal gridlines + y labels (pkt/s)
+  const Y_TICKS = 4;
+  ctx.textAlign = "right";
+  for (let i = 0; i <= Y_TICKS; i++){
+    const val = (axisMax / Y_TICKS) * i;
+    const y = Math.round(Y(val)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(plotL, y); ctx.lineTo(plotR, y);
+    ctx.lineWidth = 1; ctx.strokeStyle = i === 0 ? cAxis : cGrid; ctx.stroke();
+    ctx.fillStyle = cFgDim;
+    ctx.fillText(fmtRate(val), plotL - 6, y);
+  }
+  // vertical gridlines + time labels, one per minute of the window
+  ctx.textAlign = "center";
+  const STEP_S = 60;
+  for (let s = 0; s <= FEC_GRAPH_WINDOW_S; s += STEP_S){
+    const x = Math.round(plotL + (s / FEC_GRAPH_WINDOW_S) * plotW) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, plotT); ctx.lineTo(x, plotB);
+    ctx.lineWidth = 1; ctx.strokeStyle = cGrid; ctx.stroke();
+    const mins = (FEC_GRAPH_WINDOW_S - s) / 60;
+    ctx.fillStyle = cFgDim;
+    ctx.fillText(mins === 0 ? "now" : `-${mins}m`, x, plotB + 10);
+  }
+  // y-axis line
+  ctx.beginPath();
+  ctx.moveTo(Math.round(plotL) + 0.5, plotT); ctx.lineTo(Math.round(plotL) + 0.5, plotB);
+  ctx.lineWidth = 1; ctx.strokeStyle = cAxis; ctx.stroke();
+  ctx.textBaseline = "alphabetic";
+
+  if (!pts.length){
+    ctx.fillStyle = cFgDim;
+    ctx.textAlign = "center";
+    ctx.fillText("no decoder data", plotL + plotW / 2, plotT + plotH / 2);
+    ctx.textAlign = "left";
+    return;
+  }
 
   // Outages must show as a visual break, not a bridged straight edge: split
   // the window into contiguous runs, breaking whenever a sample's delivered
@@ -887,10 +962,10 @@ function drawFecGraph(id, series){
   // Stacked bands, FIXED order bottom->top: delivered, recovered, lost.
   // Position encodes identity (CVD-safe with the 2px separators below).
   const bands = [
-    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cUp },
-    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cWarn },
+    { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cDelivered },
+    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cRecovered },
     { lo: p => (p.delivered || 0) + (p.recovered || 0),
-      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cDown },
+      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cLost },
   ];
   bands.forEach(b => {
     runs.forEach(run => {
@@ -939,34 +1014,112 @@ function drawFecGraph(id, series){
     started = true;
     lastT = p.t;
   });
-  ctx.lineWidth = 1.5; ctx.strokeStyle = cMuted; ctx.stroke();
+  ctx.lineWidth = 1.5; ctx.strokeStyle = cWaste; ctx.stroke();
 
-  // hover readout
+  // Crosshair + shared tooltip, the other thing borrowed from the PepVPN chart:
+  // one vertical rule at the hovered sample and every series' value at that
+  // instant, rather than a single line of text jammed in the corner.
   const dir = id.includes("c2r") ? "c2r" : "r2c";
   const hx = fecHover[dir];
-  if (hx != null){
-    const ht = t0 + (hx / cssW) * FEC_GRAPH_WINDOW_S;
-    let best = pts[0];
-    pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
-    ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(X(best.t), 0); ctx.lineTo(X(best.t), cssH); ctx.stroke();
-    ctx.font = "10px sans-serif";
-    const readout = `ok ${fmtRate(best.delivered)} · rec ${fmtRate(best.recovered)}`
-                   + ` · lost ${fmtRate(best.lost)} · waste ${fmtRate(best.waste)} pkt/s`;
-    // Backdrop so the text doesn't collide with the band fills beneath it.
-    const padX = 4, boxH = 14;
-    const textW = ctx.measureText(readout).width;
-    const boxRight = cssW - 6 + padX, boxLeft = cssW - 6 - textW - padX;
-    const boxTop = 12 - boxH + 4;
-    ctx.globalAlpha = 0.9;
-    ctx.fillStyle = cInset;
-    ctx.fillRect(boxLeft, boxTop, boxRight - boxLeft, boxH);
+  if (hx == null) return;
+  // Ignore hovers in the axis gutters -- there is no sample under them.
+  if (hx < plotL || hx > plotR) return;
+
+  const ht = t0 + ((hx - plotL) / plotW) * FEC_GRAPH_WINDOW_S;
+  // Decide from the rendered INTERVAL, not from nearest-sample identity. The
+  // bands draw a break across a span; asking "is the closest sample a null one"
+  // answers a different question and gets the edges wrong -- hovering just
+  // inside a break, but marginally nearer the last valid sample, would quote
+  // that sample where the chart plainly shows nothing. At the ops width samples
+  // sit under a pixel apart so that band is invisible, but the wall layout is
+  // several times wider and it becomes big enough to land on.
+  //
+  // Bracket the hovered instant and ask whether the bands broke across it:
+  // either endpoint missing (before the first sample or past the last), either
+  // endpoint an explicitly recorded outage, or a span wider than the run
+  // threshold. That is exactly the rule the run-splitting above uses.
+  let prev = null, next = null;
+  windowed.forEach(p => {
+    if (p.t <= ht && (!prev || p.t > prev.t)) prev = p;
+    if (p.t >= ht && (!next || p.t < next.t)) next = p;
+  });
+  const inGap = !prev || !next
+             || prev.delivered == null || next.delivered == null
+             || (next.t - prev.t) > FEC_GRAPH_MAX_GAP_S;
+  // Off a break, both brackets are valid samples -- read out the nearer.
+  const best = inGap ? null
+             : (Math.abs(prev.t - ht) <= Math.abs(next.t - ht) ? prev : next);
+  const bx = inGap ? hx : X(best.t);
+
+  ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(Math.round(bx) + 0.5, plotT); ctx.lineTo(Math.round(bx) + 0.5, plotB);
+  ctx.stroke();
+
+  if (inGap){
+    ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+    const msg = "no data";
+    const w = ctx.measureText(msg).width + 16, h = 20;
+    const gx = Math.max(2, Math.min(bx + 8, cssW - w - 2));
+    ctx.globalAlpha = 0.96; ctx.fillStyle = cSurface;
+    ctx.fillRect(gx, plotT + 6, w, h);
     ctx.globalAlpha = 1;
-    ctx.fillStyle = cFg;
-    ctx.textAlign = "right";
-    ctx.fillText(readout, cssW - 6, 12);
-    ctx.textAlign = "left";
+    ctx.strokeStyle = cAxis; ctx.lineWidth = 1;
+    ctx.strokeRect(Math.round(gx) + 0.5, Math.round(plotT + 6) + 0.5, w, h);
+    ctx.fillStyle = cFgDim; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+    ctx.fillText(msg, gx + 8, plotT + 6 + h / 2);
+    ctx.textBaseline = "alphabetic";
+    return;
   }
+
+  const rows = [
+    { label: "delivered", val: best.delivered, color: cDelivered },
+    { label: "recovered", val: best.recovered, color: cRecovered },
+    { label: "lost",      val: best.lost,      color: cLost },
+    // Same wording as the legend below the canvas -- two names for one series
+    // is a reader's problem, not a layout saving.
+    { label: "parity wasted", val: best.waste,  color: cWaste },
+  ];
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  const rowH = 13, padX = 8, padY = 6, sw = 7, gap = 6;
+  let labelW = 0, valW = 0;
+  rows.forEach(r => {
+    labelW = Math.max(labelW, ctx.measureText(r.label).width);
+    valW = Math.max(valW, ctx.measureText(fmtRate(r.val)).width);
+  });
+  const boxW = padX * 2 + sw + gap + labelW + 10 + valW;
+  const boxH = padY * 2 + rows.length * rowH;
+  // Prefer the right of the crosshair, flip left if that would leave the plot.
+  let boxX = bx + 10;
+  if (boxX + boxW > plotR) boxX = bx - 10 - boxW;
+  // Clamp to the CANVAS, not the plot. On a narrow card the tooltip can be
+  // wider than the plot itself, and clamping to `plotR - boxW` then resolves
+  // below plotL, so the lower bound wins and the box runs off the canvas
+  // entirely. Better to overhang the axis gutter than to be unreadable.
+  boxX = Math.max(2, Math.min(boxX, cssW - boxW - 2));
+  // Sit near the top of the plot, but never hang past its bottom edge.
+  let boxY = plotT + 6;
+  if (boxY + boxH > plotB - 2) boxY = Math.max(plotT + 2, plotB - boxH - 2);
+
+  ctx.globalAlpha = 0.96;
+  ctx.fillStyle = cSurface;
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = cAxis; ctx.lineWidth = 1;
+  ctx.strokeRect(Math.round(boxX) + 0.5, Math.round(boxY) + 0.5, boxW, boxH);
+
+  ctx.textBaseline = "middle";
+  rows.forEach((r, i) => {
+    const y = boxY + padY + rowH * i + rowH / 2;
+    ctx.fillStyle = r.color;
+    ctx.fillRect(boxX + padX, y - sw / 2, sw, sw);
+    ctx.fillStyle = cFgDim; ctx.textAlign = "left";
+    ctx.fillText(r.label, boxX + padX + sw + gap, y);
+    ctx.fillStyle = cFg; ctx.textAlign = "right";
+    ctx.fillText(fmtRate(r.val), boxX + boxW - padX, y);
+  });
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
 }
 
 function fmtRate(v){ return v == null ? "—" : (v >= 100 ? Math.round(v) : v.toFixed(1)); }
@@ -1115,9 +1268,18 @@ $$(FORM_SELECTOR).forEach(el => {
 ["c2r", "r2c"].forEach(dir => {
   const cv = document.getElementById(`fec-${dir}-graph`);
   if (!cv) return;
+  // Coalesce hover redraws to one per frame. A pointermove can fire far more
+  // often than the display refreshes, and each redraw rebuilds the whole chart
+  // (twelve getComputedStyle reads among them) -- on the wall-display hardware
+  // that is worth not doing several times between frames.
+  let pending = null;
   cv.addEventListener("pointermove", e => {
     fecHover[dir] = e.offsetX;
-    drawFecGraph(`fec-${dir}-graph`, fecHist[dir]);
+    if (pending != null) return;
+    pending = requestAnimationFrame(() => {
+      pending = null;
+      drawFecGraph(`fec-${dir}-graph`, fecHist[dir]);
+    });
   });
   cv.addEventListener("pointerleave", () => {
     fecHover[dir] = null;
