@@ -156,6 +156,14 @@ async function fetchState(){
     setTickStatus("ok", "all systems nominal");
   } catch (e){
     setTickStatus("bad", `state error · ${e}`);
+    // Keep the FEC graphs advancing even while the feed is down. Their window
+    // is anchored to wall-clock now, but only a redraw applies that -- and the
+    // success path is the only thing that redraws. Without this the canvas
+    // freezes with the last sample still sitting under the "now" tick, which is
+    // precisely the false-currency the wall-clock anchor exists to prevent:
+    // the feed being dead is exactly when it misleads. Redrawing here ages the
+    // data off the right edge instead, from the history we already hold.
+    ["c2r", "r2c"].forEach(dir => drawFecGraph(`fec-${dir}-graph`, fecHist[dir]));
   }
 }
 async function fetchEngarde(){
