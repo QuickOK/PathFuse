@@ -1018,15 +1018,22 @@ function drawFecGraph(id, series){
   if (hx < plotL || hx > plotR) return;
 
   const ht = t0 + ((hx - plotL) / plotW) * FEC_GRAPH_WINDOW_S;
+  // Nearest VALID sample supplies the readout...
   let best = pts[0];
   pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
-
-  // `pts` holds only valid samples, so the nearest-sample search will happily
-  // jump across an outage and hand back a reading from the far side of it.
-  // Presenting that as the hovered instant's value is worse than saying
-  // nothing -- the bands deliberately render the gap as a break, and the
-  // tooltip has to agree with them.
-  const inGap = Math.abs(best.t - ht) > FEC_GRAPH_MAX_GAP_S / 2;
+  // ...but the nearest sample of ANY kind decides whether there is a reading to
+  // give. Two distinct ways to be over nothing, and a distance test alone only
+  // catches the second:
+  //   1. an explicitly recorded outage — a null-delivered sample. The bands
+  //      break on any of these however short the run, so a 3s outage leaves a
+  //      valid neighbour ~1.5s away and a distance test would happily quote it
+  //      right next to a visible break.
+  //   2. no samples at all in this stretch — nothing recorded either way, e.g.
+  //      the leading edge before history was seeded.
+  let nearest = windowed[0];
+  windowed.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(nearest.t - ht)) nearest = p; });
+  const inGap = (nearest && nearest.delivered == null)
+             || Math.abs(best.t - ht) > FEC_GRAPH_MAX_GAP_S / 2;
   const bx = inGap ? hx : X(best.t);
 
   ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
