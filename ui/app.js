@@ -865,8 +865,15 @@ function drawFecGraph(id, series){
   const plotL = ML, plotR = cssW - MR, plotT = MT, plotB = cssH - MB;
   const plotW = Math.max(1, plotR - plotL), plotH = Math.max(1, plotB - plotT);
 
+  // Anchor the window to wall-clock now, NOT to the newest sample. Anchored to
+  // the sample, a stalled feed (controller restarting, relay poll failing, tab
+  // throttled in the background) keeps its last reading pinned under the "now"
+  // tick, so minutes-old decoder history reads as current. Anchored to the
+  // clock, stale data visibly slides left and leaves a growing empty gutter --
+  // which is the honest picture. Falls back to the newest sample if the browser
+  // clock sits behind the server's, so skew cannot blank the chart.
   const last = series.length ? series[series.length - 1] : null;
-  const t1 = last ? last.t : 0;
+  const t1 = Math.max(Date.now() / 1000, last ? last.t : 0);
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
   const windowed = series.filter(p => p.t >= t0);
   const pts = windowed.filter(p => p.delivered != null);
@@ -1013,12 +1020,35 @@ function drawFecGraph(id, series){
   const ht = t0 + ((hx - plotL) / plotW) * FEC_GRAPH_WINDOW_S;
   let best = pts[0];
   pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
-  const bx = X(best.t);
+
+  // `pts` holds only valid samples, so the nearest-sample search will happily
+  // jump across an outage and hand back a reading from the far side of it.
+  // Presenting that as the hovered instant's value is worse than saying
+  // nothing -- the bands deliberately render the gap as a break, and the
+  // tooltip has to agree with them.
+  const inGap = Math.abs(best.t - ht) > FEC_GRAPH_MAX_GAP_S / 2;
+  const bx = inGap ? hx : X(best.t);
 
   ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(Math.round(bx) + 0.5, plotT); ctx.lineTo(Math.round(bx) + 0.5, plotB);
   ctx.stroke();
+
+  if (inGap){
+    ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+    const msg = "no data";
+    const w = ctx.measureText(msg).width + 16, h = 20;
+    const gx = Math.max(2, Math.min(bx + 8, cssW - w - 2));
+    ctx.globalAlpha = 0.96; ctx.fillStyle = cSurface;
+    ctx.fillRect(gx, plotT + 6, w, h);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = cAxis; ctx.lineWidth = 1;
+    ctx.strokeRect(Math.round(gx) + 0.5, Math.round(plotT + 6) + 0.5, w, h);
+    ctx.fillStyle = cFgDim; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+    ctx.fillText(msg, gx + 8, plotT + 6 + h / 2);
+    ctx.textBaseline = "alphabetic";
+    return;
+  }
 
   const rows = [
     { label: "delivered", val: best.delivered, color: cDelivered },
