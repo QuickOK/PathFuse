@@ -1026,22 +1026,29 @@ function drawFecGraph(id, series){
   if (hx < plotL || hx > plotR) return;
 
   const ht = t0 + ((hx - plotL) / plotW) * FEC_GRAPH_WINDOW_S;
-  // Nearest VALID sample supplies the readout...
-  let best = pts[0];
-  pts.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(best.t - ht)) best = p; });
-  // ...but the nearest sample of ANY kind decides whether there is a reading to
-  // give. Two distinct ways to be over nothing, and a distance test alone only
-  // catches the second:
-  //   1. an explicitly recorded outage — a null-delivered sample. The bands
-  //      break on any of these however short the run, so a 3s outage leaves a
-  //      valid neighbour ~1.5s away and a distance test would happily quote it
-  //      right next to a visible break.
-  //   2. no samples at all in this stretch — nothing recorded either way, e.g.
-  //      the leading edge before history was seeded.
-  let nearest = windowed[0];
-  windowed.forEach(p => { if (Math.abs(p.t - ht) < Math.abs(nearest.t - ht)) nearest = p; });
-  const inGap = (nearest && nearest.delivered == null)
-             || Math.abs(best.t - ht) > FEC_GRAPH_MAX_GAP_S / 2;
+  // Decide from the rendered INTERVAL, not from nearest-sample identity. The
+  // bands draw a break across a span; asking "is the closest sample a null one"
+  // answers a different question and gets the edges wrong -- hovering just
+  // inside a break, but marginally nearer the last valid sample, would quote
+  // that sample where the chart plainly shows nothing. At the ops width samples
+  // sit under a pixel apart so that band is invisible, but the wall layout is
+  // several times wider and it becomes big enough to land on.
+  //
+  // Bracket the hovered instant and ask whether the bands broke across it:
+  // either endpoint missing (before the first sample or past the last), either
+  // endpoint an explicitly recorded outage, or a span wider than the run
+  // threshold. That is exactly the rule the run-splitting above uses.
+  let prev = null, next = null;
+  windowed.forEach(p => {
+    if (p.t <= ht && (!prev || p.t > prev.t)) prev = p;
+    if (p.t >= ht && (!next || p.t < next.t)) next = p;
+  });
+  const inGap = !prev || !next
+             || prev.delivered == null || next.delivered == null
+             || (next.t - prev.t) > FEC_GRAPH_MAX_GAP_S;
+  // Off a break, both brackets are valid samples -- read out the nearer.
+  const best = inGap ? null
+             : (Math.abs(prev.t - ht) <= Math.abs(next.t - ht) ? prev : next);
   const bx = inGap ? hx : X(best.t);
 
   ctx.strokeStyle = cBorderStrong; ctx.lineWidth = 1;
