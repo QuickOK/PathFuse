@@ -839,7 +839,10 @@ function drawFecGraph(id, series){
   const cv = document.getElementById(id);
   if (!cv) return;
   const dpr = window.devicePixelRatio || 1;
-  const cssW = cv.clientWidth || 300, cssH = FEC_GRAPH_H;
+  // Both dimensions come from the laid-out box, so CSS stays the single source
+  // of truth. Sizing the backing store from a JS constant while the box is
+  // sized by CSS stretches the whole chart the moment the two drift.
+  const cssW = cv.clientWidth || 300, cssH = cv.clientHeight || FEC_GRAPH_H;
   if (cv.width !== Math.round(cssW * dpr)) cv.width = Math.round(cssW * dpr);
   if (cv.height !== Math.round(cssH * dpr)) cv.height = Math.round(cssH * dpr);
   const ctx = cv.getContext("2d");
@@ -1034,11 +1037,17 @@ function drawFecGraph(id, series){
   });
   const boxW = padX * 2 + sw + gap + labelW + 10 + valW;
   const boxH = padY * 2 + rows.length * rowH;
-  // Flip to the other side of the crosshair rather than overflow the plot.
+  // Prefer the right of the crosshair, flip left if that would leave the plot.
   let boxX = bx + 10;
   if (boxX + boxW > plotR) boxX = bx - 10 - boxW;
-  boxX = Math.max(plotL + 2, Math.min(boxX, plotR - boxW - 2));
-  const boxY = Math.max(plotT + 2, Math.min(plotT + 6, plotB - boxH - 2));
+  // Clamp to the CANVAS, not the plot. On a narrow card the tooltip can be
+  // wider than the plot itself, and clamping to `plotR - boxW` then resolves
+  // below plotL, so the lower bound wins and the box runs off the canvas
+  // entirely. Better to overhang the axis gutter than to be unreadable.
+  boxX = Math.max(2, Math.min(boxX, cssW - boxW - 2));
+  // Sit near the top of the plot, but never hang past its bottom edge.
+  let boxY = plotT + 6;
+  if (boxY + boxH > plotB - 2) boxY = Math.max(plotT + 2, plotB - boxH - 2);
 
   ctx.globalAlpha = 0.96;
   ctx.fillStyle = cSurface;
@@ -1207,9 +1216,18 @@ $$(FORM_SELECTOR).forEach(el => {
 ["c2r", "r2c"].forEach(dir => {
   const cv = document.getElementById(`fec-${dir}-graph`);
   if (!cv) return;
+  // Coalesce hover redraws to one per frame. A pointermove can fire far more
+  // often than the display refreshes, and each redraw rebuilds the whole chart
+  // (twelve getComputedStyle reads among them) -- on the wall-display hardware
+  // that is worth not doing several times between frames.
+  let pending = null;
   cv.addEventListener("pointermove", e => {
     fecHover[dir] = e.offsetX;
-    drawFecGraph(`fec-${dir}-graph`, fecHist[dir]);
+    if (pending != null) return;
+    pending = requestAnimationFrame(() => {
+      pending = null;
+      drawFecGraph(`fec-${dir}-graph`, fecHist[dir]);
+    });
   });
   cv.addEventListener("pointerleave", () => {
     fecHover[dir] = null;
