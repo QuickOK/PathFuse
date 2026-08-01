@@ -773,7 +773,13 @@ function renderFecScale(el, d, lad){
     label = pinned ? "at floor · pinned" : "at floor";
   else if (floorIdx >= 0) label = `+${applied - floorIdx} over floor`;
   else label = `${scale[applied]}`;
-  if (pinned && !below && applied > floorIdx && floorIdx >= 0) label += " · pinned";
+  // `pinned` follows the ROUTING mode, not the FEC mode, so it can be true
+  // while floorIdx is -1 (plain adaptive has no floor). Gating the suffix on
+  // floorIdx therefore dropped it exactly where the row most needs it. Append
+  // wherever the label hasn't already accounted for the state.
+  const pinnedNamed = below || applied < 0 || d.mode === "off"
+    || d.enabled === false || (floorIdx >= 0 && applied <= floorIdx);
+  if (pinned && !pinnedNamed) label += " · pinned";
 
   // `pinned` belongs in the signature even though it usually moves the span
   // with it: below-floor labels ignore pinned, so backoff could engage or
