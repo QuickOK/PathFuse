@@ -760,6 +760,9 @@ function renderFecScale(el, d, lad){
   const floorIdx = numOr(lad.floor_index, -1);
   const below = lad.below_floor === true;
   const pinned = lad.pinned === true;
+  // Prefer the ratio the payload reports over the rung it landed on: when the
+  // two disagree the reported one is the truth and the rung is our rounding.
+  const shown = d.ratio || scale[applied];
 
   let label;
   if (below) label = "below floor";
@@ -768,11 +771,11 @@ function renderFecScale(el, d, lad){
   // not pushed yet, or have just replaced. Name it rather than showing a dash:
   // the row cannot place it, but the operator can still read it.
   else if (applied < 0) label = d.ratio ? `${d.ratio} · off scale` : "—";
-  else if (d.mode === "fixed") label = `fixed · ${scale[applied]}`;
+  else if (d.mode === "fixed") label = `fixed · ${shown}`;
   else if (floorIdx >= 0 && applied <= floorIdx)
     label = pinned ? "at floor · pinned" : "at floor";
   else if (floorIdx >= 0) label = `+${applied - floorIdx} over floor`;
-  else label = `${scale[applied]}`;
+  else label = `${shown}`;
   // `pinned` follows the ROUTING mode, not the FEC mode, so it can be true
   // while floorIdx is -1 (plain adaptive has no floor). Gating the suffix on
   // floorIdx therefore dropped it exactly where the row most needs it. Append

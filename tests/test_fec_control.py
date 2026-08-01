@@ -600,3 +600,24 @@ def test_adaptive_scales_are_unchanged_by_the_context_rule():
     assert F.ladder_scale(PROFILES, F.MODE_MIN_ADAPTIVE) == SCALE
     assert F.ladder_scale(PROFILES, F.MODE_ADAPTIVE) == \
         ["8:0", "20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+
+
+def test_scale_admits_a_peers_off_scale_ratio():
+    # No cellular profile, so 20:1 is on nobody's ladder. A relay still
+    # applying it across an unacknowledged change would otherwise round down
+    # onto 8:0 and the card would understate its parity as zero.
+    base_only = [(F.DEFAULT_LOSS_TABLE, "8:1")]
+    without = F.ladder_scale(base_only, F.MODE_FIXED, fixed_ratio="8:1")
+    assert "20:1" not in without
+    assert F.scale_index(without, "20:1") == F.scale_index(without, "8:0")
+    with_relay = F.ladder_scale(base_only, F.MODE_FIXED, fixed_ratio="8:1",
+                                extra=["20:1"])
+    assert "20:1" in with_relay
+    assert F.scale_index(with_relay, "20:1") != F.scale_index(with_relay, "8:0")
+
+
+def test_scale_extra_ignores_unusable_values():
+    base_only = [(F.DEFAULT_LOSS_TABLE, "8:1")]
+    assert F.ladder_scale(base_only, F.MODE_MIN_ADAPTIVE,
+                          extra=["junk", "", "1:254"]) == \
+        F.ladder_scale(base_only, F.MODE_MIN_ADAPTIVE)

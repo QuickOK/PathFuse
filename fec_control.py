@@ -265,7 +265,7 @@ def reachable_ratios(fec_mode, table, floor_ratio, fixed_ratio=DEFAULT_FIXED_RAT
         for lv in levels)
 
 
-def ladder_scale(profiles, fec_mode, fixed_ratio=DEFAULT_FIXED_RATIO):
+def ladder_scale(profiles, fec_mode, fixed_ratio=DEFAULT_FIXED_RATIO, extra=()):
     """The fixed row of rungs the UI draws, across every profile that could
     drive this leg.
 
@@ -285,10 +285,17 @@ def ladder_scale(profiles, fec_mode, fixed_ratio=DEFAULT_FIXED_RATIO):
     an unacknowledged change (a relay on fixed 8:8 lighting the 8:1 pip). Those
     modes therefore also get their profiles' rungs as context: a ladder to
     place the chosen ratio on, with only that ratio shaded.
+
+    `extra` admits ratios a peer is reporting that our own settings would not
+    produce — a relay still applying its previous fixed ratio, say. Without
+    them scale_index rounds that ratio down onto a lower rung and the card
+    understates parity the peer really is sending. A transient extra rung is a
+    better trade than a wrong position: the anomaly is what the operator needs
+    to see, and it clears when the push is acknowledged.
     """
     context_mode = (fec_mode if fec_mode in (MODE_ADAPTIVE, MODE_MIN_ADAPTIVE)
                     else MODE_ADAPTIVE)
-    out = []
+    out = list(extra)
     for table, floor in profiles:
         out.extend(reachable_ratios(context_mode, table, floor))
         if context_mode != fec_mode:

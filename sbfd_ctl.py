@@ -2767,9 +2767,17 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             # can build it: it knows every profile's table AND floor, while the
             # relay is pushed a single resolved floor and never sees our link
             # states. So we compute BOTH legs' views here.
+            _relay_now = (fec_relay_last or {}).get("data") or {}
             fec_scale = fec_control.ladder_scale(
                 fec_profile_candidates(cfg, ov), fec_mode_eff,
-                fixed_ratio=fec_fixed_ratio_eff)
+                fixed_ratio=fec_fixed_ratio_eff,
+                # What the relay is applying RIGHT NOW, which across an
+                # unacknowledged change our own settings would not produce.
+                # Omitting it rounds that ratio down onto a lower rung, so the
+                # card would understate parity the relay really is sending.
+                extra=[r for r in (_relay_now.get("ratio"),
+                                   _relay_now.get("fixed_ratio"))
+                       if isinstance(r, str)])
             # Full-redundancy backoff pins the adaptive engine to one rung, so
             # the client leg's reachable span collapses to a single ratio. The
             # relay never applies this backoff (its run_once calls loss_to_level
