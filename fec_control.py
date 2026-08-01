@@ -232,6 +232,102 @@ def ratio_rung(ratio, table=DEFAULT_LOSS_TABLE):
     return rung
 
 
+def _by_overhead(ratios):
+    """Distinct, ascending by overhead, unusable values dropped."""
+    keyed = {}
+    for r in ratios:
+        pct = _overhead_or_none(r)
+        if pct is not None:
+            keyed.setdefault(pct, r)
+    return [keyed[p] for p in sorted(keyed)]
+
+
+def reachable_ratios(fec_mode, table, floor_ratio, fixed_ratio=DEFAULT_FIXED_RATIO,
+                     pinned_level=None):
+    """Every ratio a leg can actually take, given the mode it is in.
+
+    This is NOT the table: 'off' and 'fixed' ignore the table entirely, a
+    min_adaptive floor makes every rung beneath it unreachable, and
+    pinned_level (set when full-redundancy backoff holds the adaptive engine at
+    one rung) collapses the whole range to a single value. What the operator
+    needs to read off the row is which of these states are live NOW, not which
+    rungs the table happens to list.
+    """
+    if fec_mode == MODE_OFF:
+        return [OFF_RATIO]
+    if fec_mode == MODE_FIXED:
+        return _by_overhead([fixed_ratio]) or [OFF_RATIO]
+    levels = ([pinned_level] if pinned_level is not None
+              else list(range(len(table))))
+    return _by_overhead(
+        apply_mode(fec_mode, level_to_ratio(lv, table),
+                   fixed_ratio=fixed_ratio, floor_ratio=floor_ratio)
+        for lv in levels)
+
+
+def ladder_scale(profiles, fec_mode, fixed_ratio=DEFAULT_FIXED_RATIO):
+    """The fixed row of rungs the UI draws, across every profile that could
+    drive this leg.
+
+    Profile-relative positions would move under the operator whenever the
+    driver WAN changed — the same dot meaning 12:1 on cellular and 8:2 on the
+    base table. Anchoring every card to one scale spanning all profiles keeps a
+    position meaning one ratio, which is what makes "which dot is shaded" able
+    to say WHICH profile is driving.
+
+    profiles is an iterable of (loss_table, floor_ratio). Backoff is
+    deliberately not applied: the scale is the whole space, and the reachable
+    span within it is what narrows.
+    """
+    out = []
+    for table, floor in profiles:
+        out.extend(reachable_ratios(fec_mode, table, floor, fixed_ratio))
+    return _by_overhead(out)
+
+
+def scale_index(scale, ratio):
+    """Position of `ratio` on `scale`, or the highest position at or below it
+    when it is not itself a rung (an operator's off-scale fixed ratio). -1 when
+    nothing on the scale is at or below it, including for an unusable input —
+    callers render that as "no position", never as position 0."""
+    pct = _overhead_or_none(ratio)
+    if pct is None:
+        return -1
+    idx = -1
+    for i, r in enumerate(scale):
+        rp = _overhead_or_none(r)
+        if rp is not None and rp <= pct:
+            idx = i
+    return idx
+
+
+def ladder_view(scale, reachable, applied_ratio, floor_ratio, fec_mode,
+                pinned=False):
+    """The whole row as the UI needs it: one fixed scale, the span currently
+    reachable within it, and where the applied ratio sits.
+
+    reach_lo/reach_hi are inclusive positions and are -1/-1 when nothing on the
+    scale is reachable, which the UI must draw as an unshaded row rather than
+    as position 0."""
+    idxs = [i for i in (scale_index(scale, r) for r in reachable) if i >= 0]
+    applied_pct = _overhead_or_none(applied_ratio) if applied_ratio else None
+    floor_pct = _overhead_or_none(floor_ratio)
+    return {
+        "scale": list(scale),
+        "reach_lo": min(idxs) if idxs else -1,
+        "reach_hi": max(idxs) if idxs else -1,
+        "applied_index": scale_index(scale, applied_ratio) if applied_ratio else -1,
+        "floor_index": (scale_index(scale, floor_ratio)
+                        if fec_mode == MODE_MIN_ADAPTIVE else -1),
+        "below_floor": bool(
+            fec_mode == MODE_MIN_ADAPTIVE and applied_pct is not None
+            and floor_pct is not None and applied_pct < floor_pct),
+        # True when the adaptive engine is held at one rung by full-redundancy
+        # backoff — the reason a single-dot span is not a bug.
+        "pinned": bool(pinned),
+    }
+
+
 def ladder_state(mode, ratio, floor_ratio, table=DEFAULT_LOSS_TABLE):
     """{levels, floor_level, applied_level} describing where the ratio on the
     wire sits on the active profile's ladder. Consumed by the UI's pip row,

@@ -156,3 +156,37 @@ def test_wan_profiles_absent_is_empty():
     d["fec"] = {"fifo": "/run/udpspeeder/client.fifo"}
     cfg = M.load_config(_write(d))
     assert cfg.fec.wan_profiles == {}
+
+
+# ---------- ladder scale candidates ----------
+
+def test_fec_profile_candidates_covers_default_and_every_profile():
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "floor_ratio": "8:1",
+                "wan_profiles": {"wan1": {"floor_ratio": "12:1"}}}
+    cfg = M.load_config(_write(d))
+    cands = M.fec_profile_candidates(cfg, M.RuntimeOverlay())
+    assert [floor for _t, floor in cands] == ["8:1", "12:1"]
+    assert [r["fec"] for r in cands[0][0]] == ["8:0", "8:2", "8:4", "8:6", "8:8"]
+    assert [r["fec"] for r in cands[1][0]] == ["8:0", "20:1", "12:1", "8:1"]
+    # The scale the UI draws spans both, so a position means one ratio whichever
+    # profile is driving.
+    assert F.ladder_scale(cands, F.MODE_MIN_ADAPTIVE) == \
+        ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+
+
+def test_fec_profile_candidates_reflects_a_runtime_floor_override():
+    # An overridden floor must land ON the scale, not off the end of it.
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "floor_ratio": "8:1",
+                "wan_profiles": {"wan1": {"floor_ratio": "12:1"}}}
+    cfg = M.load_config(_write(d))
+    ov = M.RuntimeOverlay(fec_floor_ratio="8:4")
+    assert [floor for _t, floor in M.fec_profile_candidates(cfg, ov)] == \
+        ["8:4", "8:4"]
+
+
+def test_fec_profile_candidates_empty_without_fec():
+    d = dict(BASE)
+    cfg = M.load_config(_write(d))
+    assert M.fec_profile_candidates(cfg, M.RuntimeOverlay()) == []

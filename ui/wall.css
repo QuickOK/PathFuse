@@ -944,9 +944,31 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
   border: 1px solid rgba(94, 234, 212, 0.42);
   display: inline-block;
 }
+/* Reachable band. Every rung is always drawn, so the row keeps one width and
+   one meaning per position; the shaded ones are what the current mode, link
+   states and driver actually leave available. An unshaded rung is real but out
+   of reach right now — the thing a profile-relative row could not say.
+   Declared BEFORE .on so the applied dot's solid fill wins the cascade: these
+   selectors have equal specificity, and source order is all that separates
+   them. */
+.fec-level .pip.reach {
+  background: rgba(94, 234, 212, 0.16);
+  border-color: rgba(94, 234, 212, 0.55);
+}
+.fec-level .pip:not(.reach) {
+  background: transparent;
+  border-color: var(--border-strong);
+}
+/* Pinned: the span is one rung because full-redundancy backoff is holding it
+   there, not because the ladder ran out. Dashed so it doesn't read as a fault —
+   duplication is covering the loss FEC would otherwise answer. */
+.fec-level.is-pinned .pip.reach { border-style: dashed; }
+.fec-level.is-pinned .fec-level-num { color: var(--fg-dim); }
+
 .fec-level .pip.on {
   background: var(--accent);
   border-color: var(--accent);
+  border-style: solid;
   box-shadow: 0 0 7px var(--accent-glow);
 }
 .fec-level.is-flashing .pip.on { animation: fec-pip-flash 1.15s ease-in-out infinite; }

@@ -168,6 +168,36 @@ def test_relay_fec_direction_passes_through_ladder():
     assert d["ladder"] == lad
 
 
+def test_relay_fec_direction_rescales_the_relay_ladder(monkeypatch):
+    # The relay's own ladder is scaled to its view of one profile. The client
+    # re-derives it against the shared cross-profile scale so both cards share
+    # positions — anchored on the ratio the relay REPORTS, not our desired one.
+    import fec_control as F
+    scale = ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+    reach = F.reachable_ratios(F.MODE_MIN_ADAPTIVE, F.DEFAULT_LOSS_TABLE, "8:1")
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:4", "level": 2,
+        "ladder": {"levels": 5, "floor_level": 0, "applied_level": 2}}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True,
+                              ladder_inputs=(scale, reach, "8:1",
+                                             F.MODE_MIN_ADAPTIVE))
+    assert d["ladder"]["scale"] == scale
+    assert d["ladder"]["applied_index"] == 3          # 8:4
+    assert (d["ladder"]["reach_lo"], d["ladder"]["reach_hi"]) == (1, 5)
+    # The relay never applies full-redundancy backoff, so its span is never
+    # pinned even while the client leg is.
+    assert d["ladder"]["pinned"] is False
+
+
+def test_relay_fec_direction_keeps_relay_ladder_without_inputs():
+    fetch = {"ok": True, "error": None,
+             "data": {"ratio": "8:2", "ladder": {"levels": 5}}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True)
+    assert d["ladder"] == {"levels": 5}
+
+
 def test_relay_fec_direction_ladder_none_from_an_older_relay():
     # A relay that predates the field: the UI falls back rather than drawing an
     # empty pip row.

@@ -88,7 +88,10 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
                 "client_to_relay": {
                     "enabled": True, "ratio": "8:4", "level": 2,
                     "mode": "min_adaptive",
-                    "ladder": {"levels": 5, "floor_level": 0, "applied_level": 2},
+                    "ladder": {
+                        "scale": ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"],
+                        "reach_lo": 1, "reach_hi": 5, "applied_index": 3,
+                        "floor_index": 1, "below_floor": False, "pinned": False},
                     "driving_loss_pct": 3.1, "driver_wan": cfg.policy.default_master_wan,
                     "since": now - 42, "actuator_ok": True,
                     "wire": {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False},
@@ -96,7 +99,12 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
                 "relay_to_client": {
                     "enabled": True, "ratio": "12:1", "level": 2,
                     "mode": "min_adaptive",
-                    "ladder": {"levels": 4, "floor_level": 1, "applied_level": 2},
+                    # Cellular driver, pinned by full-redundancy backoff: the
+                    # single shaded rung is the state the row has to explain.
+                    "ladder": {
+                        "scale": ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"],
+                        "reach_lo": 0, "reach_hi": 0, "applied_index": 0,
+                        "floor_index": 0, "below_floor": False, "pinned": True},
                     "driving_loss_pct": 1.2, "since": now - 133,
                     "ok": True, "stale_s": 0.4, "error": None,
                     "reconcile_pending": False,

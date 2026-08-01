@@ -747,9 +747,63 @@ function clampLevel(v, hi){
   return Math.max(0, Math.min(Math.floor(v), hi));
 }
 
+/* The scale-based row: one fixed set of rungs spanning every profile, with the
+   span currently REACHABLE shaded behind them. A position means one ratio no
+   matter which profile drives, so the shaded band says which profile is
+   driving and how much room the mode leaves it — a single shaded dot in full
+   redundancy is the backoff pinning the leg, not a missing ladder. */
+function renderFecScale(el, d, lad){
+  const scale = lad.scale;
+  const n = scale.length;
+  const lo = numOr(lad.reach_lo, -1), hi = numOr(lad.reach_hi, -1);
+  const applied = numOr(lad.applied_index, -1);
+  const floorIdx = numOr(lad.floor_index, -1);
+  const below = lad.below_floor === true;
+  const pinned = lad.pinned === true;
+
+  let label;
+  if (below) label = "below floor";
+  else if (d.mode === "off" || d.enabled === false) label = "off";
+  else if (applied < 0) label = "—";
+  else if (d.mode === "fixed") label = `fixed · ${scale[applied]}`;
+  else if (floorIdx >= 0 && applied <= floorIdx)
+    label = pinned ? "at floor · pinned" : "at floor";
+  else if (floorIdx >= 0) label = `+${applied - floorIdx} over floor`;
+  else label = `${scale[applied]}`;
+  if (pinned && !below && applied > floorIdx && floorIdx >= 0) label += " · pinned";
+
+  const sig = `s${scale.join(",")}|${lo}|${hi}|${applied}|${label}|${below}`;
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
+
+  let pips = "";
+  for (let i = 0; i < n; i++){
+    const cls = ["pip"];
+    if (lo >= 0 && i >= lo && i <= hi) cls.push("reach");
+    if (i === applied) cls.push("on");
+    pips += `<i class="${cls.join(" ")}" title="${escapeHtml(scale[i])}"></i>`;
+  }
+  el.innerHTML = `${pips}<span class="fec-level-num">${escapeHtml(label)}</span>`;
+  // Flash only when loss has pushed the leg above its floor. A pinned leg
+  // cannot get there, so a pinned row never flashes.
+  el.classList.toggle("is-flashing", !below && floorIdx >= 0 && applied > floorIdx);
+  el.classList.toggle("is-below-floor", below);
+  el.classList.toggle("is-pinned", pinned);
+}
+
+function numOr(v, dflt){
+  return (typeof v === "number" && isFinite(v)) ? Math.floor(v) : dflt;
+}
+
 function renderFecLevel(el, d){
   if (!el) return;
   const lad = d.ladder;
+  // Scale-based row when the controller published one; the older
+  // profile-relative shape below stays for a payload that predates it.
+  if (lad && Array.isArray(lad.scale) && lad.scale.length){
+    renderFecScale(el, d, lad);
+    return;
+  }
   // Without a ladder, fall back to the base table with no floor rung: the row
   // then reads as plain adaptive, which is wrong only in how much headroom it
   // draws — never in claiming parity that isn't applied.
