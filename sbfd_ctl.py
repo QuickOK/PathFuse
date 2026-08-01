@@ -893,6 +893,37 @@ def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
     return (now - last_post_ts) >= heartbeat_s
 
 
+def _relay_ladder_table(data, ladder_inputs):
+    """The loss table to rebuild the relay's row against, or None to keep the
+    relay's own ladder.
+
+    Every setting the rebuild needs must be present IN THE RELAY'S REPORT.
+    Substituting our desired values for missing ones would publish a floor and
+    a reachable span the relay never claimed — which is precisely what this
+    card must never do, since the two disagree exactly when it matters (an
+    unacknowledged push, or a restart that reverted the relay to its config).
+    A relay too old to report them keeps its own ladder instead.
+
+    `profile` must also be a string: /fec is remote JSON, and an unhashable
+    value would raise on the dict lookup and take the controller loop with it.
+    """
+    mode, floor = data.get("mode"), data.get("floor_ratio")
+    profile = data.get("profile")
+    if not isinstance(mode, str) or not isinstance(floor, str) or not floor:
+        return None
+    if mode == fec_control.MODE_FIXED and not isinstance(
+            data.get("fixed_ratio"), str):
+        return None
+    if not isinstance(profile, str):
+        return None
+    if profile == "default":
+        return ladder_inputs["default_table"]
+    # A profile we no longer have (removed or renamed in config; the relay
+    # keeps reporting the pushed name until it goes stale) cannot be modelled —
+    # defaulting its table would claim rungs its real one caps below.
+    return ladder_inputs["tables"].get(profile)
+
+
 def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=None,
                         ladder_inputs=None):
     """Shape the relay->client published direction dict from a fetch_relay_fec result.
@@ -916,32 +947,17 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
     # floor, that the relay is not honoring. Our values are the fallback only
     # for a relay too old to report them.
     ladder = data.get("ladder")
-    profile = data.get("profile")
-    tables = ladder_inputs["tables"] if ladder_inputs else {}
-    # Two ways the rebuild would end up asserting things nobody reported:
-    #   - the fetch failed, so `data` is empty and EVERY input would fall back
-    #     to our desired settings — drawing a relay-confirmed span when nothing
-    #     was confirmed, which is the exact failure this sourcing rule exists
-    #     to prevent;
-    #   - the relay names a profile we no longer have (removed or renamed in
-    #     config; the relay keeps reporting the pushed name until it goes
-    #     stale), where defaulting the table would model it as the base profile
-    #     and claim rungs its real one caps below.
-    # In both cases keep the relay's own ladder, which at least describes the
-    # relay's view of itself.
-    known_profile = profile in (None, "", "default") or profile in tables
-    if ladder_inputs is not None and fetch.get("ok") and known_profile:
-        scale = ladder_inputs["scale"]
-        mode = data.get("mode") or ladder_inputs["mode"]
-        floor = data.get("floor_ratio") or ladder_inputs["floor"]
-        fixed = data.get("fixed_ratio") or ladder_inputs["fixed"]
-        table = tables.get(profile, ladder_inputs["default_table"])
+    table = _relay_ladder_table(data, ladder_inputs) if (
+        ladder_inputs is not None and fetch.get("ok")) else None
+    if table is not None:
+        mode, floor = data["mode"], data["floor_ratio"]
         ladder = fec_control.ladder_view(
-            scale,
+            ladder_inputs["scale"],
             # No pinned_level: the relay's run_once calls loss_to_level
             # directly and never consults mode_aware_level, so full-redundancy
             # backoff does not apply to this leg however our own is behaving.
-            fec_control.reachable_ratios(mode, table, floor, fixed_ratio=fixed),
+            fec_control.reachable_ratios(
+                mode, table, floor, fixed_ratio=data.get("fixed_ratio")),
             data.get("ratio"), floor, mode, pinned=False)
     return {
         "enabled": data.get("enabled"),
@@ -2778,18 +2794,16 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     pinned_level=fec_pinned_level),
                 fec_current_ratio, fec_floor_ratio_eff, fec_mode_eff,
                 pinned=fec_pinned)
-            # The relay leg's span is built from the relay's OWN reported
-            # settings (see relay_fec_direction); these are the tables it may
-            # name plus our values as the fallback for a relay too old to
-            # report them.
+            # The relay leg's span is built entirely from the relay's OWN
+            # reported settings (see relay_fec_direction). These are only the
+            # shared scale and the tables it may name — deliberately NOT our
+            # mode/floor/fixed, so there is nothing here to fall back to and
+            # the card cannot assert a setting the relay never reported.
             fec_ladder_r2c = {
                 "scale": fec_scale,
                 "tables": {name: p.loss_table
                            for name, p in cfg.fec.wan_profiles.items()},
                 "default_table": cfg.fec.loss_table,
-                "mode": fec_mode_eff,
-                "floor": fec_floor_ratio_eff,
-                "fixed": fec_fixed_ratio_eff,
             }
 
             # Reconcile desired mode/ratio to relay on the remote-fetch cadence
