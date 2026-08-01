@@ -986,11 +986,37 @@ function cssVar(name){
 
 // Round a peak up to a "nice" axis maximum (1/2/5 x 10^n) so gridline labels
 // land on readable numbers instead of whatever the busiest sample happened to be.
-function niceCeil(v){
-  if (!(v > 0)) return 1;
-  const mag = Math.pow(10, Math.floor(Math.log10(v)));
-  const n = v / mag;
-  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+// Axis steps, coarse enough to read and fine enough not to waste the plot.
+// The old 1-2-5-10 ceiling overshot by up to 2.5x — a peak of 22 became an
+// axis of 50, so the chart used 44% of its height and every band was drawn at
+// under half the size it had earned, which is the same squashing the
+// visibility marks exist to work around. Worst overshoot here is 1.33x.
+const AXIS_STEPS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+
+// Pick the gridline step first and derive the max from it, rather than
+// rounding the max and dividing. Every gridline then lands on a multiple of a
+// round number instead of on peak/4, which is what produced labels like 6.25.
+function niceAxis(peak, ticks){
+  if (!(peak > 0) || !isFinite(peak)) return { max: 1, step: 1 / ticks };
+  const raw = peak / ticks;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = tidy((AXIS_STEPS.find(sv => sv * mag >= raw * (1 - 1e-9)) || 10) * mag);
+  return { max: tidy(step * ticks), step };
+}
+
+// 0.2 * 3 is 0.6000000000000001 in binary floating point; that reaches the
+// axis label and the Y() scale as-is.
+function tidy(v){ return Number(v.toPrecision(12)); }
+
+// Decimals come from the STEP, not from the value being labelled. Deriving
+// them per value rounded a 12.5 step's gridlines to 13 and 38 — the halves the
+// step exists to show.
+function axisDecimals(step){
+  for (let d = 0; d <= 3; d++){
+    const scaled = step * Math.pow(10, d);
+    if (Math.abs(scaled - Math.round(scaled)) < 1e-6) return d;
+  }
+  return 3;
 }
 
 function drawFecGraph(id, series){
@@ -1046,22 +1072,23 @@ function drawFecGraph(id, series){
     if (tot > peak) peak = tot;
     if ((p.waste || 0) > peak) peak = p.waste;
   });
-  const axisMax = niceCeil(peak);
+  const Y_TICKS = 4;
+  const { max: axisMax, step: axisStep } = niceAxis(peak, Y_TICKS);
   const Y = v => plotB - (v / axisMax) * plotH;
 
   ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
   ctx.textBaseline = "middle";
 
   // horizontal gridlines + y labels (pkt/s)
-  const Y_TICKS = 4;
+  const axisDp = axisDecimals(axisStep);
   ctx.textAlign = "right";
   for (let i = 0; i <= Y_TICKS; i++){
-    const val = (axisMax / Y_TICKS) * i;
+    const val = axisStep * i;
     const y = Math.round(Y(val)) + 0.5;
     ctx.beginPath(); ctx.moveTo(plotL, y); ctx.lineTo(plotR, y);
     ctx.lineWidth = 1; ctx.strokeStyle = i === 0 ? cAxis : cGrid; ctx.stroke();
     ctx.fillStyle = cFgDim;
-    ctx.fillText(fmtRate(val), plotL - 6, y);
+    ctx.fillText(val.toFixed(axisDp), plotL - 6, y);
   }
   // vertical gridlines + time labels, one per minute of the window
   ctx.textAlign = "center";
