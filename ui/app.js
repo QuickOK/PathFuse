@@ -1136,26 +1136,38 @@ function drawFecGraph(id, series){
   // holds, so the separator and the presence mark can each claim the parts of
   // the edge they belong on without one painting over the other.
   function strokeEdge(b, run, want, color){
-    let seg = [];
-    const flush = () => {
-      if (!seg.length) return;
+    const spans = [];
+    let start = -1;
+    run.forEach((p, i) => {
+      if (want(p)){ if (start < 0) start = i; }
+      else if (start >= 0){ spans.push([start, i - 1]); start = -1; }
+    });
+    if (start >= 0) spans.push([start, run.length - 1]);
+
+    spans.forEach(([a, z]) => {
+      // Reach one sample into each neighbour. The segment straddling a
+      // threshold crossing satisfies NEITHER predicate, so without this it
+      // belongs to no span and goes unstroked — a band flickering across the
+      // threshold would render as detached dashes with the edge missing
+      // between them. The overlap makes both passes claim that segment; the
+      // colour pass runs second and wins, which is the right way round, since
+      // the side that needed the ink is the thin one.
+      const i0 = Math.max(0, a - 1), i1 = Math.min(run.length - 1, z + 1);
       ctx.beginPath();
-      if (seg.length === 1){
-        // A lone sample has no span to stroke; 2px of width keeps it visible.
-        const x = X(seg[0].t), y = Y(b.hi(seg[0]));
+      if (i0 === i1){
+        // Nothing to span. Butt caps keep this exactly 2px wide — round caps
+        // would add a pixel at each end and draw a 4px mark for one sample.
+        const x = X(run[i0].t), y = Y(b.hi(run[i0]));
         ctx.moveTo(x - 1, y); ctx.lineTo(x + 1, y);
       } else {
-        seg.forEach((p, i) => {
-          const x = X(p.t), y = Y(b.hi(p));
-          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-        });
+        for (let i = i0; i <= i1; i++){
+          const x = X(run[i].t), y = Y(b.hi(run[i]));
+          i === i0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
       }
       ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.globalAlpha = 1;
-      ctx.lineCap = "round"; ctx.stroke(); ctx.lineCap = "butt";
-      seg = [];
-    };
-    run.forEach(p => { want(p) ? seg.push(p) : flush(); });
-    flush();
+      ctx.stroke();
+    });
   }
   bands.forEach(b => {
     runs.forEach(run => {
