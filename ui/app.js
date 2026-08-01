@@ -1232,12 +1232,18 @@ function drawFecGraph(id, series){
   bands.forEach(b => {
     runs.forEach(run => {
       if (run.length === 1){
-        // A one-sample run has no edge to stroke; mark it directly, centred on
-        // the true edge so it does not drift off its value.
+        // A one-sample run has no edge to stroke, so mark it directly — but by
+        // the SAME rule strokeBandEdge applies, or an isolated sample (one
+        // valid poll, or the first after a gap) silently loses the surface gap
+        // that every other sample gets. Centred on the true edge so it does
+        // not drift off its value.
         const p = run[0];
-        if (!b.mustShow || !isThin(b, p)) return;
-        const x = X(p.t), y = Y(b.hi(p)) - markOffset(b, p);
-        ctx.fillStyle = b.color;
+        if (bandValue(b, p) <= 0) return;           // zero band draws nothing
+        const thin = isThin(b, p);
+        const color = thin ? (b.mustShow ? b.color : null) : cInset;
+        if (!color) return;
+        const x = X(p.t), y = Y(b.hi(p)) - (thin ? markOffset(b, p) : 0);
+        ctx.fillStyle = color;
         ctx.fillRect(x - 1, y - 1, 2, 2);
         return;
       }
