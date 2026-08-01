@@ -1113,21 +1113,107 @@ function drawFecGraph(id, series){
   // Position encodes identity (CVD-safe with the 2px separators below).
   const bands = [
     { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cDelivered },
-    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cRecovered },
+    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cRecovered, mustShow: true },
     { lo: p => (p.delivered || 0) + (p.recovered || 0),
-      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cLost },
+      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cLost, mustShow: true },
   ];
+  // Recovery and loss are the events worth seeing, and they are exactly the
+  // ones the scale hides: delivered sets the axis, so a handful of recovered
+  // packets against thousands delivered is a sub-pixel sliver — and then the
+  // 2px separator drawn on its top edge paints over what little there was, so
+  // the event is in the data and absent from the chart. Where a band is too
+  // thin to survive that, stroke its OWN colour along its true top edge at
+  // full opacity. Ink guarantees the event is seen; putting it exactly on the
+  // boundary marks presence without overstating magnitude, which inflating the
+  // band to a minimum height would do on an axis that is labelled in pkt/s.
+  // Bands with room keep the surface separator, so the gap between fills
+  // survives wherever it fits.
+  const MIN_VIS_PX = 3;
+  const bandValue = (b, p) => b.hi(p) - b.lo(p);
+  // Thin marks are a rendering floor, so two of them can collide: with
+  // recovered and lost both tiny their edges are a fraction of a pixel apart,
+  // and whichever draws second hides the other outright. Give each thin band
+  // its own MIN_VIS_PX of screen, stacked in the same order as the bands, so
+  // simultaneous events stay separately readable. Ordering stays truthful;
+  // only the exact y is floored, and only for bands already too small to
+  // render at all.
+  const isThin = (b, p) => bandValue(b, p) > 0 &&
+    Math.abs(Y(b.lo(p)) - Y(b.hi(p))) < MIN_VIS_PX;
+  const markOffset = (b, p) => {
+    if (!b.mustShow || !isThin(b, p)) return 0;
+    let off = 0;
+    for (const other of bands){
+      if (other === b) break;                       // bands below this one only
+      if (other.mustShow && isThin(other, p)) off += MIN_VIS_PX;
+    }
+    return off;
+  };
+
+  // Walk the top edge segment by segment and give each piece the style it has
+  // earned: the surface separator where the band has room for one, its own
+  // colour where it is too thin to survive one.
+  //
+  // The split happens at the CROSSING, not at a sample boundary. Snapping to
+  // samples was wrong in both directions — a whole-sample span leaves the
+  // straddling segment unstroked, and extending to cover it then paints colour
+  // across a thick stretch that still deserved its separator, and through
+  // zero-valued neighbours as if an event had happened there. Y is linear in
+  // value, so the crossing is exact arithmetic rather than a guess.
+  function strokeBandEdge(b, run){
+    const vThresh = MIN_VIS_PX * axisMax / plotH;   // value that renders MIN_VIS_PX tall
+    const pieces = [];
+    let lastX = NaN, lastY = NaN;
+    for (let i = 0; i + 1 < run.length; i++){
+      const A = run[i], B = run[i + 1];
+      const vA = bandValue(b, A), vB = bandValue(b, B);
+      if (vA <= 0 && vB <= 0) continue;             // no band over this interval
+      const cuts = [0, 1];
+      if ((vA < vThresh) !== (vB < vThresh) && vA !== vB)
+        cuts.splice(1, 0, (vThresh - vA) / (vB - vA));
+      const xA = X(A.t), xB = X(B.t);
+      // Lift a thin mark clear of any thin mark below it (see markOffset).
+      const yA = Y(b.hi(A)) - markOffset(b, A), yB = Y(b.hi(B)) - markOffset(b, B);
+      for (let k = 0; k + 1 < cuts.length; k++){
+        // f0/f1, not t0/t1: those are the plot window's start and end time in
+        // this same closure, which X() maps through.
+        const f0 = cuts[k], f1 = cuts[k + 1];
+        const vMid = vA + (vB - vA) * (f0 + f1) / 2;
+        if (vMid <= 0) continue;                    // zero band draws nothing
+        const color = vMid < vThresh ? (b.mustShow ? b.color : null) : cInset;
+        if (!color) continue;
+        pieces.push({ color,
+                      x0: xA + (xB - xA) * f0, y0: yA + (yB - yA) * f0,
+                      x1: xA + (xB - xA) * f1, y1: yA + (yB - yA) * f1 });
+      }
+    }
+    // Stroke consecutive same-coloured pieces as ONE path. Drawn individually
+    // they are butt-capped segments that meet at an angle, which leaves a
+    // notch at every join and gives a sloped edge a serrated look.
+    let path = null, pathColor = null;
+    const flush = () => {
+      if (!path) return;
+      ctx.lineWidth = 2; ctx.strokeStyle = pathColor; ctx.globalAlpha = 1;
+      ctx.stroke(path);
+      path = null;
+    };
+    pieces.forEach(pc => {
+      const joins = path && pathColor === pc.color
+        && Math.abs(pc.x0 - lastX) < 0.01 && Math.abs(pc.y0 - lastY) < 0.01;
+      if (!joins){ flush(); path = new Path2D(); path.moveTo(pc.x0, pc.y0); pathColor = pc.color; }
+      path.lineTo(pc.x1, pc.y1);
+      lastX = pc.x1; lastY = pc.y1;
+    });
+    flush();
+  }
+  // Pass 1: every fill. A later band's translucent fill lands exactly on the
+  // edge of the one beneath it, so drawing fills and marks interleaved let a
+  // fill wash out a mark that was already correct.
   bands.forEach(b => {
     runs.forEach(run => {
       if (run.length === 1){
-        // Single-sample run: the polygon fill/stroke below degenerates to a
-        // zero-area line and draws nothing. Render a minimal visible mark
-        // instead — a 2px-wide filled rect spanning lo->hi at that x — and
-        // skip the separator stroke (there's no edge to draw it along).
-        const p = run[0];
-        const x = X(p.t);
-        const yHi = Y(b.hi(p));
-        const yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
+        const p = run[0], x = X(p.t);
+        const yHi = Y(b.hi(p)), yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
+        if (b.mustShow && isThin(b, p)) return;     // pass 2 marks this one
         ctx.globalAlpha = 0.55; ctx.fillStyle = b.color;
         ctx.fillRect(x - 1, Math.min(yHi, yLo), 2, Math.abs(yLo - yHi));
         ctx.globalAlpha = 1;
@@ -1139,10 +1225,29 @@ function drawFecGraph(id, series){
       ctx.closePath();
       ctx.globalAlpha = 0.55; ctx.fillStyle = b.color; ctx.fill();
       ctx.globalAlpha = 1;
-      // 2px surface separator on the band's top edge, per run
-      ctx.beginPath();
-      run.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-      ctx.lineWidth = 2; ctx.strokeStyle = cInset; ctx.stroke();
+    });
+  });
+
+  // Pass 2: separators and visibility marks, on top of every fill.
+  bands.forEach(b => {
+    runs.forEach(run => {
+      if (run.length === 1){
+        // A one-sample run has no edge to stroke, so mark it directly — but by
+        // the SAME rule strokeBandEdge applies, or an isolated sample (one
+        // valid poll, or the first after a gap) silently loses the surface gap
+        // that every other sample gets. Centred on the true edge so it does
+        // not drift off its value.
+        const p = run[0];
+        if (bandValue(b, p) <= 0) return;           // zero band draws nothing
+        const thin = isThin(b, p);
+        const color = thin ? (b.mustShow ? b.color : null) : cInset;
+        if (!color) return;
+        const x = X(p.t), y = Y(b.hi(p)) - (thin ? markOffset(b, p) : 0);
+        ctx.fillStyle = color;
+        ctx.fillRect(x - 1, y - 1, 2, 2);
+        return;
+      }
+      strokeBandEdge(b, run);
     });
   });
   // wasted parity: thin muted overlay line. Honor the same gap/validity rules
