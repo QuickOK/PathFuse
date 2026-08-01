@@ -34,6 +34,25 @@ packet lost on *one* link — floor parity is what recovers packets dropped on b
 ~8–12% overhead on an already-doubled stream. Net effect: with a floor configured,
 `full_mode_backoff_fec` bounds only the adaptive component and cannot undercut the floor.
 
+**The driver WAN is sticky, because it selects policy and not just a number.** The driver is the
+worst active link, and it picks the whole FEC policy — table, floor, hysteresis — so changing it
+swaps the ladder beneath the adaptive engine and reseeds its runtime. `step_level` damps the
+*ratio* against loss jitter, but nothing damped the *driver*: on a duplicated stream where both
+links sit near zero loss, it flipped on noise (measured: 82 profile switches in 24h, median 95s
+apart, every one in full redundancy where the ratio should not have moved at all). The worst active link
+must now hold that position for `driver_dwell_s` before taking over, mirroring
+`policy.dynamic_swap_dwell_s` for master selection.
+
+Dwell alone is the whole mechanism: an excursion shorter than the dwell is ignored, a sustained one
+is followed, and because a tie resolves to the same WAN every tick the driver returns to the quiet
+state's pick once the excursion passes. That return is load-bearing rather than tidy — the cellular
+signal floor only engages while the cellular WAN is the driver, so a driver that never came home
+would silently disarm it. A loss *margin* was tried alongside the dwell and removed: whenever no WAN
+cleared it the same WAN challenged anyway as the canonical pick, so it never changed whether a flip
+was damped, only which WAN challenged when three or more were active — and there it picked the first
+by name rather than the worst. Only one WAN active — every mode but full redundancy — short-circuits
+entirely, so this cannot delay a master_backup failover.
+
 **The wall display draws one fixed scale, and shades what is reachable.** Each direction publishes a
 `ladder`: a `scale` of rungs, the inclusive `reach_lo`/`reach_hi` span currently available, and
 `applied_index` / `floor_index` within it. The row always draws the whole scale, so a position means

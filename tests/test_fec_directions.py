@@ -502,3 +502,140 @@ def test_relay_ladder_rebuilt_for_the_default_profile():
                               ladder_inputs=_ladder_inputs(SCALE))
     assert d["ladder"]["scale"] == SCALE
     assert d["ladder"]["applied_index"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Sticky FEC driver. The driver selects table+floor+hysteresis, so flipping it
+# swaps the ladder under the adaptive engine — it needs the same margin+dwell
+# protection the ratio already has.
+# ---------------------------------------------------------------------------
+
+DWELL = 120.0
+
+
+def _pick(loss, active, cur, cand, since, now):
+    return M.fec_driver_pick(loss, active, cur, cand, since, DWELL, now)
+
+
+def _replay(samples, start_driver, dwell=DWELL, step=0.5):
+    """Feed (duration_s, loss_dict) segments through the picker. Returns
+    (final_driver, switch_count)."""
+    cur, cand, since, switches, t = start_driver, None, None, 0, 0.0
+    for dur, loss in samples:
+        end = t + dur
+        while t < end:
+            d, cand, since = M.fec_driver_pick(loss, {"wan1", "wan2"}, cur,
+                                               cand, since, dwell, t)
+            if d != cur:
+                switches += 1
+            cur = d
+            t += step
+    return cur, switches
+
+
+def test_driver_rides_out_the_observed_blip_pattern():
+    # The measured shape: ~95s where the other link is briefly worse, ~40x a
+    # day. Before this change each one flipped the profile and reseeded the
+    # adaptive runtime; the dwell now outlasts the excursion.
+    quiet = {"wan1": 0.0, "wan2": 0.0}
+    blip = {"wan1": 0.0, "wan2": 0.3}
+    driver, switches = _replay([(600.0, quiet), (95.0, blip), (600.0, quiet)] * 4,
+                               start_driver="wan1")
+    assert (driver, switches) == ("wan1", 0)
+
+
+def test_driver_holds_a_candidate_during_a_blip_without_yielding():
+    d, c, s = _pick({"wan1": 0.0, "wan2": 0.3}, {"wan1", "wan2"}, "wan1",
+                    None, None, 100.0)
+    assert d == "wan1" and c == "wan2"
+
+
+def test_driver_dwell_clock_is_not_restarted_by_a_persisting_challenger():
+    # Distinct from creating the candidate: an unchanged challenger must keep
+    # its ORIGINAL timestamp. Restarting it each tick would mean no challenge
+    # could ever accumulate dwell and the driver would never move again.
+    active = {"wan1", "wan2"}
+    loss = {"wan1": 0.0, "wan2": 2.0}
+    d, c, s = _pick(loss, active, "wan1", None, None, 100.0)
+    assert (c, s) == ("wan2", 100.0)
+    for t in (100.5, 130.0, 100.0 + DWELL - 0.5):
+        d, c, s = _pick(loss, active, "wan1", c, s, t)
+        assert (d, c, s) == ("wan1", "wan2", 100.0)      # clock still at 100.0
+    d, c, s = _pick(loss, active, "wan1", c, s, 100.0 + DWELL)
+    assert d == "wan2"
+
+
+def test_driver_challenger_is_the_worst_link_not_the_first_by_name():
+    # With 3+ active WANs the challenger must be the most degraded path, since
+    # it selects the table/floor/hysteresis that will be applied.
+    active = {"wan1", "wan2", "wan3"}
+    loss = {"wan1": 0.0, "wan2": 2.0, "wan3": 9.0}
+    d, c, s = _pick(loss, active, "wan1", None, None, 100.0)
+    assert c == "wan3"
+    d, c, s = _pick(loss, active, "wan1", c, s, 100.0 + DWELL)
+    assert d == "wan3"
+
+
+def test_driver_candidate_is_dropped_when_the_challenge_lapses():
+    active = {"wan1", "wan2"}
+    d, c, s = _pick({"wan1": 0.0, "wan2": 2.0}, active, "wan1", None, None, 100.0)
+    assert c == "wan2"
+    # Both clean again: the incumbent IS the canonical pick, so no challenger
+    # remains and the dwell clock must not keep running.
+    d, c, s = _pick({"wan1": 0.0, "wan2": 0.0}, active, "wan1", c, s, 160.0)
+    assert (d, c, s) == ("wan1", None, None)
+
+
+def test_driver_comes_home_after_a_degradation_ends():
+    # Without an implicit challenger the driver would stay on wan2 forever once
+    # it got there, and the cell signal floor — which only engages while the
+    # cellular WAN drives — would stay disarmed.
+    driver, switches = _replay([
+        (300.0, {"wan1": 0.0, "wan2": 0.0}),     # steady on wan1
+        (900.0, {"wan1": 0.0, "wan2": 3.0}),     # wan2 degrades, takes over
+        (900.0, {"wan1": 0.0, "wan2": 0.0}),     # recovers
+    ], start_driver="wan1")
+    assert driver == "wan1"
+    assert switches == 2                          # away and back, nothing more
+
+
+def test_driver_needs_margin_and_dwell_before_switching():
+    active = {"wan1", "wan2"}
+    # Over the margin: becomes a candidate, but does not take over yet.
+    d, c, s = _pick({"wan1": 0.0, "wan2": 2.0}, active, "wan1", None, None, 100.0)
+    assert (d, c, s) == ("wan1", "wan2", 100.0)
+    # Still inside the dwell.
+    d, c, s = _pick({"wan1": 0.0, "wan2": 2.0}, active, "wan1", c, s, 100.0 + DWELL - 1)
+    assert d == "wan1" and c == "wan2"
+    # Dwell satisfied.
+    d, c, s = _pick({"wan1": 0.0, "wan2": 2.0}, active, "wan1", c, s, 100.0 + DWELL)
+    assert (d, c, s) == ("wan2", None, None)
+
+
+def test_driver_short_circuits_when_only_one_wan_is_active():
+    # Every mode but full redundancy. No race, so no dwell — this must never
+    # delay a master_backup failover.
+    d, c, s = _pick({"wan1": 9.0, "wan2": 0.0}, {"wan2"}, "wan1", "wan2", 100.0, 101.0)
+    assert (d, c, s) == ("wan2", None, None)
+
+
+def test_driver_repicks_when_the_incumbent_stops_carrying_traffic():
+    d, c, s = _pick({"wan1": 0.0, "wan2": 4.0}, {"wan2", "wan3"}, "wan1",
+                    None, None, 100.0)
+    assert d == "wan2" and c is None
+
+
+def test_driver_tie_no_longer_thrashes_on_alphabetical_order():
+    # Both clean: whoever holds it keeps it, instead of the sorted-first WAN
+    # winning every tick.
+    active = {"wan1", "wan2"}
+    assert _pick({"wan1": 0.0, "wan2": 0.0}, active, "wan2", None, None, 100.0)[0] == "wan2"
+    assert _pick({"wan1": 0.0, "wan2": 0.0}, active, "wan1", None, None, 100.0)[0] == "wan1"
+
+
+def test_driver_bootstraps_to_the_raw_ranking():
+    d, c, s = _pick({"wan1": 1.0, "wan2": 5.0}, {"wan1", "wan2"}, None,
+                    None, None, 100.0)
+    assert (d, c, s) == ("wan2", None, None)
+    assert M.fec_driver_pick({}, set(), None, None, None, DWELL, 1.0) == \
+        (None, None, None)

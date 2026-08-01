@@ -75,6 +75,7 @@
     ],
     "ramp_up_ticks": 2,
     "ramp_down_hold_s": 20,
+    "driver_dwell_s": 120,
     "full_mode_backoff_fec": "8:0",
     "full_min_up_wans": 2,
     "wire_unit": "udpspeeder-client",
