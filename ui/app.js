@@ -1088,7 +1088,23 @@ function drawFecGraph(id, series){
   const last = series.length ? series[series.length - 1] : null;
   const t1 = Math.max(Date.now() / 1000, last ? last.t : 0);
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
-  const windowed = series.filter(p => p.t >= t0);
+  // Normalise before anything computes a coordinate. A component can arrive
+  // non-finite, and two finite ones can still overflow their own sum — both
+  // reach Y() as +/-Infinity and paint outside the canvas or vanish silently.
+  // A sample we cannot plot is a sample we do not have, and the chart already
+  // draws that honestly: delivered = null is the gap the runs break on.
+  const fin = v => (typeof v === "number" && isFinite(v)) ? v : null;
+  const windowed = series.filter(p => p.t >= t0).map(p => {
+    const d = fin(p.delivered), r = fin(p.recovered), l = fin(p.lost);
+    const plottable = isFinite((d || 0) + (r || 0) + (l || 0));
+    return {
+      t: p.t,
+      delivered: plottable ? d : null,
+      recovered: plottable ? r : null,
+      lost: plottable ? l : null,
+      waste: plottable ? fin(p.waste) : null,
+    };
+  });
   const pts = windowed.filter(p => p.delivered != null);
 
   const X = t => plotL + ((t - t0) / FEC_GRAPH_WINDOW_S) * plotW;
