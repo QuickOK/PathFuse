@@ -169,6 +169,23 @@ def is_level_at_max(level, table=DEFAULT_LOSS_TABLE):
     return level >= len(table) - 1
 
 
+def _overhead_or_none(ratio):
+    """Parse-and-validate a ratio to its overhead percent, or None.
+
+    Validation is not redundant with the try/except: '1:254' parses fine and is
+    only rejected by validate_ratio's a+b<=254 bound, so without it a
+    hand-edited config row would enter the ladder as a 25400% rung — the
+    highest — instead of being ignored."""
+    try:
+        a, b = parse_ratio(ratio)
+        if not validate_ratio(a, b):
+            return None
+        return ratio_overhead_pct(a, b)
+    except (ValueError, AttributeError, TypeError,
+            KeyError, ZeroDivisionError):
+        return None
+
+
 def rung_overheads(table=DEFAULT_LOSS_TABLE):
     """The table's distinct parity rungs, ascending by overhead.
 
@@ -185,10 +202,11 @@ def rung_overheads(table=DEFAULT_LOSS_TABLE):
     pcts = set()
     for row in table:
         try:
-            pcts.add(ratio_overhead_pct(*parse_ratio(row["fec"])))
-        except (ValueError, AttributeError, TypeError,
-                KeyError, ZeroDivisionError):
+            pct = _overhead_or_none(row["fec"])
+        except (TypeError, KeyError):
             continue
+        if pct is not None:
+            pcts.add(pct)
     return sorted(pcts)
 
 
@@ -201,12 +219,11 @@ def ratio_rung(ratio, table=DEFAULT_LOSS_TABLE):
     every such value to 0. Rounding DOWN is deliberate — the UI's pip row must
     never claim more protection than the ratio actually delivers.
 
-    An unparseable ratio, or one below even the lowest rung, is position 0: a
+    An unusable ratio, or one below even the lowest rung, is position 0: a
     display helper must degrade, not raise.
     """
-    try:
-        pct = ratio_overhead_pct(*parse_ratio(ratio))
-    except (ValueError, AttributeError, TypeError, ZeroDivisionError):
+    pct = _overhead_or_none(ratio)
+    if pct is None:
         return 0
     rung = 0
     for i, overhead in enumerate(rung_overheads(table)):
@@ -236,11 +253,12 @@ def ladder_state(mode, ratio, floor_ratio, table=DEFAULT_LOSS_TABLE):
     """
     below = False
     if mode == MODE_MIN_ADAPTIVE and ratio:
-        try:
-            below = (ratio_overhead_pct(*parse_ratio(ratio))
-                     < ratio_overhead_pct(*parse_ratio(floor_ratio)))
-        except (ValueError, AttributeError, TypeError, ZeroDivisionError):
-            below = False
+        applied_pct = _overhead_or_none(ratio)
+        floor_pct = _overhead_or_none(floor_ratio)
+        # Either side unusable: claim nothing. An unusable floor is applied as
+        # the default anyway, so guessing here would be worse than silence.
+        below = (applied_pct is not None and floor_pct is not None
+                 and applied_pct < floor_pct)
     return {
         "levels": len(rung_overheads(table)),
         "floor_level": (ratio_rung(floor_ratio, table)

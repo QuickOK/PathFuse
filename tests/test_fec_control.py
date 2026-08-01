@@ -465,3 +465,28 @@ def test_below_floor_false_at_or_above_the_floor_and_outside_min_adaptive():
     # Nothing applied yet, and an unusable floor, both degrade to False.
     assert F.ladder_state(F.MODE_MIN_ADAPTIVE, None, "20:1")["below_floor"] is False
     assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:0", "junk")["below_floor"] is False
+
+
+def test_out_of_bounds_ratios_are_not_rungs():
+    # '1:254' parses cleanly and is only rejected by the a+b<=254 bound, so
+    # without validation it enters the ladder as a 25400% rung — the highest.
+    # Loss-table rows come straight from hand-editable config, unvalidated.
+    assert F.ratio_rung("1:254") == 0
+    assert F.ratio_rung("8:-1") == 0
+    poisoned = [
+        {"max_loss_pct": 0.5,   "fec": "8:0"},
+        {"max_loss_pct": 2.0,   "fec": "1:254"},   # out of bounds: ignored
+        {"max_loss_pct": 5.0,   "fec": "8:2"},
+        {"max_loss_pct": 100.0, "fec": "8:4"},
+    ]
+    assert F.rung_overheads(poisoned) == [0.0, 25.0, 50.0]
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "8:2", poisoned)
+    assert lad["levels"] == 3                      # not 4 — the bad row is gone
+    assert lad["below_floor"] is False
+
+
+def test_below_floor_needs_both_ratios_usable():
+    # An out-of-bounds floor would otherwise read as an enormous overhead and
+    # mark every applied ratio below it.
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:8", "1:254")["below_floor"] is False
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "1:254", "20:1")["below_floor"] is False
