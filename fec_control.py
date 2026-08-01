@@ -169,6 +169,53 @@ def is_level_at_max(level, table=DEFAULT_LOSS_TABLE):
     return level >= len(table) - 1
 
 
+def ratio_rung(ratio, table=DEFAULT_LOSS_TABLE):
+    """Index of the highest rung in `table` whose overhead is <= this ratio's.
+
+    Unlike ratio_to_level this does NOT require an exact match: an operator's
+    floor or fixed ratio is free to sit between two rungs (20:1 = 5% falls
+    between the base table's 8:0 and 8:2), and a strict lookup would collapse
+    every such value to 0. Rounding DOWN is deliberate — the UI's pip row must
+    never claim more protection than the ratio actually delivers.
+
+    An unparseable ratio is rung 0: a display helper must degrade, not raise.
+    """
+    try:
+        pct = ratio_overhead_pct(*parse_ratio(ratio))
+    except (ValueError, AttributeError, TypeError, ZeroDivisionError):
+        return 0
+    rung = 0
+    for i, row in enumerate(table):
+        try:
+            if ratio_overhead_pct(*parse_ratio(row["fec"])) <= pct:
+                rung = i
+        except (ValueError, AttributeError, TypeError,
+                KeyError, ZeroDivisionError):
+            continue
+    return rung
+
+
+def ladder_state(mode, ratio, floor_ratio, table=DEFAULT_LOSS_TABLE):
+    """{levels, floor_level, applied_level} describing where the ratio on the
+    wire sits on the active profile's ladder. Consumed by the UI's pip row,
+    which shows the applied level RELATIVE to the floor.
+
+    applied_level comes from the ratio actually applied, not the adaptive
+    engine's level index: that makes it right in every mode for free — fixed
+    and off ignore the engine entirely, and the signal floor lifts the ratio
+    without the published level always reflecting it.
+
+    floor_level is 0 outside min_adaptive; nothing is being held up there, so
+    the whole ladder is available.
+    """
+    return {
+        "levels": len(table),
+        "floor_level": (ratio_rung(floor_ratio, table)
+                        if mode == MODE_MIN_ADAPTIVE else 0),
+        "applied_level": ratio_rung(ratio, table) if ratio else 0,
+    }
+
+
 def mode_aware_level(mode, up_count, loss_pct, table=DEFAULT_LOSS_TABLE,
                      full_min_up_wans=2, backoff_ratio="8:0"):
     """In full-redundancy with enough healthy links, engarde already

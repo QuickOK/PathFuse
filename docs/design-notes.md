@@ -34,6 +34,15 @@ packet lost on *one* link — floor parity is what recovers packets dropped on b
 ~8–12% overhead on an already-doubled stream. Net effect: with a floor configured,
 `full_mode_backoff_fec` bounds only the adaptive component and cannot undercut the floor.
 
+**The wall display shows level relative to the floor, not absolutely.** Rung count varies by profile
+(5 on the base table, 4 on cellular), and in `min_adaptive` the floor's rung is the resting state —
+parity the operator *chose* to always pay for, not an event. So each direction publishes a `ladder`
+(`levels`, `floor_level`, `applied_level`) and the pip row draws only the rungs above the floor:
+dark at the floor, lit and flashing once loss has pushed it higher. `applied_level` is derived from
+the ratio actually on the wire rather than the adaptive engine's level index, which makes it correct
+in `fixed`/`off` (where the engine keeps stepping but doesn't drive the ratio) and under the signal
+floor without special-casing any of them.
+
 **Why "off" is `8:0`, not `1:0`:** in UDPspeeder mode 0 the data count caps how many segments a
 packet may split into; `1:0` disables the splitter, so any datagram larger than the FEC MTU is
 dropped (a large-packet black hole). `8:0` sends zero parity (same "off" bandwidth) while keeping

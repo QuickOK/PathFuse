@@ -732,6 +732,58 @@ function renderCellSignal(s){
     `${cellLabel} signal: ${parts.join(' · ')}${stale}${prof}${floor}${dupBadge}`;
 }
 
+/* The pip row shows the applied FEC level RELATIVE to what the mode makes
+   available: in floor+adaptive the floor rung is the baseline (at the floor,
+   nothing is lit — the parity it buys is the resting state, not an event), and
+   only rungs the active profile actually has get a dot. The cellular table is
+   4 rungs, the base table 5, so a fixed-width row would over- or under-state
+   the headroom on one of them. */
+const FEC_FALLBACK_LEVELS = 5;   // relay too old to publish `ladder`
+
+function clampLevel(v, hi){
+  if (typeof v !== "number" || !isFinite(v)) return 0;
+  return Math.max(0, Math.min(Math.round(v), hi));
+}
+
+function renderFecLevel(el, d){
+  if (!el) return;
+  const lad = d.ladder;
+  // Without a ladder, fall back to the base table with no floor rung: the row
+  // then reads as plain adaptive, which is wrong only in how much headroom it
+  // draws — never in claiming parity that isn't applied.
+  // Through clampLevel so a malformed payload can't make `dots` NaN (an empty
+  // row and a "+NaN" label) or ask for thousands of nodes.
+  const levels   = clampLevel(lad && lad.levels, 32) || FEC_FALLBACK_LEVELS;
+  const floorLvl = clampLevel(lad ? lad.floor_level : 0, levels - 1);
+  const applied  = clampLevel(lad ? lad.applied_level : d.level, levels - 1);
+  const dots = (levels - 1) - floorLvl;
+  const lit  = Math.max(0, Math.min(applied - floorLvl, dots));
+  const floored = d.mode === "min_adaptive";
+
+  let label;
+  if (floored) label = dots <= 0 ? "floor at max"
+                     : (lit === 0 ? "at floor" : `+${lit} over floor`);
+  else if (d.mode === "off")   label = "off";
+  else if (d.mode === "fixed") label = dots > 0 ? `fixed · ${lit}/${dots}` : "fixed";
+  else label = `level ${lit}/${dots}`;
+
+  // Rebuild only when the row's meaning changes. Re-writing innerHTML on every
+  // poll would restart the flash animation once a second (it would never get
+  // past its first frame); rebuilding on change instead also keeps every lit
+  // dot pulsing in phase, since they all start their cycle together.
+  const sig = `${dots}|${lit}|${label}`;
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
+
+  let pips = "";
+  for (let i = 0; i < dots; i++) pips += `<i class="pip ${i < lit ? "on" : ""}"></i>`;
+  el.innerHTML = `${pips}<span class="fec-level-num">${label}</span>`;
+  // Flashing means "above the floor you set" — the condition worth an
+  // operator's eye. Steady dots elsewhere: without a floor there is nothing to
+  // have exceeded.
+  el.classList.toggle("is-flashing", floored && lit > 0);
+}
+
 function renderFecCard(id, d, local){
   d = d || {};
   const card    = $(`#fec-${id}`);
@@ -747,10 +799,7 @@ function renderFecCard(id, d, local){
   ratioEl.textContent = off && ratio !== "—" ? `${ratio} OFF` : ratio;
   card.classList.toggle("is-off", off);
 
-  const lvl = (typeof d.level === "number") ? d.level : 0;
-  let pips = "";
-  for (let i = 0; i < 5; i++) pips += `<i class="pip ${i <= lvl ? "on" : ""}"></i>`;
-  levelEl.innerHTML = `${pips}<span class="fec-level-num">level ${lvl}</span>`;
+  renderFecLevel(levelEl, d);
 
   const dl = (d.driving_loss_pct != null) ? `${d.driving_loss_pct.toFixed(1)}% loss` : "— loss";
   metaEl.textContent = d.driver_wan ? `driving ${dl} · ${d.driver_wan}` : `driving ${dl}`;

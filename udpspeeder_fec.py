@@ -62,6 +62,7 @@ class FecState:
             "since": None,
             "wire": None,
             "rx": None,
+            "ladder": None,
             "profile": "default",
             "profile_source": "default",
             "signal_floor_active": False,
@@ -487,11 +488,23 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
         if driving is None:
             driving, _up = read_worst_loss(cfg["sbfd_state"])
         now = time.time()
+        # Resolve the profile again purely to publish the ladder: run_once
+        # resolves it internally and the table is dict lookups, so re-resolving
+        # is cheaper than threading it back out through the return tuple.
+        pub_table, _, _ = resolve_relay_profile(cfg, pushed_profile)
+        ladder = fec_control.ladder_state(
+            mode, current_ratio,
+            # Coerce as run_once does: an unusable floor is applied as the
+            # default, so the ladder must place it on the same rung.
+            fec_control.safe_ratio(floor_ratio, fec_control.DEFAULT_FLOOR_RATIO,
+                                   logging),
+            pub_table)
         state.publish(enabled=mode != fec_control.MODE_OFF,
                       mode=mode, fixed_ratio=fixed_ratio,
                       floor_ratio=floor_ratio,
                       ratio=current_ratio,
-                      level=rt.current_level, driving_loss_pct=driving,
+                      level=rt.current_level, ladder=ladder,
+                      driving_loss_pct=driving,
                       loss_source=("client_push" if pushed is not None
                                    else "local_sbfd"),
                       since=since,

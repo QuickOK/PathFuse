@@ -893,6 +893,9 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
         "floor_ratio": data.get("floor_ratio"),
         "ratio": data.get("ratio"),
         "level": data.get("level"),
+        # Absent from a relay older than the ladder field; the UI falls back to
+        # a fixed-width pip row rather than showing an empty one.
+        "ladder": data.get("ladder"),
         "driving_loss_pct": data.get("driving_loss_pct"),
         "loss_source": data.get("loss_source"),
         "since": data.get("since"),
@@ -2577,6 +2580,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         fec_actuator_ok = True
         fec_loss = loss
         fec_loss_source = "local"
+        # None until the profile resolves below: with cfg.fec absent there is no
+        # active loss table, and the UI must fall back rather than be handed a
+        # ladder derived from the wrong one.
+        fec_ladder = None
         relay_desired = (fec_mode_eff, fec_fixed_ratio_eff, fec_floor_ratio_eff)
         if cfg.fec:
             # Our TX leg repairs client->relay loss, which only the relay can
@@ -2673,6 +2680,12 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     logging.info("fec ratio -> %s (fec_mode=%s mode=%s active=%s)",
                                  _fec_ratio, fec_mode_eff, mode,
                                  sorted(currently_active))
+
+            # Ladder for the UI's pip row. Keyed on fec_current_ratio (what the
+            # actuator accepted), not _fec_ratio (what we wanted): a failed FIFO
+            # write must not light dots for parity that isn't on the wire.
+            fec_ladder = fec_control.ladder_state(
+                fec_mode_eff, fec_current_ratio, fec_floor_ratio_eff, prof_table)
 
             # Reconcile desired mode/ratio to relay on the remote-fetch cadence
             # only (best-effort) — rate-limiting to the relay tick keeps a slow
@@ -2778,6 +2791,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                         "fixed_ratio": fec_fixed_ratio_eff,
                         "ratio": fec_current_ratio,
                         "level": fec_rt.current_level,
+                        # Where that ratio sits on the ACTIVE profile's ladder,
+                        # so the UI can size its pip row to the rungs that
+                        # actually exist (5 on the base table, 4 on cellular).
+                        "ladder": fec_ladder,
                         "driving_loss_pct": (fec_loss.get(fec_driver_display) if fec_driver_display else None),
                         "driver_wan": fec_driver_display,
                         "loss_source": fec_loss_source,

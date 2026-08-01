@@ -933,18 +933,43 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
   gap: 5px;
   margin: 6px 0;
 }
+/* Unlit pips are the ladder itself: the rungs this profile has left to climb.
+   A hollow ring reads as an empty slot at a glance while staying clearly
+   inactive — the old near-black fill was invisible against the surface, so the
+   headroom it was meant to show wasn't. */
 .fec-level .pip {
   width: 10px; height: 10px;
   border-radius: 50%;
-  background: var(--border, #2a2f3a);
+  background: rgba(94, 234, 212, 0.07);
+  border: 1px solid rgba(94, 234, 212, 0.42);
   display: inline-block;
 }
-.fec-level .pip.on { background: var(--accent, #5b8cff); }
+.fec-level .pip.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 7px var(--accent-glow);
+}
+.fec-level.is-flashing .pip.on { animation: fec-pip-flash 1.15s ease-in-out infinite; }
+@keyframes fec-pip-flash {
+  /* The dim end stops at 0.45, not near-zero: a lit dot must stay heavier than
+     an unlit ring through the whole cycle, or the count becomes unreadable for
+     half of every pulse. */
+  0%, 100% { opacity: 1;    box-shadow: 0 0 7px var(--accent-glow); }
+  50%      { opacity: 0.45; box-shadow: 0 0 2px var(--accent-glow); }
+}
+/* The lit fill already carries the state; the pulse only draws the eye to it,
+   so dropping it costs no information. */
+@media (prefers-reduced-motion: reduce) {
+  .fec-level.is-flashing .pip.on { animation: none; }
+}
 .fec-level-num {
   margin-left: 6px;
   font-size: 11px;
   color: var(--fg-muted);
 }
+/* With no rungs above the floor there are no pips, and the label alone would
+   sit against the card's left edge with a stray indent. */
+.fec-level .fec-level-num:first-child { margin-left: 0; }
 .fec-meta { font-size: 13px; }
 .fec-since { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 .fec-badges { margin-top: 8px; }
