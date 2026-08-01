@@ -568,3 +568,35 @@ def test_pinned_is_meaningless_outside_the_adaptive_modes():
     assert F.reachable_ratios(F.MODE_FIXED, base, "8:1", fixed_ratio="8:4",
                               pinned_level=0) == ["8:4"]
     assert F.reachable_ratios(F.MODE_OFF, base, "8:1", pinned_level=0) == ["8:0"]
+
+
+def test_fixed_mode_scale_is_a_ladder_not_a_single_rung():
+    # Built only from what fixed mode reaches, the scale would be ["20:1"] and
+    # scale_index would round EVERY other ratio down onto that one pip — a
+    # relay still applying 8:8 across an unacknowledged change would light the
+    # 20:1 dot. The chosen ratio needs a ladder to sit on.
+    scale = F.ladder_scale(PROFILES, F.MODE_FIXED, fixed_ratio="20:1")
+    assert scale == ["8:0", "20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+    assert F.scale_index(scale, "20:1") == 1
+    assert F.scale_index(scale, "8:8") == 7        # distinct pip, not rounded
+    # Only the fixed ratio is reachable, so exactly one rung shades.
+    v = F.ladder_view(scale, F.reachable_ratios(F.MODE_FIXED,
+                                                F.DEFAULT_LOSS_TABLE, "8:1",
+                                                fixed_ratio="20:1"),
+                      "20:1", "8:1", F.MODE_FIXED)
+    assert (v["reach_lo"], v["reach_hi"]) == (1, 1)
+
+
+def test_off_mode_scale_also_keeps_its_ladder():
+    scale = F.ladder_scale(PROFILES, F.MODE_OFF)
+    assert scale[0] == "8:0" and len(scale) > 1
+    v = F.ladder_view(scale, F.reachable_ratios(F.MODE_OFF,
+                                                F.DEFAULT_LOSS_TABLE, "8:1"),
+                      "8:0", "8:1", F.MODE_OFF)
+    assert (v["reach_lo"], v["reach_hi"]) == (0, 0)
+
+
+def test_adaptive_scales_are_unchanged_by_the_context_rule():
+    assert F.ladder_scale(PROFILES, F.MODE_MIN_ADAPTIVE) == SCALE
+    assert F.ladder_scale(PROFILES, F.MODE_ADAPTIVE) == \
+        ["8:0", "20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]

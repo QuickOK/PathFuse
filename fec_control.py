@@ -278,10 +278,21 @@ def ladder_scale(profiles, fec_mode, fixed_ratio=DEFAULT_FIXED_RATIO):
     profiles is an iterable of (loss_table, floor_ratio). Backoff is
     deliberately not applied: the scale is the whole space, and the reachable
     span within it is what narrows.
+
+    'off' and 'fixed' reach exactly one ratio, so a scale built only from what
+    they reach would be a SINGLE rung — and scale_index would then round every
+    other ratio down onto it, including one the relay is still applying across
+    an unacknowledged change (a relay on fixed 8:8 lighting the 8:1 pip). Those
+    modes therefore also get their profiles' rungs as context: a ladder to
+    place the chosen ratio on, with only that ratio shaded.
     """
+    context_mode = (fec_mode if fec_mode in (MODE_ADAPTIVE, MODE_MIN_ADAPTIVE)
+                    else MODE_ADAPTIVE)
     out = []
     for table, floor in profiles:
-        out.extend(reachable_ratios(fec_mode, table, floor, fixed_ratio))
+        out.extend(reachable_ratios(context_mode, table, floor))
+        if context_mode != fec_mode:
+            out.extend(reachable_ratios(fec_mode, table, floor, fixed_ratio))
     return _by_overhead(out)
 
 
