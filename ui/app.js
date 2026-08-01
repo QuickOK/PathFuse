@@ -1009,10 +1009,17 @@ function niceAxis(peak, ticks){
     // rounds to 12 significant digits; either can land the max a hair UNDER
     // the peak, which clips the top of the data outside the plot. Step up the
     // ladder until it cannot.
-    if (max >= peak) return { max, step };
+    // isFinite matters: step * ticks overflows to Infinity near MAX_VALUE, and
+    // Infinity >= peak is true, so an unguarded test accepts a max that makes
+    // every label "Infinity" and every Y() NaN. Falling through to the finite
+    // saturated scale below is the honest answer for a rate that large.
+    if (isFinite(max) && max >= peak) return { max, step };
     if (++i >= AXIS_STEPS.length){ i = 0; mag *= 10; }
   }
-  return { max: tidy(raw * ticks), step: tidy(raw) };
+  // Saturated fallback, deliberately NOT tidied: rounding to 12 significant
+  // digits is what puts a max below its peak, and at MAX_VALUE there is no
+  // headroom left to round into. Exact beats round here.
+  return { max: peak, step: peak / ticks };
 }
 
 // A 44px gutter fits about six digits at 10px. Past that the labels run off
@@ -1111,19 +1118,29 @@ function drawFecGraph(id, series){
   // produce an absurd one, and the chart has to degrade rather than draw off
   // the edge. Requires ctx.font, set above.
   const axisBudget = ML - 8;
+  // "1.0e+18" is 7 characters of which two carry nothing; "1e18" is 4 and
+  // reads the same. Worth it when the gutter is the whole constraint.
+  const sci = (v, d) => v === 0 ? "0"
+    : v.toExponential(d).replace("e+", "e").replace(/\.0+e/, "e");
   const axisFormats = [
     v => (v / axisU.div).toFixed(axisDp) + axisU.suffix,   // 12.5k
-    v => v.toExponential(1),                               // 1.2e+18
-    v => v.toExponential(0),                               // 1e+18
+    v => sci(v, 1),                                        // 1.2e18
+    v => sci(v, 0),                                        // 1e18
   ];
-  const axisFits = fmt => {
-    for (let i = 0; i <= Y_TICKS; i++)
-      if (ctx.measureText(fmt(axisStep * i)).width > axisBudget) return false;
-    return true;
+  const axisTicks = fmt => {
+    const out = [];
+    for (let i = 0; i <= Y_TICKS; i++) out.push(fmt(axisStep * i));
+    return out;
   };
-  // Take the most precise form that fits, not merely the next one down —
-  // checking only the primary left the fallback free to overflow just as far.
-  const axisLabel = axisFormats.find(axisFits) || axisFormats[axisFormats.length - 1];
+  const fitsGutter = ls => ls.every(l => ctx.measureText(l).width <= axisBudget);
+  const distinct = ls => new Set(ls).size === ls.length;
+  // Fitting is not sufficient: rounding hard enough to fit can render two
+  // different gridlines with the same text, which is worse than a few pixels
+  // of overhang. Prefer the most precise form that both fits and stays
+  // distinct, and if none does, keep distinctness.
+  const axisLabel = axisFormats.find(f => fitsGutter(axisTicks(f)) && distinct(axisTicks(f)))
+    || axisFormats.find(f => distinct(axisTicks(f)))
+    || axisFormats[1];
   ctx.textAlign = "right";
   for (let i = 0; i <= Y_TICKS; i++){
     const val = axisStep * i;
