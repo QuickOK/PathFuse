@@ -1096,7 +1096,12 @@ function drawFecGraph(id, series){
   const fin = v => (typeof v === "number" && isFinite(v)) ? v : null;
   const windowed = series.filter(p => p.t >= t0).map(p => {
     const d = fin(p.delivered), r = fin(p.recovered), l = fin(p.lost);
-    const plottable = isFinite((d || 0) + (r || 0) + (l || 0));
+    // Every stack component must be readable, and `|| 0` is not a reading:
+    // coercing an unusable `recovered` to zero asserts that no recovery
+    // happened, which is a claim rather than an absence. fec_report writes all
+    // four rates together — all real, or all null when stale — so demanding
+    // the full set costs nothing that renders correctly today.
+    const plottable = d != null && r != null && l != null && isFinite(d + r + l);
     return {
       t: p.t,
       delivered: plottable ? d : null,
