@@ -764,7 +764,10 @@ function renderFecScale(el, d, lad){
   let label;
   if (below) label = "below floor";
   else if (d.mode === "off" || d.enabled === false) label = "off";
-  else if (applied < 0) label = "—";
+  // Off the scale entirely — a relay reporting a ratio from settings we have
+  // not pushed yet, or have just replaced. Name it rather than showing a dash:
+  // the row cannot place it, but the operator can still read it.
+  else if (applied < 0) label = d.ratio ? `${d.ratio} · off scale` : "—";
   else if (d.mode === "fixed") label = `fixed · ${scale[applied]}`;
   else if (floorIdx >= 0 && applied <= floorIdx)
     label = pinned ? "at floor · pinned" : "at floor";

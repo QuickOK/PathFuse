@@ -168,26 +168,72 @@ def test_relay_fec_direction_passes_through_ladder():
     assert d["ladder"] == lad
 
 
+def _ladder_inputs(scale, mode="min_adaptive", floor="8:1", fixed="20:1"):
+    import fec_control as F
+    return {"scale": scale,
+            "tables": {"wan1": F.DEFAULT_CELL_LOSS_TABLE},
+            "default_table": F.DEFAULT_LOSS_TABLE,
+            "mode": mode, "floor": floor, "fixed": fixed}
+
+
+SCALE = ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+
+
 def test_relay_fec_direction_rescales_the_relay_ladder():
     # The relay's own ladder is scaled to its view of one profile. The client
     # re-derives it against the shared cross-profile scale so both cards share
-    # positions — anchored on the ratio the relay REPORTS, not our desired one.
-    import fec_control as F
-    scale = ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
-    reach = F.reachable_ratios(F.MODE_MIN_ADAPTIVE, F.DEFAULT_LOSS_TABLE, "8:1")
+    # positions — anchored on what the relay REPORTS.
     fetch = {"ok": True, "error": None, "data": {
-        "ratio": "8:4", "level": 2,
+        "ratio": "8:4", "level": 2, "mode": "min_adaptive", "floor_ratio": "8:1",
         "ladder": {"levels": 5, "floor_level": 0, "applied_level": 2}}}
     d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
                               last_acked=True,
-                              ladder_inputs=(scale, reach, "8:1",
-                                             F.MODE_MIN_ADAPTIVE))
-    assert d["ladder"]["scale"] == scale
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"]["scale"] == SCALE
     assert d["ladder"]["applied_index"] == 3          # 8:4
     assert (d["ladder"]["reach_lo"], d["ladder"]["reach_hi"]) == (1, 5)
     # The relay never applies full-redundancy backoff, so its span is never
     # pinned even while the client leg is.
     assert d["ladder"]["pinned"] is False
+
+
+def test_relay_ladder_follows_the_relay_not_our_desired_settings():
+    # Mid-reconcile: we want min_adaptive at 8:1, the relay is still OFF. The
+    # card must not claim the floor or the adaptive span we have not got yet.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:0", "mode": "off", "floor_ratio": "8:1"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    lad = d["ladder"]
+    assert lad["floor_index"] == -1                   # not min_adaptive there
+    assert (lad["reach_lo"], lad["reach_hi"]) == (-1, -1)   # 8:0 is off-scale
+    assert lad["applied_index"] == -1
+    assert lad["below_floor"] is False
+
+
+def test_relay_ladder_uses_the_relays_floor_after_a_restart():
+    # A restarted relay reverts to its config floor for up to a heartbeat. Its
+    # 20:1 is beneath every rung of our scale, so the row places nothing rather
+    # than pretending the operator's floor is in force.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "20:1", "mode": "min_adaptive", "floor_ratio": "20:1",
+        "profile": "wan1"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE, floor="8:4"))
+    assert d["ladder"]["applied_index"] == -1
+    assert d["ladder"]["below_floor"] is False        # 20:1 IS the relay's floor
+
+
+def test_relay_ladder_falls_back_to_our_values_for_an_older_relay():
+    # No mode/floor reported: our desired values are the only ones available.
+    fetch = {"ok": True, "error": None, "data": {"ratio": "8:2"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"]["applied_index"] == 2
+    assert (d["ladder"]["reach_lo"], d["ladder"]["reach_hi"]) == (1, 5)
 
 
 def test_relay_fec_direction_keeps_relay_ladder_without_inputs():

@@ -907,14 +907,29 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
     # view of one profile. Re-derive the row against OUR cross-profile scale so
     # both cards share positions; the relay's own stays as the fallback for a
     # client that could not build one (cfg.fec absent) and for anyone reading
-    # /fec directly. Anchored on the relay's REPORTED ratio, not our desired
-    # one — a leg mid-reconcile must show what it is actually sending.
+    # /fec directly.
+    #
+    # Every INPUT comes from what the relay reports, not from what we desire.
+    # While a push is unacknowledged the two disagree, and a relay restart
+    # reverts it to its config floor for up to a heartbeat — deriving the span
+    # from our desired settings would have this card claim reachability, or a
+    # floor, that the relay is not honoring. Our values are the fallback only
+    # for a relay too old to report them.
     ladder = data.get("ladder")
     if ladder_inputs is not None:
-        scale, reachable, floor_ratio, fec_mode = ladder_inputs
+        scale = ladder_inputs["scale"]
+        mode = data.get("mode") or ladder_inputs["mode"]
+        floor = data.get("floor_ratio") or ladder_inputs["floor"]
+        fixed = data.get("fixed_ratio") or ladder_inputs["fixed"]
+        table = ladder_inputs["tables"].get(data.get("profile"),
+                                            ladder_inputs["default_table"])
         ladder = fec_control.ladder_view(
-            scale, reachable, data.get("ratio"), floor_ratio, fec_mode,
-            pinned=False)
+            scale,
+            # No pinned_level: the relay's run_once calls loss_to_level
+            # directly and never consults mode_aware_level, so full-redundancy
+            # backoff does not apply to this leg however our own is behaving.
+            fec_control.reachable_ratios(mode, table, floor, fixed_ratio=fixed),
+            data.get("ratio"), floor, mode, pinned=False)
     return {
         "enabled": data.get("enabled"),
         "mode": data.get("mode"),
@@ -2743,11 +2758,19 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     pinned_level=fec_pinned_level),
                 fec_current_ratio, fec_floor_ratio_eff, fec_mode_eff,
                 pinned=fec_full_backoff)
-            fec_ladder_r2c_reach = fec_control.reachable_ratios(
-                fec_mode_eff, prof_table, fec_floor_ratio_eff,
-                fixed_ratio=fec_fixed_ratio_eff)
-            fec_ladder_r2c = (fec_scale, fec_ladder_r2c_reach,
-                              fec_floor_ratio_eff, fec_mode_eff)
+            # The relay leg's span is built from the relay's OWN reported
+            # settings (see relay_fec_direction); these are the tables it may
+            # name plus our values as the fallback for a relay too old to
+            # report them.
+            fec_ladder_r2c = {
+                "scale": fec_scale,
+                "tables": {name: p.loss_table
+                           for name, p in cfg.fec.wan_profiles.items()},
+                "default_table": cfg.fec.loss_table,
+                "mode": fec_mode_eff,
+                "floor": fec_floor_ratio_eff,
+                "fixed": fec_fixed_ratio_eff,
+            }
 
             # Reconcile desired mode/ratio to relay on the remote-fetch cadence
             # only (best-effort) — rate-limiting to the relay tick keeps a slow
