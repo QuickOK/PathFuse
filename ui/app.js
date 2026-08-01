@@ -1129,45 +1129,61 @@ function drawFecGraph(id, series){
   // Bands with room keep the surface separator, so the gap between fills
   // survives wherever it fits.
   const MIN_VIS_PX = 3;
-  const bandThin = (b, p) =>
-    Math.abs(Y(b.lo(p)) - Y(b.hi(p))) < MIN_VIS_PX;
   const bandValue = (b, p) => b.hi(p) - b.lo(p);
   // Stroke a band's top edge only over the consecutive stretches where `want`
   // holds, so the separator and the presence mark can each claim the parts of
   // the edge they belong on without one painting over the other.
-  function strokeEdge(b, run, want, color){
-    const spans = [];
-    let start = -1;
-    run.forEach((p, i) => {
-      if (want(p)){ if (start < 0) start = i; }
-      else if (start >= 0){ spans.push([start, i - 1]); start = -1; }
-    });
-    if (start >= 0) spans.push([start, run.length - 1]);
-
-    spans.forEach(([a, z]) => {
-      // Reach one sample into each neighbour. The segment straddling a
-      // threshold crossing satisfies NEITHER predicate, so without this it
-      // belongs to no span and goes unstroked — a band flickering across the
-      // threshold would render as detached dashes with the edge missing
-      // between them. The overlap makes both passes claim that segment; the
-      // colour pass runs second and wins, which is the right way round, since
-      // the side that needed the ink is the thin one.
-      const i0 = Math.max(0, a - 1), i1 = Math.min(run.length - 1, z + 1);
-      ctx.beginPath();
-      if (i0 === i1){
-        // Nothing to span. Butt caps keep this exactly 2px wide — round caps
-        // would add a pixel at each end and draw a 4px mark for one sample.
-        const x = X(run[i0].t), y = Y(b.hi(run[i0]));
-        ctx.moveTo(x - 1, y); ctx.lineTo(x + 1, y);
-      } else {
-        for (let i = i0; i <= i1; i++){
-          const x = X(run[i].t), y = Y(b.hi(run[i]));
-          i === i0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-        }
+  // Walk the top edge segment by segment and give each piece the style it has
+  // earned: the surface separator where the band has room for one, its own
+  // colour where it is too thin to survive one.
+  //
+  // The split happens at the CROSSING, not at a sample boundary. Snapping to
+  // samples was wrong in both directions — a whole-sample span leaves the
+  // straddling segment unstroked, and extending to cover it then paints colour
+  // across a thick stretch that still deserved its separator, and through
+  // zero-valued neighbours as if an event had happened there. Y is linear in
+  // value, so the crossing is exact arithmetic rather than a guess.
+  function strokeBandEdge(b, run){
+    const vThresh = MIN_VIS_PX * axisMax / plotH;   // value that renders MIN_VIS_PX tall
+    const pieces = [];
+    let lastX = NaN, lastY = NaN;
+    for (let i = 0; i + 1 < run.length; i++){
+      const A = run[i], B = run[i + 1];
+      const vA = bandValue(b, A), vB = bandValue(b, B);
+      if (vA <= 0 && vB <= 0) continue;             // no band over this interval
+      const cuts = [0, 1];
+      if ((vA < vThresh) !== (vB < vThresh) && vA !== vB)
+        cuts.splice(1, 0, (vThresh - vA) / (vB - vA));
+      const xA = X(A.t), xB = X(B.t), yA = Y(b.hi(A)), yB = Y(b.hi(B));
+      for (let k = 0; k + 1 < cuts.length; k++){
+        const t0 = cuts[k], t1 = cuts[k + 1];
+        const vMid = vA + (vB - vA) * (t0 + t1) / 2;
+        if (vMid <= 0) continue;                    // zero band draws nothing
+        const color = vMid < vThresh ? (b.mustShow ? b.color : null) : cInset;
+        if (!color) continue;
+        pieces.push({ color,
+                      x0: xA + (xB - xA) * t0, y0: yA + (yB - yA) * t0,
+                      x1: xA + (xB - xA) * t1, y1: yA + (yB - yA) * t1 });
       }
-      ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.globalAlpha = 1;
-      ctx.stroke();
+    }
+    // Stroke consecutive same-coloured pieces as ONE path. Drawn individually
+    // they are butt-capped segments that meet at an angle, which leaves a
+    // notch at every join and gives a sloped edge a serrated look.
+    let path = null, pathColor = null;
+    const flush = () => {
+      if (!path) return;
+      ctx.lineWidth = 2; ctx.strokeStyle = pathColor; ctx.globalAlpha = 1;
+      ctx.stroke(path);
+      path = null;
+    };
+    pieces.forEach(pc => {
+      const joins = path && pathColor === pc.color
+        && Math.abs(pc.x0 - lastX) < 0.01 && Math.abs(pc.y0 - lastY) < 0.01;
+      if (!joins){ flush(); path = new Path2D(); path.moveTo(pc.x0, pc.y0); pathColor = pc.color; }
+      path.lineTo(pc.x1, pc.y1);
+      lastX = pc.x1; lastY = pc.y1;
     });
+    flush();
   }
   bands.forEach(b => {
     runs.forEach(run => {
@@ -1204,9 +1220,7 @@ function drawFecGraph(id, series){
       // has nothing to separate anyway. So draw it only across the stretches
       // this band is genuinely thick enough to carry it, and give the thin
       // stretches the band's own colour instead.
-      strokeEdge(b, run, p => !bandThin(b, p), cInset);
-      if (b.mustShow) strokeEdge(b, run, p => bandValue(b, p) > 0 && bandThin(b, p),
-                                 b.color);
+      strokeBandEdge(b, run);
     });
   });
   // wasted parity: thin muted overlay line. Honor the same gap/validity rules
