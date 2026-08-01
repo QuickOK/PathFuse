@@ -82,33 +82,33 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
             "desired_mode": "min_adaptive",
             "floor_ratio": "20:1",
             "directions": {
-                # c2r sits two rungs over its floor (pips lit and flashing);
-                # r2c is on the cellular ladder, one rung over a floor that IS
-                # a rung there — the two shapes the pip row has to handle.
+                # Both ladders are the ones this example config actually
+                # produces (default_mode "full", full_min_up_wans 2, and the
+                # snapshot above reports both WANs active), so the preview shows
+                # the real asymmetry rather than an invented pair: the client
+                # leg is PINNED to its floor by full-redundancy backoff, while
+                # the relay leg — whose run_once never consults
+                # mode_aware_level — keeps its whole span at the same moment.
                 "client_to_relay": {
-                    "enabled": True, "ratio": "8:4", "level": 2,
+                    "enabled": True, "ratio": "20:1", "level": 0,
                     "mode": "min_adaptive",
                     "ladder": {
-                        "scale": ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"],
-                        "reach_lo": 1, "reach_hi": 5, "applied_index": 3,
-                        "floor_index": 1, "below_floor": False, "pinned": False},
+                        "scale": ["8:0", "20:1", "12:1", "8:1",
+                                  "8:2", "8:4", "8:6", "8:8"],
+                        "reach_lo": 1, "reach_hi": 1, "applied_index": 1,
+                        "floor_index": 1, "below_floor": False, "pinned": True},
                     "driving_loss_pct": 3.1, "driver_wan": cfg.policy.default_master_wan,
                     "since": now - 42, "actuator_ok": True,
                     "wire": {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False},
                 },
                 "relay_to_client": {
-                    "enabled": True, "ratio": "12:1", "level": 2,
+                    "enabled": True, "ratio": "8:2", "level": 1,
                     "mode": "min_adaptive",
-                    # Cellular driver. The relay leg is NEVER pinned — its
-                    # run_once calls loss_to_level directly and never consults
-                    # mode_aware_level — so it keeps the full cellular span
-                    # (12:1 → 8:1) even while the client leg is held at one
-                    # rung. That asymmetry is the thing this preview exists to
-                    # show; marking it pinned would misrepresent it.
                     "ladder": {
-                        "scale": ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"],
-                        "reach_lo": 0, "reach_hi": 1, "applied_index": 0,
-                        "floor_index": 0, "below_floor": False, "pinned": False},
+                        "scale": ["8:0", "20:1", "12:1", "8:1",
+                                  "8:2", "8:4", "8:6", "8:8"],
+                        "reach_lo": 1, "reach_hi": 7, "applied_index": 4,
+                        "floor_index": 1, "below_floor": False, "pinned": False},
                     "driving_loss_pct": 1.2, "since": now - 133,
                     "ok": True, "stale_s": 0.4, "error": None,
                     "reconcile_pending": False,
