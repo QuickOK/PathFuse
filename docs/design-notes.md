@@ -34,14 +34,27 @@ packet lost on *one* link — floor parity is what recovers packets dropped on b
 ~8–12% overhead on an already-doubled stream. Net effect: with a floor configured,
 `full_mode_backoff_fec` bounds only the adaptive component and cannot undercut the floor.
 
-**The wall display shows level relative to the floor, not absolutely.** Rung count varies by profile
-(5 on the base table, 4 on cellular), and in `min_adaptive` the floor's rung is the resting state —
-parity the operator *chose* to always pay for, not an event. So each direction publishes a `ladder`
-(`levels`, `floor_level`, `applied_level`) and the pip row draws only the rungs above the floor:
-dark at the floor, lit and flashing once loss has pushed it higher. `applied_level` is derived from
-the ratio actually on the wire rather than the adaptive engine's level index, which makes it correct
-in `fixed`/`off` (where the engine keeps stepping but doesn't drive the ratio) and under the signal
-floor without special-casing any of them.
+**The wall display draws one fixed scale, and shades what is reachable.** Each direction publishes a
+`ladder`: a `scale` of rungs, the inclusive `reach_lo`/`reach_hi` span currently available, and
+`applied_index` / `floor_index` within it. The row always draws the whole scale, so a position means
+one ratio no matter which profile is driving — which is what lets the *shaded span alone* say which
+profile that is.
+
+The span is the point. A leg's reachable set is not its loss table: `off` and `fixed` ignore the
+table entirely, a `min_adaptive` floor makes every rung beneath it unreachable, and full-redundancy
+backoff pins the adaptive engine to a single rung. In steady full redundancy the client leg has
+**exactly one** reachable ratio — its floor — at every loss value from 0% to 100%, so the row shows
+one shaded dot and says `pinned`. The relay leg, whose `run_once` calls `loss_to_level` directly and
+never consults `mode_aware_level`, keeps its full span under the same conditions; the two cards
+differing is that asymmetry made visible, not a rendering bug.
+
+Only the client can build this: it knows every profile's table *and* floor, while the relay is
+pushed a single resolved floor and never sees the client's link states. So the client computes both
+legs' views and re-scales the relay's reported ratio onto the shared scale. `applied_index` comes
+from the ratio actually on the wire rather than the adaptive engine's level index, which makes it
+correct in `fixed`/`off` and under the signal floor with no special cases, and `below_floor`
+compares the ratios themselves — a floor between two rungs shares a position with the rung beneath
+it, so a position compare would call a leg carrying less parity than its floor "at floor".
 
 **Why "off" is `8:0`, not `1:0`:** in UDPspeeder mode 0 the data count caps how many segments a
 packet may split into; `1:0` disables the splitter, so any datagram larger than the FEC MTU is

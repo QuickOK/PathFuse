@@ -747,9 +747,82 @@ function clampLevel(v, hi){
   return Math.max(0, Math.min(Math.floor(v), hi));
 }
 
+/* The scale-based row: one fixed set of rungs spanning every profile, with the
+   span currently REACHABLE shaded behind them. A position means one ratio no
+   matter which profile drives, so the shaded band says which profile is
+   driving and how much room the mode leaves it — a single shaded dot in full
+   redundancy is the backoff pinning the leg, not a missing ladder. */
+function renderFecScale(el, d, lad){
+  const scale = lad.scale;
+  const n = scale.length;
+  const lo = numOr(lad.reach_lo, -1), hi = numOr(lad.reach_hi, -1);
+  const applied = numOr(lad.applied_index, -1);
+  const floorIdx = numOr(lad.floor_index, -1);
+  const below = lad.below_floor === true;
+  const pinned = lad.pinned === true;
+  // Prefer the ratio the payload reports over the rung it landed on: when the
+  // two disagree the reported one is the truth and the rung is our rounding.
+  const shown = d.ratio || scale[applied];
+
+  let label;
+  if (below) label = "below floor";
+  else if (d.mode === "off" || d.enabled === false) label = "off";
+  // Off the scale entirely — a relay reporting a ratio from settings we have
+  // not pushed yet, or have just replaced. Name it rather than showing a dash:
+  // the row cannot place it, but the operator can still read it.
+  else if (applied < 0) label = d.ratio ? `${d.ratio} · off scale` : "—";
+  else if (d.mode === "fixed") label = `fixed · ${shown}`;
+  else if (floorIdx >= 0 && applied <= floorIdx)
+    label = pinned ? "at floor · pinned" : "at floor";
+  else if (floorIdx >= 0) label = `+${applied - floorIdx} over floor`;
+  else label = `${shown}`;
+  // `pinned` follows the ROUTING mode, not the FEC mode, so it can be true
+  // while floorIdx is -1 (plain adaptive has no floor). Gating the suffix on
+  // floorIdx therefore dropped it exactly where the row most needs it. Append
+  // wherever the label hasn't already accounted for the state.
+  const pinnedNamed = below || applied < 0 || d.mode === "off"
+    || d.enabled === false || (floorIdx >= 0 && applied <= floorIdx);
+  if (pinned && !pinnedNamed) label += " · pinned";
+
+  // `pinned` belongs in the signature even though it usually moves the span
+  // with it: below-floor labels ignore pinned, so backoff could engage or
+  // release with lo/hi/applied/label all unchanged and leave the class stale.
+  const sig = `s${scale.join(",")}|${lo}|${hi}|${applied}|${label}|${below}|${pinned}`;
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
+
+  let pips = "";
+  for (let i = 0; i < n; i++){
+    const cls = ["pip"];
+    if (lo >= 0 && i >= lo && i <= hi) cls.push("reach");
+    if (i === applied) cls.push("on");
+    pips += `<i class="${cls.join(" ")}" title="${escapeHtml(scale[i])}"></i>`;
+  }
+  el.innerHTML = `${pips}<span class="fec-level-num">${escapeHtml(label)}</span>`;
+  // Flash only when loss has pushed the leg above its floor. A pinned leg
+  // cannot get there, so a pinned row never flashes.
+  el.classList.toggle("is-flashing", !below && floorIdx >= 0 && applied > floorIdx);
+  el.classList.toggle("is-below-floor", below);
+  el.classList.toggle("is-pinned", pinned);
+  // Gates the out-of-reach styling: legacy rows have no reachable band, and
+  // without this every one of their pips would match :not(.reach) and lose the
+  // hollow accent ring.
+  el.classList.add("is-scale");
+}
+
+function numOr(v, dflt){
+  return (typeof v === "number" && isFinite(v)) ? Math.floor(v) : dflt;
+}
+
 function renderFecLevel(el, d){
   if (!el) return;
   const lad = d.ladder;
+  // Scale-based row when the controller published one; the older
+  // profile-relative shape below stays for a payload that predates it.
+  if (lad && Array.isArray(lad.scale) && lad.scale.length){
+    renderFecScale(el, d, lad);
+    return;
+  }
   // Without a ladder, fall back to the base table with no floor rung: the row
   // then reads as plain adaptive, which is wrong only in how much headroom it
   // draws — never in claiming parity that isn't applied.
@@ -806,6 +879,10 @@ function renderFecLevel(el, d){
   // have exceeded.
   el.classList.toggle("is-flashing", floored && lit > 0);
   el.classList.toggle("is-below-floor", belowFloor);
+  // Clear both scale-row states: a payload can fall back to this shape mid-run
+  // (relay downgrade, or a restart landing between publishers), and a stale
+  // is-pinned would dim a row that is not pinned at all.
+  el.classList.remove("is-scale", "is-pinned");
 }
 
 function renderFecCard(id, d, local){

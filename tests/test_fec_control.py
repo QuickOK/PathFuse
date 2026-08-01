@@ -490,3 +490,134 @@ def test_below_floor_needs_both_ratios_usable():
     # mark every applied ratio below it.
     assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:8", "1:254")["below_floor"] is False
     assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "1:254", "20:1")["below_floor"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-profile scale + reachable span. A position must mean one ratio whatever
+# profile is driving, so the shaded span can identify the driver.
+# ---------------------------------------------------------------------------
+
+PROFILES = [(F.DEFAULT_LOSS_TABLE, "8:1"), (F.DEFAULT_CELL_LOSS_TABLE, "12:1")]
+SCALE = ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+
+
+def test_ladder_scale_spans_every_profile():
+    # Both floors are rungs, and each profile's rungs BELOW its own floor are
+    # unreachable, so they never reach the scale: 8:0 and 20:1 are absent.
+    assert F.ladder_scale(PROFILES, F.MODE_MIN_ADAPTIVE) == SCALE
+
+
+def test_reachable_collapses_to_one_rung_when_pinned():
+    # Full-redundancy backoff holds the adaptive engine at the off rung; the
+    # min_adaptive floor then lifts that single value to the floor itself.
+    cell = F.DEFAULT_CELL_LOSS_TABLE
+    pinned = F.ratio_to_level("8:0", cell)
+    assert F.reachable_ratios(F.MODE_MIN_ADAPTIVE, cell, "12:1",
+                              pinned_level=pinned) == ["12:1"]
+    # Unpinned, the same leg can climb to the cellular ceiling.
+    assert F.reachable_ratios(F.MODE_MIN_ADAPTIVE, cell, "12:1") == ["12:1", "8:1"]
+
+
+def test_reachable_ignores_the_table_in_off_and_fixed():
+    assert F.reachable_ratios(F.MODE_OFF, F.DEFAULT_LOSS_TABLE, "8:1") == ["8:0"]
+    assert F.reachable_ratios(F.MODE_FIXED, F.DEFAULT_LOSS_TABLE, "8:1",
+                              fixed_ratio="8:4") == ["8:4"]
+
+
+def _span(table, floor, pinned, applied):
+    lvl = F.ratio_to_level("8:0", table) if pinned else None
+    reach = F.reachable_ratios(F.MODE_MIN_ADAPTIVE, table, floor, pinned_level=lvl)
+    v = F.ladder_view(SCALE, reach, applied, floor, F.MODE_MIN_ADAPTIVE,
+                      pinned=pinned)
+    return (v["reach_lo"], v["reach_hi"]), v["applied_index"], v["pinned"]
+
+
+def test_spans_identify_the_driver_in_full_redundancy():
+    cell, base = F.DEFAULT_CELL_LOSS_TABLE, F.DEFAULT_LOSS_TABLE
+    # Pinned (full mode, both links up): ONE reachable rung, and which rung it
+    # is names the driver — position 0 cellular, position 1 non-cellular.
+    assert _span(cell, "12:1", True, "12:1") == ((0, 0), 0, True)
+    assert _span(base, "8:1", True, "8:1") == ((1, 1), 1, True)
+    # Backoff released (a link dropped): the span opens up to each profile's
+    # own ceiling — cellular stops at 8:1, the base table runs to 8:8.
+    assert _span(cell, "12:1", False, "12:1") == ((0, 1), 0, False)
+    assert _span(base, "8:1", False, "8:4") == ((1, 5), 3, False)
+
+
+def test_ladder_view_marks_below_floor_and_missing_positions():
+    v = F.ladder_view(SCALE, ["12:1"], "8:0", "12:1", F.MODE_MIN_ADAPTIVE)
+    assert v["below_floor"] is True
+    assert v["applied_index"] == -1     # 8:0 is under every rung of the scale
+    # Nothing reachable maps onto the scale: an unshaded row, not position 0.
+    empty = F.ladder_view(SCALE, ["8:0"], "8:0", "8:0", F.MODE_ADAPTIVE)
+    assert (empty["reach_lo"], empty["reach_hi"]) == (-1, -1)
+
+
+def test_scale_index_rounds_down_and_reports_absence():
+    assert F.scale_index(SCALE, "8:2") == 2
+    assert F.scale_index(SCALE, "10:1") == 0    # 10% -> between 12:1 and 8:1
+    assert F.scale_index(SCALE, "8:0") == -1    # below every rung
+    assert F.scale_index(SCALE, "junk") == -1
+
+
+def test_pinned_is_meaningless_outside_the_adaptive_modes():
+    # reachable_ratios ignores pinned_level for off/fixed — the adaptive engine
+    # does not pick the ratio there — so a caller must not report those as
+    # pinned either. This asserts the helper's half of that contract.
+    base = F.DEFAULT_LOSS_TABLE
+    assert F.reachable_ratios(F.MODE_FIXED, base, "8:1", fixed_ratio="8:4",
+                              pinned_level=0) == ["8:4"]
+    assert F.reachable_ratios(F.MODE_OFF, base, "8:1", pinned_level=0) == ["8:0"]
+
+
+def test_fixed_mode_scale_is_a_ladder_not_a_single_rung():
+    # Built only from what fixed mode reaches, the scale would be ["20:1"] and
+    # scale_index would round EVERY other ratio down onto that one pip — a
+    # relay still applying 8:8 across an unacknowledged change would light the
+    # 20:1 dot. The chosen ratio needs a ladder to sit on.
+    scale = F.ladder_scale(PROFILES, F.MODE_FIXED, fixed_ratio="20:1")
+    assert scale == ["8:0", "20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+    assert F.scale_index(scale, "20:1") == 1
+    assert F.scale_index(scale, "8:8") == 7        # distinct pip, not rounded
+    # Only the fixed ratio is reachable, so exactly one rung shades.
+    v = F.ladder_view(scale, F.reachable_ratios(F.MODE_FIXED,
+                                                F.DEFAULT_LOSS_TABLE, "8:1",
+                                                fixed_ratio="20:1"),
+                      "20:1", "8:1", F.MODE_FIXED)
+    assert (v["reach_lo"], v["reach_hi"]) == (1, 1)
+
+
+def test_off_mode_scale_also_keeps_its_ladder():
+    scale = F.ladder_scale(PROFILES, F.MODE_OFF)
+    assert scale[0] == "8:0" and len(scale) > 1
+    v = F.ladder_view(scale, F.reachable_ratios(F.MODE_OFF,
+                                                F.DEFAULT_LOSS_TABLE, "8:1"),
+                      "8:0", "8:1", F.MODE_OFF)
+    assert (v["reach_lo"], v["reach_hi"]) == (0, 0)
+
+
+def test_adaptive_scales_are_unchanged_by_the_context_rule():
+    assert F.ladder_scale(PROFILES, F.MODE_MIN_ADAPTIVE) == SCALE
+    assert F.ladder_scale(PROFILES, F.MODE_ADAPTIVE) == \
+        ["8:0", "20:1", "12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+
+
+def test_scale_admits_a_peers_off_scale_ratio():
+    # No cellular profile, so 20:1 is on nobody's ladder. A relay still
+    # applying it across an unacknowledged change would otherwise round down
+    # onto 8:0 and the card would understate its parity as zero.
+    base_only = [(F.DEFAULT_LOSS_TABLE, "8:1")]
+    without = F.ladder_scale(base_only, F.MODE_FIXED, fixed_ratio="8:1")
+    assert "20:1" not in without
+    assert F.scale_index(without, "20:1") == F.scale_index(without, "8:0")
+    with_relay = F.ladder_scale(base_only, F.MODE_FIXED, fixed_ratio="8:1",
+                                extra=["20:1"])
+    assert "20:1" in with_relay
+    assert F.scale_index(with_relay, "20:1") != F.scale_index(with_relay, "8:0")
+
+
+def test_scale_extra_ignores_unusable_values():
+    base_only = [(F.DEFAULT_LOSS_TABLE, "8:1")]
+    assert F.ladder_scale(base_only, F.MODE_MIN_ADAPTIVE,
+                          extra=["junk", "", "1:254"]) == \
+        F.ladder_scale(base_only, F.MODE_MIN_ADAPTIVE)

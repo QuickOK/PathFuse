@@ -864,6 +864,24 @@ def resolve_fec_profile(fec_cfg, driver_wan):
             p.floor_ratio, p.signal_floor_fec)
 
 
+def fec_profile_candidates(cfg: Config, ov: RuntimeOverlay):
+    """[(loss_table, floor_ratio)] for every profile that could drive FEC.
+
+    The driver WAN is chosen per tick, so any of these can be active moments
+    from now; the UI's scale has to span all of them or its positions would
+    shift under the operator on a driver change. Each floor goes through the
+    same precedence the live path uses, so a runtime override is reflected in
+    the scale rather than sitting off the end of it."""
+    if not cfg.fec:
+        return []
+    out = [(cfg.fec.loss_table, effective_fec_floor_ratio(cfg, ov))]
+    for p in cfg.fec.wan_profiles.values():
+        out.append((p.loss_table,
+                    effective_fec_floor_ratio(cfg, ov,
+                                              profile_floor=p.floor_ratio)))
+    return out
+
+
 def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
     """Reconcile decision: POST when desired differs from last-acked (assert until
     acked), on the first tick, or once the heartbeat elapses (defends against an
@@ -875,7 +893,39 @@ def should_post_fec(desired, last_acked, last_post_ts, now, heartbeat_s=30.0):
     return (now - last_post_ts) >= heartbeat_s
 
 
-def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=None):
+def _relay_ladder_table(data, ladder_inputs):
+    """The loss table to rebuild the relay's row against, or None to keep the
+    relay's own ladder.
+
+    Every setting the rebuild needs must be present IN THE RELAY'S REPORT.
+    Substituting our desired values for missing ones would publish a floor and
+    a reachable span the relay never claimed — which is precisely what this
+    card must never do, since the two disagree exactly when it matters (an
+    unacknowledged push, or a restart that reverted the relay to its config).
+    A relay too old to report them keeps its own ladder instead.
+
+    `profile` must also be a string: /fec is remote JSON, and an unhashable
+    value would raise on the dict lookup and take the controller loop with it.
+    """
+    mode, floor = data.get("mode"), data.get("floor_ratio")
+    profile = data.get("profile")
+    if not isinstance(mode, str) or not isinstance(floor, str) or not floor:
+        return None
+    if mode == fec_control.MODE_FIXED and not isinstance(
+            data.get("fixed_ratio"), str):
+        return None
+    if not isinstance(profile, str):
+        return None
+    if profile == "default":
+        return ladder_inputs["default_table"]
+    # A profile we no longer have (removed or renamed in config; the relay
+    # keeps reporting the pushed name until it goes stale) cannot be modelled —
+    # defaulting its table would claim rungs its real one caps below.
+    return ladder_inputs["tables"].get(profile)
+
+
+def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=None,
+                        ladder_inputs=None):
     """Shape the relay->client published direction dict from a fetch_relay_fec result.
 
     `desired` / `last_acked` are the 6-tuple
@@ -884,6 +934,31 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
     echoes back what it actually applied."""
     fetch = fetch or {}
     data = fetch.get("data") or {}
+    # The relay publishes a ladder of its own, but it is scaled to the relay's
+    # view of one profile. Re-derive the row against OUR cross-profile scale so
+    # both cards share positions; the relay's own stays as the fallback for a
+    # client that could not build one (cfg.fec absent) and for anyone reading
+    # /fec directly.
+    #
+    # Every INPUT comes from what the relay reports, not from what we desire.
+    # While a push is unacknowledged the two disagree, and a relay restart
+    # reverts it to its config floor for up to a heartbeat — deriving the span
+    # from our desired settings would have this card claim reachability, or a
+    # floor, that the relay is not honoring. Our values are the fallback only
+    # for a relay too old to report them.
+    ladder = data.get("ladder")
+    table = _relay_ladder_table(data, ladder_inputs) if (
+        ladder_inputs is not None and fetch.get("ok")) else None
+    if table is not None:
+        mode, floor = data["mode"], data["floor_ratio"]
+        ladder = fec_control.ladder_view(
+            ladder_inputs["scale"],
+            # No pinned_level: the relay's run_once calls loss_to_level
+            # directly and never consults mode_aware_level, so full-redundancy
+            # backoff does not apply to this leg however our own is behaving.
+            fec_control.reachable_ratios(
+                mode, table, floor, fixed_ratio=data.get("fixed_ratio")),
+            data.get("ratio"), floor, mode, pinned=False)
     return {
         "enabled": data.get("enabled"),
         "mode": data.get("mode"),
@@ -895,7 +970,7 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
         "level": data.get("level"),
         # Absent from a relay older than the ladder field; the UI falls back to
         # a fixed-width pip row rather than showing an empty one.
-        "ladder": data.get("ladder"),
+        "ladder": ladder,
         "driving_loss_pct": data.get("driving_loss_pct"),
         "loss_source": data.get("loss_source"),
         "since": data.get("since"),
@@ -2584,6 +2659,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         # active loss table, and the UI must fall back rather than be handed a
         # ladder derived from the wrong one.
         fec_ladder = None
+        fec_ladder_r2c = None
         relay_desired = (fec_mode_eff, fec_fixed_ratio_eff, fec_floor_ratio_eff)
         if cfg.fec:
             # Our TX leg repairs client->relay loss, which only the relay can
@@ -2684,8 +2760,59 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             # Ladder for the UI's pip row. Keyed on fec_current_ratio (what the
             # actuator accepted), not _fec_ratio (what we wanted): a failed FIFO
             # write must not light dots for parity that isn't on the wire.
-            fec_ladder = fec_control.ladder_state(
-                fec_mode_eff, fec_current_ratio, fec_floor_ratio_eff, prof_table)
+            #
+            # The scale spans every profile that could drive either leg, so a
+            # position means one ratio no matter which profile is active — that
+            # is what lets the shaded span identify the driver. Only the client
+            # can build it: it knows every profile's table AND floor, while the
+            # relay is pushed a single resolved floor and never sees our link
+            # states. So we compute BOTH legs' views here.
+            _relay_now = (fec_relay_last or {}).get("data") or {}
+            fec_scale = fec_control.ladder_scale(
+                fec_profile_candidates(cfg, ov), fec_mode_eff,
+                fixed_ratio=fec_fixed_ratio_eff,
+                # What the relay is applying RIGHT NOW, which across an
+                # unacknowledged change our own settings would not produce.
+                # Omitting it rounds that ratio down onto a lower rung, so the
+                # card would understate parity the relay really is sending.
+                extra=[r for r in (_relay_now.get("ratio"),
+                                   _relay_now.get("fixed_ratio"))
+                       if isinstance(r, str)])
+            # Full-redundancy backoff pins the adaptive engine to one rung, so
+            # the client leg's reachable span collapses to a single ratio. The
+            # relay never applies this backoff (its run_once calls loss_to_level
+            # directly), so its span stays the full floor-to-top range — the two
+            # legs genuinely differ here, and the row now shows that.
+            # fec_full_backoff tracks the ROUTING mode and up-count alone, but
+            # backoff only holds anything when the adaptive engine is what
+            # picks the ratio: 'off' and 'fixed' ignore the engine entirely, so
+            # reporting them as pinned would put "· pinned" on a row nothing is
+            # pinning.
+            fec_pinned = fec_full_backoff and fec_mode_eff in (
+                fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE)
+            fec_pinned_level = (
+                fec_control.ratio_to_level(cfg.fec.full_mode_backoff_fec,
+                                           prof_table)
+                if fec_pinned else None)
+            fec_ladder = fec_control.ladder_view(
+                fec_scale,
+                fec_control.reachable_ratios(
+                    fec_mode_eff, prof_table, fec_floor_ratio_eff,
+                    fixed_ratio=fec_fixed_ratio_eff,
+                    pinned_level=fec_pinned_level),
+                fec_current_ratio, fec_floor_ratio_eff, fec_mode_eff,
+                pinned=fec_pinned)
+            # The relay leg's span is built entirely from the relay's OWN
+            # reported settings (see relay_fec_direction). These are only the
+            # shared scale and the tables it may name — deliberately NOT our
+            # mode/floor/fixed, so there is nothing here to fall back to and
+            # the card cannot assert a setting the relay never reported.
+            fec_ladder_r2c = {
+                "scale": fec_scale,
+                "tables": {name: p.loss_table
+                           for name, p in cfg.fec.wan_profiles.items()},
+                "default_table": cfg.fec.loss_table,
+            }
 
             # Reconcile desired mode/ratio to relay on the remote-fetch cadence
             # only (best-effort) — rate-limiting to the relay tick keeps a slow
@@ -2809,7 +2936,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                         fec_relay_last, fec_relay_last_at, loop_start,
                         relay_desired, fec_relay_last_acked,
                         local_rx=(wire_tracker.rx_snapshot(loop_start)
-                                  if wire_tracker else None)),
+                                  if wire_tracker else None),
+                        ladder_inputs=fec_ladder_r2c),
                 },
             },
             "environmental": environmental_snapshot(

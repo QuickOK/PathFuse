@@ -168,6 +168,107 @@ def test_relay_fec_direction_passes_through_ladder():
     assert d["ladder"] == lad
 
 
+def _ladder_inputs(scale):
+    # Deliberately carries no client mode/floor/fixed: the rebuild must take
+    # every setting from the relay's own report or not run at all.
+    import fec_control as F
+    return {"scale": scale,
+            "tables": {"wan1": F.DEFAULT_CELL_LOSS_TABLE},
+            "default_table": F.DEFAULT_LOSS_TABLE}
+
+
+SCALE = ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"]
+
+
+def test_relay_fec_direction_rescales_the_relay_ladder():
+    # The relay's own ladder is scaled to its view of one profile. The client
+    # re-derives it against the shared cross-profile scale so both cards share
+    # positions — anchored on what the relay REPORTS.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:4", "level": 2, "mode": "min_adaptive", "floor_ratio": "8:1",
+        "profile": "default",
+        "ladder": {"levels": 5, "floor_level": 0, "applied_level": 2}}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"]["scale"] == SCALE
+    assert d["ladder"]["applied_index"] == 3          # 8:4
+    assert (d["ladder"]["reach_lo"], d["ladder"]["reach_hi"]) == (1, 5)
+    # The relay never applies full-redundancy backoff, so its span is never
+    # pinned even while the client leg is.
+    assert d["ladder"]["pinned"] is False
+
+
+def test_relay_ladder_follows_the_relay_not_our_desired_settings():
+    # Mid-reconcile: we want min_adaptive at 8:1, the relay is still OFF. The
+    # card must not claim the floor or the adaptive span we have not got yet.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:0", "mode": "off", "floor_ratio": "8:1",
+        "profile": "default"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    lad = d["ladder"]
+    assert lad["floor_index"] == -1                   # not min_adaptive there
+    assert (lad["reach_lo"], lad["reach_hi"]) == (-1, -1)   # 8:0 is off-scale
+    assert lad["applied_index"] == -1
+    assert lad["below_floor"] is False
+
+
+def test_relay_ladder_uses_the_relays_floor_after_a_restart():
+    # A restarted relay reverts to its config floor for up to a heartbeat. Its
+    # 20:1 is beneath every rung of our scale, so the row places nothing rather
+    # than pretending the operator's floor is in force.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "20:1", "mode": "min_adaptive", "floor_ratio": "20:1",
+        "profile": "wan1"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"]["applied_index"] == -1
+    assert d["ladder"]["below_floor"] is False        # 20:1 IS the relay's floor
+
+
+def test_relay_ladder_not_rebuilt_when_the_relay_omits_settings():
+    # A minimal or older response is NOT enough. Substituting our desired mode
+    # and floor for the missing ones would publish a floor and a reachable span
+    # the relay never claimed.
+    relay_own = {"levels": 5, "floor_level": 0, "applied_level": 1}
+    fetch = {"ok": True, "error": None,
+             "data": {"ratio": "8:2", "ladder": relay_own}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"] == relay_own
+    # Fixed mode additionally needs the ratio it is fixed AT.
+    nofixed = {"ok": True, "error": None, "data": {
+        "ratio": "8:2", "mode": "fixed", "floor_ratio": "8:1",
+        "profile": "default"}}
+    assert M.relay_fec_direction(nofixed, 100.0, 100.5, True, True,
+                                 ladder_inputs=_ladder_inputs(SCALE))["ladder"] is None
+
+
+def test_relay_ladder_survives_a_non_string_profile():
+    # /fec is remote JSON. An unhashable profile value would raise on the dict
+    # lookup and take the controller loop down with it.
+    for bad in ([], {}, 7, True):
+        fetch = {"ok": True, "error": None, "data": {
+            "ratio": "8:2", "mode": "min_adaptive", "floor_ratio": "8:1",
+            "profile": bad}}
+        d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5,
+                                  desired=True, last_acked=True,
+                                  ladder_inputs=_ladder_inputs(SCALE))
+        assert d["ladder"] is None
+
+
+def test_relay_fec_direction_keeps_relay_ladder_without_inputs():
+    fetch = {"ok": True, "error": None,
+             "data": {"ratio": "8:2", "ladder": {"levels": 5}}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True)
+    assert d["ladder"] == {"levels": 5}
+
+
 def test_relay_fec_direction_ladder_none_from_an_older_relay():
     # A relay that predates the field: the UI falls back rather than drawing an
     # empty pip row.
@@ -364,3 +465,40 @@ def test_relay_fec_direction_rx_comes_from_local_tracker_not_fetch():
 def test_relay_fec_direction_rx_defaults_none():
     d = M.relay_fec_direction({"ok": True, "data": {}}, 100.0, 101.0, "a", "a")
     assert d["rx"] is None
+
+
+def test_relay_ladder_not_rebuilt_when_the_fetch_failed():
+    # data is empty, so every input would fall back to OUR desired settings —
+    # a relay-confirmed span drawn from nothing the relay confirmed.
+    fetch = {"ok": False, "data": None, "error": "transport: x"}
+    d = M.relay_fec_direction(fetch, fetched_at=None, now=100.0, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"] is None
+
+
+def test_relay_ladder_not_rebuilt_for_an_unknown_profile():
+    # The relay keeps reporting a pushed profile name until it goes stale; if
+    # that profile has since been removed from our config, modelling it as the
+    # default table would claim rungs its real (cellular) table caps below.
+    relay_own = {"levels": 4, "floor_level": 1, "applied_level": 3}
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:1", "mode": "min_adaptive", "floor_ratio": "20:1",
+        "profile": "wan9", "ladder": relay_own}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"] == relay_own          # the relay's own view is kept
+
+
+def test_relay_ladder_rebuilt_for_the_default_profile():
+    # "default" is not a key in tables but IS resolvable — it means the base
+    # table, so this one must still be rebuilt onto the shared scale.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:2", "mode": "min_adaptive", "floor_ratio": "8:1",
+        "profile": "default"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"]["scale"] == SCALE
+    assert d["ladder"]["applied_index"] == 2
