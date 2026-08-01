@@ -1156,14 +1156,16 @@ function drawFecGraph(id, series){
         cuts.splice(1, 0, (vThresh - vA) / (vB - vA));
       const xA = X(A.t), xB = X(B.t), yA = Y(b.hi(A)), yB = Y(b.hi(B));
       for (let k = 0; k + 1 < cuts.length; k++){
-        const t0 = cuts[k], t1 = cuts[k + 1];
-        const vMid = vA + (vB - vA) * (t0 + t1) / 2;
+        // f0/f1, not t0/t1: those are the plot window's start and end time in
+        // this same closure, which X() maps through.
+        const f0 = cuts[k], f1 = cuts[k + 1];
+        const vMid = vA + (vB - vA) * (f0 + f1) / 2;
         if (vMid <= 0) continue;                    // zero band draws nothing
         const color = vMid < vThresh ? (b.mustShow ? b.color : null) : cInset;
         if (!color) continue;
         pieces.push({ color,
-                      x0: xA + (xB - xA) * t0, y0: yA + (yB - yA) * t0,
-                      x1: xA + (xB - xA) * t1, y1: yA + (yB - yA) * t1 });
+                      x0: xA + (xB - xA) * f0, y0: yA + (yB - yA) * f0,
+                      x1: xA + (xB - xA) * f1, y1: yA + (yB - yA) * f1 });
       }
     }
     // Stroke consecutive same-coloured pieces as ONE path. Drawn individually
@@ -1196,7 +1198,7 @@ function drawFecGraph(id, series){
         const x = X(p.t);
         const yHi = Y(b.hi(p));
         const yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
-        if (b.mustShow && bandValue(b, p) > 0 && Math.abs(yLo - yHi) < 2){
+        if (b.mustShow && bandValue(b, p) > 0 && Math.abs(yLo - yHi) < MIN_VIS_PX){
           // Same rule as the runs below, in the degenerate one-sample case:
           // centred on the true edge so it does not drift off its value.
           ctx.fillStyle = b.color;
