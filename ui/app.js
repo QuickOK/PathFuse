@@ -1104,6 +1104,26 @@ function drawFecGraph(id, series){
   // horizontal gridlines + y labels (pkt/s)
   const axisU = axisUnit(axisMax);
   const axisDp = axisDecimals(axisStep / axisU.div);
+  // The gutter is a fixed width, so rather than chasing the unit ladder ever
+  // upward, ask the canvas whether the labels actually fit and fall back to
+  // exponential when they do not — that stays ~6 characters at any magnitude.
+  // Rates come from counter deltas, so a wrapped counter or a clock step can
+  // produce an absurd one, and the chart has to degrade rather than draw off
+  // the edge. Requires ctx.font, set above.
+  const axisBudget = ML - 8;
+  const axisFormats = [
+    v => (v / axisU.div).toFixed(axisDp) + axisU.suffix,   // 12.5k
+    v => v.toExponential(1),                               // 1.2e+18
+    v => v.toExponential(0),                               // 1e+18
+  ];
+  const axisFits = fmt => {
+    for (let i = 0; i <= Y_TICKS; i++)
+      if (ctx.measureText(fmt(axisStep * i)).width > axisBudget) return false;
+    return true;
+  };
+  // Take the most precise form that fits, not merely the next one down —
+  // checking only the primary left the fallback free to overflow just as far.
+  const axisLabel = axisFormats.find(axisFits) || axisFormats[axisFormats.length - 1];
   ctx.textAlign = "right";
   for (let i = 0; i <= Y_TICKS; i++){
     const val = axisStep * i;
@@ -1111,7 +1131,7 @@ function drawFecGraph(id, series){
     ctx.beginPath(); ctx.moveTo(plotL, y); ctx.lineTo(plotR, y);
     ctx.lineWidth = 1; ctx.strokeStyle = i === 0 ? cAxis : cGrid; ctx.stroke();
     ctx.fillStyle = cFgDim;
-    ctx.fillText((val / axisU.div).toFixed(axisDp) + axisU.suffix, plotL - 6, y);
+    ctx.fillText(axisLabel(val), plotL - 6, y);
   }
   // vertical gridlines + time labels, one per minute of the window
   ctx.textAlign = "center";
