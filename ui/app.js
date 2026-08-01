@@ -1130,9 +1130,25 @@ function drawFecGraph(id, series){
   // survives wherever it fits.
   const MIN_VIS_PX = 3;
   const bandValue = (b, p) => b.hi(p) - b.lo(p);
-  // Stroke a band's top edge only over the consecutive stretches where `want`
-  // holds, so the separator and the presence mark can each claim the parts of
-  // the edge they belong on without one painting over the other.
+  // Thin marks are a rendering floor, so two of them can collide: with
+  // recovered and lost both tiny their edges are a fraction of a pixel apart,
+  // and whichever draws second hides the other outright. Give each thin band
+  // its own MIN_VIS_PX of screen, stacked in the same order as the bands, so
+  // simultaneous events stay separately readable. Ordering stays truthful;
+  // only the exact y is floored, and only for bands already too small to
+  // render at all.
+  const isThin = (b, p) => bandValue(b, p) > 0 &&
+    Math.abs(Y(b.lo(p)) - Y(b.hi(p))) < MIN_VIS_PX;
+  const markOffset = (b, p) => {
+    if (!b.mustShow || !isThin(b, p)) return 0;
+    let off = 0;
+    for (const other of bands){
+      if (other === b) break;                       // bands below this one only
+      if (other.mustShow && isThin(other, p)) off += MIN_VIS_PX;
+    }
+    return off;
+  };
+
   // Walk the top edge segment by segment and give each piece the style it has
   // earned: the surface separator where the band has room for one, its own
   // colour where it is too thin to survive one.
@@ -1154,7 +1170,9 @@ function drawFecGraph(id, series){
       const cuts = [0, 1];
       if ((vA < vThresh) !== (vB < vThresh) && vA !== vB)
         cuts.splice(1, 0, (vThresh - vA) / (vB - vA));
-      const xA = X(A.t), xB = X(B.t), yA = Y(b.hi(A)), yB = Y(b.hi(B));
+      const xA = X(A.t), xB = X(B.t);
+      // Lift a thin mark clear of any thin mark below it (see markOffset).
+      const yA = Y(b.hi(A)) - markOffset(b, A), yB = Y(b.hi(B)) - markOffset(b, B);
       for (let k = 0; k + 1 < cuts.length; k++){
         // f0/f1, not t0/t1: those are the plot window's start and end time in
         // this same closure, which X() maps through.
@@ -1187,24 +1205,15 @@ function drawFecGraph(id, series){
     });
     flush();
   }
+  // Pass 1: every fill. A later band's translucent fill lands exactly on the
+  // edge of the one beneath it, so drawing fills and marks interleaved let a
+  // fill wash out a mark that was already correct.
   bands.forEach(b => {
     runs.forEach(run => {
       if (run.length === 1){
-        // Single-sample run: the polygon fill/stroke below degenerates to a
-        // zero-area line and draws nothing. Render a minimal visible mark
-        // instead — a 2px-wide filled rect spanning lo->hi at that x — and
-        // skip the separator stroke (there's no edge to draw it along).
-        const p = run[0];
-        const x = X(p.t);
-        const yHi = Y(b.hi(p));
-        const yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
-        if (b.mustShow && bandValue(b, p) > 0 && Math.abs(yLo - yHi) < MIN_VIS_PX){
-          // Same rule as the runs below, in the degenerate one-sample case:
-          // centred on the true edge so it does not drift off its value.
-          ctx.fillStyle = b.color;
-          ctx.fillRect(x - 1, yHi - 1, 2, 2);
-          return;
-        }
+        const p = run[0], x = X(p.t);
+        const yHi = Y(b.hi(p)), yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
+        if (b.mustShow && isThin(b, p)) return;     // pass 2 marks this one
         ctx.globalAlpha = 0.55; ctx.fillStyle = b.color;
         ctx.fillRect(x - 1, Math.min(yHi, yLo), 2, Math.abs(yLo - yHi));
         ctx.globalAlpha = 1;
@@ -1216,12 +1225,22 @@ function drawFecGraph(id, series){
       ctx.closePath();
       ctx.globalAlpha = 0.55; ctx.fillStyle = b.color; ctx.fill();
       ctx.globalAlpha = 1;
-      // The surface separator sits ON the band's top edge, 1px either side, so
-      // it lands on whatever is immediately below — for a band with no room of
-      // its own that is the band beneath, which it erases. A zero-height band
-      // has nothing to separate anyway. So draw it only across the stretches
-      // this band is genuinely thick enough to carry it, and give the thin
-      // stretches the band's own colour instead.
+    });
+  });
+
+  // Pass 2: separators and visibility marks, on top of every fill.
+  bands.forEach(b => {
+    runs.forEach(run => {
+      if (run.length === 1){
+        // A one-sample run has no edge to stroke; mark it directly, centred on
+        // the true edge so it does not drift off its value.
+        const p = run[0];
+        if (!b.mustShow || !isThin(b, p)) return;
+        const x = X(p.t), y = Y(b.hi(p)) - markOffset(b, p);
+        ctx.fillStyle = b.color;
+        ctx.fillRect(x - 1, y - 1, 2, 2);
+        return;
+      }
       strokeBandEdge(b, run);
     });
   });
