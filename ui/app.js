@@ -1113,10 +1113,50 @@ function drawFecGraph(id, series){
   // Position encodes identity (CVD-safe with the 2px separators below).
   const bands = [
     { lo: () => 0,                              hi: p => p.delivered || 0,                                    color: cDelivered },
-    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cRecovered },
+    { lo: p => p.delivered || 0,                hi: p => (p.delivered || 0) + (p.recovered || 0),             color: cRecovered, mustShow: true },
     { lo: p => (p.delivered || 0) + (p.recovered || 0),
-      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cLost },
+      hi: p => (p.delivered || 0) + (p.recovered || 0) + (p.lost || 0),                                       color: cLost, mustShow: true },
   ];
+  // Recovery and loss are the events worth seeing, and they are exactly the
+  // ones the scale hides: delivered sets the axis, so a handful of recovered
+  // packets against thousands delivered is a sub-pixel sliver — and then the
+  // 2px separator drawn on its top edge paints over what little there was, so
+  // the event is in the data and absent from the chart. Where a band is too
+  // thin to survive that, stroke its OWN colour along its true top edge at
+  // full opacity. Ink guarantees the event is seen; putting it exactly on the
+  // boundary marks presence without overstating magnitude, which inflating the
+  // band to a minimum height would do on an axis that is labelled in pkt/s.
+  // Bands with room keep the surface separator, so the gap between fills
+  // survives wherever it fits.
+  const MIN_VIS_PX = 3;
+  const bandThin = (b, p) =>
+    Math.abs(Y(b.lo(p)) - Y(b.hi(p))) < MIN_VIS_PX;
+  const bandValue = (b, p) => b.hi(p) - b.lo(p);
+  // Stroke a band's top edge only over the consecutive stretches where `want`
+  // holds, so the separator and the presence mark can each claim the parts of
+  // the edge they belong on without one painting over the other.
+  function strokeEdge(b, run, want, color){
+    let seg = [];
+    const flush = () => {
+      if (!seg.length) return;
+      ctx.beginPath();
+      if (seg.length === 1){
+        // A lone sample has no span to stroke; 2px of width keeps it visible.
+        const x = X(seg[0].t), y = Y(b.hi(seg[0]));
+        ctx.moveTo(x - 1, y); ctx.lineTo(x + 1, y);
+      } else {
+        seg.forEach((p, i) => {
+          const x = X(p.t), y = Y(b.hi(p));
+          i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        });
+      }
+      ctx.lineWidth = 2; ctx.strokeStyle = color; ctx.globalAlpha = 1;
+      ctx.lineCap = "round"; ctx.stroke(); ctx.lineCap = "butt";
+      seg = [];
+    };
+    run.forEach(p => { want(p) ? seg.push(p) : flush(); });
+    flush();
+  }
   bands.forEach(b => {
     runs.forEach(run => {
       if (run.length === 1){
@@ -1128,6 +1168,13 @@ function drawFecGraph(id, series){
         const x = X(p.t);
         const yHi = Y(b.hi(p));
         const yLo = Y(typeof b.lo === "function" ? b.lo(p) : 0);
+        if (b.mustShow && bandValue(b, p) > 0 && Math.abs(yLo - yHi) < 2){
+          // Same rule as the runs below, in the degenerate one-sample case:
+          // centred on the true edge so it does not drift off its value.
+          ctx.fillStyle = b.color;
+          ctx.fillRect(x - 1, yHi - 1, 2, 2);
+          return;
+        }
         ctx.globalAlpha = 0.55; ctx.fillStyle = b.color;
         ctx.fillRect(x - 1, Math.min(yHi, yLo), 2, Math.abs(yLo - yHi));
         ctx.globalAlpha = 1;
@@ -1139,10 +1186,15 @@ function drawFecGraph(id, series){
       ctx.closePath();
       ctx.globalAlpha = 0.55; ctx.fillStyle = b.color; ctx.fill();
       ctx.globalAlpha = 1;
-      // 2px surface separator on the band's top edge, per run
-      ctx.beginPath();
-      run.forEach((p, i) => { const x = X(p.t), y = Y(b.hi(p)); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
-      ctx.lineWidth = 2; ctx.strokeStyle = cInset; ctx.stroke();
+      // The surface separator sits ON the band's top edge, 1px either side, so
+      // it lands on whatever is immediately below — for a band with no room of
+      // its own that is the band beneath, which it erases. A zero-height band
+      // has nothing to separate anyway. So draw it only across the stretches
+      // this band is genuinely thick enough to carry it, and give the thin
+      // stretches the band's own colour instead.
+      strokeEdge(b, run, p => !bandThin(b, p), cInset);
+      if (b.mustShow) strokeEdge(b, run, p => bandValue(b, p) > 0 && bandThin(b, p),
+                                 b.color);
     });
   });
   // wasted parity: thin muted overlay line. Honor the same gap/validity rules
