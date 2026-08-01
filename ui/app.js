@@ -999,9 +999,31 @@ const AXIS_STEPS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
 function niceAxis(peak, ticks){
   if (!(peak > 0) || !isFinite(peak)) return { max: 1, step: 1 / ticks };
   const raw = peak / ticks;
-  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
-  const step = tidy((AXIS_STEPS.find(sv => sv * mag >= raw * (1 - 1e-9)) || 10) * mag);
-  return { max: tidy(step * ticks), step };
+  let mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  let i = AXIS_STEPS.findIndex(sv => sv * mag >= raw * (1 - 1e-9));
+  if (i < 0){ i = 0; mag *= 10; }
+  for (let guard = 0; guard < 64; guard++){
+    const step = tidy(AXIS_STEPS[i] * mag);
+    const max = tidy(step * ticks);
+    // The epsilon above tolerates float noise in the comparison, and tidy()
+    // rounds to 12 significant digits; either can land the max a hair UNDER
+    // the peak, which clips the top of the data outside the plot. Step up the
+    // ladder until it cannot.
+    if (max >= peak) return { max, step };
+    if (++i >= AXIS_STEPS.length){ i = 0; mag *= 10; }
+  }
+  return { max: tidy(raw * ticks), step: tidy(raw) };
+}
+
+// A 44px gutter fits about six digits at 10px. Past that the labels run off
+// the canvas, so scale the whole axis to one unit — all of them, never a mix
+// of "7500" and "10k" down the same column.
+function axisUnit(max){
+  if (max >= 1e12) return { div: 1e12, suffix: "T" };
+  if (max >= 1e9)  return { div: 1e9,  suffix: "G" };
+  if (max >= 1e6)  return { div: 1e6,  suffix: "M" };
+  if (max >= 1e4)  return { div: 1e3,  suffix: "k" };
+  return { div: 1, suffix: "" };
 }
 
 // 0.2 * 3 is 0.6000000000000001 in binary floating point; that reaches the
@@ -1080,7 +1102,8 @@ function drawFecGraph(id, series){
   ctx.textBaseline = "middle";
 
   // horizontal gridlines + y labels (pkt/s)
-  const axisDp = axisDecimals(axisStep);
+  const axisU = axisUnit(axisMax);
+  const axisDp = axisDecimals(axisStep / axisU.div);
   ctx.textAlign = "right";
   for (let i = 0; i <= Y_TICKS; i++){
     const val = axisStep * i;
@@ -1088,7 +1111,7 @@ function drawFecGraph(id, series){
     ctx.beginPath(); ctx.moveTo(plotL, y); ctx.lineTo(plotR, y);
     ctx.lineWidth = 1; ctx.strokeStyle = i === 0 ? cAxis : cGrid; ctx.stroke();
     ctx.fillStyle = cFgDim;
-    ctx.fillText(val.toFixed(axisDp), plotL - 6, y);
+    ctx.fillText((val / axisU.div).toFixed(axisDp) + axisU.suffix, plotL - 6, y);
   }
   // vertical gridlines + time labels, one per minute of the window
   ctx.textAlign = "center";
