@@ -34,6 +34,22 @@ packet lost on *one* link — floor parity is what recovers packets dropped on b
 ~8–12% overhead on an already-doubled stream. Net effect: with a floor configured,
 `full_mode_backoff_fec` bounds only the adaptive component and cannot undercut the floor.
 
+**The driver WAN is sticky, because it selects policy and not just a number.** The driver is the
+worst active link, and it picks the whole FEC policy — table, floor, hysteresis — so changing it
+swaps the ladder beneath the adaptive engine and reseeds its runtime. `step_level` damps the
+*ratio* against loss jitter, but nothing damped the *driver*: on a duplicated stream where both
+links sit near zero loss, it flipped on noise (measured: 82 profile switches in 24h, median 95s
+apart, every one in full redundancy where the ratio should not have moved at all). A challenger
+must now be worse by `driver_loss_margin_pct` and stay worse for `driver_dwell_s`, mirroring
+`policy.dynamic_*` for master selection.
+
+Stickiness alone would strand the driver on whichever link last degraded, so when nothing is
+materially worse the canonical ranking challenges the incumbent under the same dwell and the driver
+comes home. That return path is load-bearing: the cellular signal floor only engages while the
+cellular WAN is the driver, so a driver that never came home would silently disarm it. Only one WAN
+active — every mode but full redundancy — short-circuits entirely, so this cannot delay a
+master_backup failover.
+
 **The wall display draws one fixed scale, and shades what is reachable.** Each direction publishes a
 `ladder`: a `scale` of rungs, the inclusive `reach_lo`/`reach_hi` span currently available, and
 `applied_index` / `floor_index` within it. The row always draws the whole scale, so a position means

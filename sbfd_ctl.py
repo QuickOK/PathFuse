@@ -102,6 +102,13 @@ class FecCfg:
     fixed_ratio: str = fec_control.DEFAULT_FIXED_RATIO
     floor_ratio: str = fec_control.DEFAULT_FLOOR_RATIO
     wan_profiles: dict = field(default_factory=dict)
+    # Hysteresis on the DRIVER choice, mirroring policy.dynamic_* for the
+    # master. step_level damps the ratio, but nothing damped the driver, so a
+    # momentary loss blip on the other link swapped the profile — and with it
+    # the table and floor — beneath the adaptive engine. Only bites when more
+    # than one WAN is active, i.e. full redundancy.
+    driver_loss_margin_pct: float = 1.0
+    driver_dwell_s: float = 120.0
 
 
 @dataclass
@@ -849,6 +856,64 @@ def fec_driver_wan(loss, active_wans):
     return max(sorted(active), key=lambda w: loss.get(w, 0.0))
 
 
+def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
+                    loss_margin_pct, dwell_s, now):
+    """Sticky version of fec_driver_wan: (driver, candidate, candidate_since).
+
+    The driver picks the WHOLE FEC policy — table, floor, hysteresis — so
+    changing it swaps the ladder beneath the adaptive engine and reseeds its
+    runtime. step_level damps the ratio against loss jitter, but nothing damped
+    this, so on a duplicated stream where both links are near zero loss the
+    driver flipped on noise: measured 82 profile switches in 24h, median 95s
+    apart, every one of them in full redundancy where the ratio should not have
+    moved at all.
+
+    So a challenger must be worse than the incumbent by loss_margin_pct AND
+    stay worse for dwell_s. Sticky toward the incumbent, which is what keeps a
+    tie (both links clean) from resolving on alphabetical order every tick.
+
+    Only one WAN active — every mode but full redundancy — has no race to lose
+    and short-circuits, so this cannot delay a master_backup failover.
+    """
+    active = active_wans or set(loss.keys())
+    if not active:
+        return None, None, None
+    if len(active) == 1:
+        return next(iter(active)), None, None
+    if current is None or current not in active:
+        # Nothing to be sticky about yet (boot, or the incumbent stopped
+        # carrying traffic): take the raw ranking and start clean.
+        return fec_driver_wan(loss, active), None, None
+
+    cur_loss = loss.get(current, 0.0)
+    challenger = None
+    for w in sorted(active):
+        if w == current:
+            continue
+        if loss.get(w, 0.0) >= cur_loss + loss_margin_pct:
+            challenger = w
+            break
+
+    if challenger is None:
+        # Nobody is materially worse, so the incumbent has no claim beyond
+        # having been here. Let the canonical ranking challenge it, under the
+        # same dwell: without this the driver never comes home after a
+        # degradation ends, and a leg that once flipped to the non-cellular
+        # profile would stay there — silently disarming the cell signal floor,
+        # which only engages while the cellular WAN is the driver.
+        canonical = fec_driver_wan(loss, active)
+        if canonical is not None and canonical != current:
+            challenger = canonical
+
+    if challenger is None:
+        return current, None, None
+    if candidate == challenger and candidate_since is not None:
+        if now - candidate_since >= dwell_s:
+            return challenger, None, None
+        return current, candidate, candidate_since
+    return current, challenger, now
+
+
 def resolve_fec_profile(fec_cfg, driver_wan):
     """(name, loss_table, hysteresis, profile_floor, signal_floor_fec) for the
     current fec driver WAN. profile_floor is None for the default profile so
@@ -1328,6 +1393,9 @@ def load_config(path: str) -> Config:
                 fixed_ratio=raw_fec.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
                 floor_ratio=raw_fec.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO),
                 wan_profiles=profiles,
+                driver_loss_margin_pct=float(
+                    raw_fec.get("driver_loss_margin_pct", 1.0)),
+                driver_dwell_s=float(raw_fec.get("driver_dwell_s", 120.0)),
             )
 
         raw_env = raw.get("environmental")
@@ -2456,6 +2524,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
 
     fec_rt = fec_control.FecRuntime(current_level=0, up_streak=0, last_change_ts=time.time())
     fec_profile_active = "default"
+    # Sticky-driver state (see fec_driver_pick).
+    fec_driver_current = None
+    fec_driver_candidate = None
+    fec_driver_candidate_since = None
     fec_signal_floor = fec_control.SignalFloor(fec_control.SignalThresholds(
         rsrq_degrade_db=cfg.cell.rsrq_degrade_db,
         rsrq_recover_db=cfg.cell.rsrq_recover_db,
@@ -2671,7 +2743,16 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 local, last_remote, remote_fresh, cfg.wans)
             # Profile first: the driver WAN picks table/hysteresis/floor, so it
             # must be known before the adaptive engine steps.
-            fec_driver = fec_driver_wan(fec_loss, currently_active)
+            (fec_driver, fec_driver_candidate,
+             fec_driver_candidate_since) = fec_driver_pick(
+                fec_loss, currently_active, fec_driver_current,
+                fec_driver_candidate, fec_driver_candidate_since,
+                cfg.fec.driver_loss_margin_pct, cfg.fec.driver_dwell_s,
+                loop_start)
+            if fec_driver != fec_driver_current:
+                logging.info("fec driver -> %s (was %s)",
+                             fec_driver, fec_driver_current)
+            fec_driver_current = fec_driver
             # The client_to_relay direction's driver_wan/driving_loss_pct
             # predate profiles and only mean something in a mode where the
             # adaptive engine actually picks the ratio — off/fixed ignore
@@ -2909,7 +2990,18 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 # the fixed and the floor dropdown.
                 "fixed_ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
                 "ratio_presets": list(fec_control.FIXED_RATIO_PRESETS),
-                "profile": {"name": fec_profile_active, "driver_wan": fec_driver},
+                "profile": {
+                    "name": fec_profile_active, "driver_wan": fec_driver,
+                    # Mirrors the `dynamic` block: what is challenging the
+                    # driver and how long it still has to hold, so a profile
+                    # that looks stuck can be told apart from one being held.
+                    "driver_candidate": fec_driver_candidate,
+                    "driver_dwell_remaining_s": (
+                        max(0.0, cfg.fec.driver_dwell_s
+                            - (loop_start - fec_driver_candidate_since))
+                        if (cfg.fec and fec_driver_candidate_since is not None)
+                        else 0.0),
+                },
                 "signal_floor_active": fec_signal_floor_applied,
                 "directions": {
                     "client_to_relay": {

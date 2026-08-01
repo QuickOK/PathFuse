@@ -190,3 +190,16 @@ def test_fec_profile_candidates_empty_without_fec():
     d = dict(BASE)
     cfg = M.load_config(_write(d))
     assert M.fec_profile_candidates(cfg, M.RuntimeOverlay()) == []
+
+
+def test_driver_hysteresis_defaults_and_overrides():
+    d = dict(BASE)
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo"}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.driver_loss_margin_pct == 1.0
+    assert cfg.fec.driver_dwell_s == 120.0
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo",
+                "driver_loss_margin_pct": 2.5, "driver_dwell_s": 45}
+    cfg = M.load_config(_write(d))
+    assert cfg.fec.driver_loss_margin_pct == 2.5
+    assert cfg.fec.driver_dwell_s == 45.0
