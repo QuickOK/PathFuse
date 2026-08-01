@@ -970,6 +970,10 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 /* With no rungs above the floor there are no pips, and the label alone would
    sit against the card's left edge with a stray indent. */
 .fec-level .fec-level-num:first-child { margin-left: 0; }
+/* Below the floor the operator is getting LESS parity than they asked for —
+   amber, not the accent, so it doesn't read as a healthy resting state. */
+.fec-level.is-below-floor .fec-level-num { color: var(--warn); }
+.fec-level.is-below-floor .pip { border-color: rgba(251, 191, 36, 0.45); }
 .fec-meta { font-size: 13px; }
 .fec-since { font-size: 12px; color: var(--fg-muted); margin-top: 2px; }
 .fec-badges { margin-top: 8px; }

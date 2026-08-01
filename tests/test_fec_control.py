@@ -398,3 +398,41 @@ def test_ladder_state_tracks_the_applied_ratio_not_the_engine():
 def test_ladder_state_no_ratio_yet():
     # First tick before the actuator has written anything.
     assert F.ladder_state(F.MODE_ADAPTIVE, None, "20:1")["applied_level"] == 0
+
+
+def test_rung_positions_are_independent_of_row_order():
+    # A loss table's rows are ordered by loss band; nothing validates that their
+    # ratios ascend with them. Ladder positions must come from parity order, or
+    # a hand-written table silently reports the wrong rung.
+    shuffled = [
+        {"max_loss_pct": 0.5,   "fec": "8:0"},
+        {"max_loss_pct": 2.0,   "fec": "8:4"},
+        {"max_loss_pct": 5.0,   "fec": "8:6"},
+        {"max_loss_pct": 10.0,  "fec": "8:2"},
+        {"max_loss_pct": 100.0, "fec": "8:8"},
+    ]
+    assert F.ratio_rung("8:2", shuffled) == 1
+    assert F.ratio_rung("8:4", shuffled) == 2
+    assert F.ratio_rung("8:6", shuffled) == 3
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "8:2", shuffled)
+    assert lad == {"levels": 5, "floor_level": 1, "applied_level": 2}
+
+
+def test_duplicate_ratios_are_one_rung():
+    # Two loss bands carrying the same parity are one level of protection.
+    dupes = [
+        {"max_loss_pct": 0.5,   "fec": "8:0"},
+        {"max_loss_pct": 2.0,   "fec": "8:2"},
+        {"max_loss_pct": 5.0,   "fec": "8:2"},
+        {"max_loss_pct": 100.0, "fec": "8:4"},
+    ]
+    assert F.rung_overheads(dupes) == [0.0, 25.0, 50.0]
+    assert F.ladder_state(F.MODE_ADAPTIVE, "8:4", "8:0", dupes)["levels"] == 3
+
+
+def test_ladder_state_can_report_below_the_floor():
+    # The actuator refused the write after the floor rose: the ratio on the wire
+    # is the last one accepted, which is now UNDER the floor. The ladder must
+    # expose that rather than clamp it into looking like "at floor".
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "8:4")
+    assert lad["applied_level"] < lad["floor_level"]

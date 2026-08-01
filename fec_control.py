@@ -169,8 +169,31 @@ def is_level_at_max(level, table=DEFAULT_LOSS_TABLE):
     return level >= len(table) - 1
 
 
+def rung_overheads(table=DEFAULT_LOSS_TABLE):
+    """The table's distinct parity rungs, ascending by overhead.
+
+    A ladder is an ordering of PARITY, which a loss table only incidentally is:
+    its rows are ordered by loss band, and nothing validates that their ratios
+    ascend along with them. Deriving rung positions from this sorted view
+    instead of from row index keeps the pip row coherent for a hand-written
+    table whose rows are out of order, and collapses duplicate ratios — two
+    loss bands carrying the same parity are one rung, not two.
+
+    Identical to row order for every table that is already monotonic, which
+    includes both built-in tables.
+    """
+    pcts = set()
+    for row in table:
+        try:
+            pcts.add(ratio_overhead_pct(*parse_ratio(row["fec"])))
+        except (ValueError, AttributeError, TypeError,
+                KeyError, ZeroDivisionError):
+            continue
+    return sorted(pcts)
+
+
 def ratio_rung(ratio, table=DEFAULT_LOSS_TABLE):
-    """Index of the highest rung in `table` whose overhead is <= this ratio's.
+    """Position of the highest rung whose overhead is <= this ratio's.
 
     Unlike ratio_to_level this does NOT require an exact match: an operator's
     floor or fixed ratio is free to sit between two rungs (20:1 = 5% falls
@@ -178,20 +201,17 @@ def ratio_rung(ratio, table=DEFAULT_LOSS_TABLE):
     every such value to 0. Rounding DOWN is deliberate — the UI's pip row must
     never claim more protection than the ratio actually delivers.
 
-    An unparseable ratio is rung 0: a display helper must degrade, not raise.
+    An unparseable ratio, or one below even the lowest rung, is position 0: a
+    display helper must degrade, not raise.
     """
     try:
         pct = ratio_overhead_pct(*parse_ratio(ratio))
     except (ValueError, AttributeError, TypeError, ZeroDivisionError):
         return 0
     rung = 0
-    for i, row in enumerate(table):
-        try:
-            if ratio_overhead_pct(*parse_ratio(row["fec"])) <= pct:
-                rung = i
-        except (ValueError, AttributeError, TypeError,
-                KeyError, ZeroDivisionError):
-            continue
+    for i, overhead in enumerate(rung_overheads(table)):
+        if overhead <= pct:
+            rung = i
     return rung
 
 
@@ -209,7 +229,7 @@ def ladder_state(mode, ratio, floor_ratio, table=DEFAULT_LOSS_TABLE):
     the whole ladder is available.
     """
     return {
-        "levels": len(table),
+        "levels": len(rung_overheads(table)),
         "floor_level": (ratio_rung(floor_ratio, table)
                         if mode == MODE_MIN_ADAPTIVE else 0),
         "applied_level": ratio_rung(ratio, table) if ratio else 0,

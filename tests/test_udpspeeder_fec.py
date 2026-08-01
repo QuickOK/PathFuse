@@ -257,23 +257,34 @@ def test_run_publishes_ladder_for_the_active_profile(tmp_path):
                     profile_names=frozenset({"wan2"}))
     stop = _t.Event()
     th = _t.Thread(target=lambda: U.run(cfg, stop, st), daemon=True)
-    th.start()
-    _time.sleep(0.15)
-    base = st.snapshot()["ladder"]
-    st.set_pushed_link("wan2", False, time.time())
-    _time.sleep(0.15)
-    cell = st.snapshot()["ladder"]
+
+    def await_ladder(expected, deadline_s=5.0):
+        """Poll rather than sleep a fixed interval: the control thread's cadence
+        is not ours to assume, and a loaded box makes any fixed wait a flake."""
+        end = _time.monotonic() + deadline_s
+        seen = None
+        while _time.monotonic() < end:
+            seen = st.snapshot()["ladder"]
+            if seen == expected:
+                return seen
+            _time.sleep(0.01)
+        return seen
+
     try:
+        th.start()
+        # Base table: floor 20:1 (5%) sits under 8:2, so it holds rung 0 and the
+        # idle leg lights nothing.
+        base = {"levels": 5, "floor_level": 0, "applied_level": 0}
+        assert await_ladder(base) == base
+        st.set_pushed_link(profile="wan2", signal_floor=False, ts=time.time())
+        # Cellular table: 20:1 IS a rung, so the floor occupies rung 1 and only
+        # two rungs remain above it.
+        cell = {"levels": 4, "floor_level": 1, "applied_level": 1}
+        assert await_ladder(cell) == cell
+    finally:
         stop.set()
         th.join(timeout=2)
-    finally:
         os.close(rfd)
-    # Base table: floor 20:1 (5%) sits under 8:2, so it holds rung 0 and the
-    # idle leg lights nothing.
-    assert base == {"levels": 5, "floor_level": 0, "applied_level": 0}
-    # Cellular table: 20:1 IS a rung, so the floor occupies rung 1 and only two
-    # rungs remain above it.
-    assert cell == {"levels": 4, "floor_level": 1, "applied_level": 1}
 
 
 def test_fec_state_ladder_defaults_none():

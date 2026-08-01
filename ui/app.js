@@ -742,7 +742,9 @@ const FEC_FALLBACK_LEVELS = 5;   // relay too old to publish `ladder`
 
 function clampLevel(v, hi){
   if (typeof v !== "number" || !isFinite(v)) return 0;
-  return Math.max(0, Math.min(Math.round(v), hi));
+  // Floor, not round: the controller maps a between-rungs ratio to the rung
+  // below it, and the row must not disagree with that.
+  return Math.max(0, Math.min(Math.floor(v), hi));
 }
 
 function renderFecLevel(el, d){
@@ -758,12 +760,24 @@ function renderFecLevel(el, d){
   const applied  = clampLevel(lad ? lad.applied_level : d.level, levels - 1);
   const dots = (levels - 1) - floorLvl;
   const lit  = Math.max(0, Math.min(applied - floorLvl, dots));
-  const floored = d.mode === "min_adaptive";
+  // Same off test renderFecCard uses for the card's is-off state, so the two
+  // can't disagree: a floor of 8:0 (reachable by typing 0% into the custom
+  // field) is min_adaptive by mode but carries no parity at all, and the card
+  // already labels that ratio OFF.
+  const off = (d.enabled === false) || (d.ratio === "8:0");
+  const floored = !off && d.mode === "min_adaptive";
+  // The ratio on the wire can sit BELOW the floor: raise the floor while the
+  // actuator is down and the controller keeps publishing the last ratio it
+  // actually got applied. `lit` clamps that to zero, which is indistinguishable
+  // from resting at the floor — so the floor would appear to be holding when
+  // its parity is exactly what is missing. Read it before the clamp.
+  const belowFloor = floored && applied < floorLvl;
 
   let label;
-  if (floored) label = dots <= 0 ? "floor at max"
+  if (off || d.mode === "off") label = "off";
+  else if (belowFloor) label = "below floor";
+  else if (floored) label = dots <= 0 ? "floor at max"
                      : (lit === 0 ? "at floor" : `+${lit} over floor`);
-  else if (d.mode === "off")   label = "off";
   else if (d.mode === "fixed") label = dots > 0 ? `fixed · ${lit}/${dots}` : "fixed";
   else label = `level ${lit}/${dots}`;
 
@@ -782,6 +796,7 @@ function renderFecLevel(el, d){
   // operator's eye. Steady dots elsewhere: without a floor there is nothing to
   // have exceeded.
   el.classList.toggle("is-flashing", floored && lit > 0);
+  el.classList.toggle("is-below-floor", belowFloor);
 }
 
 function renderFecCard(id, d, local){
