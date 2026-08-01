@@ -440,3 +440,40 @@ def test_relay_fec_direction_rx_comes_from_local_tracker_not_fetch():
 def test_relay_fec_direction_rx_defaults_none():
     d = M.relay_fec_direction({"ok": True, "data": {}}, 100.0, 101.0, "a", "a")
     assert d["rx"] is None
+
+
+def test_relay_ladder_not_rebuilt_when_the_fetch_failed():
+    # data is empty, so every input would fall back to OUR desired settings —
+    # a relay-confirmed span drawn from nothing the relay confirmed.
+    fetch = {"ok": False, "data": None, "error": "transport: x"}
+    d = M.relay_fec_direction(fetch, fetched_at=None, now=100.0, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"] is None
+
+
+def test_relay_ladder_not_rebuilt_for_an_unknown_profile():
+    # The relay keeps reporting a pushed profile name until it goes stale; if
+    # that profile has since been removed from our config, modelling it as the
+    # default table would claim rungs its real (cellular) table caps below.
+    relay_own = {"levels": 4, "floor_level": 1, "applied_level": 3}
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:1", "mode": "min_adaptive", "floor_ratio": "20:1",
+        "profile": "wan9", "ladder": relay_own}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=False,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"] == relay_own          # the relay's own view is kept
+
+
+def test_relay_ladder_rebuilt_for_the_default_profile():
+    # "default" is not a key in tables but IS resolvable — it means the base
+    # table, so this one must still be rebuilt onto the shared scale.
+    fetch = {"ok": True, "error": None, "data": {
+        "ratio": "8:2", "mode": "min_adaptive", "floor_ratio": "8:1",
+        "profile": "default"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True,
+                              last_acked=True,
+                              ladder_inputs=_ladder_inputs(SCALE))
+    assert d["ladder"]["scale"] == SCALE
+    assert d["ladder"]["applied_index"] == 2

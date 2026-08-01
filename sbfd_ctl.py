@@ -916,13 +916,26 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
     # floor, that the relay is not honoring. Our values are the fallback only
     # for a relay too old to report them.
     ladder = data.get("ladder")
-    if ladder_inputs is not None:
+    profile = data.get("profile")
+    tables = ladder_inputs["tables"] if ladder_inputs else {}
+    # Two ways the rebuild would end up asserting things nobody reported:
+    #   - the fetch failed, so `data` is empty and EVERY input would fall back
+    #     to our desired settings — drawing a relay-confirmed span when nothing
+    #     was confirmed, which is the exact failure this sourcing rule exists
+    #     to prevent;
+    #   - the relay names a profile we no longer have (removed or renamed in
+    #     config; the relay keeps reporting the pushed name until it goes
+    #     stale), where defaulting the table would model it as the base profile
+    #     and claim rungs its real one caps below.
+    # In both cases keep the relay's own ladder, which at least describes the
+    # relay's view of itself.
+    known_profile = profile in (None, "", "default") or profile in tables
+    if ladder_inputs is not None and fetch.get("ok") and known_profile:
         scale = ladder_inputs["scale"]
         mode = data.get("mode") or ladder_inputs["mode"]
         floor = data.get("floor_ratio") or ladder_inputs["floor"]
         fixed = data.get("fixed_ratio") or ladder_inputs["fixed"]
-        table = ladder_inputs["tables"].get(data.get("profile"),
-                                            ladder_inputs["default_table"])
+        table = tables.get(profile, ladder_inputs["default_table"])
         ladder = fec_control.ladder_view(
             scale,
             # No pinned_level: the relay's run_once calls loss_to_level
@@ -2746,10 +2759,17 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             # relay never applies this backoff (its run_once calls loss_to_level
             # directly), so its span stays the full floor-to-top range — the two
             # legs genuinely differ here, and the row now shows that.
+            # fec_full_backoff tracks the ROUTING mode and up-count alone, but
+            # backoff only holds anything when the adaptive engine is what
+            # picks the ratio: 'off' and 'fixed' ignore the engine entirely, so
+            # reporting them as pinned would put "· pinned" on a row nothing is
+            # pinning.
+            fec_pinned = fec_full_backoff and fec_mode_eff in (
+                fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE)
             fec_pinned_level = (
                 fec_control.ratio_to_level(cfg.fec.full_mode_backoff_fec,
                                            prof_table)
-                if fec_full_backoff else None)
+                if fec_pinned else None)
             fec_ladder = fec_control.ladder_view(
                 fec_scale,
                 fec_control.reachable_ratios(
@@ -2757,7 +2777,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     fixed_ratio=fec_fixed_ratio_eff,
                     pinned_level=fec_pinned_level),
                 fec_current_ratio, fec_floor_ratio_eff, fec_mode_eff,
-                pinned=fec_full_backoff)
+                pinned=fec_pinned)
             # The relay leg's span is built from the relay's OWN reported
             # settings (see relay_fec_direction); these are the tables it may
             # name plus our values as the fallback for a relay too old to

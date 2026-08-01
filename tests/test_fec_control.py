@@ -558,3 +558,13 @@ def test_scale_index_rounds_down_and_reports_absence():
     assert F.scale_index(SCALE, "10:1") == 0    # 10% -> between 12:1 and 8:1
     assert F.scale_index(SCALE, "8:0") == -1    # below every rung
     assert F.scale_index(SCALE, "junk") == -1
+
+
+def test_pinned_is_meaningless_outside_the_adaptive_modes():
+    # reachable_ratios ignores pinned_level for off/fixed — the adaptive engine
+    # does not pick the ratio there — so a caller must not report those as
+    # pinned either. This asserts the helper's half of that contract.
+    base = F.DEFAULT_LOSS_TABLE
+    assert F.reachable_ratios(F.MODE_FIXED, base, "8:1", fixed_ratio="8:4",
+                              pinned_level=0) == ["8:4"]
+    assert F.reachable_ratios(F.MODE_OFF, base, "8:1", pinned_level=0) == ["8:0"]
