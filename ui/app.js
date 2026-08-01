@@ -986,11 +986,66 @@ function cssVar(name){
 
 // Round a peak up to a "nice" axis maximum (1/2/5 x 10^n) so gridline labels
 // land on readable numbers instead of whatever the busiest sample happened to be.
-function niceCeil(v){
-  if (!(v > 0)) return 1;
-  const mag = Math.pow(10, Math.floor(Math.log10(v)));
-  const n = v / mag;
-  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+// Axis steps, coarse enough to read and fine enough not to waste the plot.
+// The old 1-2-5-10 ceiling overshot by up to 2.5x — a peak of 22 became an
+// axis of 50, so the chart used 44% of its height and every band was drawn at
+// under half the size it had earned, which is the same squashing the
+// visibility marks exist to work around. Worst overshoot here is 1.33x.
+const AXIS_STEPS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+
+// Pick the gridline step first and derive the max from it, rather than
+// rounding the max and dividing. Every gridline then lands on a multiple of a
+// round number instead of on peak/4, which is what produced labels like 6.25.
+function niceAxis(peak, ticks){
+  if (!(peak > 0) || !isFinite(peak)) return { max: 1, step: 1 / ticks };
+  const raw = peak / ticks;
+  let mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  let i = AXIS_STEPS.findIndex(sv => sv * mag >= raw * (1 - 1e-9));
+  if (i < 0){ i = 0; mag *= 10; }
+  for (let guard = 0; guard < 64; guard++){
+    const step = tidy(AXIS_STEPS[i] * mag);
+    const max = tidy(step * ticks);
+    // The epsilon above tolerates float noise in the comparison, and tidy()
+    // rounds to 12 significant digits; either can land the max a hair UNDER
+    // the peak, which clips the top of the data outside the plot. Step up the
+    // ladder until it cannot.
+    // isFinite matters: step * ticks overflows to Infinity near MAX_VALUE, and
+    // Infinity >= peak is true, so an unguarded test accepts a max that makes
+    // every label "Infinity" and every Y() NaN. Falling through to the finite
+    // saturated scale below is the honest answer for a rate that large.
+    if (isFinite(max) && max >= peak) return { max, step };
+    if (++i >= AXIS_STEPS.length){ i = 0; mag *= 10; }
+  }
+  // Saturated fallback, deliberately NOT tidied: rounding to 12 significant
+  // digits is what puts a max below its peak, and at MAX_VALUE there is no
+  // headroom left to round into. Exact beats round here.
+  return { max: peak, step: peak / ticks };
+}
+
+// A 44px gutter fits about six digits at 10px. Past that the labels run off
+// the canvas, so scale the whole axis to one unit — all of them, never a mix
+// of "7500" and "10k" down the same column.
+function axisUnit(max){
+  if (max >= 1e12) return { div: 1e12, suffix: "T" };
+  if (max >= 1e9)  return { div: 1e9,  suffix: "G" };
+  if (max >= 1e6)  return { div: 1e6,  suffix: "M" };
+  if (max >= 1e4)  return { div: 1e3,  suffix: "k" };
+  return { div: 1, suffix: "" };
+}
+
+// 0.2 * 3 is 0.6000000000000001 in binary floating point; that reaches the
+// axis label and the Y() scale as-is.
+function tidy(v){ return Number(v.toPrecision(12)); }
+
+// Decimals come from the STEP, not from the value being labelled. Deriving
+// them per value rounded a 12.5 step's gridlines to 13 and 38 — the halves the
+// step exists to show.
+function axisDecimals(step){
+  for (let d = 0; d <= 3; d++){
+    const scaled = step * Math.pow(10, d);
+    if (Math.abs(scaled - Math.round(scaled)) < 1e-6) return d;
+  }
+  return 3;
 }
 
 function drawFecGraph(id, series){
@@ -1033,7 +1088,28 @@ function drawFecGraph(id, series){
   const last = series.length ? series[series.length - 1] : null;
   const t1 = Math.max(Date.now() / 1000, last ? last.t : 0);
   const t0 = t1 - FEC_GRAPH_WINDOW_S;
-  const windowed = series.filter(p => p.t >= t0);
+  // Normalise before anything computes a coordinate. A component can arrive
+  // non-finite, and two finite ones can still overflow their own sum — both
+  // reach Y() as +/-Infinity and paint outside the canvas or vanish silently.
+  // A sample we cannot plot is a sample we do not have, and the chart already
+  // draws that honestly: delivered = null is the gap the runs break on.
+  const fin = v => (typeof v === "number" && isFinite(v)) ? v : null;
+  const windowed = series.filter(p => p.t >= t0).map(p => {
+    const d = fin(p.delivered), r = fin(p.recovered), l = fin(p.lost);
+    // Every stack component must be readable, and `|| 0` is not a reading:
+    // coercing an unusable `recovered` to zero asserts that no recovery
+    // happened, which is a claim rather than an absence. fec_report writes all
+    // four rates together — all real, or all null when stale — so demanding
+    // the full set costs nothing that renders correctly today.
+    const plottable = d != null && r != null && l != null && isFinite(d + r + l);
+    return {
+      t: p.t,
+      delivered: plottable ? d : null,
+      recovered: plottable ? r : null,
+      lost: plottable ? l : null,
+      waste: plottable ? fin(p.waste) : null,
+    };
+  });
   const pts = windowed.filter(p => p.delivered != null);
 
   const X = t => plotL + ((t - t0) / FEC_GRAPH_WINDOW_S) * plotW;
@@ -1046,22 +1122,54 @@ function drawFecGraph(id, series){
     if (tot > peak) peak = tot;
     if ((p.waste || 0) > peak) peak = p.waste;
   });
-  const axisMax = niceCeil(peak);
+  const Y_TICKS = 4;
+  const { max: axisMax, step: axisStep } = niceAxis(peak, Y_TICKS);
   const Y = v => plotB - (v / axisMax) * plotH;
 
   ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
   ctx.textBaseline = "middle";
 
   // horizontal gridlines + y labels (pkt/s)
-  const Y_TICKS = 4;
+  const axisU = axisUnit(axisMax);
+  const axisDp = axisDecimals(axisStep / axisU.div);
+  // The gutter is a fixed width, so rather than chasing the unit ladder ever
+  // upward, ask the canvas whether the labels actually fit and fall back to
+  // exponential when they do not — that stays ~6 characters at any magnitude.
+  // Rates come from counter deltas, so a wrapped counter or a clock step can
+  // produce an absurd one, and the chart has to degrade rather than draw off
+  // the edge. Requires ctx.font, set above.
+  const axisBudget = ML - 8;
+  // "1.0e+18" is 7 characters of which two carry nothing; "1e18" is 4 and
+  // reads the same. Worth it when the gutter is the whole constraint.
+  const sci = (v, d) => v === 0 ? "0"
+    : v.toExponential(d).replace("e+", "e").replace(/\.0+e/, "e");
+  const axisFormats = [
+    v => (v / axisU.div).toFixed(axisDp) + axisU.suffix,   // 12.5k
+    v => sci(v, 1),                                        // 1.2e18
+    v => sci(v, 0),                                        // 1e18
+  ];
+  const axisTicks = fmt => {
+    const out = [];
+    for (let i = 0; i <= Y_TICKS; i++) out.push(fmt(axisStep * i));
+    return out;
+  };
+  const fitsGutter = ls => ls.every(l => ctx.measureText(l).width <= axisBudget);
+  const distinct = ls => new Set(ls).size === ls.length;
+  // Fitting is not sufficient: rounding hard enough to fit can render two
+  // different gridlines with the same text, which is worse than a few pixels
+  // of overhang. Prefer the most precise form that both fits and stays
+  // distinct, and if none does, keep distinctness.
+  const axisLabel = axisFormats.find(f => fitsGutter(axisTicks(f)) && distinct(axisTicks(f)))
+    || axisFormats.find(f => distinct(axisTicks(f)))
+    || axisFormats[1];
   ctx.textAlign = "right";
   for (let i = 0; i <= Y_TICKS; i++){
-    const val = (axisMax / Y_TICKS) * i;
+    const val = axisStep * i;
     const y = Math.round(Y(val)) + 0.5;
     ctx.beginPath(); ctx.moveTo(plotL, y); ctx.lineTo(plotR, y);
     ctx.lineWidth = 1; ctx.strokeStyle = i === 0 ? cAxis : cGrid; ctx.stroke();
     ctx.fillStyle = cFgDim;
-    ctx.fillText(fmtRate(val), plotL - 6, y);
+    ctx.fillText(axisLabel(val), plotL - 6, y);
   }
   // vertical gridlines + time labels, one per minute of the window
   ctx.textAlign = "center";
