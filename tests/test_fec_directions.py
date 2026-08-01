@@ -510,14 +510,14 @@ def test_relay_ladder_rebuilt_for_the_default_profile():
 # protection the ratio already has.
 # ---------------------------------------------------------------------------
 
-MARGIN, DWELL = 1.0, 120.0
+DWELL = 120.0
 
 
 def _pick(loss, active, cur, cand, since, now):
-    return M.fec_driver_pick(loss, active, cur, cand, since, MARGIN, DWELL, now)
+    return M.fec_driver_pick(loss, active, cur, cand, since, DWELL, now)
 
 
-def _replay(samples, start_driver, margin=MARGIN, dwell=DWELL, step=0.5):
+def _replay(samples, start_driver, dwell=DWELL, step=0.5):
     """Feed (duration_s, loss_dict) segments through the picker. Returns
     (final_driver, switch_count)."""
     cur, cand, since, switches, t = start_driver, None, None, 0, 0.0
@@ -525,7 +525,7 @@ def _replay(samples, start_driver, margin=MARGIN, dwell=DWELL, step=0.5):
         end = t + dur
         while t < end:
             d, cand, since = M.fec_driver_pick(loss, {"wan1", "wan2"}, cur,
-                                               cand, since, margin, dwell, t)
+                                               cand, since, dwell, t)
             if d != cur:
                 switches += 1
             cur = d
@@ -545,11 +545,35 @@ def test_driver_rides_out_the_observed_blip_pattern():
 
 
 def test_driver_holds_a_candidate_during_a_blip_without_yielding():
-    # Sub-margin, but still the canonical (worst-link) pick, so it legitimately
-    # challenges — it just never outlasts the dwell.
     d, c, s = _pick({"wan1": 0.0, "wan2": 0.3}, {"wan1", "wan2"}, "wan1",
                     None, None, 100.0)
     assert d == "wan1" and c == "wan2"
+
+
+def test_driver_dwell_clock_is_not_restarted_by_a_persisting_challenger():
+    # Distinct from creating the candidate: an unchanged challenger must keep
+    # its ORIGINAL timestamp. Restarting it each tick would mean no challenge
+    # could ever accumulate dwell and the driver would never move again.
+    active = {"wan1", "wan2"}
+    loss = {"wan1": 0.0, "wan2": 2.0}
+    d, c, s = _pick(loss, active, "wan1", None, None, 100.0)
+    assert (c, s) == ("wan2", 100.0)
+    for t in (100.5, 130.0, 100.0 + DWELL - 0.5):
+        d, c, s = _pick(loss, active, "wan1", c, s, t)
+        assert (d, c, s) == ("wan1", "wan2", 100.0)      # clock still at 100.0
+    d, c, s = _pick(loss, active, "wan1", c, s, 100.0 + DWELL)
+    assert d == "wan2"
+
+
+def test_driver_challenger_is_the_worst_link_not_the_first_by_name():
+    # With 3+ active WANs the challenger must be the most degraded path, since
+    # it selects the table/floor/hysteresis that will be applied.
+    active = {"wan1", "wan2", "wan3"}
+    loss = {"wan1": 0.0, "wan2": 2.0, "wan3": 9.0}
+    d, c, s = _pick(loss, active, "wan1", None, None, 100.0)
+    assert c == "wan3"
+    d, c, s = _pick(loss, active, "wan1", c, s, 100.0 + DWELL)
+    assert d == "wan3"
 
 
 def test_driver_candidate_is_dropped_when_the_challenge_lapses():
@@ -613,5 +637,5 @@ def test_driver_bootstraps_to_the_raw_ranking():
     d, c, s = _pick({"wan1": 1.0, "wan2": 5.0}, {"wan1", "wan2"}, None,
                     None, None, 100.0)
     assert (d, c, s) == ("wan2", None, None)
-    assert M.fec_driver_pick({}, set(), None, None, None, MARGIN, DWELL, 1.0) == \
+    assert M.fec_driver_pick({}, set(), None, None, None, DWELL, 1.0) == \
         (None, None, None)

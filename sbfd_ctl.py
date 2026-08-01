@@ -102,12 +102,11 @@ class FecCfg:
     fixed_ratio: str = fec_control.DEFAULT_FIXED_RATIO
     floor_ratio: str = fec_control.DEFAULT_FLOOR_RATIO
     wan_profiles: dict = field(default_factory=dict)
-    # Hysteresis on the DRIVER choice, mirroring policy.dynamic_* for the
-    # master. step_level damps the ratio, but nothing damped the driver, so a
-    # momentary loss blip on the other link swapped the profile — and with it
+    # Dwell on the DRIVER choice, mirroring policy.dynamic_swap_dwell_s for
+    # the master. step_level damps the ratio, but nothing damped the driver, so
+    # a momentary loss blip on the other link swapped the profile — and with it
     # the table and floor — beneath the adaptive engine. Only bites when more
     # than one WAN is active, i.e. full redundancy.
-    driver_loss_margin_pct: float = 1.0
     driver_dwell_s: float = 120.0
 
 
@@ -857,7 +856,7 @@ def fec_driver_wan(loss, active_wans):
 
 
 def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
-                    loss_margin_pct, dwell_s, now):
+                    dwell_s, now):
     """Sticky version of fec_driver_wan: (driver, candidate, candidate_since).
 
     The driver picks the WHOLE FEC policy — table, floor, hysteresis — so
@@ -868,9 +867,19 @@ def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
     apart, every one of them in full redundancy where the ratio should not have
     moved at all.
 
-    So a challenger must be worse than the incumbent by loss_margin_pct AND
-    stay worse for dwell_s. Sticky toward the incumbent, which is what keeps a
-    tie (both links clean) from resolving on alphabetical order every tick.
+    The challenger is always fec_driver_wan's pick — the worst active link,
+    ties broken deterministically — and it must hold that position for dwell_s
+    before taking over. Dwell alone is the whole mechanism: an excursion
+    shorter than dwell_s is ignored, a sustained one is followed, and because a
+    tie resolves to the same WAN every tick, the driver returns to the quiet
+    state's pick once the excursion passes. That return matters beyond
+    tidiness: the cell signal floor only engages while the cellular WAN is the
+    driver, so a driver that never came home would silently disarm it.
+
+    A loss MARGIN was tried here and removed: whenever no WAN cleared it, the
+    same WAN challenged anyway as the canonical pick, so it never changed
+    whether a flip was damped — only which WAN challenged when three or more
+    were active, and there it picked the first by name rather than the worst.
 
     Only one WAN active — every mode but full redundancy — has no race to lose
     and short-circuits, so this cannot delay a master_backup failover.
@@ -885,29 +894,12 @@ def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
         # carrying traffic): take the raw ranking and start clean.
         return fec_driver_wan(loss, active), None, None
 
-    cur_loss = loss.get(current, 0.0)
-    challenger = None
-    for w in sorted(active):
-        if w == current:
-            continue
-        if loss.get(w, 0.0) >= cur_loss + loss_margin_pct:
-            challenger = w
-            break
-
-    if challenger is None:
-        # Nobody is materially worse, so the incumbent has no claim beyond
-        # having been here. Let the canonical ranking challenge it, under the
-        # same dwell: without this the driver never comes home after a
-        # degradation ends, and a leg that once flipped to the non-cellular
-        # profile would stay there — silently disarming the cell signal floor,
-        # which only engages while the cellular WAN is the driver.
-        canonical = fec_driver_wan(loss, active)
-        if canonical is not None and canonical != current:
-            challenger = canonical
-
-    if challenger is None:
+    challenger = fec_driver_wan(loss, active)
+    if challenger is None or challenger == current:
         return current, None, None
     if candidate == challenger and candidate_since is not None:
+        # Same challenger as last tick: let its clock run rather than
+        # restarting it, or a challenge could never accumulate dwell.
         if now - candidate_since >= dwell_s:
             return challenger, None, None
         return current, candidate, candidate_since
@@ -1393,8 +1385,6 @@ def load_config(path: str) -> Config:
                 fixed_ratio=raw_fec.get("fixed_ratio", fec_control.DEFAULT_FIXED_RATIO),
                 floor_ratio=raw_fec.get("floor_ratio", fec_control.DEFAULT_FLOOR_RATIO),
                 wan_profiles=profiles,
-                driver_loss_margin_pct=float(
-                    raw_fec.get("driver_loss_margin_pct", 1.0)),
                 driver_dwell_s=float(raw_fec.get("driver_dwell_s", 120.0)),
             )
 
@@ -1492,6 +1482,13 @@ def load_config(path: str) -> Config:
         raise ValueError(
             f"egress.default_mode must be one of {sorted(VALID_EGRESS_MODES)}, "
             f"got {egress.default_mode!r}")
+    # A negative dwell promotes a challenger on the very next tick, and NaN or
+    # inf leaves one pending forever — both silently defeat the hysteresis
+    # rather than failing, so reject them at load.
+    if fec_cfg is not None and not (0 <= fec_cfg.driver_dwell_s < float("inf")):
+        raise ValueError(
+            f"fec.driver_dwell_s must be finite and >= 0, "
+            f"got {fec_cfg.driver_dwell_s}")
     if env_cfg is not None and env_cfg.auto_override_ttl_s <= 0:
         raise ValueError(
             f"environmental.auto_override.ttl_s must be > 0, got {env_cfg.auto_override_ttl_s}")
@@ -2747,8 +2744,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
              fec_driver_candidate_since) = fec_driver_pick(
                 fec_loss, currently_active, fec_driver_current,
                 fec_driver_candidate, fec_driver_candidate_since,
-                cfg.fec.driver_loss_margin_pct, cfg.fec.driver_dwell_s,
-                loop_start)
+                cfg.fec.driver_dwell_s, loop_start)
             if fec_driver != fec_driver_current:
                 logging.info("fec driver -> %s (was %s)",
                              fec_driver, fec_driver_current)

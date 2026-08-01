@@ -196,10 +196,18 @@ def test_driver_hysteresis_defaults_and_overrides():
     d = dict(BASE)
     d["fec"] = {"fifo": "/run/udpspeeder/client.fifo"}
     cfg = M.load_config(_write(d))
-    assert cfg.fec.driver_loss_margin_pct == 1.0
     assert cfg.fec.driver_dwell_s == 120.0
-    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo",
-                "driver_loss_margin_pct": 2.5, "driver_dwell_s": 45}
+    d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "driver_dwell_s": 45}
     cfg = M.load_config(_write(d))
-    assert cfg.fec.driver_loss_margin_pct == 2.5
     assert cfg.fec.driver_dwell_s == 45.0
+
+
+def test_driver_dwell_rejects_values_that_defeat_the_hysteresis():
+    # Negative promotes a challenger on the next tick; NaN/inf leave one
+    # pending forever. Both disable the damping silently, so fail at load.
+    import pytest
+    for bad in (-1, float("nan"), float("inf")):
+        d = dict(BASE)
+        d["fec"] = {"fifo": "/run/udpspeeder/client.fifo", "driver_dwell_s": bad}
+        with pytest.raises(ValueError, match="driver_dwell_s"):
+            M.load_config(_write(d))
