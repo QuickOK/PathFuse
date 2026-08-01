@@ -99,12 +99,16 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
                 "relay_to_client": {
                     "enabled": True, "ratio": "12:1", "level": 2,
                     "mode": "min_adaptive",
-                    # Cellular driver, pinned by full-redundancy backoff: the
-                    # single shaded rung is the state the row has to explain.
+                    # Cellular driver. The relay leg is NEVER pinned — its
+                    # run_once calls loss_to_level directly and never consults
+                    # mode_aware_level — so it keeps the full cellular span
+                    # (12:1 → 8:1) even while the client leg is held at one
+                    # rung. That asymmetry is the thing this preview exists to
+                    # show; marking it pinned would misrepresent it.
                     "ladder": {
                         "scale": ["12:1", "8:1", "8:2", "8:4", "8:6", "8:8"],
-                        "reach_lo": 0, "reach_hi": 0, "applied_index": 0,
-                        "floor_index": 0, "below_floor": False, "pinned": True},
+                        "reach_lo": 0, "reach_hi": 1, "applied_index": 0,
+                        "floor_index": 0, "below_floor": False, "pinned": False},
                     "driving_loss_pct": 1.2, "since": now - 133,
                     "ok": True, "stale_s": 0.4, "error": None,
                     "reconcile_pending": False,

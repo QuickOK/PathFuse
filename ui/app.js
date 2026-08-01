@@ -772,7 +772,10 @@ function renderFecScale(el, d, lad){
   else label = `${scale[applied]}`;
   if (pinned && !below && applied > floorIdx && floorIdx >= 0) label += " · pinned";
 
-  const sig = `s${scale.join(",")}|${lo}|${hi}|${applied}|${label}|${below}`;
+  // `pinned` belongs in the signature even though it usually moves the span
+  // with it: below-floor labels ignore pinned, so backoff could engage or
+  // release with lo/hi/applied/label all unchanged and leave the class stale.
+  const sig = `s${scale.join(",")}|${lo}|${hi}|${applied}|${label}|${below}|${pinned}`;
   if (el.dataset.sig === sig) return;
   el.dataset.sig = sig;
 
@@ -789,6 +792,10 @@ function renderFecScale(el, d, lad){
   el.classList.toggle("is-flashing", !below && floorIdx >= 0 && applied > floorIdx);
   el.classList.toggle("is-below-floor", below);
   el.classList.toggle("is-pinned", pinned);
+  // Gates the out-of-reach styling: legacy rows have no reachable band, and
+  // without this every one of their pips would match :not(.reach) and lose the
+  // hollow accent ring.
+  el.classList.add("is-scale");
 }
 
 function numOr(v, dflt){
@@ -860,6 +867,10 @@ function renderFecLevel(el, d){
   // have exceeded.
   el.classList.toggle("is-flashing", floored && lit > 0);
   el.classList.toggle("is-below-floor", belowFloor);
+  // Clear both scale-row states: a payload can fall back to this shape mid-run
+  // (relay downgrade, or a restart landing between publishers), and a stale
+  // is-pinned would dim a row that is not pinned at all.
+  el.classList.remove("is-scale", "is-pinned");
 }
 
 function renderFecCard(id, d, local){

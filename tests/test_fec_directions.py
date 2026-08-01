@@ -168,7 +168,7 @@ def test_relay_fec_direction_passes_through_ladder():
     assert d["ladder"] == lad
 
 
-def test_relay_fec_direction_rescales_the_relay_ladder(monkeypatch):
+def test_relay_fec_direction_rescales_the_relay_ladder():
     # The relay's own ladder is scaled to its view of one profile. The client
     # re-derives it against the shared cross-profile scale so both cards share
     # positions — anchored on the ratio the relay REPORTS, not our desired one.

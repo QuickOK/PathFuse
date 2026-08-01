@@ -955,7 +955,10 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
   background: rgba(94, 234, 212, 0.16);
   border-color: rgba(94, 234, 212, 0.55);
 }
-.fec-level .pip:not(.reach) {
+/* Scoped to the scale row: a legacy row draws no reachable band, so an
+   unscoped :not(.reach) would strip the accent ring from every one of its
+   pips. */
+.fec-level.is-scale .pip:not(.reach) {
   background: transparent;
   border-color: var(--border-strong);
 }
