@@ -333,3 +333,160 @@ def test_apply_signal_floor_lifts_to_12_1_rung():
     assert F.apply_signal_floor(0, False, t) == 0
     # floor ratio absent from the table -> no-op, never raises
     assert F.apply_signal_floor(1, True, F.DEFAULT_LOSS_TABLE) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ladder view (UI pip row): where the applied ratio sits relative to the floor,
+# on the rungs the ACTIVE profile actually has.
+# ---------------------------------------------------------------------------
+
+def test_ratio_rung_exact_rungs():
+    assert F.ratio_rung("8:0") == 0
+    assert F.ratio_rung("8:2") == 1
+    assert F.ratio_rung("8:8") == 4
+
+
+def test_ratio_rung_rounds_down_between_rungs():
+    # 20:1 is 5% overhead: above the base table's 8:0 (0%) but well under its
+    # 8:2 (25%). It must not be credited with the higher rung's protection.
+    assert F.ratio_rung("20:1") == 0
+    # Same ratio IS a rung of the cellular table.
+    assert F.ratio_rung("20:1", F.DEFAULT_CELL_LOSS_TABLE) == 1
+    assert F.ratio_rung("12:1", F.DEFAULT_CELL_LOSS_TABLE) == 2
+    assert F.ratio_rung("8:1", F.DEFAULT_CELL_LOSS_TABLE) == 3
+    # Above every cellular rung -> clamps to the top one.
+    assert F.ratio_rung("8:8", F.DEFAULT_CELL_LOSS_TABLE) == 3
+
+
+def test_ratio_rung_unusable_input_is_rung_zero():
+    for bad in ("", "nonsense", None, 7, "0:2"):
+        assert F.ratio_rung(bad) == 0
+
+
+def test_ladder_state_min_adaptive_base_table():
+    # Floor 20:1 sits on rung 0 of the base table, so all four rungs above the
+    # idle tier are available and the floor itself lights nothing.
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "20:1")
+    assert lad == {"levels": 5, "floor_level": 0, "applied_level": 0,
+                   "below_floor": False}
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "20:1")
+    assert lad["applied_level"] == 2
+
+
+def test_ladder_state_min_adaptive_cell_table():
+    t = F.DEFAULT_CELL_LOSS_TABLE
+    # Floor 20:1 IS rung 1 here: only 2 of the 4 rungs are above the floor.
+    at_floor = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "20:1", t)
+    assert at_floor == {"levels": 4, "floor_level": 1, "applied_level": 1,
+                        "below_floor": False}
+    top = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:1", "20:1", t)
+    assert top["applied_level"] - top["floor_level"] == 2
+
+
+def test_ladder_state_floor_only_counts_in_min_adaptive():
+    # An adaptive/fixed/off leg has no floor holding it up: the whole ladder is
+    # available even though a floor_ratio is still configured.
+    for mode in (F.MODE_ADAPTIVE, F.MODE_FIXED, F.MODE_OFF):
+        assert F.ladder_state(mode, "8:2", "8:4")["floor_level"] == 0
+
+
+def test_ladder_state_tracks_the_applied_ratio_not_the_engine():
+    # In fixed mode the adaptive engine keeps stepping, but the pip row must
+    # follow the ratio actually on the wire.
+    assert F.ladder_state(F.MODE_FIXED, "8:6", "20:1")["applied_level"] == 3
+    assert F.ladder_state(F.MODE_OFF, "8:0", "20:1")["applied_level"] == 0
+
+
+def test_ladder_state_no_ratio_yet():
+    # First tick before the actuator has written anything.
+    assert F.ladder_state(F.MODE_ADAPTIVE, None, "20:1")["applied_level"] == 0
+
+
+def test_rung_positions_are_independent_of_row_order():
+    # A loss table's rows are ordered by loss band; nothing validates that their
+    # ratios ascend with them. Ladder positions must come from parity order, or
+    # a hand-written table silently reports the wrong rung.
+    shuffled = [
+        {"max_loss_pct": 0.5,   "fec": "8:0"},
+        {"max_loss_pct": 2.0,   "fec": "8:4"},
+        {"max_loss_pct": 5.0,   "fec": "8:6"},
+        {"max_loss_pct": 10.0,  "fec": "8:2"},
+        {"max_loss_pct": 100.0, "fec": "8:8"},
+    ]
+    assert F.ratio_rung("8:2", shuffled) == 1
+    assert F.ratio_rung("8:4", shuffled) == 2
+    assert F.ratio_rung("8:6", shuffled) == 3
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "8:2", shuffled)
+    assert lad == {"levels": 5, "floor_level": 1, "applied_level": 2,
+                   "below_floor": False}
+
+
+def test_duplicate_ratios_are_one_rung():
+    # Two loss bands carrying the same parity are one level of protection.
+    dupes = [
+        {"max_loss_pct": 0.5,   "fec": "8:0"},
+        {"max_loss_pct": 2.0,   "fec": "8:2"},
+        {"max_loss_pct": 5.0,   "fec": "8:2"},
+        {"max_loss_pct": 100.0, "fec": "8:4"},
+    ]
+    assert F.rung_overheads(dupes) == [0.0, 25.0, 50.0]
+    assert F.ladder_state(F.MODE_ADAPTIVE, "8:4", "8:0", dupes)["levels"] == 3
+
+
+def test_ladder_state_can_report_below_the_floor():
+    # The actuator refused the write after the floor rose: the ratio on the wire
+    # is the last one accepted, which is now UNDER the floor. The ladder must
+    # expose that rather than clamp it into looking like "at floor".
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "8:4")
+    assert lad["applied_level"] < lad["floor_level"]
+    assert lad["below_floor"] is True
+
+
+def test_below_floor_compares_ratios_not_rung_positions():
+    # 8:0 (0%) and the default 20:1 floor (5%) BOTH sit on base-table position 0,
+    # so a position compare would call a leg carrying no parity at all "at
+    # floor". Same trap on the cellular table, where a floor of 8:2 (25%) shares
+    # position 3 with the 8:1 (12.5%) top rung.
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:0", "20:1")
+    assert lad["applied_level"] == lad["floor_level"] == 0
+    assert lad["below_floor"] is True
+    cell = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:1", "8:2",
+                          F.DEFAULT_CELL_LOSS_TABLE)
+    assert cell["applied_level"] == cell["floor_level"] == 3
+    assert cell["below_floor"] is True
+
+
+def test_below_floor_false_at_or_above_the_floor_and_outside_min_adaptive():
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "20:1")["below_floor"] is False
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "20:1")["below_floor"] is False
+    # No floor is being held in these modes, so nothing can be under one.
+    for mode in (F.MODE_ADAPTIVE, F.MODE_FIXED, F.MODE_OFF):
+        assert F.ladder_state(mode, "8:0", "8:4")["below_floor"] is False
+    # Nothing applied yet, and an unusable floor, both degrade to False.
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, None, "20:1")["below_floor"] is False
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:0", "junk")["below_floor"] is False
+
+
+def test_out_of_bounds_ratios_are_not_rungs():
+    # '1:254' parses cleanly and is only rejected by the a+b<=254 bound, so
+    # without validation it enters the ladder as a 25400% rung — the highest.
+    # Loss-table rows come straight from hand-editable config, unvalidated.
+    assert F.ratio_rung("1:254") == 0
+    assert F.ratio_rung("8:-1") == 0
+    poisoned = [
+        {"max_loss_pct": 0.5,   "fec": "8:0"},
+        {"max_loss_pct": 2.0,   "fec": "1:254"},   # out of bounds: ignored
+        {"max_loss_pct": 5.0,   "fec": "8:2"},
+        {"max_loss_pct": 100.0, "fec": "8:4"},
+    ]
+    assert F.rung_overheads(poisoned) == [0.0, 25.0, 50.0]
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "8:2", poisoned)
+    assert lad["levels"] == 3                      # not 4 — the bad row is gone
+    assert lad["below_floor"] is False
+
+
+def test_below_floor_needs_both_ratios_usable():
+    # An out-of-bounds floor would otherwise read as an enormous overhead and
+    # mark every applied ratio below it.
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:8", "1:254")["below_floor"] is False
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "1:254", "20:1")["below_floor"] is False

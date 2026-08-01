@@ -160,6 +160,22 @@ def test_relay_fec_direction_wire_none_when_absent():
     assert d["wire"] is None
 
 
+def test_relay_fec_direction_passes_through_ladder():
+    lad = {"levels": 4, "floor_level": 1, "applied_level": 3}
+    fetch = {"ok": True, "error": None, "data": {
+        "enabled": True, "ratio": "8:1", "level": 3, "ladder": lad}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True, last_acked=True)
+    assert d["ladder"] == lad
+
+
+def test_relay_fec_direction_ladder_none_from_an_older_relay():
+    # A relay that predates the field: the UI falls back rather than drawing an
+    # empty pip row.
+    fetch = {"ok": True, "error": None, "data": {"ratio": "8:2", "level": 1}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5, desired=True, last_acked=True)
+    assert d["ladder"] is None
+
+
 # ---------------------------------------------------------------------------
 # Direction-correct loss sourcing (2026-07-08): sbfd loss_pct is RX-side, so
 # the loss that the client->relay FEC leg repairs is measured at the RELAY.

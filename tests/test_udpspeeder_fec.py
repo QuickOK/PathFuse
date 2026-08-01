@@ -241,6 +241,59 @@ def test_fec_state_wire_defaults_none():
     assert U.FecState(enabled=True).snapshot()["wire"] is None
 
 
+def test_run_publishes_ladder_for_the_active_profile(tmp_path):
+    """The pip row's rung count must follow the profile actually driving the
+    leg — the cellular table is one rung shorter than the base table."""
+    import threading as _t, time as _time
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"sessions": {"a": {"session_id": 1, "state": "UP", "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state_path), "poll_interval_s": 0.01,
+           "loss_table": fec_control.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1,
+           "ramp_down_hold_s": 0, "wan_profiles": {"wan2": {}}}
+    st = U.FecState(mode=fec_control.MODE_MIN_ADAPTIVE, floor_ratio="20:1",
+                    profile_names=frozenset({"wan2"}))
+    stop = _t.Event()
+    th = _t.Thread(target=lambda: U.run(cfg, stop, st), daemon=True)
+
+    def await_ladder(expected, deadline_s=5.0):
+        """Poll rather than sleep a fixed interval: the control thread's cadence
+        is not ours to assume, and a loaded box makes any fixed wait a flake."""
+        end = _time.monotonic() + deadline_s
+        seen = None
+        while _time.monotonic() < end:
+            seen = st.snapshot()["ladder"]
+            if seen == expected:
+                return seen
+            _time.sleep(0.01)
+        return seen
+
+    try:
+        th.start()
+        # Base table: floor 20:1 (5%) sits under 8:2, so it holds rung 0 and the
+        # idle leg lights nothing.
+        base = {"levels": 5, "floor_level": 0, "applied_level": 0,
+                "below_floor": False}
+        assert await_ladder(base) == base
+        st.set_pushed_link(profile="wan2", signal_floor=False, ts=time.time())
+        # Cellular table: 20:1 IS a rung, so the floor occupies rung 1 and only
+        # two rungs remain above it.
+        cell = {"levels": 4, "floor_level": 1, "applied_level": 1,
+                "below_floor": False}
+        assert await_ladder(cell) == cell
+    finally:
+        stop.set()
+        th.join(timeout=2)
+        os.close(rfd)
+
+
+def test_fec_state_ladder_defaults_none():
+    # Absent until the first control tick; the UI treats None as "unknown".
+    assert U.FecState(enabled=True).snapshot()["ladder"] is None
+
+
 # ---------------------------------------------------------------------------
 # Client-pushed loss (2026-07-08): the relay's TX leg (relay->client) repairs
 # loss measured at the CLIENT; relay-local sbfd loss is the opposite

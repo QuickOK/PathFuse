@@ -169,6 +169,105 @@ def is_level_at_max(level, table=DEFAULT_LOSS_TABLE):
     return level >= len(table) - 1
 
 
+def _overhead_or_none(ratio):
+    """Parse-and-validate a ratio to its overhead percent, or None.
+
+    Validation is not redundant with the try/except: '1:254' parses fine and is
+    only rejected by validate_ratio's a+b<=254 bound, so without it a
+    hand-edited config row would enter the ladder as a 25400% rung — the
+    highest — instead of being ignored."""
+    try:
+        a, b = parse_ratio(ratio)
+        if not validate_ratio(a, b):
+            return None
+        return ratio_overhead_pct(a, b)
+    except (ValueError, AttributeError, TypeError,
+            KeyError, ZeroDivisionError):
+        return None
+
+
+def rung_overheads(table=DEFAULT_LOSS_TABLE):
+    """The table's distinct parity rungs, ascending by overhead.
+
+    A ladder is an ordering of PARITY, which a loss table only incidentally is:
+    its rows are ordered by loss band, and nothing validates that their ratios
+    ascend along with them. Deriving rung positions from this sorted view
+    instead of from row index keeps the pip row coherent for a hand-written
+    table whose rows are out of order, and collapses duplicate ratios — two
+    loss bands carrying the same parity are one rung, not two.
+
+    Identical to row order for every table that is already monotonic, which
+    includes both built-in tables.
+    """
+    pcts = set()
+    for row in table:
+        try:
+            pct = _overhead_or_none(row["fec"])
+        except (TypeError, KeyError):
+            continue
+        if pct is not None:
+            pcts.add(pct)
+    return sorted(pcts)
+
+
+def ratio_rung(ratio, table=DEFAULT_LOSS_TABLE):
+    """Position of the highest rung whose overhead is <= this ratio's.
+
+    Unlike ratio_to_level this does NOT require an exact match: an operator's
+    floor or fixed ratio is free to sit between two rungs (20:1 = 5% falls
+    between the base table's 8:0 and 8:2), and a strict lookup would collapse
+    every such value to 0. Rounding DOWN is deliberate — the UI's pip row must
+    never claim more protection than the ratio actually delivers.
+
+    An unusable ratio, or one below even the lowest rung, is position 0: a
+    display helper must degrade, not raise.
+    """
+    pct = _overhead_or_none(ratio)
+    if pct is None:
+        return 0
+    rung = 0
+    for i, overhead in enumerate(rung_overheads(table)):
+        if overhead <= pct:
+            rung = i
+    return rung
+
+
+def ladder_state(mode, ratio, floor_ratio, table=DEFAULT_LOSS_TABLE):
+    """{levels, floor_level, applied_level} describing where the ratio on the
+    wire sits on the active profile's ladder. Consumed by the UI's pip row,
+    which shows the applied level RELATIVE to the floor.
+
+    applied_level comes from the ratio actually applied, not the adaptive
+    engine's level index: that makes it right in every mode for free — fixed
+    and off ignore the engine entirely, and the signal floor lifts the ratio
+    without the published level always reflecting it.
+
+    floor_level is 0 outside min_adaptive; nothing is being held up there, so
+    the whole ladder is available.
+
+    below_floor is decided on the RATIOS, not on the rung positions derived from
+    them: a floor between two rungs shares a position with the rung beneath it
+    (20:1 and 8:0 are both position 0 on the base table), so a position compare
+    would call a leg carrying less parity than its floor "at floor". Positions
+    are for drawing; this is the truth claim.
+    """
+    below = False
+    if mode == MODE_MIN_ADAPTIVE and ratio:
+        applied_pct = _overhead_or_none(ratio)
+        floor_pct = _overhead_or_none(floor_ratio)
+        # Either side unusable: claim nothing. An unusable floor is applied as
+        # the default anyway, so guessing here would be worse than silence.
+        below = (applied_pct is not None and floor_pct is not None
+                 and applied_pct < floor_pct)
+    return {
+        "levels": len(rung_overheads(table)),
+        "floor_level": (ratio_rung(floor_ratio, table)
+                        if mode == MODE_MIN_ADAPTIVE else 0),
+        "applied_level": ratio_rung(ratio, table) if ratio else 0,
+        "below_floor": below,
+    }
+
+
 def mode_aware_level(mode, up_count, loss_pct, table=DEFAULT_LOSS_TABLE,
                      full_min_up_wans=2, backoff_ratio="8:0"):
     """In full-redundancy with enough healthy links, engarde already

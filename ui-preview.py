@@ -79,15 +79,24 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
         "fec": {
             "configured": True,
             "desired_enabled": True,
+            "desired_mode": "min_adaptive",
+            "floor_ratio": "20:1",
             "directions": {
+                # c2r sits two rungs over its floor (pips lit and flashing);
+                # r2c is on the cellular ladder, one rung over a floor that IS
+                # a rung there — the two shapes the pip row has to handle.
                 "client_to_relay": {
                     "enabled": True, "ratio": "8:4", "level": 2,
+                    "mode": "min_adaptive",
+                    "ladder": {"levels": 5, "floor_level": 0, "applied_level": 2},
                     "driving_loss_pct": 3.1, "driver_wan": cfg.policy.default_master_wan,
                     "since": now - 42, "actuator_ok": True,
                     "wire": {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False},
                 },
                 "relay_to_client": {
-                    "enabled": True, "ratio": "8:2", "level": 1,
+                    "enabled": True, "ratio": "12:1", "level": 2,
+                    "mode": "min_adaptive",
+                    "ladder": {"levels": 4, "floor_level": 1, "applied_level": 2},
                     "driving_loss_pct": 1.2, "since": now - 133,
                     "ok": True, "stale_s": 0.4, "error": None,
                     "reconcile_pending": False,
