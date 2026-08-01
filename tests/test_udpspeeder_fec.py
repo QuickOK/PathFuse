@@ -274,12 +274,14 @@ def test_run_publishes_ladder_for_the_active_profile(tmp_path):
         th.start()
         # Base table: floor 20:1 (5%) sits under 8:2, so it holds rung 0 and the
         # idle leg lights nothing.
-        base = {"levels": 5, "floor_level": 0, "applied_level": 0}
+        base = {"levels": 5, "floor_level": 0, "applied_level": 0,
+                "below_floor": False}
         assert await_ladder(base) == base
         st.set_pushed_link(profile="wan2", signal_floor=False, ts=time.time())
         # Cellular table: 20:1 IS a rung, so the floor occupies rung 1 and only
         # two rungs remain above it.
-        cell = {"levels": 4, "floor_level": 1, "applied_level": 1}
+        cell = {"levels": 4, "floor_level": 1, "applied_level": 1,
+                "below_floor": False}
         assert await_ladder(cell) == cell
     finally:
         stop.set()

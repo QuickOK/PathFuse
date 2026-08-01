@@ -367,7 +367,8 @@ def test_ladder_state_min_adaptive_base_table():
     # Floor 20:1 sits on rung 0 of the base table, so all four rungs above the
     # idle tier are available and the floor itself lights nothing.
     lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "20:1")
-    assert lad == {"levels": 5, "floor_level": 0, "applied_level": 0}
+    assert lad == {"levels": 5, "floor_level": 0, "applied_level": 0,
+                   "below_floor": False}
     lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "20:1")
     assert lad["applied_level"] == 2
 
@@ -376,7 +377,8 @@ def test_ladder_state_min_adaptive_cell_table():
     t = F.DEFAULT_CELL_LOSS_TABLE
     # Floor 20:1 IS rung 1 here: only 2 of the 4 rungs are above the floor.
     at_floor = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "20:1", t)
-    assert at_floor == {"levels": 4, "floor_level": 1, "applied_level": 1}
+    assert at_floor == {"levels": 4, "floor_level": 1, "applied_level": 1,
+                        "below_floor": False}
     top = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:1", "20:1", t)
     assert top["applied_level"] - top["floor_level"] == 2
 
@@ -415,7 +417,8 @@ def test_rung_positions_are_independent_of_row_order():
     assert F.ratio_rung("8:4", shuffled) == 2
     assert F.ratio_rung("8:6", shuffled) == 3
     lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "8:2", shuffled)
-    assert lad == {"levels": 5, "floor_level": 1, "applied_level": 2}
+    assert lad == {"levels": 5, "floor_level": 1, "applied_level": 2,
+                   "below_floor": False}
 
 
 def test_duplicate_ratios_are_one_rung():
@@ -436,3 +439,29 @@ def test_ladder_state_can_report_below_the_floor():
     # expose that rather than clamp it into looking like "at floor".
     lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "8:4")
     assert lad["applied_level"] < lad["floor_level"]
+    assert lad["below_floor"] is True
+
+
+def test_below_floor_compares_ratios_not_rung_positions():
+    # 8:0 (0%) and the default 20:1 floor (5%) BOTH sit on base-table position 0,
+    # so a position compare would call a leg carrying no parity at all "at
+    # floor". Same trap on the cellular table, where a floor of 8:2 (25%) shares
+    # position 3 with the 8:1 (12.5%) top rung.
+    lad = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:0", "20:1")
+    assert lad["applied_level"] == lad["floor_level"] == 0
+    assert lad["below_floor"] is True
+    cell = F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:1", "8:2",
+                          F.DEFAULT_CELL_LOSS_TABLE)
+    assert cell["applied_level"] == cell["floor_level"] == 3
+    assert cell["below_floor"] is True
+
+
+def test_below_floor_false_at_or_above_the_floor_and_outside_min_adaptive():
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "20:1", "20:1")["below_floor"] is False
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:4", "20:1")["below_floor"] is False
+    # No floor is being held in these modes, so nothing can be under one.
+    for mode in (F.MODE_ADAPTIVE, F.MODE_FIXED, F.MODE_OFF):
+        assert F.ladder_state(mode, "8:0", "8:4")["below_floor"] is False
+    # Nothing applied yet, and an unusable floor, both degrade to False.
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, None, "20:1")["below_floor"] is False
+    assert F.ladder_state(F.MODE_MIN_ADAPTIVE, "8:0", "junk")["below_floor"] is False

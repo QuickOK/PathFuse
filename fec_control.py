@@ -227,12 +227,26 @@ def ladder_state(mode, ratio, floor_ratio, table=DEFAULT_LOSS_TABLE):
 
     floor_level is 0 outside min_adaptive; nothing is being held up there, so
     the whole ladder is available.
+
+    below_floor is decided on the RATIOS, not on the rung positions derived from
+    them: a floor between two rungs shares a position with the rung beneath it
+    (20:1 and 8:0 are both position 0 on the base table), so a position compare
+    would call a leg carrying less parity than its floor "at floor". Positions
+    are for drawing; this is the truth claim.
     """
+    below = False
+    if mode == MODE_MIN_ADAPTIVE and ratio:
+        try:
+            below = (ratio_overhead_pct(*parse_ratio(ratio))
+                     < ratio_overhead_pct(*parse_ratio(floor_ratio)))
+        except (ValueError, AttributeError, TypeError, ZeroDivisionError):
+            below = False
     return {
         "levels": len(rung_overheads(table)),
         "floor_level": (ratio_rung(floor_ratio, table)
                         if mode == MODE_MIN_ADAPTIVE else 0),
         "applied_level": ratio_rung(ratio, table) if ratio else 0,
+        "below_floor": below,
     }
 
 

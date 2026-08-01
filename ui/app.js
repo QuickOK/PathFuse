@@ -765,17 +765,26 @@ function renderFecLevel(el, d){
   // field) is min_adaptive by mode but carries no parity at all, and the card
   // already labels that ratio OFF.
   const off = (d.enabled === false) || (d.ratio === "8:0");
-  const floored = !off && d.mode === "min_adaptive";
+  const minAdaptive = d.mode === "min_adaptive";
+  const floored = !off && minAdaptive;
   // The ratio on the wire can sit BELOW the floor: raise the floor while the
   // actuator is down and the controller keeps publishing the last ratio it
   // actually got applied. `lit` clamps that to zero, which is indistinguishable
   // from resting at the floor — so the floor would appear to be holding when
-  // its parity is exactly what is missing. Read it before the clamp.
-  const belowFloor = floored && applied < floorLvl;
+  // its parity is exactly what is missing.
+  //
+  // Prefer the server's flag, which compares the ratios themselves; the rung
+  // compare is the fallback for a relay too old to send it, and is coarser (a
+  // floor between two rungs shares a position with the rung below it).
+  const belowFloor = minAdaptive && (lad && typeof lad.below_floor === "boolean"
+    ? lad.below_floor
+    : applied < floorLvl);
 
   let label;
-  if (off || d.mode === "off") label = "off";
-  else if (belowFloor) label = "below floor";
+  // Ahead of the off label: a min_adaptive leg carrying no parity at all is the
+  // worst case of below-floor, and "off" would read as an intended state.
+  if (belowFloor) label = "below floor";
+  else if (off || d.mode === "off") label = "off";
   else if (floored) label = dots <= 0 ? "floor at max"
                      : (lit === 0 ? "at floor" : `+${lit} over floor`);
   else if (d.mode === "fixed") label = dots > 0 ? `fixed · ${lit}/${dots}` : "fixed";
