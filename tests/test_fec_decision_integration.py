@@ -185,13 +185,17 @@ def test_profile_swap_reseeds_from_the_adaptive_level_not_the_applied_ratio():
 def test_profile_swap_applies_the_new_floor_on_the_same_tick():
     # The 60s ramp-down hold must have nothing to hold: the swap tick itself
     # has to land on the wan1 profile's 12:1 floor, not sit at 8:1 for a minute.
+    # Table, hysteresis and floor all come out of the profile, as they do in the
+    # loop — a literal floor here would assert apply_mode and nothing else.
+    fc = _fec_cfg_with_profile()
+    fc.wan_profiles["wan1"].floor_ratio = "12:1"
+    _, table, hyst, profile_floor, _ = M.resolve_fec_profile(fc, "wan1")
     rt = M.fec_reseed_runtime(F.FecRuntime(0, 0, 100.0), F.DEFAULT_LOSS_TABLE,
-                              F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
-    rt, _ = F.step_level(0, rt, F.FecHysteresis(1, 60.0), now=200.0)
+                              table, now=200.0)
+    rt, _ = F.step_level(0, rt, hyst, now=200.0)
     assert F.apply_mode(F.MODE_MIN_ADAPTIVE,
-                        F.level_to_ratio(rt.current_level,
-                                         F.DEFAULT_CELL_LOSS_TABLE),
-                        floor_ratio="12:1") == "12:1"
+                        F.level_to_ratio(rt.current_level, table),
+                        floor_ratio=profile_floor) == "12:1"
 
 
 def test_profile_swap_does_not_report_fec_at_max_while_idle():
@@ -216,7 +220,8 @@ def test_profile_swap_restarts_the_ramp_down_clock():
     # that would let the fresh level decay immediately.
     rt = M.fec_reseed_runtime(F.FecRuntime(0, 0, 100.0), F.DEFAULT_LOSS_TABLE,
                               F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
-    assert rt.last_change_ts == 200.0 and rt.up_streak == 0
+    assert rt.last_change_ts == 200.0
+    assert rt.up_streak == 0
 
 
 # ---------- entering full redundancy: the profile must not wait out a dwell ----
