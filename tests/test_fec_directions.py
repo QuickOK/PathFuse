@@ -633,6 +633,52 @@ def test_driver_tie_no_longer_thrashes_on_alphabetical_order():
     assert _pick({"wan1": 0.0, "wan2": 0.0}, active, "wan1", None, None, 100.0)[0] == "wan1"
 
 
+def test_driver_adopts_a_joining_wan_without_making_it_serve_the_dwell():
+    # Entering full redundancy: wan2 was the sole active link, so it holds the
+    # driver by short-circuit, and wan1 arrives. Both are clean, so the tie
+    # resolves to wan1 — but as a plain challenger it would owe 120s of dwell
+    # first, and for that whole time the default profile keeps driving the
+    # cellular link. A WAN that just joined never had the chance to compete for
+    # the incumbency it is being measured against.
+    d, c, s = M.fec_driver_pick({"wan1": 0.0, "wan2": 0.0}, {"wan1", "wan2"},
+                                "wan2", None, None, DWELL, 100.0,
+                                prev_active={"wan2"})
+    assert (d, c, s) == ("wan1", None, None)
+
+
+def test_driver_still_makes_an_incumbent_rival_serve_the_dwell_after_a_join():
+    # Only the newcomer skips the queue. wan3 arriving clean while wan2 — which
+    # was active all along — degrades must start an ordinary challenge: the
+    # membership change is not a licence to re-rank everyone.
+    d, c, s = M.fec_driver_pick({"wan1": 0.0, "wan2": 4.0, "wan3": 0.0},
+                                {"wan1", "wan2", "wan3"}, "wan1", None, None,
+                                DWELL, 100.0, prev_active={"wan1", "wan2"})
+    assert (d, c, s) == ("wan1", "wan2", 100.0)
+
+
+def test_driver_keeps_a_running_dwell_when_a_bystander_joins():
+    # wan2 is mid-challenge against wan1. wan3 joining is unrelated to that
+    # race, and must not hand wan2 the driver ahead of its clock.
+    active = {"wan1", "wan2"}
+    loss = {"wan1": 0.0, "wan2": 2.0, "wan3": 0.0}
+    d, c, s = _pick(loss, active, "wan1", None, None, 100.0)
+    assert (c, s) == ("wan2", 100.0)
+    d, c, s = M.fec_driver_pick(loss, {"wan1", "wan2", "wan3"}, "wan1", c, s,
+                                DWELL, 130.0, prev_active=active)
+    assert (d, c, s) == ("wan1", "wan2", 100.0)      # clock still at 100.0
+
+
+def test_driver_keeps_a_running_dwell_when_a_bystander_leaves():
+    # The mirror case: losing a WAN the incumbent already outranked changes
+    # nothing about the challenge in flight.
+    loss = {"wan1": 0.0, "wan2": 2.0, "wan3": 0.0}
+    d, c, s = _pick(loss, {"wan1", "wan2", "wan3"}, "wan1", None, None, 100.0)
+    assert (c, s) == ("wan2", 100.0)
+    d, c, s = M.fec_driver_pick(loss, {"wan1", "wan2"}, "wan1", c, s,
+                                DWELL, 130.0, prev_active={"wan1", "wan2", "wan3"})
+    assert (d, c, s) == ("wan1", "wan2", 100.0)
+
+
 def test_driver_bootstraps_to_the_raw_ranking():
     d, c, s = _pick({"wan1": 1.0, "wan2": 5.0}, {"wan1", "wan2"}, None,
                     None, None, 100.0)

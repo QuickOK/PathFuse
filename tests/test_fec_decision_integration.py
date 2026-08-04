@@ -217,3 +217,43 @@ def test_profile_swap_restarts_the_ramp_down_clock():
     rt = M.fec_reseed_runtime(F.FecRuntime(0, 0, 100.0), F.DEFAULT_LOSS_TABLE,
                               F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
     assert rt.last_change_ts == 200.0 and rt.up_streak == 0
+
+
+# ---------- entering full redundancy: the profile must not wait out a dwell ----
+
+def _profile_per_tick(fc, ticks, dwell=120.0):
+    """Replay (now, active, loss) samples through the driver picker and profile
+    resolution the way the control loop does. Returns the profile name in force
+    after each tick."""
+    cur = cand = since = prev = None
+    names = []
+    for now, active, loss in ticks:
+        cur, cand, since = M.fec_driver_pick(loss, active, cur, cand, since,
+                                             dwell, now, prev_active=prev)
+        prev = set(active)
+        names.append(M.resolve_fec_profile(fc, cur)[0])
+    return names
+
+
+def test_entering_full_redundancy_adopts_the_cellular_profile_on_the_first_tick():
+    # The other half of the live 2026-08-04 regression: before the reseed bug
+    # could even be reached, the driver owed wan1 a 120s dwell, so the cellular
+    # link ran the default profile — and its 8:1 config floor — for two minutes
+    # after the switch to full redundancy.
+    fc = _fec_cfg_with_profile()
+    quiet = {"wan1": 0.0, "wan2": 0.0}
+    assert _profile_per_tick(fc, [
+        (0.0, {"wan2"}, {"wan2": 0.0}),           # master_backup: wan2 alone
+        (0.5, {"wan1", "wan2"}, quiet),           # wan1 joins
+        (1.0, {"wan1", "wan2"}, quiet),
+    ]) == ["default", "wan1", "wan1"]
+
+
+def test_leaving_full_redundancy_hands_the_profile_back_at_once():
+    # The exit was never delayed and must stay that way: one active WAN is not
+    # a race, so dropping back to wan2 alone restores the default profile.
+    fc = _fec_cfg_with_profile()
+    assert _profile_per_tick(fc, [
+        (0.0, {"wan1", "wan2"}, {"wan1": 0.0, "wan2": 0.0}),
+        (0.5, {"wan2"}, {"wan1": 0.0, "wan2": 0.0}),
+    ]) == ["wan1", "default"]

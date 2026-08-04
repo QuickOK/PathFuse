@@ -856,7 +856,7 @@ def fec_driver_wan(loss, active_wans):
 
 
 def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
-                    dwell_s, now):
+                    dwell_s, now, prev_active=None):
     """Sticky version of fec_driver_wan: (driver, candidate, candidate_since).
 
     The driver picks the WHOLE FEC policy — table, floor, hysteresis — so
@@ -883,6 +883,18 @@ def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
 
     Only one WAN active — every mode but full redundancy — has no race to lose
     and short-circuits, so this cannot delay a master_backup failover.
+
+    prev_active is last tick's set. Incumbency means "worst of THIS field for
+    dwell_s", a claim a WAN that just joined never got to contest, so when the
+    canonical pick is a newcomer it takes over at once instead of owing dwell.
+    Entering full redundancy is that case: the second link joins, both are
+    clean, and the tie hands the driver to a WAN the incumbent had no race
+    against — waiting 120s there just runs the wrong profile on a live link.
+    Only the newcomer skips the queue; a WAN that was already active keeps
+    serving its dwell, and a departure leaves a challenge in flight untouched,
+    so the anti-flap damping still covers every same-membership tick, which is
+    where the measured thrash lived. Pass None (the default) when last tick's
+    set is unknown and every WAN is treated as an incumbent.
     """
     active = active_wans or set(loss.keys())
     if not active:
@@ -895,6 +907,8 @@ def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
         return fec_driver_wan(loss, active), None, None
 
     challenger = fec_driver_wan(loss, active)
+    if prev_active and challenger is not None and challenger not in prev_active:
+        return challenger, None, None
     if challenger is None or challenger == current:
         return current, None, None
     if candidate == challenger and candidate_since is not None:
@@ -2550,6 +2564,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     fec_driver_current = None
     fec_driver_candidate = None
     fec_driver_candidate_since = None
+    # Last tick's active set, so a WAN that has just joined can be told apart
+    # from one that has been racing all along. None on the first tick: no
+    # membership is known yet, so nobody counts as a newcomer.
+    fec_driver_active_prev = None
     fec_signal_floor = fec_control.SignalFloor(fec_control.SignalThresholds(
         rsrq_degrade_db=cfg.cell.rsrq_degrade_db,
         rsrq_recover_db=cfg.cell.rsrq_recover_db,
@@ -2769,7 +2787,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
              fec_driver_candidate_since) = fec_driver_pick(
                 fec_loss, currently_active, fec_driver_current,
                 fec_driver_candidate, fec_driver_candidate_since,
-                cfg.fec.driver_dwell_s, loop_start)
+                cfg.fec.driver_dwell_s, loop_start,
+                prev_active=fec_driver_active_prev)
+            fec_driver_active_prev = set(currently_active or ())
             if fec_driver != fec_driver_current:
                 logging.info("fec driver -> %s (was %s)",
                              fec_driver, fec_driver_current)
