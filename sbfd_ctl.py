@@ -856,7 +856,7 @@ def fec_driver_wan(loss, active_wans):
 
 
 def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
-                    dwell_s, now):
+                    dwell_s, now, prev_active=None):
     """Sticky version of fec_driver_wan: (driver, candidate, candidate_since).
 
     The driver picks the WHOLE FEC policy — table, floor, hysteresis — so
@@ -883,6 +883,18 @@ def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
 
     Only one WAN active — every mode but full redundancy — has no race to lose
     and short-circuits, so this cannot delay a master_backup failover.
+
+    prev_active is last tick's set. Incumbency means "worst of THIS field for
+    dwell_s", a claim a WAN that just joined never got to contest, so when the
+    canonical pick is a newcomer it takes over at once instead of owing dwell.
+    Entering full redundancy is that case: the second link joins, both are
+    clean, and the tie hands the driver to a WAN the incumbent had no race
+    against — waiting 120s there just runs the wrong profile on a live link.
+    Only the newcomer skips the queue; a WAN that was already active keeps
+    serving its dwell, and a departure leaves a challenge in flight untouched,
+    so the anti-flap damping still covers every same-membership tick, which is
+    where the measured thrash lived. Pass None (the default) when last tick's
+    set is unknown and every WAN is treated as an incumbent.
     """
     active = active_wans or set(loss.keys())
     if not active:
@@ -895,6 +907,8 @@ def fec_driver_pick(loss, active_wans, current, candidate, candidate_since,
         return fec_driver_wan(loss, active), None, None
 
     challenger = fec_driver_wan(loss, active)
+    if prev_active and challenger is not None and challenger not in prev_active:
+        return challenger, None, None
     if challenger is None or challenger == current:
         return current, None, None
     if candidate == challenger and candidate_since is not None:
@@ -919,6 +933,28 @@ def resolve_fec_profile(fec_cfg, driver_wan):
     return (p.name, p.loss_table,
             fec_control.FecHysteresis(p.ramp_up_ticks, p.ramp_down_hold_s),
             p.floor_ratio, p.signal_floor_fec)
+
+
+def fec_reseed_runtime(rt, old_table, new_table, now):
+    """Re-base the adaptive runtime onto a new profile's table on a driver swap.
+
+    Carries the ADAPTIVE level's ratio, never the ratio actually applied: under
+    min_adaptive the applied value is floor-lifted, so reseeding from it hands
+    the engine a level it never chose. Live case (2026-08-04): the default
+    profile was applying the 8:1 config floor over an idle level 0, and 8:1 is
+    the TOP rung of the cellular table — so entering full redundancy reseeded
+    the wan1 profile at maximum parity against 0% loss, and its 60s ramp-down
+    hold pinned 8:1 for a full minute before the profile's own 12:1 floor could
+    take effect. A ratio the new table has no rung for still lands at 0 and
+    re-ramps (one tick on cellular).
+
+    The ramp-down clock restarts at the swap by design: the incoming profile's
+    hold is its own, not something the outgoing one has already served.
+    """
+    ratio = fec_control.level_to_ratio(rt.current_level,
+                                       old_table or new_table)
+    return fec_control.FecRuntime(
+        fec_control.ratio_to_level(ratio, new_table), 0, now)
 
 
 def fec_profile_candidates(cfg: Config, ov: RuntimeOverlay):
@@ -2521,10 +2557,17 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
 
     fec_rt = fec_control.FecRuntime(current_level=0, up_streak=0, last_change_ts=time.time())
     fec_profile_active = "default"
+    # The table `fec_rt`'s level is indexed against. Tracked alongside the
+    # profile name because a swap has to re-base the level from the OLD table.
+    fec_profile_table = cfg.fec.loss_table if cfg.fec else None
     # Sticky-driver state (see fec_driver_pick).
     fec_driver_current = None
     fec_driver_candidate = None
     fec_driver_candidate_since = None
+    # Last tick's active set, so a WAN that has just joined can be told apart
+    # from one that has been racing all along. None on the first tick: no
+    # membership is known yet, so nobody counts as a newcomer.
+    fec_driver_active_prev = None
     fec_signal_floor = fec_control.SignalFloor(fec_control.SignalThresholds(
         rsrq_degrade_db=cfg.cell.rsrq_degrade_db,
         rsrq_recover_db=cfg.cell.rsrq_recover_db,
@@ -2744,7 +2787,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
              fec_driver_candidate_since) = fec_driver_pick(
                 fec_loss, currently_active, fec_driver_current,
                 fec_driver_candidate, fec_driver_candidate_since,
-                cfg.fec.driver_dwell_s, loop_start)
+                cfg.fec.driver_dwell_s, loop_start,
+                prev_active=fec_driver_active_prev)
+            fec_driver_active_prev = set(currently_active or ())
             if fec_driver != fec_driver_current:
                 logging.info("fec driver -> %s (was %s)",
                              fec_driver, fec_driver_current)
@@ -2761,13 +2806,11 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             (prof_name, prof_table, prof_hyst,
              prof_floor, prof_sf_fec) = resolve_fec_profile(cfg.fec, fec_driver)
             if prof_name != fec_profile_active:
-                # Carry the current ratio into the new table's level space;
-                # unknown ratios land at 0 and re-ramp (1 tick on cellular).
-                fec_rt = fec_control.FecRuntime(
-                    fec_control.ratio_to_level(fec_current_ratio or "8:0",
-                                               prof_table), 0, loop_start)
+                fec_rt = fec_reseed_runtime(fec_rt, fec_profile_table,
+                                            prof_table, loop_start)
                 logging.info("fec profile -> %s (driver=%s)", prof_name, fec_driver)
                 fec_profile_active = prof_name
+                fec_profile_table = prof_table
             fec_floor_ratio_eff = effective_fec_floor_ratio(
                 cfg, ov, profile_floor=prof_floor)
             # Signal floor: only for a profiled driver that IS the telemetry
