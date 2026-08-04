@@ -166,3 +166,54 @@ def test_apply_handoff_window_guards():
     # no cell wan configured -> inert
     assert M.apply_handoff_window("master_backup", w, None, {"wan1"}) == \
         ("master_backup", None)
+
+
+# ---------- profile swap: reseed the engine from the ADAPTIVE level ----------
+
+def test_profile_swap_reseeds_from_the_adaptive_level_not_the_applied_ratio():
+    # Live regression 2026-08-04: entering full redundancy, the wan2 -> wan1
+    # driver swap reseeded the engine from the APPLIED ratio 8:1 — a value the
+    # min_adaptive floor had produced while the adaptive level was 0 (idle).
+    # 8:1 is the TOP rung of the cellular table, so the engine came out of the
+    # swap believing it was at maximum parity against 0% loss.
+    rt = F.FecRuntime(0, 0, 100.0)                  # idle under the default table
+    rt = M.fec_reseed_runtime(rt, F.DEFAULT_LOSS_TABLE,
+                              F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
+    assert rt.current_level == 0
+
+
+def test_profile_swap_applies_the_new_floor_on_the_same_tick():
+    # The 60s ramp-down hold must have nothing to hold: the swap tick itself
+    # has to land on the wan1 profile's 12:1 floor, not sit at 8:1 for a minute.
+    rt = M.fec_reseed_runtime(F.FecRuntime(0, 0, 100.0), F.DEFAULT_LOSS_TABLE,
+                              F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
+    rt, _ = F.step_level(0, rt, F.FecHysteresis(1, 60.0), now=200.0)
+    assert F.apply_mode(F.MODE_MIN_ADAPTIVE,
+                        F.level_to_ratio(rt.current_level,
+                                         F.DEFAULT_CELL_LOSS_TABLE),
+                        floor_ratio="12:1") == "12:1"
+
+
+def test_profile_swap_does_not_report_fec_at_max_while_idle():
+    # is_level_at_max feeds the fec-at-max notification; a reseed artefact must
+    # not page as "FEC at maximum" with the link at 0% loss.
+    rt = M.fec_reseed_runtime(F.FecRuntime(0, 0, 100.0), F.DEFAULT_LOSS_TABLE,
+                              F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
+    assert F.is_level_at_max(rt.current_level, F.DEFAULT_CELL_LOSS_TABLE) is False
+
+
+def test_profile_swap_re_ramps_a_rung_the_new_table_lacks():
+    # Unchanged semantics: a genuine level whose ratio has no rung in the new
+    # table lands at 0 and re-ramps (one tick on the cellular profile).
+    rt = M.fec_reseed_runtime(F.FecRuntime(2, 0, 100.0),   # 8:4, real loss
+                              F.DEFAULT_LOSS_TABLE,
+                              F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
+    assert rt.current_level == 0
+
+
+def test_profile_swap_restarts_the_ramp_down_clock():
+    # The new profile's hold starts at the swap; it must not inherit a clock
+    # that would let the fresh level decay immediately.
+    rt = M.fec_reseed_runtime(F.FecRuntime(0, 0, 100.0), F.DEFAULT_LOSS_TABLE,
+                              F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
+    assert rt.last_change_ts == 200.0 and rt.up_streak == 0

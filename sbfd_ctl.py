@@ -921,6 +921,28 @@ def resolve_fec_profile(fec_cfg, driver_wan):
             p.floor_ratio, p.signal_floor_fec)
 
 
+def fec_reseed_runtime(rt, old_table, new_table, now):
+    """Re-base the adaptive runtime onto a new profile's table on a driver swap.
+
+    Carries the ADAPTIVE level's ratio, never the ratio actually applied: under
+    min_adaptive the applied value is floor-lifted, so reseeding from it hands
+    the engine a level it never chose. Live case (2026-08-04): the default
+    profile was applying the 8:1 config floor over an idle level 0, and 8:1 is
+    the TOP rung of the cellular table — so entering full redundancy reseeded
+    the wan1 profile at maximum parity against 0% loss, and its 60s ramp-down
+    hold pinned 8:1 for a full minute before the profile's own 12:1 floor could
+    take effect. A ratio the new table has no rung for still lands at 0 and
+    re-ramps (one tick on cellular).
+
+    The ramp-down clock restarts at the swap by design: the incoming profile's
+    hold is its own, not something the outgoing one has already served.
+    """
+    ratio = fec_control.level_to_ratio(rt.current_level,
+                                       old_table or new_table)
+    return fec_control.FecRuntime(
+        fec_control.ratio_to_level(ratio, new_table), 0, now)
+
+
 def fec_profile_candidates(cfg: Config, ov: RuntimeOverlay):
     """[(loss_table, floor_ratio)] for every profile that could drive FEC.
 
@@ -2521,6 +2543,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
 
     fec_rt = fec_control.FecRuntime(current_level=0, up_streak=0, last_change_ts=time.time())
     fec_profile_active = "default"
+    # The table `fec_rt`'s level is indexed against. Tracked alongside the
+    # profile name because a swap has to re-base the level from the OLD table.
+    fec_profile_table = cfg.fec.loss_table if cfg.fec else None
     # Sticky-driver state (see fec_driver_pick).
     fec_driver_current = None
     fec_driver_candidate = None
@@ -2761,13 +2786,11 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             (prof_name, prof_table, prof_hyst,
              prof_floor, prof_sf_fec) = resolve_fec_profile(cfg.fec, fec_driver)
             if prof_name != fec_profile_active:
-                # Carry the current ratio into the new table's level space;
-                # unknown ratios land at 0 and re-ramp (1 tick on cellular).
-                fec_rt = fec_control.FecRuntime(
-                    fec_control.ratio_to_level(fec_current_ratio or "8:0",
-                                               prof_table), 0, loop_start)
+                fec_rt = fec_reseed_runtime(fec_rt, fec_profile_table,
+                                            prof_table, loop_start)
                 logging.info("fec profile -> %s (driver=%s)", prof_name, fec_driver)
                 fec_profile_active = prof_name
+                fec_profile_table = prof_table
             fec_floor_ratio_eff = effective_fec_floor_ratio(
                 cfg, ov, profile_floor=prof_floor)
             # Signal floor: only for a profiled driver that IS the telemetry
