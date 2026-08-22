@@ -1,7 +1,11 @@
 # PathFuse — persistent journald storage on the client (survives reboots for
 # post-mortem of link-flap events). Some minimal images default to volatile
 # storage; this overrides that. Caps disk use.
+#
+# A busy client writes on the order of 200M/day, so the old 200M cap held less
+# than a day — short enough that a link fault found the next morning had
+# already aged out of the client's own journal. 2G buys about a week.
 [Journal]
 Storage=persistent
-SystemMaxUse=200M
-SystemMaxFileSize=20M
+SystemMaxUse=2G
+SystemMaxFileSize=50M
