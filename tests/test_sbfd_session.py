@@ -333,3 +333,46 @@ def test_first_socket_rebuild_happens_even_at_time_zero(rebuildable, clock):
     sess.consecutive_send_errors = M.SEND_ERROR_REBUILD_THRESHOLD
 
     assert M.maybe_rebuild_socket(sess, dcfg) is True
+
+
+def test_rewind_exactly_at_the_restart_threshold_is_treated_as_reordering():
+    """SEQ_RESTART_REWIND is the largest rewind still called reordering."""
+    sess = _session(state=M.State.UP)
+    sess.last_rx_seq = 10_000
+
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=10_000 - M.SEQ_RESTART_REWIND), PEER)
+
+    assert sess.last_rx_seq == 10_000
+
+
+def test_rewind_past_the_restart_threshold_is_still_accepted():
+    sess = _session(state=M.State.UP)
+    sess.last_rx_seq = 10_000
+
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=10_000 - M.SEQ_RESTART_REWIND - 1), PEER)
+
+    assert sess.last_rx_seq == 10_000 - M.SEQ_RESTART_REWIND - 1
+
+
+def test_second_send_failure_stays_quiet_after_a_first_at_time_zero(caplog, clock):
+    """An action recorded at t=0 must not read back as 'never happened'."""
+    clock[0] = 0.0
+    sess = _sending_session(_FailingSock())
+
+    with caplog.at_level(logging.WARNING):
+        M.send_packet(sess)
+        clock[0] = 30.0
+        M.send_packet(sess)
+
+    assert len(_warnings(caplog)) == 1
+
+
+def test_second_rebuild_is_refused_after_a_rebuild_at_time_zero(rebuildable, clock):
+    clock[0] = 0.0
+    sess, dcfg = rebuildable
+    sess.consecutive_send_errors = M.SEND_ERROR_REBUILD_THRESHOLD
+    assert M.maybe_rebuild_socket(sess, dcfg) is True
+
+    clock[0] = 30.0
+    sess.consecutive_send_errors = M.SEND_ERROR_REBUILD_THRESHOLD
+    assert M.maybe_rebuild_socket(sess, dcfg) is False

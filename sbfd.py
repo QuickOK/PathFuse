@@ -108,8 +108,11 @@ class Session:
     # Tx-failure bookkeeping: a send that fails every tick is invisible
     # otherwise, and it is exactly what a wedged interface socket looks like.
     consecutive_send_errors: int = 0
-    last_send_error_log: float = 0.0
-    last_socket_rebuild: float = 0.0
+    # None, not 0.0: these are "has this ever happened", and a clock that can
+    # legitimately read 0.0 must not make a recorded action look like one that
+    # never occurred.
+    last_send_error_log: Optional[float] = None
+    last_socket_rebuild: Optional[float] = None
 
     # For loss math: track expected vs received over a window
     rx_count_window: int = 0
@@ -178,7 +181,7 @@ def maybe_rebuild_socket(sess: Session, cfg: DaemonConfig) -> bool:
     if sess.consecutive_send_errors < SEND_ERROR_REBUILD_THRESHOLD:
         return False
     now = now_s()
-    if (sess.last_socket_rebuild != 0.0
+    if (sess.last_socket_rebuild is not None
             and now - sess.last_socket_rebuild < SOCKET_REBUILD_INTERVAL_S):
         return False
     sess.last_socket_rebuild = now
@@ -238,7 +241,7 @@ def on_rx(sess: Session, packet: tuple, src_addr: tuple):
     # Replay/reorder filter. A small rewind is reordering and is dropped; a
     # large one means the peer restarted its sequence space, so we accept it
     # and resynchronise rather than filtering the peer out permanently.
-    if sess.last_rx_seq - SEQ_RESTART_REWIND < seq <= sess.last_rx_seq:
+    if sess.last_rx_seq - SEQ_RESTART_REWIND <= seq <= sess.last_rx_seq:
         return
 
     # Loss math: count gap if any
@@ -350,7 +353,7 @@ def send_packet(sess: Session):
         # actually visible -- rate-limited, since we retry every tick.
         sess.consecutive_send_errors += 1
         now = now_s()
-        if (sess.last_send_error_log == 0.0
+        if (sess.last_send_error_log is None
                 or now - sess.last_send_error_log >= SEND_ERROR_LOG_INTERVAL_S):
             sess.last_send_error_log = now
             logging.warning("session %s: sendto failed: %s (%d failures in a row)",
@@ -361,7 +364,7 @@ def send_packet(sess: Session):
         logging.info("session %s: sendto recovered after %d failures",
                      sess.cfg.name, sess.consecutive_send_errors)
         sess.consecutive_send_errors = 0
-        sess.last_send_error_log = 0.0
+        sess.last_send_error_log = None
     sess.last_tx_time = now_s()
     sess.tx_seq = (sess.tx_seq + 1) & 0xFFFFFFFFFFFFFFFF
 
