@@ -43,6 +43,13 @@ assert PACKET_SIZE == 32
 
 FLAG_UP = 0x01
 
+# A failing tx path retries every tick; log it loudly but not once per packet.
+SEND_ERROR_LOG_INTERVAL_S = 60.0
+# Consecutive send failures before we suspect the socket itself, and the
+# floor between rebuild attempts once we do.
+SEND_ERROR_REBUILD_THRESHOLD = 8
+SOCKET_REBUILD_INTERVAL_S = 60.0
+
 # -- State machine -----------------------------------------------------------
 
 class State(IntEnum):
@@ -95,6 +102,11 @@ class Session:
     sock: Optional[socket.socket] = None
     peer_sockaddr: Optional[tuple] = None
     last_peer_flags: int = 0
+    # Tx-failure bookkeeping: a send that fails every tick is invisible
+    # otherwise, and it is exactly what a wedged interface socket looks like.
+    consecutive_send_errors: int = 0
+    last_send_error_log: float = 0.0
+    last_socket_rebuild: float = 0.0
 
     # For loss math: track expected vs received over a window
     rx_count_window: int = 0
@@ -149,6 +161,43 @@ def make_session_socket(cfg: SessionConfig, bind_host: str, bind_port: int) -> s
     s.bind((bind_host, local_port))
     s.setblocking(False)
     return s
+
+def maybe_rebuild_socket(sess: Session, cfg: DaemonConfig) -> bool:
+    """Re-create a session socket whose sends keep failing. Returns True if it did.
+
+    A socket bound with SO_BINDTODEVICE outlives the interface configuration it
+    was bound under. After a link flap or a lease change every sendto on it can
+    fail for the life of the process while receives on the same socket keep
+    working -- so the detect timer never fires and the session sits UP against
+    a peer that stopped hearing us. Restarting the daemon is what clears that;
+    this does the same thing without dropping the other sessions.
+    """
+    if sess.consecutive_send_errors < SEND_ERROR_REBUILD_THRESHOLD:
+        return False
+    now = now_s()
+    if now - sess.last_socket_rebuild < SOCKET_REBUILD_INTERVAL_S:
+        return False
+    sess.last_socket_rebuild = now
+
+    # Build the replacement before dropping the incumbent: a duplicate UDP bind
+    # is permitted, so there is no window in which the session has no socket.
+    try:
+        new_sock = make_session_socket(sess.cfg, cfg.bind_host, cfg.bind_port)
+    except OSError as e:
+        logging.warning("session %s: socket rebuild failed: %s", sess.cfg.name, e)
+        return False
+
+    logging.warning("session %s: re-created socket after %d send failures",
+                    sess.cfg.name, sess.consecutive_send_errors)
+    old = sess.sock
+    sess.sock = new_sock
+    sess.consecutive_send_errors = 0
+    if old is not None:
+        try:
+            old.close()
+        except OSError:
+            pass
+    return True
 
 # -- State transitions -------------------------------------------------------
 
@@ -216,7 +265,12 @@ def on_rx(sess: Session, packet: tuple, src_addr: tuple):
             # Peer is hearing us; bidirectional confirmed
             transition(sess, State.UP, "peer reports UP, bidirectional")
     elif sess.state == State.UP:
-        pass
+        if not (flags & FLAG_UP):
+            # The peer has stopped hearing us. However well we hear it, the
+            # path is one-way and the session is not UP -- without this the
+            # detect timer (which only counts *our* rx misses) keeps us UP
+            # indefinitely while the far end has long since gone DOWN.
+            transition(sess, State.DOWN, "peer stopped reporting UP (one-way path)")
 
 def check_timeouts(sess: Session):
     """Called once per tx tick to advance miss counters."""
@@ -283,11 +337,26 @@ def send_packet(sess: Session):
 
     try:
         sess.sock.sendto(pkt, dest)
-        sess.last_tx_time = now_s()
-        sess.tx_seq = (sess.tx_seq + 1) & 0xFFFFFFFFFFFFFFFF
     except OSError as e:
-        # Network unreachable, etc. — that itself is a signal
-        logging.debug("session %s: sendto failed: %s", sess.cfg.name, e)
+        # Network unreachable, EPERM from a filter rule, a socket bound to an
+        # interface that has since been reconfigured. Any of these can persist
+        # for as long as the process lives, so say so at a level that is
+        # actually visible -- rate-limited, since we retry every tick.
+        sess.consecutive_send_errors += 1
+        now = now_s()
+        if now - sess.last_send_error_log >= SEND_ERROR_LOG_INTERVAL_S:
+            sess.last_send_error_log = now
+            logging.warning("session %s: sendto failed: %s (%d failures in a row)",
+                            sess.cfg.name, e, sess.consecutive_send_errors)
+        return
+
+    if sess.consecutive_send_errors:
+        logging.info("session %s: sendto recovered after %d failures",
+                     sess.cfg.name, sess.consecutive_send_errors)
+        sess.consecutive_send_errors = 0
+        sess.last_send_error_log = 0.0
+    sess.last_tx_time = now_s()
+    sess.tx_seq = (sess.tx_seq + 1) & 0xFFFFFFFFFFFFFFFF
 
 # -- State file --------------------------------------------------------------
 
@@ -507,12 +576,18 @@ def run(cfg: DaemonConfig):
         now = now_s()
 
         # Send due packets, run timeout checks
+        rebuilt_any = False
         for sess in sessions:
             if now >= next_tx_at[sess.cfg.session_id]:
                 send_packet(sess)
                 next_tx_at[sess.cfg.session_id] = now + sess.cfg.tx_interval_ms / 1000.0
                 check_timeouts(sess)
                 update_loss_ewma(sess)
+                rebuilt_any |= maybe_rebuild_socket(sess, cfg)
+
+        # A rebuild retires a file descriptor select() is still watching.
+        if rebuilt_any:
+            fd_to_sess = {s.sock.fileno(): s for s in sessions if s.sock is not None}
 
         # Periodic state file write
         if now - last_state_write >= cfg.state_write_interval_s:
