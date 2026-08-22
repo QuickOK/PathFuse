@@ -49,6 +49,9 @@ SEND_ERROR_LOG_INTERVAL_S = 60.0
 # floor between rebuild attempts once we do.
 SEND_ERROR_REBUILD_THRESHOLD = 8
 SOCKET_REBUILD_INTERVAL_S = 60.0
+# A backwards jump in the peer's sequence larger than any plausible network
+# reordering means the peer restarted, not that the packet is stale.
+SEQ_RESTART_REWIND = 64
 
 # -- State machine -----------------------------------------------------------
 
@@ -175,7 +178,8 @@ def maybe_rebuild_socket(sess: Session, cfg: DaemonConfig) -> bool:
     if sess.consecutive_send_errors < SEND_ERROR_REBUILD_THRESHOLD:
         return False
     now = now_s()
-    if now - sess.last_socket_rebuild < SOCKET_REBUILD_INTERVAL_S:
+    if (sess.last_socket_rebuild != 0.0
+            and now - sess.last_socket_rebuild < SOCKET_REBUILD_INTERVAL_S):
         return False
     sess.last_socket_rebuild = now
 
@@ -208,9 +212,10 @@ def transition(sess: Session, new_state: State, reason: str):
     sess.state = new_state
     sess.state_since = now_s()
     if new_state == State.DOWN:
-        # Forget the peer's sequence space so a restarted peer's seq=1
-        # is not stale-filtered by our replay guard.
-        sess.last_rx_seq = 0
+        # The peer's sequence space is deliberately NOT forgotten here. A
+        # restarted peer is recognised by the rewind test in on_rx, whereas
+        # clearing the watermark would let packets that predate this
+        # transition walk the session straight back up.
         sess.last_rx_time = 0.0
         sess.rx_count_window = 0
         sess.expected_count_window = 0
@@ -230,9 +235,10 @@ def on_rx(sess: Session, packet: tuple, src_addr: tuple):
     # Update peer address (handles cellular IP changes)
     sess.peer_sockaddr = src_addr
 
-    # Replay/reorder filter
-    if seq <= sess.last_rx_seq and sess.last_rx_seq != 0:
-        # Allow the very first packet through; otherwise drop stale
+    # Replay/reorder filter. A small rewind is reordering and is dropped; a
+    # large one means the peer restarted its sequence space, so we accept it
+    # and resynchronise rather than filtering the peer out permanently.
+    if sess.last_rx_seq - SEQ_RESTART_REWIND < seq <= sess.last_rx_seq:
         return
 
     # Loss math: count gap if any
@@ -344,7 +350,8 @@ def send_packet(sess: Session):
         # actually visible -- rate-limited, since we retry every tick.
         sess.consecutive_send_errors += 1
         now = now_s()
-        if now - sess.last_send_error_log >= SEND_ERROR_LOG_INTERVAL_S:
+        if (sess.last_send_error_log == 0.0
+                or now - sess.last_send_error_log >= SEND_ERROR_LOG_INTERVAL_S):
             sess.last_send_error_log = now
             logging.warning("session %s: sendto failed: %s (%d failures in a row)",
                             sess.cfg.name, e, sess.consecutive_send_errors)

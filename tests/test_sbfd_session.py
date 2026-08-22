@@ -273,3 +273,63 @@ def test_failed_rebuild_keeps_the_existing_socket(rebuildable, clock, monkeypatc
     assert M.maybe_rebuild_socket(sess, dcfg) is False
     assert sess.sock is before
     assert before.fileno() != -1
+
+
+# -- Reordering around a demotion --------------------------------------------
+
+def test_delayed_packets_from_before_a_demotion_do_not_restore_up():
+    """Reordered FLAG_UP packets that predate the demotion say nothing about
+    whether the peer hears us *now*; they must not walk us back to UP."""
+    sess = _session(state=M.State.UP)          # last_rx_seq == 10
+
+    M.on_rx(sess, _packet(flags=0, seq=13), PEER)           # UP -> DOWN
+    assert sess.state == M.State.DOWN
+
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=11), PEER)   # stale, reordered
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=12), PEER)   # stale, reordered
+
+    assert sess.state == M.State.DOWN
+
+
+def test_peer_that_restarts_its_sequence_space_still_resyncs():
+    """The replay guard must not outlive the peer that set it: a restarted
+    peer begins again at a low seq and has to be able to come back."""
+    sess = _session(state=M.State.UP)
+    sess.last_rx_seq = 4_851_829
+
+    M.on_rx(sess, _packet(flags=0, seq=4_851_830), PEER)    # UP -> DOWN
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=1), PEER)    # peer restarted
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=2), PEER)
+
+    assert sess.state == M.State.UP
+
+
+def test_duplicate_packet_is_still_filtered():
+    sess = _session(state=M.State.UP)
+    sess.last_rx_seq = 20
+    sess.rx_count_window = 0
+
+    M.on_rx(sess, _packet(flags=M.FLAG_UP, seq=20), PEER)
+
+    assert sess.rx_count_window == 0
+
+
+# -- Clock-origin independence -----------------------------------------------
+
+def test_first_send_failure_logs_even_at_time_zero(caplog, clock):
+    """Eligibility must not depend on the wall clock being far from zero."""
+    clock[0] = 0.0
+    sess = _sending_session(_FailingSock())
+
+    with caplog.at_level(logging.WARNING):
+        M.send_packet(sess)
+
+    assert len(_warnings(caplog)) == 1
+
+
+def test_first_socket_rebuild_happens_even_at_time_zero(rebuildable, clock):
+    clock[0] = 0.0
+    sess, dcfg = rebuildable
+    sess.consecutive_send_errors = M.SEND_ERROR_REBUILD_THRESHOLD
+
+    assert M.maybe_rebuild_socket(sess, dcfg) is True
