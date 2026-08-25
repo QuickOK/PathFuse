@@ -1659,7 +1659,15 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
                 fec_floor_ratio=raw.get("fec_floor_ratio"),
                 environmental_enabled=raw.get("environmental_enabled"),
-                location_fec_enabled=raw.get("location_fec_enabled"),
+                # Only a real bool is an operator opinion. The API path
+                # already refuses anything else, but this file can be hand
+                # edited, and bool("false") is True — so "off" written by hand
+                # would have switched the floor ON. None lets the config
+                # default stand, which is what an unusable value means.
+                location_fec_enabled=(
+                    raw.get("location_fec_enabled")
+                    if isinstance(raw.get("location_fec_enabled"), bool)
+                    else None),
                 maintenance_enabled=raw.get("maintenance_enabled"),
                 maintenance_hour=raw.get("maintenance_hour"),
             )
@@ -1726,7 +1734,8 @@ def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
     try:
         raw = _json.loads(Path(env.auto_override_path).read_text())
         set_ts = float(raw["set_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     if now - set_ts > env.auto_override_ttl_s:
         return None
@@ -1775,7 +1784,8 @@ def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
     try:
         raw = _json.loads(Path(cfg.cell.state_path).read_text())
         set_ts = float(raw["set_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     out = {"set_ts": set_ts}
     for k in ("rsrp", "rsrq", "sinr"):
@@ -1802,7 +1812,8 @@ def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
     try:
         raw = _json.loads(Path(cfg.location.state_path).read_text())
         set_ts = float(raw["set_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     if not math.isfinite(set_ts):
         return None
@@ -1852,7 +1863,8 @@ def load_cell_handoff(cfg: Config, now: float) -> Optional[HandoffWindow]:
         raw = _json.loads(Path(cfg.cell.handoff_path).read_text())
         set_ts = float(raw["set_ts"])
         until_ts = float(raw["until_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     if not (math.isfinite(set_ts) and math.isfinite(until_ts)):
         return None

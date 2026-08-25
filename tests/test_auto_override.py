@@ -714,6 +714,54 @@ def test_runtime_overlay_roundtrips_location_fec_enabled(tmp_path):
     assert M.load_runtime_overlay(c).location_fec_enabled is False
 
 
+def test_runtime_overlay_ignores_a_non_bool_location_fec_enabled(tmp_path):
+    """The API path rejects a non-bool; the FILE path did not.
+
+    bool("false") is True, so a hand-edited persist file saying the operator
+    turned the floor off would have turned it on. An unusable value means "no
+    operator opinion", which lets the config default stand."""
+    c = _loc_cfg(tmp_path, enabled=False)
+    Path(c.runtime_state).write_text(json.dumps({
+        "set_by": "hand", "set_ts": 1.0, "location_fec_enabled": "false"}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.location_fec_enabled is None
+    assert M.effective_location_fec_enabled(c, ov) is False   # config default
+
+
+def test_runtime_overlay_still_honours_a_real_bool_location_fec_enabled(tmp_path):
+    c = _loc_cfg(tmp_path, enabled=False)
+    Path(c.runtime_state).write_text(json.dumps({
+        "set_by": "ui", "set_ts": 1.0, "location_fec_enabled": True}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.location_fec_enabled is True
+    assert M.effective_location_fec_enabled(c, ov) is True
+
+
+def _oversized_set_ts_json(extra=""):
+    """A JSON integer with more digits than a double can hold. json.loads keeps
+    it as a Python int, and float() on it raises OverflowError rather than
+    returning inf — so the finiteness guards downstream never get a chance."""
+    return '{"set_ts": 1' + "0" * 400 + extra + '}'
+
+
+def test_load_location_floor_survives_an_oversized_set_ts(tmp_path):
+    # The controller tick calls this loader directly, so a raise here
+    # interrupts failover for as long as the poisoned file sits there.
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(_oversized_set_ts_json(', "wans": {}'))
+    assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_load_auto_override_survives_an_oversized_set_ts(tmp_path):
+    # Same idiom, same tick, same one-word fix.
+    c = base_cfg(environmental=M.EnvironmentalCfg(
+        enabled=True, auto_override_path=str(tmp_path / "auto.json"),
+        auto_override_ttl_s=180.0))
+    Path(c.environmental.auto_override_path).write_text(
+        _oversized_set_ts_json(', "mode": "full"'))
+    assert M.load_auto_override(c, 1001.0) is None
+
+
 def test_validate_runtime_payload_location_fec_enabled():
     ok, _ = M.validate_runtime_payload({"location_fec_enabled": True},
                                        wan_names={"wan1"})
