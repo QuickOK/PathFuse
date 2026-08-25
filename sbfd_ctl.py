@@ -1976,6 +1976,15 @@ def location_floor_active(mode, requested_level, level_before):
     return requested_level > level_before
 
 
+def pinned_ladder_level(backoff_ratio, table, location_level):
+    """The single rung the ladder's span collapses to under full-redundancy
+    backoff. Backoff holds the ADAPTIVE ENGINE at one rung, but the location
+    floor is deliberately not suppressed by backoff, so it can lift the applied
+    ratio above that rung — and a span pinned to the backoff rung alone would
+    draw the applied dot outside the span it is meant to sit in."""
+    return max(fec_control.ratio_to_level(backoff_ratio, table), location_level)
+
+
 def effective_maintenance_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     """Resolve the maintenance-reboot toggle. Same shape as environmental (NOT
     FEC): cfg.maintenance.enabled is only the boot default and the operator's
@@ -3109,8 +3118,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             fec_pinned = fec_full_backoff and fec_mode_eff in (
                 fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE)
             fec_pinned_level = (
-                fec_control.ratio_to_level(cfg.fec.full_mode_backoff_fec,
-                                           prof_table)
+                pinned_ladder_level(cfg.fec.full_mode_backoff_fec, prof_table,
+                                    fec_location_level)
                 if fec_pinned else None)
             fec_ladder = fec_control.ladder_view(
                 fec_scale,

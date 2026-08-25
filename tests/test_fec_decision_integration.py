@@ -328,3 +328,21 @@ def test_location_floor_inactive_in_modes_that_discard_the_adaptive_ratio():
 
 def test_location_floor_active_in_min_adaptive():
     assert M.location_floor_active(F.MODE_MIN_ADAPTIVE, 3, 0) is True
+
+
+# ---------- pinned ladder: the location floor widens the pin ----------
+
+def test_pinned_ladder_level_is_the_backoff_rung_without_a_location_floor():
+    base = F.DEFAULT_LOSS_TABLE
+    assert M.pinned_ladder_level("8:0", base, 0) == F.ratio_to_level("8:0", base)
+
+
+def test_pinned_ladder_level_rises_to_a_location_floor_above_the_backoff_rung():
+    # Backoff pins the engine at 8:0, but the location floor is not suppressed
+    # by backoff, so the applied ratio really is the level-3 rung. Pinning the
+    # span at the backoff rung would draw the applied dot outside its own span.
+    base = F.DEFAULT_LOSS_TABLE
+    assert M.pinned_ladder_level("8:0", base, 3) == 3
+    reach = F.reachable_ratios(F.MODE_ADAPTIVE, base, "8:0",
+                               pinned_level=M.pinned_ladder_level("8:0", base, 3))
+    assert reach == [F.level_to_ratio(3, base)]
