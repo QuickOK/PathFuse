@@ -1517,6 +1517,7 @@ function renderLocationFec(s){
   const loc = ((s.fec || {}).location_floor) || {};
   const mode = (s.fec || {}).desired_mode;
   const ignores = mode === 'off' || mode === 'fixed';
+  const c2r = (((s.fec || {}).directions) || {}).client_to_relay || {};
   const el = document.getElementById('location-effective');
   if (el) {
     if (!loc.configured)      el.textContent = 'not configured';
@@ -1526,6 +1527,12 @@ function renderLocationFec(s){
     // to a higher engine level — it is not being consulted at all.
     else if (loc.level > 0 && ignores)
       el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (mode ${mode} ignores it)`;
+    // A refused FIFO write leaves the old ratio flowing however high the floor
+    // reached, so `active` is false through no fault of the floor OR the
+    // engine. Strict === false: an older cached page whose state has no
+    // actuator_ok must fall through to the branch below, not accuse the FIFO.
+    else if (loc.level > 0 && c2r.actuator_ok === false)
+      el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (actuator refused the write)`;
     else if (loc.level > 0)   el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (engine already higher)`;
     else                      el.textContent = 'clear';
   }
