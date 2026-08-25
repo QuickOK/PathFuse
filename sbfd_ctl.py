@@ -1786,7 +1786,12 @@ def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
     """{wan: {level, reason}} from location_fec.py, or None when unconfigured,
     missing, malformed, or older than stale_after_s. Fail-open like
     load_auto_override: a floor that cannot be read is no floor. Only `level`
-    is trusted, and only as a non-bool int — it crosses a process boundary."""
+    is trusted, and only as a non-bool int — it crosses a process boundary.
+
+    Finiteness and future-timestamp guards match load_cell_handoff's
+    precedent below: json.loads accepts the bareword NaN, and
+    `now - set_ts > stale_after_s` is False forever against it, making the
+    staleness gate inert -- a dead daemon's floor would hold forever."""
     if cfg.location is None:
         return None
     try:
@@ -1794,10 +1799,19 @@ def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
         set_ts = float(raw["set_ts"])
     except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
         return None
+    if not math.isfinite(set_ts):
+        return None
+    if set_ts > now + 5.0:
+        return None
     if now - set_ts > cfg.location.stale_after_s:
         return None
+    wans_raw = raw.get("wans")
+    if wans_raw is None:
+        wans_raw = {}
+    if not isinstance(wans_raw, dict):
+        return None
     out = {}
-    for wan, obj in (raw.get("wans") or {}).items():
+    for wan, obj in wans_raw.items():
         if not isinstance(obj, dict):
             continue
         level = obj.get("level")

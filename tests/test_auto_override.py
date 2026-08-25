@@ -707,3 +707,41 @@ def test_validate_runtime_payload_location_fec_enabled():
     ok, err = M.validate_runtime_payload({"location_fec_enabled": "yes"},
                                          wan_names={"wan1"})
     assert not ok and "location_fec_enabled" in err
+
+
+def test_load_location_floor_non_dict_wans_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    for bad_wans in ("nope", [1, 2], 7):
+        Path(c.location.state_path).write_text(json.dumps(
+            {"set_ts": 1000.0, "wans": bad_wans}))
+        assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_load_location_floor_missing_wans_is_empty(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({"set_ts": 1000.0}))
+    assert M.load_location_floor(c, 1001.0) == {}
+
+
+def test_load_location_floor_empty_wans_is_explicit_withdrawal(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps(
+        {"set_ts": 1000.0, "wans": {}}))
+    assert M.load_location_floor(c, 1001.0) == {}
+
+
+def test_load_location_floor_rejects_nan_set_ts(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(
+        '{"set_ts": NaN, "wans": {"wan1": {"level": 9, "reason": ""}}}')
+    assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_load_location_floor_rejects_future_set_ts(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps(
+        {"set_ts": 9999999.0, "wans": {"wan1": {"level": 9, "reason": ""}}}))
+    assert M.load_location_floor(c, 1001.0) is None
+    Path(c.location.state_path).write_text(json.dumps(
+        {"set_ts": 1005.0, "wans": {"wan1": {"level": 9, "reason": ""}}}))
+    assert M.load_location_floor(c, 1001.0) == {"wan1": {"level": 9, "reason": ""}}
