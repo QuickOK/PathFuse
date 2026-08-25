@@ -133,12 +133,13 @@ class ExitHold:
         self.hold_s = float(hold_s)
         self._held = {}
 
-    def update(self, levels, now_mono):
+    def update(self, levels, now_mono, reasons=None):
         out = {}
         for wan, level in levels.items():
             held = self._held.get(wan)
             if held is None or level >= held["level"]:
-                self._held[wan] = {"level": level, "since": None}
+                self._held[wan] = {"level": level, "since": None,
+                                   "reason": (reasons or {}).get(wan, "")}
                 out[wan] = level
                 continue
             if held["since"] is None:
@@ -146,9 +147,13 @@ class ExitHold:
             if now_mono - held["since"] < self.hold_s:
                 out[wan] = held["level"]
             else:
-                self._held[wan] = {"level": level, "since": None}
+                self._held[wan] = {"level": level, "since": None,
+                                   "reason": (reasons or {}).get(wan, "")}
                 out[wan] = level
         return out
+
+    def reason_for(self, wan):
+        return (self._held.get(wan) or {}).get("reason", "")
 
 
 @dataclass
@@ -273,6 +278,18 @@ def read_state(path, now_wall, max_age_s):
     return loss, residual
 
 
+def fresh_fix(fix, now_wall, max_age_s):
+    """The fix, or None if gpsd's TPV timestamp is older than max_age_s.
+    A fix with no timestamp is trusted (some receivers omit it); a stale
+    one is a lost fix — the last position gpsd served is not where we are."""
+    if fix is None:
+        return None
+    fix_ts = fix[4] if len(fix) > 4 else None
+    if fix_ts is not None and (now_wall - fix_ts) > max_age_s:
+        return None
+    return fix
+
+
 def build_record(levels, now_wall):
     """The published contract. LEVEL is the actuated field — each WAN profile
     has its own loss table, so a ratio resolved here could mean something
@@ -313,10 +330,12 @@ def poll_once(cfg, store, hold, fix, state, now_mono, now_wall):
                      precision=cfg.precision, lookahead_s=cfg.lookahead_s,
                      min_speed_ms=cfg.min_speed_ms,
                      sample_step_m=cfg.sample_step_m)
-    held = hold.update({w: v["level"] for w, v in levels.items()}, now_mono)
+    reasons = {w: v["reason"] for w, v in levels.items()}
+    held = hold.update({w: v["level"] for w, v in levels.items()}, now_mono, reasons=reasons)
     for wan, level in held.items():
         if level != levels[wan]["level"]:
-            levels[wan] = {"level": level, "reason": levels[wan]["reason"] or "exit hold"}
+            levels[wan] = {"level": level,
+                           "reason": f"exit hold ({hold.reason_for(wan)})"}
     return build_record(levels, now_wall)
 
 
@@ -364,7 +383,8 @@ def main():
                 _reload = False
                 cfg = load_location_config(args.config)
                 log.info("config reloaded: %d zones", len(cfg.zones))
-            fix = environ_ctl.get_fix(cfg.gpsd_host, cfg.gpsd_port, timeout=1.5)
+            fix = fresh_fix(environ_ctl.get_fix(cfg.gpsd_host, cfg.gpsd_port, timeout=1.5),
+                            now_wall, cfg.max_fix_age_s)
             state = read_state(cfg.state_path, now_wall, cfg.max_state_age_s)
             if fix is not None:
                 last_good = now_mono

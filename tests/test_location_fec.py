@@ -284,3 +284,55 @@ def test_write_record_is_atomic_and_readable(tmp_path):
     M.write_record(str(p), {"set_ts": 1000.0, "wans": {"wan1": {"level": 2}}})
     assert _json.loads(p.read_text())["wans"]["wan1"]["level"] == 2
     assert not (tmp_path / "out" / "location_fec.json.tmp").exists()
+
+
+def test_fresh_fix_passes_a_recent_fix():
+    fix = (41.1, -73.5, 0.0, None, 1000.0)
+    assert M.fresh_fix(fix, now_wall=1010.0, max_age_s=30) == fix
+
+
+def test_fresh_fix_rejects_a_stale_fix():
+    fix = (41.1, -73.5, 0.0, None, 1000.0)
+    assert M.fresh_fix(fix, now_wall=1040.0, max_age_s=30) is None
+
+
+def test_fresh_fix_trusts_a_fix_without_a_timestamp():
+    fix5 = (41.1, -73.5, 0.0, None, None)
+    assert M.fresh_fix(fix5, now_wall=1040.0, max_age_s=30) == fix5
+    fix4 = (41.1, -73.5, 0.0, None)
+    assert M.fresh_fix(fix4, now_wall=1040.0, max_age_s=30) == fix4
+
+
+def test_fresh_fix_none_is_none():
+    assert M.fresh_fix(None, now_wall=1000.0, max_age_s=30) is None
+
+
+def test_exit_hold_remembers_the_reason_it_adopted():
+    h = M.ExitHold(hold_s=20.0)
+    h.update({"wan1": 3}, now_mono=0.0, reasons={"wan1": "zone A"})
+    assert h.update({"wan1": 1}, now_mono=5.0, reasons={"wan1": "zone B"}) == {"wan1": 3}
+    assert h.reason_for("wan1") == "zone A"
+
+
+def test_poll_once_labels_a_held_level_with_the_exit_hold_and_its_origin(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path, zones=[
+        {"label": "A", "lat": 41.1, "lon": -73.5, "radius_m": 150, "level": 3},
+        {"label": "B", "lat": 41.104, "lon": -73.5, "radius_m": 150, "level": 1},
+    ], wans=["wan1"]))
+    store = T.TileStore()
+    hold = M.ExitHold(cfg.exit_hold_s)
+
+    rec = M.poll_once(cfg, store, hold, fix=(41.1, -73.5, 0.0, None),
+                      state=None, now_mono=0.0, now_wall=1000.0)
+    assert rec["wans"]["wan1"]["level"] == 3
+    assert rec["wans"]["wan1"]["reason"] == "zone A"
+
+    rec = M.poll_once(cfg, store, hold, fix=(41.104, -73.5, 0.0, None),
+                      state=None, now_mono=5.0, now_wall=1005.0)
+    assert rec["wans"]["wan1"]["level"] == 3
+    assert rec["wans"]["wan1"]["reason"] == "exit hold (zone A)"
+
+    rec = M.poll_once(cfg, store, hold, fix=(41.104, -73.5, 0.0, None),
+                      state=None, now_mono=30.0, now_wall=1030.0)
+    assert rec["wans"]["wan1"]["level"] == 1
+    assert rec["wans"]["wan1"]["reason"] == "zone B"
