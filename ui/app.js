@@ -1515,15 +1515,27 @@ function renderEnvironmental(s){
 /* ---------- location FEC ---------- */
 function renderLocationFec(s){
   const loc = ((s.fec || {}).location_floor) || {};
+  const mode = (s.fec || {}).desired_mode;
+  const ignores = mode === 'off' || mode === 'fixed';
   const el = document.getElementById('location-effective');
   if (el) {
     if (!loc.configured)      el.textContent = 'not configured';
     else if (!loc.enabled)    el.textContent = 'off';
     else if (loc.active)      el.textContent = `raising to level ${loc.level} · ${loc.reason || 'location'}`;
+    // off and fixed throw the adaptive ratio away, so the floor is not losing
+    // to a higher engine level — it is not being consulted at all.
+    else if (loc.level > 0 && ignores)
+      el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (mode ${mode} ignores it)`;
     else if (loc.level > 0)   el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (engine already higher)`;
     else                      el.textContent = 'clear';
   }
-  $$('input[name="location_fec_enabled"]').forEach(r => r.disabled = !loc.configured);
+  // Disabled is not unchecked: a radio that was checked before the daemon went
+  // away still submits its value, so Apply would post a toggle for a feature
+  // the node has no config for.
+  $$('input[name="location_fec_enabled"]').forEach(r => {
+    r.disabled = !loc.configured;
+    if (!loc.configured) r.checked = false;
+  });
 }
 
 /* ---------- maintenance reboot ---------- */

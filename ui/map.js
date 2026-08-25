@@ -53,35 +53,42 @@ function drawLocation(loc) {
   if (!loc) return;
   // One bad value must cost the location layer alone. tick() draws this
   // in the same pass that moves the vehicle marker, so an exception
-  // escaping here would freeze the marker and the breadcrumb.
+  // escaping here would freeze the marker and the breadcrumb. And one bad
+  // ENTRY must cost only itself: the per-item try/catch below keeps a single
+  // `bbox: null` from taking every other tile and zone down with it. The
+  // outer catch stays as the last resort.
   try {
     (loc.tiles || []).forEach((t) => {
-      const [s, w, n, e] = t.bbox;
-      const entries = Object.entries(t.wans || {});
-      const worst = Math.max(0, ...entries.map(([, v]) => v.ewma_loss || 0));
-      const confirmed = entries.some(([, v]) => (v.passes || 0) >= 3);
-      // Colour by loss band, not by level: the map has no profile table.
-      const level = worst > 10 ? 4 : worst > 5 ? 3 : worst > 2 ? 2 : worst > 0.5 ? 1 : 0;
-      const r = L.rectangle([[s, w], [n, e]], {
-        color: levelColor(level), weight: confirmed ? 1.5 : 0.5,
-        fillColor: levelColor(level), fillOpacity: confirmed ? 0.35 : 0.12,
-      }).addTo(locationLayer);
-      const tip = document.createElement("span");
-      tip.className = "stn-tip";
-      tip.textContent = entries.map(([wan, v]) =>
-        `${wan}: ${(v.ewma_loss || 0).toFixed(1)}% (${v.passes || 0} passes)`).join("  ")
-        + (t.residual != null ? `  residual ${Number(t.residual).toFixed(1)}/s` : "");
-      r.bindTooltip(tip);
+      try {
+        const [s, w, n, e] = t.bbox;
+        const entries = Object.entries(t.wans || {});
+        const worst = Math.max(0, ...entries.map(([, v]) => v.ewma_loss || 0));
+        const confirmed = entries.some(([, v]) => (v.passes || 0) >= 3);
+        // Colour by loss band, not by level: the map has no profile table.
+        const level = worst > 10 ? 4 : worst > 5 ? 3 : worst > 2 ? 2 : worst > 0.5 ? 1 : 0;
+        const r = L.rectangle([[s, w], [n, e]], {
+          color: levelColor(level), weight: confirmed ? 1.5 : 0.5,
+          fillColor: levelColor(level), fillOpacity: confirmed ? 0.35 : 0.12,
+        }).addTo(locationLayer);
+        const tip = document.createElement("span");
+        tip.className = "stn-tip";
+        tip.textContent = entries.map(([wan, v]) =>
+          `${wan}: ${(v.ewma_loss || 0).toFixed(1)}% (${v.passes || 0} passes)`).join("  ")
+          + (t.residual != null ? `  residual ${Number(t.residual).toFixed(1)}/s` : "");
+        r.bindTooltip(tip);
+      } catch (e) { /* skip this tile, draw the rest */ }
     });
     (loc.zones || []).forEach((z) => {
-      const c = L.circle([z.lat, z.lon], {
-        radius: z.radius_m, color: "#fff", weight: 2, dashArray: "6 4",
-        fillColor: levelColor(z.level), fillOpacity: 0.2,
-      }).addTo(locationLayer);
-      const tip = document.createElement("span");
-      tip.className = "stn-tip";
-      tip.textContent = `${z.label}: level ${z.level}` + (z.wans ? ` (${z.wans.join(", ")})` : "");
-      c.bindTooltip(tip, { permanent: true, direction: "center" });
+      try {
+        const c = L.circle([z.lat, z.lon], {
+          radius: z.radius_m, color: "#fff", weight: 2, dashArray: "6 4",
+          fillColor: levelColor(z.level), fillOpacity: 0.2,
+        }).addTo(locationLayer);
+        const tip = document.createElement("span");
+        tip.className = "stn-tip";
+        tip.textContent = `${z.label}: level ${z.level}` + (z.wans ? ` (${z.wans.join(", ")})` : "");
+        c.bindTooltip(tip, { permanent: true, direction: "center" });
+      } catch (e) { /* skip this zone, draw the rest */ }
     });
   } catch (e) {
     locationLayer.clearLayers();
