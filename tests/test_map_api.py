@@ -313,6 +313,23 @@ def test_map_location_layer_drops_a_non_finite_residual(tmp_path):
         _json.dumps(out, allow_nan=False)      # what the browser must parse
 
 
+def test_map_payload_stays_parseable_with_a_non_finite_loss_in_the_store(tmp_path):
+    # _send_json's json.dumps would emit a bare NaN token for this, and the
+    # browser's JSON.parse rejects the whole body — not just the bad tile.
+    tile = T.encode(41.1, -73.5, 7)
+    store = tmp_path / "store.json"
+    store.write_text('{"tiles": {"%s": {"wan1": {"passes": 4, '
+                     '"ewma_loss": NaN, "last_seen": 1000.0}}}}' % tile)
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(store),
+                           "location_config_path": str(tmp_path / "lf.json")})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    _json.dumps(out, allow_nan=False)
+    assert out["location_fec"]["tiles"] == []
+
+
 def test_assemble_map_payload_clamps_a_negative_max_location_tiles(tmp_path):
     # rows[:-5] is a NEGATIVE slice: it drops the five NEAREST tiles and keeps
     # the rest, which is the exact opposite of a cap.

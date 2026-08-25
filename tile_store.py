@@ -29,6 +29,18 @@ DEFAULT_PRECISION = 7
 LOSSY_EWMA_PCT = 0.5
 
 
+def finite_number(v):
+    """A real number we can store, publish and do arithmetic on.
+
+    bool is a subclass of int, and NaN/inf are perfectly good floats, so
+    `isinstance(v, (int, float))` alone admits both. NaN matters beyond taste:
+    json.loads accepts the bareword NaN, json.dumps writes it straight back
+    out, and the browser's JSON.parse then rejects the WHOLE payload over one
+    tile. Every number entering the store goes through here."""
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
 def encode(lat, lon, precision=DEFAULT_PRECISION):
     """Geohash of a position. Precision 7 is ~153 m square at the equator and
     narrower with latitude, which is the resolution a road-scale bad spot wants:
@@ -142,9 +154,9 @@ class TileStore:
         self._tile = tile
         self._last_mono = now_mono
         for wan, loss in (per_wan_loss or {}).items():
-            if isinstance(loss, (int, float)) and not isinstance(loss, bool):
+            if finite_number(loss):
                 self._samples.setdefault(wan, []).append(float(loss))
-        if isinstance(residual, (int, float)) and not isinstance(residual, bool):
+        if finite_number(residual):
             self._residual.append(float(residual))
 
     def close_pass(self, now_wall):
@@ -257,10 +269,8 @@ class TileStore:
                     last_seen = entry.get("last_seen")
                     if (isinstance(passes, int) and not isinstance(passes, bool)
                             and passes >= 0
-                            and isinstance(ewma_loss, (int, float))
-                            and not isinstance(ewma_loss, bool)
-                            and isinstance(last_seen, (int, float))
-                            and not isinstance(last_seen, bool)):
+                            and finite_number(ewma_loss)
+                            and finite_number(last_seen)):
                         clean_wan[wan] = {"passes": passes,
                                           "ewma_loss": float(ewma_loss),
                                           "last_seen": float(last_seen)}
@@ -280,9 +290,7 @@ class TileStore:
                     continue
                 ewma = r.get("ewma")
                 last_seen = r.get("last_seen")
-                if (isinstance(ewma, (int, float)) and not isinstance(ewma, bool)
-                        and isinstance(last_seen, (int, float))
-                        and not isinstance(last_seen, bool)):
+                if finite_number(ewma) and finite_number(last_seen):
                     clean_residual[tile] = {"ewma": float(ewma),
                                             "last_seen": float(last_seen)}
                 else:

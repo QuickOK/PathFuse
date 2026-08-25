@@ -368,6 +368,25 @@ def test_reload_keeps_saving_to_the_store_it_actually_loaded(tmp_path, caplog):
     assert sum("store_path" in r.getMessage() for r in caplog.records) == 1
 
 
+def test_read_state_drops_a_non_finite_loss_and_keeps_the_good_wan(tmp_path):
+    # A NaN loss would blend into that WAN's tile EWMA and stay there: every
+    # later average is NaN, so the tile can never confirm again.
+    p = tmp_path / "state.json"
+    p.write_text('{"ts": 1000.0, "client_local": '
+                 '{"wan1": {"loss_pct": NaN}, "wan2": {"loss_pct": 4.0}}}')
+    loss, _ = M.read_state(str(p), now_wall=1000.0, max_age_s=10.0)
+    assert loss == {"wan2": 4.0}
+
+
+def test_read_state_drops_a_non_finite_residual(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text('{"ts": 1000.0, "client_local": {"wan1": {"loss_pct": 4.0}}, '
+                 '"fec": {"directions": {"client_to_relay": '
+                 '{"rx": {"lost_pkts_est_per_s": Infinity}}}}}')
+    loss, residual = M.read_state(str(p), now_wall=1000.0, max_age_s=10.0)
+    assert loss == {"wan1": 4.0} and residual is None
+
+
 def test_validate_zone_rejects_a_boolean_level():
     # int(True) is 1, so a hand-edited `"level": true` would quietly become a
     # real floor of level 1 instead of being reported as the mistake it is.

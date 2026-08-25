@@ -430,11 +430,14 @@ def read_state(path, now_wall, max_age_s):
         if not isinstance(obj, dict):
             continue
         value = obj.get("loss_pct")
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Finite, because these blend into a tile's EWMA and stay there: one
+        # NaN makes every later average NaN, so the tile can never confirm
+        # again. json.loads accepts the bareword NaN, so this is reachable.
+        if tile_store.finite_number(value):
             loss[wan] = float(value)
     rx = _dig(snap, "fec", "directions", "client_to_relay", "rx")
     residual = rx.get("lost_pkts_est_per_s")
-    if not isinstance(residual, (int, float)) or isinstance(residual, bool):
+    if not tile_store.finite_number(residual):
         residual = None
     return loss, residual
 

@@ -224,6 +224,42 @@ def test_from_dict_keeps_valid_entries_beside_malformed_ones():
     assert "dr79z6y" not in s.tiles
 
 
+def test_from_dict_drops_a_non_finite_number_and_keeps_the_good_sibling():
+    """NaN and inf are floats, so every isinstance guard waves them through —
+    and json.dumps then writes a bare NaN token that JSON.parse rejects, so one
+    poisoned value costs the map its ENTIRE payload. Drop them where they enter
+    the process, which is the only place that covers every reader."""
+    import json
+    raw = json.loads("""
+        {"tiles": {"dr79z6n": {"wan1": {"passes": 4, "ewma_loss": NaN,
+                                        "last_seen": 1000.0},
+                               "wan2": {"passes": 3, "ewma_loss": 6.0,
+                                        "last_seen": 1000.0}},
+                   "dr79z6p": {"wan1": {"passes": 3, "ewma_loss": 6.0,
+                                        "last_seen": Infinity}}},
+         "residual": {"dr79z6n": {"ewma": -Infinity, "last_seen": 1000.0},
+                      "dr79z6p": {"ewma": 2.5, "last_seen": 1000.0}}}""")
+    s = T.TileStore.from_dict(raw)
+    assert "wan1" not in s.tiles["dr79z6n"]           # NaN loss dropped
+    assert s.tiles["dr79z6n"]["wan2"]["passes"] == 3  # good sibling survives
+    assert "dr79z6p" not in s.tiles                   # inf last_seen dropped
+    assert "dr79z6n" not in s.residual                # -inf residual dropped
+    assert s.residual["dr79z6p"]["ewma"] == 2.5
+    json.dumps(s.to_dict(), allow_nan=False)          # what the browser must parse
+
+
+def test_observe_ignores_a_non_finite_sample():
+    # The other boundary a number can enter the store by. A NaN folded into a
+    # pass makes that tile's EWMA NaN for good.
+    s = T.TileStore()
+    s.observe("dr79z6n", {"wan1": float("nan"), "wan2": 6.0},
+              float("inf"), now_mono=0.0, now_wall=1000.0)
+    s.close_pass(now_wall=1000.0)
+    assert "wan1" not in s.tiles["dr79z6n"]
+    assert s.tiles["dr79z6n"]["wan2"]["ewma_loss"] == 6.0
+    assert s.residual == {}
+
+
 def test_store_rejects_a_non_finite_alpha():
     # NaN poisons the EWMA permanently and silently: every subsequent blend is
     # NaN, so a tile can never confirm again. Refuse it where it enters.
