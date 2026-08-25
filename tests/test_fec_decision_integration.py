@@ -310,24 +310,48 @@ def test_location_floor_for_driver_clamps_to_the_active_table():
 
 # ---------- location floor: did it actually change the applied ratio? ----------
 
-def test_location_floor_active_only_when_it_lifts_the_level():
+def _floor_active(mode, level_before, location_level, floor="8:0", fixed="20:1"):
+    """Replay the tick's two ratios and ask the predicate which the wire got.
+
+    `active` is a claim about the RATIO the FIFO receives, not about levels: a
+    level the floor lifted can still map to the ratio the leg was already
+    sending, and then the location floor changed nothing."""
+    table = F.DEFAULT_LOSS_TABLE
+    lifted = F.apply_location_floor(level_before, location_level, table)
+    with_loc = F.apply_mode(mode, F.level_to_ratio(lifted, table),
+                            fixed_ratio=fixed, floor_ratio=floor)
+    without_loc = F.apply_mode(mode, F.level_to_ratio(level_before, table),
+                               fixed_ratio=fixed, floor_ratio=floor)
+    return M.location_floor_active(with_loc, without_loc)
+
+
+def test_location_floor_active_only_when_it_lifts_the_ratio():
     # It asked for more than the engine had: the extra parity is on the wire.
-    assert M.location_floor_active(F.MODE_ADAPTIVE, 3, 1) is True
+    assert _floor_active(F.MODE_ADAPTIVE, 1, 3) is True
     # The signal floor already stands higher, so the location floor changed
     # nothing — reporting it as active credits it with the other floor's work.
-    assert M.location_floor_active(F.MODE_ADAPTIVE, 2, 3) is False
-    assert M.location_floor_active(F.MODE_ADAPTIVE, 0, 0) is False
+    assert _floor_active(F.MODE_ADAPTIVE, 3, 2) is False
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 0) is False
 
 
 def test_location_floor_inactive_in_modes_that_discard_the_adaptive_ratio():
     # apply_mode returns OFF_RATIO / the fixed ratio regardless of the level the
     # floor lifted, so an "active" badge here promises parity nothing is sending.
-    assert M.location_floor_active(F.MODE_OFF, 3, 0) is False
-    assert M.location_floor_active(F.MODE_FIXED, 3, 0) is False
+    assert _floor_active(F.MODE_OFF, 0, 3) is False
+    assert _floor_active(F.MODE_FIXED, 0, 3) is False
 
 
 def test_location_floor_active_in_min_adaptive():
-    assert M.location_floor_active(F.MODE_MIN_ADAPTIVE, 3, 0) is True
+    assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3) is True
+
+
+def test_location_floor_inactive_under_a_config_floor_that_already_covers_it():
+    # A min_adaptive floor of 8:8 lifts EVERY level to the top rung, so the
+    # location floor's level 3 leaves the transmitted ratio exactly as it was.
+    # Same defect as crediting it for the signal floor's work, one floor along.
+    assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3, floor="8:8") is False
+    # ...and it is genuinely active once the config floor leaves room again.
+    assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3, floor="8:2") is True
 
 
 # ---------- pinned ladder: the location floor widens the pin ----------

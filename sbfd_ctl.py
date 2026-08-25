@@ -1967,18 +1967,17 @@ def location_floor_for_driver(floors, enabled, driver, table):
     return level, (entry.get("reason", "") if level > 0 else "")
 
 
-def location_floor_active(mode, requested_level, level_before):
+def location_floor_active(ratio_with_location, ratio_without_location):
     """Did the location floor actually change the parity on the wire?
 
-    Two ways it can ask and get nothing. `off` and `fixed` discard the adaptive
-    ratio entirely (apply_mode returns OFF_RATIO / the fixed ratio), so the
-    lifted level never reaches the FIFO. And a signal or config floor may
-    already stand at or above the requested level, in which case the location
-    floor is a passenger. `level_before` is the level as it stood immediately
-    before apply_location_floor — after every other floor has had its say."""
-    if mode not in (fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE):
-        return False
-    return requested_level > level_before
+    The honest test is the RATIO the FIFO receives, not the level: every way
+    the floor can ask and get nothing collapses into one comparison. `off` and
+    `fixed` discard the adaptive ratio outright; a signal floor may already
+    stand higher; and a min_adaptive config floor of 8:8 lifts every level to
+    the same top rung, so a location level of 3 changes the level and nothing
+    else. Compare the ratio the tick is sending against the one it would have
+    sent had the location floor said nothing."""
+    return ratio_with_location != ratio_without_location
 
 
 def pinned_ladder_level(backoff_ratio, table, location_level):
@@ -2974,9 +2973,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         fec_ladder = None
         fec_ladder_r2c = None
         fec_location_level, fec_location_reason = 0, ""
-        # The level as it stood just before the location floor was applied, so
-        # the publish below can say whether the floor changed anything.
-        fec_level_before_location = 0
+        # Whether the floor changed the ratio this tick actually sends. With no
+        # FEC config there is no ratio to change.
+        fec_location_applied = False
         relay_desired = (fec_mode_eff, fec_fixed_ratio_eff, fec_floor_ratio_eff)
         if cfg.fec:
             # Our TX leg repairs client->relay loss, which only the relay can
@@ -3063,7 +3062,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             # both links at once is exactly where parity beats duplication.
             fec_location_level, fec_location_reason = location_floor_for_driver(
                 location_floors, location_enabled, fec_driver, prof_table)
-            fec_level_before_location = _fec_level
+            _level_before_location = _fec_level
             _fec_level = fec_control.apply_location_floor(
                 _fec_level, fec_location_level, prof_table)
             if fec_location_level != fec_location_level_prev:
@@ -3075,6 +3074,19 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 fec_mode_eff, _adaptive_ratio,
                 fixed_ratio=fec_fixed_ratio_eff,
                 floor_ratio=fec_floor_ratio_eff)
+            # The same ratio computed as if the location floor had said
+            # nothing. Comparing the two is the only honest way to report
+            # whether the floor changed the parity actually sent: a lifted
+            # LEVEL can still land on the ratio the leg was already sending
+            # (off/fixed ignore the level; a min_adaptive floor of 8:8 lifts
+            # every level to the same rung).
+            _ratio_without_location = fec_control.apply_mode(
+                fec_mode_eff,
+                fec_control.level_to_ratio(_level_before_location, prof_table),
+                fixed_ratio=fec_fixed_ratio_eff,
+                floor_ratio=fec_floor_ratio_eff)
+            fec_location_applied = location_floor_active(
+                _fec_ratio, _ratio_without_location)
             # Push our locally measured (relay->client) loss so the relay can
             # drive ITS leg on the direction it actually repairs. Quantized to
             # a table level in relay_desired so posts fire on level changes,
@@ -3263,13 +3275,11 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 "location_floor": {
                     "configured": cfg.location is not None,
                     "enabled": location_enabled,
-                    # Binding = it actually lifted the applied level this tick.
+                    # Binding = it actually changed the ratio sent this tick.
                     # level/reason/wans stay published in every mode (the
                     # daemon's request is informative either way); only
                     # `active` claims the parity reached the wire.
-                    "active": location_floor_active(
-                        fec_mode_eff, fec_location_level,
-                        fec_level_before_location),
+                    "active": fec_location_applied,
                     "level": fec_location_level,
                     "reason": fec_location_reason,
                     "wans": location_floors or {},

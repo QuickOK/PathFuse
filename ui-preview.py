@@ -106,7 +106,7 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
                         "floor_index": 1, "below_floor": False, "pinned": True},
                     "driving_loss_pct": 3.1, "driver_wan": cfg.policy.default_master_wan,
                     "since": now - 42, "actuator_ok": True,
-                    "wire": {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False},
+                    "wire": {"tx_mbps": 4.2, "overhead_pct": 75.0, "sample_age_s": 6.0, "stale": False},
                 },
                 "relay_to_client": {
                     "enabled": True, "ratio": "8:2", "level": 1,
