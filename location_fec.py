@@ -61,38 +61,68 @@ def candidate_tiles(points, precision):
     return out
 
 
-def zone_terms(zones, points, wans):
+def zone_terms(zones, points, wans, tiles=()):
     """(levels, labels, suppressed) contributed by operator zones.
 
     A zone matches on the current position OR any look-ahead point, so a manual
-    zone leads arrival on the same terms a learned tile does."""
+    zone leads arrival on the same terms a learned tile does.
+
+    `suppressed` is {wan: {tile, ...}} — the tiles a `suppress_learned` zone
+    covers, NOT the WANs it touches. The two differ the moment the look-ahead
+    is longer than the zone: the operator overruled the learner about one
+    place, and a confirmed bad tile a few hundred metres short of that place
+    must still raise the floor."""
     levels = {w: 0 for w in wans}
     labels = {w: "" for w in wans}
-    suppressed = set()
+    suppressed = {}
     for zone in zones or []:
         if not any(station_tracker.haversine_m(zone["lat"], zone["lon"], lat, lon)
                    <= zone["radius_m"] for lat, lon in points):
             continue
         targets = zone.get("wans") or wans
+        covered = None
         for wan in wans:
             if wan not in targets:
                 continue
             if zone["level"] > levels[wan]:
                 levels[wan] = zone["level"]
                 labels[wan] = zone.get("label") or "zone"
-            if zone.get("suppress_learned"):
-                suppressed.add(wan)
+            if not zone.get("suppress_learned"):
+                continue
+            if covered is None:
+                covered = _tiles_in_zone(zone, tiles)
+            if covered:
+                suppressed.setdefault(wan, set()).update(covered)
     return levels, labels, suppressed
 
 
-def learned_terms(store, tiles, wans, table, suppressed=()):
-    """(levels, sources) contributed by the learned store, worst tile wins."""
+def _tiles_in_zone(zone, tiles):
+    """The candidate tiles whose centre falls inside the zone's circle."""
+    out = set()
+    for tile in tiles or ():
+        try:
+            lat, lon = tile_store.center(tile)
+        except ValueError:
+            continue
+        if station_tracker.haversine_m(zone["lat"], zone["lon"],
+                                       lat, lon) <= zone["radius_m"]:
+            out.add(tile)
+    return out
+
+
+def learned_terms(store, tiles, wans, table, suppressed=None):
+    """(levels, sources) contributed by the learned store, worst tile wins.
+
+    `suppressed` is {wan: {tile, ...}} from zone_terms: only those (wan, tile)
+    pairs are skipped, so suppression stays inside the zone that asked for
+    it."""
     levels = {w: 0 for w in wans}
     sources = {w: "" for w in wans}
     for wan in wans:
-        if wan in suppressed:
-            continue
+        blocked = (suppressed or {}).get(wan) or ()
         for tile in tiles:
+            if tile in blocked:
+                continue
             level = store.level_for(tile, wan, table)
             if level > levels[wan]:
                 levels[wan] = level
@@ -106,7 +136,7 @@ def resolve(store, fix, zones, wans, table, *, precision, lookahead_s,
     every term is a max and the floor of the range is 0 (no opinion)."""
     points = candidate_points(fix, lookahead_s, min_speed_ms, sample_step_m)
     tiles = candidate_tiles(points, precision)
-    manual, labels, suppressed = zone_terms(zones, points, wans)
+    manual, labels, suppressed = zone_terms(zones, points, wans, tiles)
     learned, sources = learned_terms(store, tiles, wans, table, suppressed)
     top = len(table) - 1
     out = {}

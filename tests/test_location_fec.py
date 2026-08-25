@@ -73,7 +73,7 @@ def test_zone_matches_the_current_position():
     levels, labels, suppressed = M.zone_terms(zones, [(41.1, -73.5)], ["wan1"])
     assert levels["wan1"] == 2
     assert labels["wan1"] == "yard"
-    assert suppressed == set()
+    assert suppressed == {}          # {wan: {tile, ...}}, empty: nothing suppressed
 
 
 def test_zone_matches_a_projected_point_before_arrival():
@@ -131,6 +131,46 @@ def test_suppress_learned_leaves_only_the_manual_level():
                     F.DEFAULT_LOSS_TABLE, precision=7, lookahead_s=25.0,
                     min_speed_ms=2.0, sample_step_m=75.0)
     assert out["wan1"]["level"] == 1
+
+
+def test_suppress_learned_is_scoped_to_the_zone_tiles():
+    """A suppress zone must not blind the whole look-ahead.
+
+    Approaching a zone at speed, the look-ahead reaches it and the zone
+    matches — but a confirmed bad tile 400 m short of the zone is nowhere near
+    it, and the operator only overruled the learner INSIDE the circle."""
+    tile = T.encode(41.1, -73.5, 7)
+    store = _learned(tile, loss=9.0)                       # level 3
+    zones = [{"label": "underpass", "lat": 41.104, "lon": -73.5,
+              "radius_m": 150, "level": 1, "wans": None,
+              "suppress_learned": True}]
+    out = M.resolve(store, (41.1, -73.5, 25.0, 0.0), zones, ["wan1"],
+                    F.DEFAULT_LOSS_TABLE, precision=7, lookahead_s=25.0,
+                    min_speed_ms=2.0, sample_step_m=75.0)
+    assert out["wan1"]["level"] == 3
+    assert out["wan1"]["reason"].startswith("learned ")
+
+
+def test_zone_terms_suppresses_only_the_tiles_inside_the_circle():
+    inside = T.encode(41.104, -73.5, 7)
+    outside = T.encode(41.1, -73.5, 7)
+    zones = [{"label": "underpass", "lat": 41.104, "lon": -73.5,
+              "radius_m": 150, "level": 1, "wans": None,
+              "suppress_learned": True}]
+    _, _, suppressed = M.zone_terms(zones, [(41.1, -73.5), (41.104, -73.5)],
+                                    ["wan1"], [outside, inside])
+    assert suppressed == {"wan1": {inside}}
+
+
+def test_learned_terms_skips_only_the_suppressed_tile():
+    near, far = T.encode(41.1, -73.5, 7), T.encode(41.104, -73.5, 7)
+    store = _learned(far, loss=9.0)                        # level 3
+    levels, _ = M.learned_terms(store, [near, far], ["wan1"],
+                                F.DEFAULT_LOSS_TABLE, {"wan1": {far}})
+    assert levels["wan1"] == 0
+    levels, _ = M.learned_terms(store, [near, far], ["wan1"],
+                                F.DEFAULT_LOSS_TABLE, {"wan1": {near}})
+    assert levels["wan1"] == 3
 
 
 def test_resolve_clamps_a_level_to_the_active_table():
