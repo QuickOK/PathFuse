@@ -62,9 +62,15 @@ A zone matches when its centre is within `radius_m` of the position or any
 look-ahead point. `level` is a guaranteed minimum for the listed `wans`
 (default: all); the learned value can only push above it, and the two combine
 by `max`. `suppress_learned: true` ignores the learned value inside that zone,
-for a place the learner has simply got wrong. Zones are re-read on `SIGHUP`
-(`systemctl reload location-fec`). Read a station's label off the `:8081` map
-and paste its centroid to name a place you already recognise.
+for a place the learner has simply got wrong. Read a station's label off the
+`:8081` map and paste its centroid to name a place you already recognise.
+
+Edited zones are re-read on `SIGHUP`: `systemctl reload location-fec`, or
+`kill -HUP <pid>` where the daemon is not run under systemd. A reload re-reads
+the **whole** config file — zones, the gpsd host/port, `wans`, the intervals,
+the loss table — but it does **not** re-apply `exit_hold_s` or the `learning`
+parameters: those are baked into the `ExitHold` and tile store built at start,
+and changing them needs a restart.
 
 ## Operator controls
 

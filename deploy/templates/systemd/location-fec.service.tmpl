@@ -8,6 +8,12 @@ Type=simple
 User=$users_sbfdctl
 Group=$users_sbfdctl
 ExecStart=$paths_sbfdctl_opt/location_fec.py -c $paths_sbfdctl_etc/location-fec.json
+# The third deliberate difference from environ-ctl.service (with the
+# Description and the ExecStart): SIGHUP re-reads the config, and
+# docs/location-fec.md tells the operator to use it. The doubled dollar
+# is the escape render.py's string.Template needs to emit a literal one;
+# written singly it renders as a MISSING placeholder and --check fails.
+ExecReload=/bin/kill -HUP $$MAINPID
 RuntimeDirectory=sbfd-ctl
 RuntimeDirectoryMode=0755
 # RuntimeDirectoryPreserve is PER-UNIT, and this unit declares the SAME runtime

@@ -207,6 +207,25 @@ def test_every_unit_sharing_run_sbfd_ctl_preserves_it():
             f"{tmpl.name} declares RuntimeDirectory=sbfd-ctl but does not "
             f"preserve it — restarting it would wipe /run/sbfd-ctl out from "
             f"under sbfd-ctl.service (WAN overlay, maintenance window, run lock)")
-    # the two units known to share it; a new one must come here deliberately
+    # the three units known to share it; a new one must come here deliberately
     assert sharers == ["environ-ctl.service.tmpl", "location-fec.service.tmpl",
                        "sbfd-ctl.service.tmpl"]
+
+
+def test_location_fec_unit_can_be_reloaded():
+    """docs/location-fec.md tells the operator to re-read zones with
+    `systemctl reload location-fec`. Without ExecReload= systemd refuses the
+    job outright ("Job type reload is not applicable"), so the documented way
+    to change a zone would be a restart, which loses the open pass.
+
+    Asserted on the RENDERED unit, not the template: systemd's $MAINPID has to
+    be written $$MAINPID or string.Template eats it (and --check fails on the
+    missing placeholder)."""
+    import tempfile
+    r = _render()
+    values = json.loads((ROOT / "deploy" / "values.example.json").read_text())
+    values["role"] = "client"
+    with tempfile.TemporaryDirectory() as td:
+        r.render_all(values, td)
+        unit = (Path(td) / "etc/systemd/system/location-fec.service").read_text()
+    assert "ExecReload=/bin/kill -HUP $MAINPID" in unit.splitlines()
