@@ -1,3 +1,5 @@
+import json as _json
+
 import fec_control as F
 import tile_store as T
 import location_fec as M
@@ -167,3 +169,118 @@ def test_exit_hold_abandons_the_hold_when_the_level_climbs_again():
     h.update({"wan1": 0}, now_mono=5.0)
     assert h.update({"wan1": 4}, now_mono=6.0) == {"wan1": 4}
     assert h.update({"wan1": 0}, now_mono=7.0) == {"wan1": 4}
+
+
+def _cfg_raw(tmp_path, **over):
+    raw = {
+        "gpsd": {"host": "127.0.0.1", "port": 2947},
+        "wans": ["wan1", "wan2"],
+        "state_path": str(tmp_path / "state.json"),
+        "store_path": str(tmp_path / "store.json"),
+        "output_path": str(tmp_path / "location_fec.json"),
+        "poll_interval_s": 1.0,
+        "tile": {"precision": 7},
+        "learning": {"min_passes": 3, "alpha": 0.35, "pass_gap_s": 30,
+                     "max_tiles": 20000, "max_age_days": 14,
+                     "clean_drop_days": 7, "save_interval_s": 60},
+        "withdraw": {"max_stale_s": 600},
+        "lookahead": {"seconds": 25, "min_speed_ms": 2.0,
+                      "sample_step_m": 75, "exit_hold_s": 20},
+        "zones": [{"label": "yard", "lat": 41.1, "lon": -73.5,
+                   "radius_m": 300, "level": 2}],
+    }
+    raw.update(over)
+    p = tmp_path / "location-fec.json"
+    p.write_text(_json.dumps(raw))
+    return str(p)
+
+
+def test_load_config_reads_zones_and_defaults(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    assert cfg.precision == 7
+    assert cfg.lookahead_s == 25
+    assert cfg.exit_hold_s == 20
+    assert cfg.wans == ["wan1", "wan2"]
+    assert cfg.zones[0]["label"] == "yard"
+    assert cfg.zones[0]["wans"] is None
+    assert cfg.zones[0]["suppress_learned"] is False
+
+
+def test_an_invalid_zone_is_skipped_not_fatal(tmp_path):
+    path = _cfg_raw(tmp_path, zones=[
+        {"label": "good", "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2},
+        {"label": "no level", "lat": 41.1, "lon": -73.5, "radius_m": 300},
+        {"label": "level past the table", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 99},
+        {"label": "no position", "radius_m": 300, "level": 2},
+    ])
+    cfg = M.load_location_config(path)
+    assert [z["label"] for z in cfg.zones] == ["good"]
+
+
+def test_read_state_returns_per_wan_loss_and_residual(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text(_json.dumps({
+        "ts": 1000.0,
+        "client_local": {"wan1": {"loss_pct": 4.0}, "wan2": {"loss_pct": None}},
+        "fec": {"directions": {"client_to_relay": {
+            "rx": {"lost_pkts_est_per_s": 3.5}}}},
+    }))
+    loss, residual = M.read_state(str(p), now_wall=1005.0, max_age_s=10.0)
+    assert loss == {"wan1": 4.0}
+    assert residual == 3.5
+
+
+def test_read_state_rejects_a_stale_snapshot(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text(_json.dumps({"ts": 1000.0, "client_local": {"wan1": {"loss_pct": 4.0}}}))
+    assert M.read_state(str(p), now_wall=1100.0, max_age_s=10.0) is None
+
+
+def test_read_state_fails_open_on_junk(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text("{not json")
+    assert M.read_state(str(p), now_wall=1000.0, max_age_s=10.0) is None
+    assert M.read_state(str(tmp_path / "absent.json"), 1000.0, 10.0) is None
+
+
+def test_poll_once_publishes_a_zone_floor_without_any_state(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    store = T.TileStore()
+    hold = M.ExitHold(cfg.exit_hold_s)
+    rec = M.poll_once(cfg, store, hold, fix=(41.1, -73.5, 0.0, None),
+                      state=None, now_mono=0.0, now_wall=1000.0)
+    # A floor needs a POSITION, not live loss: the store and the zones already
+    # hold everything the resolver needs.
+    assert rec["wans"]["wan1"]["level"] == 2
+    assert rec["set_ts"] == 1000.0
+
+
+def test_poll_once_without_a_fix_writes_an_explicit_withdrawal(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    store = T.TileStore()
+    hold = M.ExitHold(cfg.exit_hold_s)
+    rec = M.poll_once(cfg, store, hold, fix=None, state=None,
+                      now_mono=0.0, now_wall=1000.0)
+    assert rec["wans"] == {}
+    assert rec["set_ts"] == 1000.0
+
+
+def test_poll_once_learns_from_state(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path, zones=[]))
+    store = T.TileStore()
+    hold = M.ExitHold(cfg.exit_hold_s)
+    tile = T.encode(41.1, -73.5, 7)
+    for p in range(3):
+        M.poll_once(cfg, store, hold, fix=(41.1, -73.5, 0.0, None),
+                    state=({"wan1": 9.0}, None), now_mono=1000.0 * p,
+                    now_wall=1000.0 + p)
+        store.close_pass(now_wall=1000.0 + p)
+    assert store.passes_for(tile, "wan1") == 3
+
+
+def test_write_record_is_atomic_and_readable(tmp_path):
+    p = tmp_path / "out" / "location_fec.json"
+    M.write_record(str(p), {"set_ts": 1000.0, "wans": {"wan1": {"level": 2}}})
+    assert _json.loads(p.read_text())["wans"]["wan1"]["level"] == 2
+    assert not (tmp_path / "out" / "location_fec.json.tmp").exists()
