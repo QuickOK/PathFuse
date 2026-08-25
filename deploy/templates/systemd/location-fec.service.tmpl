@@ -1,0 +1,46 @@
+[Unit]
+Description=PathFuse location-aware FEC floors (learned tiles + zones)
+After=network-online.target gpsd.service
+Wants=network-online.target gpsd.service
+
+[Service]
+Type=simple
+User=$users_sbfdctl
+Group=$users_sbfdctl
+ExecStart=$paths_sbfdctl_opt/location_fec.py -c $paths_sbfdctl_etc/location-fec.json
+RuntimeDirectory=sbfd-ctl
+RuntimeDirectoryMode=0755
+# RuntimeDirectoryPreserve is PER-UNIT, and this unit declares the SAME runtime
+# directory sbfd-ctl.service owns. Without this line, systemd deletes /run/sbfd-ctl
+# whenever THIS unit stops — even though sbfd-ctl.service is still running and
+# still using it. The fix on sbfd-ctl.service does not cover us; we need our own.
+# Three live things sit in that directory, and every `systemctl restart
+# environ-ctl` would take all three:
+#   runtime.json            the operator's WAN-mode overlay — deleting it
+#                           silently reverts the mode to policy.default_mode.
+#   maintenance_window.json alert suppression, killed mid-window: the night's
+#                           planned reboot then pages as though it were an outage.
+#   maintenance.lock        the worst of the three. flock is PER-INODE, so a
+#                           second maintenance run does not find the lock gone
+#                           and wait — it CREATES A FRESH INODE at the same path
+#                           and locks that one successfully. Both runs then
+#                           believe they hold the lock, and the mutual exclusion
+#                           that stops two runs from taking both WANs down at
+#                           once is silently defeated.
+# "yes", not "restart", to match sbfd-ctl.service: "restart" still clears the
+# directory on a full stop/start pair, which is exactly when an override, a
+# window or a lock most needs to outlive this unit.
+RuntimeDirectoryPreserve=yes
+StateDirectory=sbfd-ctl
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ReadWritePaths=/run/sbfd-ctl /var/lib/sbfd-ctl
+
+[Install]
+WantedBy=multi-user.target

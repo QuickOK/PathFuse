@@ -208,4 +208,5 @@ def test_every_unit_sharing_run_sbfd_ctl_preserves_it():
             f"preserve it — restarting it would wipe /run/sbfd-ctl out from "
             f"under sbfd-ctl.service (WAN overlay, maintenance window, run lock)")
     # the two units known to share it; a new one must come here deliberately
-    assert sharers == ["environ-ctl.service.tmpl", "sbfd-ctl.service.tmpl"]
+    assert sharers == ["environ-ctl.service.tmpl", "location-fec.service.tmpl",
+                       "sbfd-ctl.service.tmpl"]

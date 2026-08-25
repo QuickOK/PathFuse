@@ -143,6 +143,9 @@ sudo systemctl enable --now hotspot-watchdog
 # optional: wan1 modem signal telemetry (feeds the FEC signal floor); needs
 # cell-telemetry.json alongside hotspot-watchdog's admin secret (see above)
 sudo systemctl enable --now cell-telemetry
+# optional; needs gpsd. Learns per-place loss and raises the FEC floor before
+# arrival — see docs/location-fec.md
+sudo systemctl enable --now location-fec
 # optional: daily maintenance reboot (enable the TIMER, not the service; needs
 # hotspot-watchdog above for its wan1 leg)
 sudo systemctl enable --now maintenance-reboot.timer

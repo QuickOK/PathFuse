@@ -27,6 +27,10 @@ is detected (GPS + Open-Meteo), with a master on/off toggle on the `:8081` UI.
 See [`docs/environmental.md`](docs/environmental.md). It is not part of the core
 data plane.
 
+**Optional: location-aware FEC.** `location_fec.py` learns which places
+degrade which link and raises the FEC floor before arrival; see
+[`docs/location-fec.md`](docs/location-fec.md).
+
 ## Three ways to use this repo
 
 1. **Run / read the code (this repo).** Quickstart below.

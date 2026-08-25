@@ -21,5 +21,7 @@
   {"template":"systemd/maintenance-reboot.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/maintenance-reboot.service","mode":"0644"},
   {"template":"systemd/maintenance-reboot.timer.tmpl","roles":["client"],"dest":"/etc/systemd/system/maintenance-reboot.timer","mode":"0644"},
   {"template":"config/maintenance.config.json.tmpl","roles":["client"],"dest":"/etc/sbfd-ctl/maintenance.json","mode":"0644"},
-  {"template":"systemd/ntfy-control.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/ntfy-control.service","mode":"0644"}
+  {"template":"systemd/ntfy-control.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/ntfy-control.service","mode":"0644"},
+  {"template":"systemd/location-fec.service.tmpl","roles":["client"],"dest":"/etc/systemd/system/location-fec.service","mode":"0644"},
+  {"template":"config/location-fec.config.json.tmpl","roles":["client"],"dest":"/etc/sbfd-ctl/location-fec.json","mode":"0644"}
 ]

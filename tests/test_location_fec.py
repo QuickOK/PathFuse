@@ -1,8 +1,11 @@
 import json as _json
+from pathlib import Path
 
 import fec_control as F
 import tile_store as T
 import location_fec as M
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def _learned(tile, wan="wan1", loss=9.0, passes=3):
@@ -336,3 +339,11 @@ def test_poll_once_labels_a_held_level_with_the_exit_hold_and_its_origin(tmp_pat
                       state=None, now_mono=30.0, now_wall=1030.0)
     assert rec["wans"]["wan1"]["level"] == 1
     assert rec["wans"]["wan1"]["reason"] == "zone B"
+
+
+def test_example_config_loads():
+    cfg = M.load_location_config(str(ROOT / "config" / "location-fec.example.json"))
+    assert cfg.precision == 7
+    assert cfg.wans == ["wan1", "wan2"]
+    assert len(cfg.zones) == 2
+    assert all(z["lat"] == 0.0 and z["lon"] == 0.0 for z in cfg.zones)
