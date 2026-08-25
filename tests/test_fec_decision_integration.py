@@ -310,19 +310,24 @@ def test_location_floor_for_driver_clamps_to_the_active_table():
 
 # ---------- location floor: did it actually change the applied ratio? ----------
 
-def _floor_active(mode, level_before, location_level, floor="8:0", fixed="20:1"):
+def _floor_active(mode, level_before, location_level, floor="8:0", fixed="20:1",
+                  write_ok=True, prev_accepted=None):
     """Replay the tick's two ratios and ask the predicate which the wire got.
 
-    `active` is a claim about the RATIO the FIFO receives, not about levels: a
+    `active` is a claim about the RATIO THE ACTUATOR HOLDS, not about levels: a
     level the floor lifted can still map to the ratio the leg was already
-    sending, and then the location floor changed nothing."""
+    sending, and a refused FIFO write leaves the old ratio flowing however high
+    the floor reached. `write_ok=False` models that refusal, leaving the wire at
+    `prev_accepted` (by default whatever the leg was already sending)."""
     table = F.DEFAULT_LOSS_TABLE
     lifted = F.apply_location_floor(level_before, location_level, table)
     with_loc = F.apply_mode(mode, F.level_to_ratio(lifted, table),
                             fixed_ratio=fixed, floor_ratio=floor)
     without_loc = F.apply_mode(mode, F.level_to_ratio(level_before, table),
                                fixed_ratio=fixed, floor_ratio=floor)
-    return M.location_floor_active(with_loc, without_loc)
+    on_wire = with_loc if write_ok else (
+        prev_accepted if prev_accepted is not None else without_loc)
+    return M.location_floor_active(on_wire, without_loc)
 
 
 def test_location_floor_active_only_when_it_lifts_the_ratio():
@@ -352,6 +357,22 @@ def test_location_floor_inactive_under_a_config_floor_that_already_covers_it():
     assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3, floor="8:8") is False
     # ...and it is genuinely active once the config floor leaves room again.
     assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3, floor="8:2") is True
+
+
+def test_location_floor_answers_to_the_actuator_not_to_the_decision():
+    # The FIFO refused the lifted ratio, so the wire still carries the old one.
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 3, write_ok=False) is False
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 3, write_ok=True) is True
+    # A refusal does NOT retract a floor already flowing from an earlier tick:
+    # the parity is on the wire, whoever wrote it and whenever.
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 3, write_ok=False,
+                         prev_accepted="8:6") is True
+
+
+def test_location_floor_claims_nothing_before_the_first_accepted_write():
+    # fec_current_ratio is None until a write lands. Nothing is known to be on
+    # the wire, so nothing can be credited to the floor.
+    assert M.location_floor_active(None, "8:1") is False
 
 
 # ---------- pinned ladder: the location floor widens the pin ----------
