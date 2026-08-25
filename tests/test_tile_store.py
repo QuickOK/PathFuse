@@ -248,6 +248,25 @@ def test_from_dict_drops_a_non_finite_number_and_keeps_the_good_sibling():
     json.dumps(s.to_dict(), allow_nan=False)          # what the browser must parse
 
 
+def test_finite_number_survives_an_int_too_large_for_a_float():
+    """math.isfinite converts to float first, so a pathological integer raises
+    OverflowError rather than answering. That would escape from_dict, observe
+    and read_state — a raise out of the daemon loop over a value we were about
+    to reject anyway, which is the fail-open posture inverted."""
+    assert T.finite_number(10 ** 5000) is False
+    assert T.finite_number(-(10 ** 5000)) is False
+    # The ordinary large-but-representable case is unaffected.
+    assert T.finite_number(10 ** 300) is True
+
+
+def test_from_dict_drops_an_int_too_large_for_a_float():
+    s = T.TileStore.from_dict({"tiles": {"dr79z6n": {
+        "wan1": {"passes": 4, "ewma_loss": 10 ** 5000, "last_seen": 1000.0},
+        "wan2": {"passes": 3, "ewma_loss": 6.0, "last_seen": 1000.0}}}})
+    assert "wan1" not in s.tiles["dr79z6n"]
+    assert s.tiles["dr79z6n"]["wan2"]["passes"] == 3
+
+
 def test_observe_ignores_a_non_finite_sample():
     # The other boundary a number can enter the store by. A NaN folded into a
     # pass makes that tile's EWMA NaN for good.

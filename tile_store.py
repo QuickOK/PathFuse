@@ -37,8 +37,15 @@ def finite_number(v):
     json.loads accepts the bareword NaN, json.dumps writes it straight back
     out, and the browser's JSON.parse then rejects the WHOLE payload over one
     tile. Every number entering the store goes through here."""
-    return (isinstance(v, (int, float)) and not isinstance(v, bool)
-            and math.isfinite(v))
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        # isfinite converts to float first, so an int with more digits than a
+        # double can hold raises instead of answering. A value we were about to
+        # reject anyway must not raise out of from_dict, observe or read_state.
+        return False
 
 
 def encode(lat, lon, precision=DEFAULT_PRECISION):
