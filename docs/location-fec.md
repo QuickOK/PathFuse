@@ -32,7 +32,7 @@ cleanup. An empty `wans` is an explicit withdrawal.
 Positions are keyed to ~150 m geohash tiles. One contiguous visit to a tile is
 a **pass**; each pass contributes that WAN's p90 loss to a per-tile running
 average. A tile actuates after `min_passes` (3) distinct passes, so one bad
-day cannot brand a place, and a truck parked in a dead spot cannot confirm it
+day cannot brand a place, and a vehicle parked in a dead spot cannot confirm it
 by sheer sample count. Clean passes decay the average — about six clear a
 level-3 tile. Tiles not seen for `max_age_days`, or clean for
 `clean_drop_days`, are dropped; the store is capped at `max_tiles`.
@@ -81,7 +81,7 @@ and paste its centroid to name a place you already recognise.
 | gpsd down or no fix | explicit withdrawal; learning pauses |
 | `state.json` stale | learning skipped that tick; the floor still resolves |
 | daemon dies | floor withdrawn by `stale_after_s` |
-| daemon alive but blind for `withdraw.max_stale_s` | explicit withdrawal |
+| daemon alive but blind for `withdraw.max_stale_s` | already withdrawn (no fix ⇒ withdrawal is immediate); logs a warning so the blindness is visible in the journal |
 | corrupt store | starts empty, one log line |
 | invalid zone | logged and skipped |
 
