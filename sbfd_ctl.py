@@ -1949,6 +1949,19 @@ def effective_location_fec_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     return bool(cfg.location.enabled)
 
 
+def location_floor_for_driver(floors, enabled, driver, table):
+    """(level, reason) the location floor asks of the FEC DRIVER WAN only —
+    a place that kills cellular must not lift the floor while satellite is
+    driving. Clamped to the active profile's table. 0 means no opinion."""
+    if not enabled or not floors or not driver:
+        return 0, ""
+    entry = floors.get(driver)
+    if not entry:
+        return 0, ""
+    level = fec_control.apply_location_floor(0, entry.get("level"), table)
+    return level, (entry.get("reason", "") if level > 0 else "")
+
+
 def effective_maintenance_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     """Resolve the maintenance-reboot toggle. Same shape as environmental (NOT
     FEC): cfg.maintenance.enabled is only the boot default and the operator's
@@ -2658,6 +2671,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         if cfg.cell else None)
     fec_signal_engaged = False
     fec_signal_floor_applied = False
+    fec_location_level_prev = 0
     fec_current_ratio = None
     fec_ratio_since: Optional[float] = None
     fec_relay_last = {"ok": False, "data": None, "error": "not yet fetched"}
@@ -2698,6 +2712,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         mode, policy, master_wan, egress_mode = effective_policy(cfg, ov)
         env_auto = load_auto_override(cfg, loop_start)
         cell_sample = load_cell_sample(cfg, loop_start)
+        location_floors = load_location_floor(cfg, loop_start)
+        location_enabled = effective_location_fec_enabled(cfg, ov)
         env_enabled = effective_environmental_enabled(cfg, ov)
         mode, env_active = apply_auto_override(mode, env_enabled, env_auto)
         handoff_win = load_cell_handoff(cfg, loop_start)
@@ -2854,6 +2870,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         # ladder derived from the wrong one.
         fec_ladder = None
         fec_ladder_r2c = None
+        fec_location_level, fec_location_reason = 0, ""
         relay_desired = (fec_mode_eff, fec_fixed_ratio_eff, fec_floor_ratio_eff)
         if cfg.fec:
             # Our TX leg repairs client->relay loss, which only the relay can
@@ -2934,6 +2951,18 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 _fec_target, fec_rt, prof_hyst, loop_start)
             _fec_level = fec_control.apply_signal_floor(
                 fec_rt.current_level, fec_signal_floor_applied, prof_table, prof_sf_fec)
+            # Location floor: raise-only, driver WAN only, resolved against
+            # the ACTIVE profile's table. Unlike the signal floor it is NOT
+            # suppressed by full-redundancy backoff — a place known to drop
+            # both links at once is exactly where parity beats duplication.
+            fec_location_level, fec_location_reason = location_floor_for_driver(
+                location_floors, location_enabled, fec_driver, prof_table)
+            _fec_level = fec_control.apply_location_floor(
+                _fec_level, fec_location_level, prof_table)
+            if fec_location_level != fec_location_level_prev:
+                logging.info("fec location floor -> level %d (%s)",
+                             fec_location_level, fec_location_reason or "released")
+                fec_location_level_prev = fec_location_level
             _adaptive_ratio = fec_control.level_to_ratio(_fec_level, prof_table)
             _fec_ratio = fec_control.apply_mode(
                 fec_mode_eff, _adaptive_ratio,
@@ -3124,6 +3153,16 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                         else 0.0),
                 },
                 "signal_floor_active": fec_signal_floor_applied,
+                "location_floor": {
+                    "configured": cfg.location is not None,
+                    "enabled": location_enabled,
+                    # Binding = it actually lifted the level this tick.
+                    "active": (fec_location_level > 0
+                               and fec_location_level > fec_rt.current_level),
+                    "level": fec_location_level,
+                    "reason": fec_location_reason,
+                    "wans": location_floors or {},
+                },
                 "directions": {
                     "client_to_relay": {
                         "enabled": fec_desired,

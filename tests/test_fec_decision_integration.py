@@ -262,3 +262,26 @@ def test_leaving_full_redundancy_hands_the_profile_back_at_once():
         (0.0, {"wan1", "wan2"}, {"wan1": 0.0, "wan2": 0.0}),
         (0.5, {"wan2"}, {"wan1": 0.0, "wan2": 0.0}),
     ]) == ["wan1", "default"]
+
+
+# ---------- location floor: driver-WAN-only resolution ----------
+
+def test_location_floor_for_driver_picks_the_driver_wan():
+    floors = {"wan1": {"level": 3, "reason": "learned a"},
+              "wan2": {"level": 1, "reason": "learned b"}}
+    assert M.location_floor_for_driver(floors, True, "wan2", F.DEFAULT_LOSS_TABLE) \
+        == (1, "learned b")
+
+
+def test_location_floor_for_driver_is_zero_when_disabled_or_absent():
+    floors = {"wan1": {"level": 3, "reason": "x"}}
+    assert M.location_floor_for_driver(floors, False, "wan1", F.DEFAULT_LOSS_TABLE) == (0, "")
+    assert M.location_floor_for_driver(None, True, "wan1", F.DEFAULT_LOSS_TABLE) == (0, "")
+    assert M.location_floor_for_driver(floors, True, "wan2", F.DEFAULT_LOSS_TABLE) == (0, "")
+    assert M.location_floor_for_driver(floors, True, None, F.DEFAULT_LOSS_TABLE) == (0, "")
+
+
+def test_location_floor_for_driver_clamps_to_the_active_table():
+    floors = {"wan1": {"level": 4, "reason": "x"}}
+    level, _ = M.location_floor_for_driver(floors, True, "wan1", F.DEFAULT_CELL_LOSS_TABLE)
+    assert level == len(F.DEFAULT_CELL_LOSS_TABLE) - 1
