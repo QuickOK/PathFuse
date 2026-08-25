@@ -222,3 +222,12 @@ def test_from_dict_keeps_valid_entries_beside_malformed_ones():
     assert s.tiles["dr79z6n"]["wan1"]["passes"] == 3
     assert abs(s.tiles["dr79z6n"]["wan1"]["ewma_loss"] - 9.0) < 1e-9
     assert "dr79z6y" not in s.tiles
+
+
+def test_store_rejects_a_non_finite_alpha():
+    # NaN poisons the EWMA permanently and silently: every subsequent blend is
+    # NaN, so a tile can never confirm again. Refuse it where it enters.
+    import pytest
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="alpha"):
+            T.TileStore(alpha=bad)

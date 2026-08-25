@@ -1478,9 +1478,14 @@ def load_config(path: str) -> Config:
         raw_loc = raw.get("location_fec")
         loc_cfg = None
         if raw_loc is not None:
+            # bool("false") is True, so a string here would turn the operator's
+            # "off" into on. Absent still means on; present must be a boolean.
+            loc_enabled = raw_loc.get("enabled", True)
+            if not isinstance(loc_enabled, bool):
+                raise ValueError("location_fec.enabled must be true or false")
             loc_cfg = LocationFecCfg(
                 state_path=raw_loc.get("state_path", "/run/sbfd-ctl/location_fec.json"),
-                enabled=bool(raw_loc.get("enabled", True)),
+                enabled=loc_enabled,
                 stale_after_s=float(raw_loc.get("stale_after_s", 30.0)))
 
         raw_notif = raw.get("notifications")
@@ -2318,7 +2323,11 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
                 if fix else 0.0)
         r = residual.get(tid)
         res = r.get("ewma") if isinstance(r, dict) else None
-        if isinstance(res, bool) or not isinstance(res, (int, float)):
+        # NaN and inf ARE floats, and json.dumps writes them as bare
+        # NaN/Infinity tokens — JSON.parse throws on those, so one poisoned
+        # tile would cost the page the entire payload.
+        if (isinstance(res, bool) or not isinstance(res, (int, float))
+                or not math.isfinite(res)):
             res = None
         rows.append((dist, {
             "id": tid, "bbox": box, "wans": per_wan, "residual": res}))
@@ -2368,7 +2377,9 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
         out_fix = {"lat": lat, "lon": lon, "speed": speed,
                    "track": track, "age_s": age}
     try:
-        max_tiles = int(map_cfg.get("max_location_tiles", 2000))
+        # Clamped at 0: rows[:-5] is a negative slice, which drops the five
+        # NEAREST tiles and keeps everything else — the opposite of a cap.
+        max_tiles = max(0, int(map_cfg.get("max_location_tiles", 2000)))
     except (TypeError, ValueError):
         max_tiles = 2000
     return {"ts": now,

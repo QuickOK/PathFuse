@@ -294,3 +294,37 @@ def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
                            "max_location_tiles": "lots"})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     assert out["location_fec"] == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_drops_a_non_finite_residual(tmp_path):
+    # NaN and inf are floats, so they pass the numeric guard, and json.dumps
+    # writes them as bare NaN/Infinity tokens: JSON.parse throws and the page
+    # loses the WHOLE payload, not just one tile's residual.
+    tile = T.encode(41.1, -73.5, 7)
+    wan = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    store = tmp_path / "store.json"
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        store.write_text(
+            '{"tiles": %s, "residual": {"%s": {"ewma": %s, "last_seen": 1000.0}}}'
+            % (_json.dumps({tile: wan}), tile, bad))
+        out = M.map_location_layer(str(store), str(tmp_path / "absent.json"),
+                                   None, max_tiles=10)
+        assert out["tiles"][0]["residual"] is None
+        _json.dumps(out, allow_nan=False)      # what the browser must parse
+
+
+def test_assemble_map_payload_clamps_a_negative_max_location_tiles(tmp_path):
+    # rows[:-5] is a NEGATIVE slice: it drops the five NEAREST tiles and keeps
+    # the rest, which is the exact opposite of a cap.
+    entry = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    tiles = {T.encode(41.1 + 0.01 * i, -73.5, 7): entry for i in range(8)}
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"tiles": tiles}))
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(store),
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "max_location_tiles": -5})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"]["tiles"] == []

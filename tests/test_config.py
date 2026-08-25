@@ -458,3 +458,23 @@ def test_location_fec_rejects_nan_stale_after_s(tmp_path: Path):
     p.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="location_fec.stale_after_s"):
         sbfd_ctl.load_config(str(p))
+
+
+def test_location_fec_enabled_must_be_a_real_boolean(tmp_path: Path):
+    # bool("false") is True. An operator who writes the string means off, and
+    # silently getting the opposite of what the file says is worse than a
+    # startup error naming the field.
+    raw = dict(SAMPLE)
+    raw["location_fec"] = {"state_path": "/x", "enabled": "false"}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="location_fec.enabled"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_location_fec_enabled_defaults_to_true_when_absent(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["location_fec"] = {"state_path": "/x"}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    assert sbfd_ctl.load_config(str(p)).location.enabled is True

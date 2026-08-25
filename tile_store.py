@@ -10,6 +10,7 @@ Spec: docs/superpowers/specs/2026-08-25-location-aware-fec-design.md
 
 import json
 import logging
+import math
 import os
 
 import fec_control
@@ -21,6 +22,11 @@ _B32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 _B32_INDEX = {c: i for i, c in enumerate(_B32)}
 
 DEFAULT_PRECISION = 7
+
+# A tile whose remembered loss is at or below this is "clean": prune drops it on
+# the shorter clean_drop_days clock. Well under the lowest table rung — the point
+# is to forget places that never had a problem, not places that have recovered.
+LOSSY_EWMA_PCT = 0.5
 
 
 def encode(lat, lon, precision=DEFAULT_PRECISION):
@@ -104,6 +110,10 @@ class TileStore:
     def __init__(self, *, min_passes=3, alpha=0.35, pass_gap_s=30.0,
                  max_tiles=20000, max_age_days=14.0, clean_drop_days=7.0):
         self.min_passes = int(min_passes)
+        # A NaN alpha poisons every subsequent blend, so a tile can never
+        # confirm again — silently, and for the life of the store file.
+        if not math.isfinite(float(alpha)):
+            raise ValueError("alpha must be a finite number")
         self.alpha = float(alpha)
         self.pass_gap_s = float(pass_gap_s)
         self.max_tiles = int(max_tiles)
@@ -194,7 +204,8 @@ class TileStore:
             per_wan = self.tiles[tile]
             last = max((e.get("last_seen", 0.0) for e in per_wan.values()),
                        default=0.0)
-            lossy = any(e.get("ewma_loss", 0.0) > 0.5 for e in per_wan.values())
+            lossy = any(e.get("ewma_loss", 0.0) > LOSSY_EWMA_PCT
+                        for e in per_wan.values())
             if last < age_cut or (not lossy and last < clean_cut):
                 del self.tiles[tile]
         if len(self.tiles) > self.max_tiles:
