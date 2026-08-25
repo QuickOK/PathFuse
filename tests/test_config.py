@@ -422,3 +422,39 @@ def test_shipped_example_config_still_loads_with_new_wan_reference_checks():
     cfg = sbfd_ctl.load_config(str(ROOT / "config" / "sbfd-ctl.example.json"))
     assert cfg.cell.wan in cfg.wans
     assert all(w in cfg.wans for w in cfg.fec.wan_profiles)
+
+
+def test_location_fec_config_parsed(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["location_fec"] = {"state_path": "/run/sbfd-ctl/location_fec.json",
+                           "enabled": False, "stale_after_s": 45}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.location.state_path == "/run/sbfd-ctl/location_fec.json"
+    assert cfg.location.enabled is False
+    assert cfg.location.stale_after_s == 45.0
+
+
+def test_location_fec_absent_is_none(tmp_path: Path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(SAMPLE))
+    assert sbfd_ctl.load_config(str(p)).location is None
+
+
+def test_location_fec_rejects_non_positive_stale_after_s(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["location_fec"] = {"state_path": "/x", "stale_after_s": 0}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="location_fec.stale_after_s"):
+        sbfd_ctl.load_config(str(p))
+
+
+def test_location_fec_rejects_nan_stale_after_s(tmp_path: Path):
+    raw = dict(SAMPLE)
+    raw["location_fec"] = {"state_path": "/x", "stale_after_s": float("nan")}
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="location_fec.stale_after_s"):
+        sbfd_ctl.load_config(str(p))

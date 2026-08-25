@@ -133,6 +133,15 @@ class CellTelemetryCfg:
 
 
 @dataclass
+class LocationFecCfg:
+    """Reader side of location_fec.py's floor file. `enabled` is the boot-time
+    default; the operator's runtime toggle wins in either direction."""
+    state_path: str
+    enabled: bool = True
+    stale_after_s: float = 30.0
+
+
+@dataclass
 class MaintenanceCfg:
     """Nightly one-at-a-time WAN reboot. `enabled`/`hour` here are boot-time
     DEFAULTS only — the operator's runtime overlay wins in either direction.
@@ -160,6 +169,7 @@ class Config:
     environmental: Optional[EnvironmentalCfg] = None
     maintenance: Optional[MaintenanceCfg] = None
     cell: Optional[CellTelemetryCfg] = None
+    location: Optional[LocationFecCfg] = None
     notifications: Optional["notify.NotifyCfg"] = None
     map: object = None                 # raw `map` config section (dict | None)
 
@@ -1465,6 +1475,14 @@ def load_config(path: str) -> Config:
                 handoff_path=raw_cell.get("handoff_path", "/run/sbfd-ctl/cell_handoff.json"),
                 handoff_ttl_s=float(raw_cell.get("handoff_ttl_s", 30.0)))
 
+        raw_loc = raw.get("location_fec")
+        loc_cfg = None
+        if raw_loc is not None:
+            loc_cfg = LocationFecCfg(
+                state_path=raw_loc.get("state_path", "/run/sbfd-ctl/location_fec.json"),
+                enabled=bool(raw_loc.get("enabled", True)),
+                stale_after_s=float(raw_loc.get("stale_after_s", 30.0)))
+
         raw_notif = raw.get("notifications")
         notif_cfg = None
         if raw_notif is not None:
@@ -1494,6 +1512,7 @@ def load_config(path: str) -> Config:
             environmental=env_cfg,
             maintenance=maint_cfg,
             cell=cell_cfg,
+            location=loc_cfg,
             notifications=notif_cfg,
             map=raw.get("map"),
         )
@@ -1554,6 +1573,12 @@ def load_config(path: str) -> Config:
                 f"cell_telemetry.wan {cell_cfg.wan!r} not in wans={list(wans)}")
         if cell_cfg.handoff_ttl_s <= 0:
             raise ValueError("cell_telemetry.handoff_ttl_s must be > 0")
+    if loc_cfg is not None:
+        # NaN is not <= 0 (every comparison against NaN is False), so it would
+        # sail through and make the staleness gate inert: a dead daemon's
+        # floor would hold forever.
+        if not math.isfinite(loc_cfg.stale_after_s) or loc_cfg.stale_after_s <= 0:
+            raise ValueError("location_fec.stale_after_s must be a finite number > 0")
     if fec_cfg is not None:
         for wname in fec_cfg.wan_profiles:
             if wname not in wans:
@@ -1596,6 +1621,7 @@ class RuntimeOverlay:
     fec_fixed_ratio: Optional[str] = None
     fec_floor_ratio: Optional[str] = None
     environmental_enabled: Optional[bool] = None
+    location_fec_enabled: Optional[bool] = None
     # First integer overlay field. Note hour 0 (midnight) is falsy and real, so
     # every read/write path here must test for None, never for truthiness.
     maintenance_enabled: Optional[bool] = None
@@ -1628,6 +1654,7 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
                 fec_floor_ratio=raw.get("fec_floor_ratio"),
                 environmental_enabled=raw.get("environmental_enabled"),
+                location_fec_enabled=raw.get("location_fec_enabled"),
                 maintenance_enabled=raw.get("maintenance_enabled"),
                 maintenance_hour=raw.get("maintenance_hour"),
             )
@@ -1659,6 +1686,7 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
         "fec_fixed_ratio": ov.fec_fixed_ratio,
         "fec_floor_ratio": ov.fec_floor_ratio,
         "environmental_enabled": ov.environmental_enabled,
+        "location_fec_enabled": ov.location_fec_enabled,
         "maintenance_enabled": ov.maintenance_enabled,
         "maintenance_hour": ov.maintenance_hour,
     }
@@ -1751,6 +1779,31 @@ def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
     for k in ("cell_id", "band"):
         v = raw.get(k)
         out[k] = str(v) if v is not None else None
+    return out
+
+
+def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
+    """{wan: {level, reason}} from location_fec.py, or None when unconfigured,
+    missing, malformed, or older than stale_after_s. Fail-open like
+    load_auto_override: a floor that cannot be read is no floor. Only `level`
+    is trusted, and only as a non-bool int — it crosses a process boundary."""
+    if cfg.location is None:
+        return None
+    try:
+        raw = _json.loads(Path(cfg.location.state_path).read_text())
+        set_ts = float(raw["set_ts"])
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+        return None
+    if now - set_ts > cfg.location.stale_after_s:
+        return None
+    out = {}
+    for wan, obj in (raw.get("wans") or {}).items():
+        if not isinstance(obj, dict):
+            continue
+        level = obj.get("level")
+        if isinstance(level, bool) or not isinstance(level, int):
+            continue
+        out[wan] = {"level": level, "reason": str(obj.get("reason", ""))}
     return out
 
 
@@ -1870,6 +1923,16 @@ def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     if ov.environmental_enabled is not None:
         return ov.environmental_enabled
     return bool(cfg.environmental.enabled)
+
+
+def effective_location_fec_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
+    """Same shape as effective_environmental_enabled: config is the default,
+    the operator's runtime toggle wins, hard-off only when unconfigured."""
+    if cfg.location is None:
+        return False
+    if ov.location_fec_enabled is not None:
+        return ov.location_fec_enabled
+    return bool(cfg.location.enabled)
 
 
 def effective_maintenance_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
@@ -2071,6 +2134,9 @@ def validate_runtime_payload(payload: dict, wan_names: set):
                 return False, f"{_key}: {e}"
     if "environmental_enabled" in payload and not isinstance(payload["environmental_enabled"], bool):
         return False, "environmental_enabled must be true or false"
+    if ("location_fec_enabled" in payload
+            and not isinstance(payload["location_fec_enabled"], bool)):
+        return False, "location_fec_enabled must be true or false"
     if ("maintenance_enabled" in payload
             and not isinstance(payload["maintenance_enabled"], bool)):
         return False, "maintenance_enabled must be true or false"
@@ -2514,6 +2580,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 ov.fec_floor_ratio = payload["fec_floor_ratio"]
             if "environmental_enabled" in payload:
                 ov.environmental_enabled = payload["environmental_enabled"]
+            if "location_fec_enabled" in payload:
+                ov.location_fec_enabled = payload["location_fec_enabled"]
             # `in payload`, never `payload.get(k) or default`: hour 0 is midnight
             # and falsy, and the `or` idiom would rewrite it to the config default.
             if "maintenance_enabled" in payload:

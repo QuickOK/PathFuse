@@ -616,3 +616,94 @@ def test_load_cell_handoff_rejects_future_set_ts(tmp_path):
     (tmp_path / "handoff.json").write_text(json.dumps(
         {"set_ts": 100_000.0, "until_ts": 100_004.0, "reason": "x"}))
     assert M.load_cell_handoff(cfg, now=1000.0) is None
+
+
+def _loc_cfg(tmp_path, enabled=True):
+    return M.Config(
+        wans={"wan1": M.WanCfg("wan1", 1, "A"), "wan2": M.WanCfg("wan2", 2, "B")},
+        relay=M.RelayCfg("http://x"),
+        engarde=M.EngardeCfg("198.51.100.10", 59402),
+        nft=M.NftCfg(), policy=M.PolicyCfg(), ui_listen="127.0.0.1:0",
+        sbfd_local_state=str(tmp_path / "s.json"),
+        runtime_state=str(tmp_path / "r.json"),
+        persist_state=str(tmp_path / "p.json"),
+        published_state=str(tmp_path / "pub.json"),
+        location=M.LocationFecCfg(state_path=str(tmp_path / "location_fec.json"),
+                                  enabled=enabled, stale_after_s=30.0),
+    )
+
+
+def test_load_location_floor_unconfigured_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    c.location = None
+    assert M.load_location_floor(c, 1000.0) is None
+
+
+def test_load_location_floor_missing_file_is_none(tmp_path):
+    assert M.load_location_floor(_loc_cfg(tmp_path), 1000.0) is None
+
+
+def test_load_location_floor_reads_fresh_levels(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0, "wans": {"wan1": {"level": 3, "reason": "learned x"}}}))
+    out = M.load_location_floor(c, 1010.0)
+    assert out == {"wan1": {"level": 3, "reason": "learned x"}}
+
+
+def test_load_location_floor_stale_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0, "wans": {"wan1": {"level": 3, "reason": ""}}}))
+    assert M.load_location_floor(c, 1031.0) is None
+
+
+def test_load_location_floor_drops_junk_entries(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0,
+        "wans": {"wan1": {"level": "3"}, "wan2": {"level": True},
+                 "wan3": {"level": 2, "reason": 7}, "wan4": "nope"}}))
+    out = M.load_location_floor(c, 1001.0)
+    assert out == {"wan3": {"level": 2, "reason": "7"}}
+
+
+def test_load_location_floor_corrupt_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text("{not json")
+    assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_effective_location_fec_enabled_false_when_unconfigured(tmp_path):
+    c = _loc_cfg(tmp_path)
+    c.location = None
+    assert M.effective_location_fec_enabled(c, M.RuntimeOverlay()) is False
+
+
+def test_effective_location_fec_enabled_uses_config_default(tmp_path):
+    assert M.effective_location_fec_enabled(_loc_cfg(tmp_path, enabled=False),
+                                            M.RuntimeOverlay()) is False
+    assert M.effective_location_fec_enabled(_loc_cfg(tmp_path, enabled=True),
+                                            M.RuntimeOverlay()) is True
+
+
+def test_effective_location_fec_enabled_operator_override_wins(tmp_path):
+    c = _loc_cfg(tmp_path, enabled=True)
+    assert M.effective_location_fec_enabled(
+        c, M.RuntimeOverlay(location_fec_enabled=False)) is False
+
+
+def test_runtime_overlay_roundtrips_location_fec_enabled(tmp_path):
+    c = _loc_cfg(tmp_path)
+    M.save_runtime_overlay(c, M.RuntimeOverlay(location_fec_enabled=False,
+                                               set_by="t", set_ts=1.0))
+    assert M.load_runtime_overlay(c).location_fec_enabled is False
+
+
+def test_validate_runtime_payload_location_fec_enabled():
+    ok, _ = M.validate_runtime_payload({"location_fec_enabled": True},
+                                       wan_names={"wan1"})
+    assert ok
+    ok, err = M.validate_runtime_payload({"location_fec_enabled": "yes"},
+                                         wan_names={"wan1"})
+    assert not ok and "location_fec_enabled" in err
