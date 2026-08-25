@@ -229,3 +229,20 @@ def test_location_fec_unit_can_be_reloaded():
         r.render_all(values, td)
         unit = (Path(td) / "etc/systemd/system/location-fec.service").read_text()
     assert "ExecReload=/bin/kill -HUP $MAINPID" in unit.splitlines()
+
+
+def test_location_fec_config_wans_follow_the_values_file():
+    """The daemon only publishes a floor for the WANs its config names. A literal
+    ["wan1","wan2"] in the template means an operator-named deployment, or one with
+    a third link, renders a daemon that stays silent for the links it never heard of."""
+    import tempfile
+    r = _render()
+    values = json.loads((ROOT / "deploy" / "values.example.json").read_text())
+    values["role"] = "client"
+    values["wans"] = {"cell_a": {"iface": "eth1", "session_id": 1},
+                      "cell_b": {"iface": "eth2", "session_id": 2},
+                      "sat": {"iface": "eth3", "session_id": 3}}
+    with tempfile.TemporaryDirectory() as td:
+        r.render_all(values, td)
+        loc = json.loads((Path(td) / "etc/sbfd-ctl/location-fec.json").read_text())
+    assert loc["wans"] == ["cell_a", "cell_b", "sat"]
