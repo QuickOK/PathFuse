@@ -287,6 +287,75 @@ def test_read_state_fails_open_on_junk(tmp_path):
     assert M.read_state(str(tmp_path / "absent.json"), 1000.0, 10.0) is None
 
 
+def test_read_state_survives_a_non_dict_client_local(tmp_path):
+    # `or {}` only rescues a FALSY value: a non-empty string reaches .items().
+    p = tmp_path / "state.json"
+    p.write_text(_json.dumps({"ts": 1000.0, "client_local": "wan1"}))
+    assert M.read_state(str(p), now_wall=1000.0, max_age_s=10.0) is None
+
+
+def test_read_state_skips_a_malformed_wan_and_keeps_the_good_one(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text(_json.dumps({"ts": 1000.0,
+                              "client_local": {"wan1": "up", "wan2": {"loss_pct": 4.0}}}))
+    loss, residual = M.read_state(str(p), now_wall=1000.0, max_age_s=10.0)
+    assert loss == {"wan2": 4.0} and residual is None
+
+
+def test_read_state_treats_a_non_dict_rx_as_no_residual(tmp_path):
+    p = tmp_path / "state.json"
+    p.write_text(_json.dumps({
+        "ts": 1000.0, "client_local": {"wan1": {"loss_pct": 4.0}},
+        "fec": {"directions": {"client_to_relay": {"rx": "none"}}}}))
+    loss, residual = M.read_state(str(p), now_wall=1000.0, max_age_s=10.0)
+    assert loss == {"wan1": 4.0} and residual is None
+
+
+def test_reload_reapplies_the_hold_and_the_learning_parameters(tmp_path):
+    # SIGHUP is the documented way to change zones without losing the open
+    # pass. An operator who edits the hold or the learning parameters in the
+    # same file must not have to guess that those alone need a restart.
+    cfg = M.load_location_config(_cfg_raw(
+        tmp_path, **{"lookahead": {"seconds": 25, "min_speed_ms": 2.0,
+                                   "sample_step_m": 75, "exit_hold_s": 45},
+                     "learning": {"min_passes": 5, "alpha": 0.2,
+                                  "pass_gap_s": 90, "max_tiles": 100,
+                                  "max_age_days": 3, "clean_drop_days": 2}}))
+    store = T.TileStore()
+    hold = M.ExitHold(20.0)
+    applied = M.apply_reload(cfg, store, hold, cfg.store_path)
+    assert hold.hold_s == 45.0
+    assert (store.min_passes, store.alpha, store.pass_gap_s) == (5, 0.2, 90.0)
+    assert (store.max_tiles, store.max_age_days, store.clean_drop_days) == (100, 3.0, 2.0)
+    assert "exit_hold_s" in applied and "alpha" in applied
+
+
+def test_reload_ignores_an_unusable_learning_value(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(
+        tmp_path, learning={"alpha": "sticky", "min_passes": 4}))
+    store = T.TileStore()
+    applied = M.apply_reload(cfg, store, M.ExitHold(20.0), cfg.store_path)
+    assert store.alpha == 0.35            # unchanged, not crashed on
+    assert store.min_passes == 4
+    assert "alpha" not in applied
+
+
+def test_reload_does_not_swap_the_store_out_from_under_the_open_pass(tmp_path):
+    # Learned tiles live in memory between saves; rebinding the path mid-run
+    # would write them to the new file or lose them outright. Defer to restart.
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    store = T.TileStore()
+    applied = M.apply_reload(cfg, store, M.ExitHold(20.0), "/var/lib/elsewhere.json")
+    assert "store_path" not in applied
+
+
+def test_validate_zone_rejects_a_boolean_level():
+    # int(True) is 1, so a hand-edited `"level": true` would quietly become a
+    # real floor of level 1 instead of being reported as the mistake it is.
+    assert M.validate_zone({"label": "yard", "lat": 41.1, "lon": -73.5,
+                            "radius_m": 300, "level": True}, 6) is None
+
+
 def test_poll_once_publishes_a_zone_floor_without_any_state(tmp_path):
     cfg = M.load_location_config(_cfg_raw(tmp_path))
     store = T.TileStore()

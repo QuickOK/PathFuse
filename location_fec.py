@@ -14,6 +14,7 @@ Spec: docs/superpowers/specs/2026-08-25-location-aware-fec-design.md
 import argparse
 import json
 import logging
+import math
 import os
 import signal
 import sys
@@ -276,6 +277,10 @@ def validate_zone(raw, table_len):
     try:
         lat, lon = float(raw["lat"]), float(raw["lon"])
         radius = float(raw["radius_m"])
+        # bool is a subclass of int: int(True) is 1, so `"level": true` would
+        # otherwise become a silent floor of level 1 instead of a rejection.
+        if isinstance(raw["level"], bool):
+            raise TypeError("level must be a number")
         level = int(raw["level"])
     except (KeyError, TypeError, ValueError):
         log.warning("zone %r ignored: needs lat, lon, radius_m and level", label)
@@ -334,6 +339,62 @@ def load_location_config(path) -> LocationConfig:
     )
 
 
+# The learning parameters a reload may re-apply to a live store, and the type
+# each is stored as (TileStore.__init__ coerces the same way).
+_LEARNING_ATTRS = {"min_passes": int, "alpha": float, "pass_gap_s": float,
+                   "max_tiles": int, "max_age_days": float,
+                   "clean_drop_days": float}
+
+
+def apply_reload(cfg, store, hold, old_store_path):
+    """Re-apply a reloaded config to the objects built from the previous one,
+    returning the names of what actually changed.
+
+    SIGHUP is the documented way to change zones without restarting, because a
+    restart loses the open pass. But `hold` and the store were constructed from
+    the OLD config and would otherwise keep its hold and learning parameters
+    until a restart — silently, which is the worst way to be ignored. A value
+    that will not coerce is skipped rather than raised on (fail-open: a typo in
+    one field must not take the daemon down mid-pass).
+
+    store_path is the one thing deliberately NOT re-applied: swapping the store
+    mid-run would strand everything learned since boot. The caller warns."""
+    applied = []
+    if hold.hold_s != float(cfg.exit_hold_s):
+        hold.hold_s = float(cfg.exit_hold_s)
+        applied.append("exit_hold_s")
+    for name, cast in _LEARNING_ATTRS.items():
+        if name not in cfg.learning:
+            continue
+        try:
+            value = cast(cfg.learning[name])
+        except (TypeError, ValueError):
+            log.warning("reload: %s=%r is not usable; keeping %r",
+                        name, cfg.learning[name], getattr(store, name))
+            continue
+        if cast is float and not math.isfinite(value):
+            log.warning("reload: %s=%r is not finite; keeping %r",
+                        name, cfg.learning[name], getattr(store, name))
+            continue
+        if getattr(store, name) != value:
+            setattr(store, name, value)
+            applied.append(name)
+    if old_store_path != cfg.store_path:
+        log.warning("reload: store_path now %s; that takes effect on restart, "
+                    "the running store still writes %s",
+                    cfg.store_path, old_store_path)
+    return applied
+
+
+def _dig(obj, *keys):
+    """Walk a nested-dict path, yielding {} the moment a level is not a dict."""
+    for key in keys:
+        if not isinstance(obj, dict):
+            return {}
+        obj = obj.get(key)
+    return obj if isinstance(obj, dict) else {}
+
+
 def read_state(path, now_wall, max_age_s):
     """(per_wan_loss, residual) from sbfd-ctl's published snapshot, or None.
 
@@ -349,13 +410,20 @@ def read_state(path, now_wall, max_age_s):
         return None
     if now_wall - ts > max_age_s:
         return None
+    # `or {}` rescues only a FALSY wrong type — a non-empty string walks
+    # straight into .items()/.get() and raises. A hand-edited or half-written
+    # snapshot must cost us this tick's learning, not the daemon.
+    client_local = snap.get("client_local")
+    if not isinstance(client_local, dict):
+        return None
     loss = {}
-    for wan, obj in (snap.get("client_local") or {}).items():
-        value = (obj or {}).get("loss_pct")
+    for wan, obj in client_local.items():
+        if not isinstance(obj, dict):
+            continue
+        value = obj.get("loss_pct")
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             loss[wan] = float(value)
-    rx = (((snap.get("fec") or {}).get("directions") or {})
-          .get("client_to_relay") or {}).get("rx") or {}
+    rx = _dig(snap, "fec", "directions", "client_to_relay", "rx")
     residual = rx.get("lost_pkts_est_per_s")
     if not isinstance(residual, (int, float)) or isinstance(residual, bool):
         residual = None
@@ -461,7 +529,11 @@ def main():
     blind = Episode()               # blind for longer than max_stale_s
     gpsd_out = Episode()            # gpsd handed us nothing at all
     poll_errors = RateLimitedLog(60.0)
-    last_save = last_prune = time.time()
+    # Cadence is a DURATION, so it is measured on the monotonic clock. This
+    # hardware has no dependable RTC: the first fix can step the wall clock
+    # minutes forward or back, and a backward step would stall saves and the
+    # hourly prune for exactly as long as the step was.
+    last_save = last_prune = time.monotonic()
     last_good = time.monotonic()
     last_published = None
     global _reload
@@ -470,8 +542,11 @@ def main():
         try:
             if _reload:
                 _reload = False
+                old_store_path = cfg.store_path
                 cfg = load_location_config(args.config)
-                log.info("config reloaded: %d zones", len(cfg.zones))
+                applied = apply_reload(cfg, store, hold, old_store_path)
+                log.info("config reloaded: %d zones; re-applied %s",
+                         len(cfg.zones), ", ".join(applied) or "nothing else")
             # quiet=True: environ_ctl's own warning is written for a caller
             # polling once a minute. One line per outage is ours to write.
             raw_fix = environ_ctl.get_fix(cfg.gpsd_host, cfg.gpsd_port,
@@ -503,12 +578,12 @@ def main():
             if published != last_published:
                 log.info("location floor -> %s", published or "none")
                 last_published = published
-            if now_wall - last_save >= cfg.save_interval_s:
+            if now_mono - last_save >= cfg.save_interval_s:
                 store.save(cfg.store_path)
-                last_save = now_wall
-            if now_wall - last_prune >= 3600.0:
+                last_save = now_mono
+            if now_mono - last_prune >= 3600.0:
                 dropped = store.prune(now_wall)
-                last_prune = now_wall
+                last_prune = now_mono
                 if dropped:
                     log.info("pruned %d tiles (%d remain)", dropped, len(store.tiles))
         except Exception as e:  # noqa: BLE001 - keep the daemon alive

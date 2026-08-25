@@ -75,9 +75,12 @@ tile on the approach still raises the floor. Read a station's label off the
 Edited zones are re-read on `SIGHUP`: `systemctl reload location-fec`, or
 `kill -HUP <pid>` where the daemon is not run under systemd. A reload re-reads
 the **whole** config file — zones, the gpsd host/port, `wans`, the intervals,
-the loss table — but it does **not** re-apply `exit_hold_s` or the `learning`
-parameters: those are baked into the `ExitHold` and tile store built at start,
-and changing them needs a restart.
+the loss table — and re-applies `exit_hold_s` and the `learning` parameters to
+the running hold and tile store, naming what it changed in one log line. A
+value that will not parse is logged and left as it was. `store_path` is the one
+exception: the running store keeps writing the old path, because rebinding it
+mid-run would strand everything learned since boot. Changing it needs a
+restart, and the reload says so.
 
 ## Operator controls
 
@@ -104,7 +107,10 @@ there. The approach tiles usually still learn; a manual zone covers the rest.
 ## Run
 
 ```bash
+cp config/location-fec.example.json config/location-fec.json   # then edit it
 location_fec.py -c config/location-fec.json
 ```
+
+A deployed node reads the rendered `/etc/sbfd-ctl/location-fec.json` instead.
 
 Requires `gpsd`. Deploy via `deploy/templates/systemd/location-fec.service.tmpl`.

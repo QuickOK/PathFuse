@@ -21,7 +21,7 @@ RuntimeDirectoryMode=0755
 # whenever THIS unit stops — even though sbfd-ctl.service is still running and
 # still using it. The fix on sbfd-ctl.service does not cover us; we need our own.
 # Three live things sit in that directory, and every `systemctl restart
-# environ-ctl` would take all three:
+# location-fec` would take all three:
 #   runtime.json            the operator's WAN-mode overlay — deleting it
 #                           silently reverts the mode to policy.default_mode.
 #   maintenance_window.json alert suppression, killed mid-window: the night's
