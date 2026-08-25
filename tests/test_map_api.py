@@ -2,6 +2,7 @@ import json as _json
 from pathlib import Path
 
 import sbfd_ctl as M
+import tile_store as T
 
 
 def test_resolve_map_cfg_defaults():
@@ -144,3 +145,48 @@ def test_apply_station_label_set_and_delete(tmp_path):
     out = M.apply_station_label(lp, "s1", "")
     assert out == {"s2": "Yard"}
     assert _json.loads(Path(lp).read_text()) == {"s2": "Yard"}
+
+
+def test_map_location_layer_reads_tiles_and_zones(tmp_path):
+    tile = T.encode(41.1, -73.5, 7)
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"version": 1, "tiles": {
+        tile: {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}},
+        "residual": {tile: {"ewma": 1.5, "last_seen": 1000.0}}}))
+    zones = tmp_path / "location-fec.json"
+    zones.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2}]}))
+    out = M.map_location_layer(str(store), str(zones), (41.1, -73.5), max_tiles=100)
+    assert out["tiles"][0]["id"] == tile
+    assert out["tiles"][0]["bbox"] == list(T.bbox(tile))
+    assert out["tiles"][0]["wans"]["wan1"]["passes"] == 4
+    assert out["tiles"][0]["residual"] == 1.5
+    assert out["zones"][0]["label"] == "yard"
+
+
+def test_map_location_layer_keeps_the_nearest_tiles(tmp_path):
+    near, far = T.encode(41.1, -73.5, 7), T.encode(42.0, -73.5, 7)
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"version": 1, "tiles": {
+        far: {"wan1": {"passes": 3, "ewma_loss": 6.0, "last_seen": 1.0}},
+        near: {"wan1": {"passes": 3, "ewma_loss": 6.0, "last_seen": 1.0}}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"),
+                               (41.1, -73.5), max_tiles=1)
+    assert [t["id"] for t in out["tiles"]] == [near]
+
+
+def test_map_location_layer_degrades_to_empty(tmp_path):
+    (tmp_path / "store.json").write_text("{junk")
+    out = M.map_location_layer(str(tmp_path / "store.json"),
+                               str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out == {"tiles": [], "zones": []}
+
+
+def test_assemble_map_payload_carries_location_fec(tmp_path):
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(tmp_path / "store.json"),
+                           "location_config_path": str(tmp_path / "lf.json")})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"] == {"tiles": [], "zones": []}

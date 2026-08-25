@@ -1,5 +1,6 @@
-/* Map page: polls /api/map, draws vehicle + stations + environ points,
-   base tiles via the local caching proxy, radar via RainViewer. */
+/* Map page: polls /api/map, draws vehicle + stations + environ points +
+   location FEC tiles/zones, base tiles via the local caching proxy,
+   radar via RainViewer. */
 "use strict";
 
 const map = L.map("map", { zoomControl: true }).setView([39.0, -98.0], 5);
@@ -40,7 +41,45 @@ let follow = true;
 let vehMarker = null, crumb = null, crumbPts = [];
 const stationLayer = L.layerGroup().addTo(map);
 const environLayer = L.layerGroup().addTo(map);
+const locationLayer = L.layerGroup().addTo(map);
 let firstFix = true;
+
+function levelColor(level) {
+  return ["#2b2", "#9c2", "#eb0", "#e83", "#e33"][Math.max(0, Math.min(level || 0, 4))];
+}
+
+function drawLocation(loc) {
+  locationLayer.clearLayers();
+  if (!loc) return;
+  (loc.tiles || []).forEach((t) => {
+    const [s, w, n, e] = t.bbox;
+    const entries = Object.entries(t.wans || {});
+    const worst = Math.max(0, ...entries.map(([, v]) => v.ewma_loss || 0));
+    const confirmed = entries.some(([, v]) => (v.passes || 0) >= 3);
+    // Colour by loss band, not by level: the map has no profile table.
+    const level = worst > 10 ? 4 : worst > 5 ? 3 : worst > 2 ? 2 : worst > 0.5 ? 1 : 0;
+    const r = L.rectangle([[s, w], [n, e]], {
+      color: levelColor(level), weight: confirmed ? 1.5 : 0.5,
+      fillColor: levelColor(level), fillOpacity: confirmed ? 0.35 : 0.12,
+    }).addTo(locationLayer);
+    const tip = document.createElement("span");
+    tip.className = "stn-tip";
+    tip.textContent = entries.map(([wan, v]) =>
+      `${wan}: ${(v.ewma_loss || 0).toFixed(1)}% (${v.passes || 0} passes)`).join("  ")
+      + (t.residual != null ? `  residual ${Number(t.residual).toFixed(1)}/s` : "");
+    r.bindTooltip(tip);
+  });
+  (loc.zones || []).forEach((z) => {
+    const c = L.circle([z.lat, z.lon], {
+      radius: z.radius_m, color: "#fff", weight: 2, dashArray: "6 4",
+      fillColor: levelColor(z.level), fillOpacity: 0.2,
+    }).addTo(locationLayer);
+    const tip = document.createElement("span");
+    tip.className = "stn-tip";
+    tip.textContent = `${z.label}: level ${z.level}` + (z.wans ? ` (${z.wans.join(", ")})` : "");
+    c.bindTooltip(tip, { permanent: true, direction: "center" });
+  });
+}
 
 function vehIcon(track) {
   const rot = track == null ? 0 : track;
@@ -123,6 +162,7 @@ async function tick() {
   banner(d);
   drawStations(d.stations || [], d.predictions || []);
   drawEnviron(d.environ);
+  drawLocation(d.location_fec);
   if (d.fix) {
     const ll = [d.fix.lat, d.fix.lon];
     if (!vehMarker) vehMarker = L.marker(ll, { icon: vehIcon(d.fix.track),

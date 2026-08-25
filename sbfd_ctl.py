@@ -2187,6 +2187,9 @@ _MAP_DEFAULTS = {
     "gpsd": {"host": "127.0.0.1", "port": 2947},
     "tile_cache": {"path": "/var/lib/sbfd-ctl/tilecache",
                    "max_mb": 512, "max_zoom": 17},
+    "location_store_path": "/var/lib/sbfd-ctl/location_fec_store.json",
+    "location_config_path": "/etc/sbfd-ctl/location-fec.json",
+    "max_location_tiles": 2000,
 }
 
 _SID_RE = re.compile(r"^s[0-9]+$")
@@ -2263,6 +2266,51 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+def map_location_layer(store_path, zones_path, fix, max_tiles):
+    """Learned tiles (nearest the fix first, capped) and operator zones for
+    the map. Degrades to empty lists: a broken source must never 500 the
+    endpoint. Lazy import keeps the failover daemon free of a hard dependency
+    on the location module."""
+    import tile_store
+    import station_tracker
+    out = {"tiles": [], "zones": []}
+    raw = _read_json_file(store_path)
+    tiles = (raw or {}).get("tiles") if isinstance(raw, dict) else None
+    residual = (raw or {}).get("residual") if isinstance(raw, dict) else {}
+    if isinstance(tiles, dict):
+        rows = []
+        for tid, per_wan in tiles.items():
+            if not isinstance(per_wan, dict):
+                continue
+            try:
+                lat, lon = tile_store.center(tid)
+                box = list(tile_store.bbox(tid))
+            except ValueError:
+                continue
+            dist = (station_tracker.haversine_m(fix[0], fix[1], lat, lon)
+                    if fix else 0.0)
+            rows.append((dist, {
+                "id": tid, "bbox": box, "wans": per_wan,
+                "residual": ((residual or {}).get(tid) or {}).get("ewma")}))
+        rows.sort(key=lambda r: r[0])
+        out["tiles"] = [r[1] for r in rows[:max_tiles]]
+    zcfg = _read_json_file(zones_path)
+    zones = (zcfg or {}).get("zones") if isinstance(zcfg, dict) else None
+    if isinstance(zones, list):
+        for z in zones:
+            if not isinstance(z, dict):
+                continue
+            try:
+                out["zones"].append({
+                    "label": str(z.get("label") or "zone"),
+                    "lat": float(z["lat"]), "lon": float(z["lon"]),
+                    "radius_m": float(z["radius_m"]), "level": int(z["level"]),
+                    "wans": z.get("wans")})
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
 def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
     """Aggregate every map data source; each degrades independently to
     null/empty — a broken source must never 500 the endpoint."""
@@ -2289,7 +2337,11 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
             "predictions": predict_from_stations(st),
             "environ": _read_json_file(map_cfg["environ_points_path"]),
             "mode": snap.get("mode"),
-            "active": snap.get("active_wans")}
+            "active": snap.get("active_wans"),
+            "location_fec": map_location_layer(
+                map_cfg["location_store_path"], map_cfg["location_config_path"],
+                (fix[0], fix[1]) if fix is not None else None,
+                int(map_cfg["max_location_tiles"]))}
 
 
 _GPS_MEMO = {"ts": 0.0, "fix": None}
