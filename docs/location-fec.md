@@ -27,6 +27,11 @@ table) — never lowered. A record older than `location_fec.stale_after_s`
 (default 30 s) is ignored, so a stopped daemon withdraws its floor with no
 cleanup. An empty `wans` is an explicit withdrawal.
 
+The floor lifts the **client→relay leg only** — the parity this box sends. The
+relay→client leg keeps its own profile and config floor, untouched by
+location: pushing the location level to the relay is a planned follow-up, so a
+place known to hurt the downstream direction is not yet protected in it.
+
 ## Learning
 
 Positions are keyed to ~150 m geohash tiles. One contiguous visit to a tile is
