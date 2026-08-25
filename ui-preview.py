@@ -83,7 +83,8 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
             "floor_ratio": "20:1",
             "location_floor": {"configured": True, "enabled": True, "active": True,
                                "level": 3, "reason": "learned dr79z6n (4 passes)",
-                               "wans": {}},
+                               "wans": {"wan1": {"level": 3,
+                                                  "reason": "learned dr79z6n (4 passes)"}}},
             "directions": {
                 # Both ladders are the ones this example config actually
                 # produces (default_mode "full", full_min_up_wans 2, and the
