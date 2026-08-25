@@ -1,4 +1,5 @@
 import json as _json
+import logging as _logging
 from pathlib import Path
 
 import fec_control as F
@@ -347,6 +348,24 @@ def test_reload_does_not_swap_the_store_out_from_under_the_open_pass(tmp_path):
     store = T.TileStore()
     applied = M.apply_reload(cfg, store, M.ExitHold(20.0), "/var/lib/elsewhere.json")
     assert "store_path" not in applied
+
+
+def test_reload_keeps_saving_to_the_store_it_actually_loaded(tmp_path, caplog):
+    """Warning about the deferral is not the same as deferring.
+
+    main() saves with `store.save(cfg.store_path)`, and cfg has already been
+    rebound to the reloaded config by then — so a changed store_path would take
+    effect at the very next save: tiles loaded from the old file written to the
+    new one, and the old file frozen. Pin the path back for the life of the
+    process, which is what the warning and the docs promise."""
+    new_path = str(tmp_path / "somewhere-else.json")
+    cfg = M.load_location_config(_cfg_raw(tmp_path, store_path=new_path))
+    old_path = str(tmp_path / "store.json")
+    with caplog.at_level(_logging.WARNING, logger="location_fec"):
+        applied = M.apply_reload(cfg, T.TileStore(), M.ExitHold(20.0), old_path)
+    assert cfg.store_path == old_path
+    assert "store_path" not in applied
+    assert sum("store_path" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_validate_zone_rejects_a_boolean_level():

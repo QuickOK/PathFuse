@@ -358,7 +358,9 @@ def apply_reload(cfg, store, hold, old_store_path):
     one field must not take the daemon down mid-pass).
 
     store_path is the one thing deliberately NOT re-applied: swapping the store
-    mid-run would strand everything learned since boot. The caller warns."""
+    mid-run would strand everything learned since boot. A changed one is warned
+    about and PINNED BACK on cfg, so the running process keeps saving where it
+    loaded from — a warning alone would not have stopped the next save."""
     applied = []
     if hold.hold_s != float(cfg.exit_hold_s):
         hold.hold_s = float(cfg.exit_hold_s)
@@ -383,6 +385,13 @@ def apply_reload(cfg, store, hold, old_store_path):
         log.warning("reload: store_path now %s; that takes effect on restart, "
                     "the running store still writes %s",
                     cfg.store_path, old_store_path)
+        # Warning about the deferral is not deferring. main() saves with
+        # `store.save(cfg.store_path)` and cfg is already the reloaded one, so
+        # without this the very next save writes tiles loaded from the old file
+        # into the new one and freezes the old. Pin it for the life of the
+        # process; the operator gets the new path on the restart we just asked
+        # for. The dataclass is deliberately not frozen.
+        cfg.store_path = old_store_path
     return applied
 
 
