@@ -216,15 +216,72 @@ class TileStore:
 
     @classmethod
     def from_dict(cls, raw, **kw):
+        """A schema-malformed store loads with only its valid entries — never
+        by raising later. `load()`'s try/except only catches a store that
+        isn't parseable JSON; a store that parses fine into the wrong shape
+        (a list, a per-WAN entry that isn't a dict, a passes/ewma_loss/
+        last_seen of the wrong type) has to be caught here, or it survives
+        into the next passes_for()/level_for() call as a crash instead of a
+        cache miss. At most one log line either way."""
         store = cls(**kw)
-        if isinstance(raw, dict):
-            tiles = raw.get("tiles")
-            residual = raw.get("residual")
-            if isinstance(tiles, dict):
-                store.tiles = {t: w for t, w in tiles.items() if isinstance(w, dict)}
-            if isinstance(residual, dict):
-                store.residual = {t: r for t, r in residual.items()
-                                  if isinstance(r, dict)}
+        if not isinstance(raw, dict):
+            log.warning("tile store malformed (%s); starting empty",
+                        type(raw).__name__)
+            return store
+        dropped = 0
+        tiles = raw.get("tiles")
+        if isinstance(tiles, dict):
+            clean_tiles = {}
+            for tile, per_wan in tiles.items():
+                if not isinstance(per_wan, dict):
+                    dropped += 1
+                    continue
+                clean_wan = {}
+                for wan, entry in per_wan.items():
+                    if not isinstance(entry, dict):
+                        dropped += 1
+                        continue
+                    passes = entry.get("passes")
+                    ewma_loss = entry.get("ewma_loss")
+                    last_seen = entry.get("last_seen")
+                    if (isinstance(passes, int) and not isinstance(passes, bool)
+                            and passes >= 0
+                            and isinstance(ewma_loss, (int, float))
+                            and not isinstance(ewma_loss, bool)
+                            and isinstance(last_seen, (int, float))
+                            and not isinstance(last_seen, bool)):
+                        clean_wan[wan] = {"passes": passes,
+                                          "ewma_loss": float(ewma_loss),
+                                          "last_seen": float(last_seen)}
+                    else:
+                        dropped += 1
+                if clean_wan:
+                    clean_tiles[tile] = clean_wan
+            store.tiles = clean_tiles
+        elif tiles is not None:
+            dropped += 1
+        residual = raw.get("residual")
+        if isinstance(residual, dict):
+            clean_residual = {}
+            for tile, r in residual.items():
+                if not isinstance(r, dict):
+                    dropped += 1
+                    continue
+                ewma = r.get("ewma")
+                last_seen = r.get("last_seen")
+                if (isinstance(ewma, (int, float)) and not isinstance(ewma, bool)
+                        and isinstance(last_seen, (int, float))
+                        and not isinstance(last_seen, bool)):
+                    clean_residual[tile] = {"ewma": float(ewma),
+                                            "last_seen": float(last_seen)}
+                else:
+                    dropped += 1
+            store.residual = clean_residual
+        elif residual is not None:
+            dropped += 1
+        if dropped:
+            log.warning("tile store: dropped %d malformed entr%s",
+                        dropped, "y" if dropped == 1 else "ies")
         return store
 
     def save(self, path):

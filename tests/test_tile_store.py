@@ -191,3 +191,34 @@ def test_a_corrupt_store_loads_empty(tmp_path):
 def test_a_missing_store_loads_empty(tmp_path):
     back = T.TileStore.load(str(tmp_path / "absent.json"))
     assert back.tiles == {}
+
+
+def test_a_schema_malformed_store_loads_empty_and_does_not_crash_later():
+    s = T.TileStore.from_dict({"tiles": {"dr79z6n": {"wan1": "not-a-dict"}}})
+    assert s.level_for("dr79z6n", "wan1", F.DEFAULT_LOSS_TABLE) == 0
+    assert s.passes_for("dr79z6n", "wan1") == 0
+    assert "dr79z6n" not in s.tiles
+
+
+def test_a_wrong_shape_store_logs_and_loads_empty(tmp_path, caplog):
+    p = tmp_path / "store.json"
+    p.write_text("[1, 2, 3]")
+    with caplog.at_level("WARNING", logger="tile_store"):
+        back = T.TileStore.load(str(p))
+    assert back.tiles == {}
+    records = [r for r in caplog.records if r.name == "tile_store"]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+
+
+def test_from_dict_keeps_valid_entries_beside_malformed_ones():
+    raw = {
+        "tiles": {
+            "dr79z6n": {"wan1": {"passes": 3, "ewma_loss": 9.0, "last_seen": 1000.0}},
+            "dr79z6y": {"wan1": "not-a-dict"},
+        }
+    }
+    s = T.TileStore.from_dict(raw)
+    assert s.tiles["dr79z6n"]["wan1"]["passes"] == 3
+    assert abs(s.tiles["dr79z6n"]["wan1"]["ewma_loss"] - 9.0) < 1e-9
+    assert "dr79z6y" not in s.tiles
