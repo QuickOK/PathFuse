@@ -2276,7 +2276,9 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
     out = {"tiles": [], "zones": []}
     raw = _read_json_file(store_path)
     tiles = (raw or {}).get("tiles") if isinstance(raw, dict) else None
-    residual = (raw or {}).get("residual") if isinstance(raw, dict) else {}
+    residual = (raw or {}).get("residual") if isinstance(raw, dict) else None
+    if not isinstance(residual, dict):
+        residual = {}
     if isinstance(tiles, dict):
         rows = []
         for tid, per_wan in tiles.items():
@@ -2289,9 +2291,12 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
                 continue
             dist = (station_tracker.haversine_m(fix[0], fix[1], lat, lon)
                     if fix else 0.0)
+            r = residual.get(tid)
+            res = r.get("ewma") if isinstance(r, dict) else None
+            if isinstance(res, bool) or not isinstance(res, (int, float)):
+                res = None
             rows.append((dist, {
-                "id": tid, "bbox": box, "wans": per_wan,
-                "residual": ((residual or {}).get(tid) or {}).get("ewma")}))
+                "id": tid, "bbox": box, "wans": per_wan, "residual": res}))
         rows.sort(key=lambda r: r[0])
         out["tiles"] = [r[1] for r in rows[:max_tiles]]
     zcfg = _read_json_file(zones_path)
@@ -2331,6 +2336,10 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
         age = round(now - fix_ts, 1) if fix_ts else None
         out_fix = {"lat": lat, "lon": lon, "speed": speed,
                    "track": track, "age_s": age}
+    try:
+        max_tiles = int(map_cfg.get("max_location_tiles", 2000))
+    except (TypeError, ValueError):
+        max_tiles = 2000
     return {"ts": now,
             "fix": out_fix,
             "stations": stations,
@@ -2341,7 +2350,7 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
             "location_fec": map_location_layer(
                 map_cfg["location_store_path"], map_cfg["location_config_path"],
                 (fix[0], fix[1]) if fix is not None else None,
-                int(map_cfg["max_location_tiles"]))}
+                max_tiles)}
 
 
 _GPS_MEMO = {"ts": 0.0, "fix": None}

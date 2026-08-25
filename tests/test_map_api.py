@@ -190,3 +190,65 @@ def test_assemble_map_payload_carries_location_fec(tmp_path):
                            "location_config_path": str(tmp_path / "lf.json")})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     assert out["location_fec"] == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_tolerates_a_malformed_residual(tmp_path):
+    tile = T.encode(41.1, -73.5, 7)
+    wan = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    store = tmp_path / "store.json"
+
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": "garbage"}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["id"] == tile
+    assert out["tiles"][0]["residual"] is None
+
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": {tile: 5}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["residual"] is None
+
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": {tile: {"ewma": "x"}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["residual"] is None
+
+
+def test_map_location_layer_tolerates_a_non_dict_tiles(tmp_path):
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"tiles": "nope"}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_skips_a_tile_id_that_is_not_a_geohash(tmp_path):
+    good = T.encode(41.1, -73.5, 7)
+    wan = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"tiles": {"not a geohash!": wan, good: wan}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert [t["id"] for t in out["tiles"]] == [good]
+
+
+def test_map_location_layer_tolerates_non_list_zones_and_a_zone_missing_a_key(tmp_path):
+    store = tmp_path / "absent.json"
+    zones = tmp_path / "zones.json"
+
+    zones.write_text(_json.dumps({"zones": "nope"}))
+    out = M.map_location_layer(str(store), str(zones), None, max_tiles=10)
+    assert out["zones"] == []
+
+    zones.write_text(_json.dumps({"zones": [
+        {"label": "x"},
+        {"label": "ok", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1}]}))
+    out = M.map_location_layer(str(store), str(zones), None, max_tiles=10)
+    assert len(out["zones"]) == 1
+    assert out["zones"][0]["label"] == "ok"
+
+
+def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(tmp_path / "store.json"),
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "max_location_tiles": "lots"})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"] == {"tiles": [], "zones": []}
