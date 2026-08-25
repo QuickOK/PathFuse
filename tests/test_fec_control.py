@@ -621,3 +621,28 @@ def test_scale_extra_ignores_unusable_values():
     assert F.ladder_scale(base_only, F.MODE_MIN_ADAPTIVE,
                           extra=["junk", "", "1:254"]) == \
         F.ladder_scale(base_only, F.MODE_MIN_ADAPTIVE)
+
+def test_apply_location_floor_lifts_to_the_location_level():
+    assert F.apply_location_floor(1, 3, F.DEFAULT_LOSS_TABLE) == 3
+
+
+def test_apply_location_floor_never_lowers():
+    assert F.apply_location_floor(4, 1, F.DEFAULT_LOSS_TABLE) == 4
+
+
+def test_apply_location_floor_is_a_no_op_at_level_zero():
+    assert F.apply_location_floor(2, 0, F.DEFAULT_LOSS_TABLE) == 2
+
+
+def test_apply_location_floor_clamps_to_the_active_table():
+    # A level learned against the 5-row default table must not index past the
+    # 4-row cellular table.
+    top = len(F.DEFAULT_CELL_LOSS_TABLE) - 1
+    assert F.apply_location_floor(0, 4, F.DEFAULT_CELL_LOSS_TABLE) == top
+
+
+def test_apply_location_floor_ignores_junk():
+    assert F.apply_location_floor(2, None, F.DEFAULT_LOSS_TABLE) == 2
+    assert F.apply_location_floor(2, "3", F.DEFAULT_LOSS_TABLE) == 2
+    assert F.apply_location_floor(2, True, F.DEFAULT_LOSS_TABLE) == 2
+    assert F.apply_location_floor(2, -1, F.DEFAULT_LOSS_TABLE) == 2

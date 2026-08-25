@@ -472,6 +472,22 @@ def apply_signal_floor(level, engaged, table, floor_fec=DEFAULT_SIGNAL_FLOOR_FEC
     return max(level, ratio_to_level(floor_fec, table))
 
 
+def apply_location_floor(level, location_level, table):
+    """Lift the loss-driven level to the one this PLACE is known to need.
+
+    Raise-only, and clamped to the ACTIVE profile's table: a level learned
+    against the 5-row default table would otherwise index past the 4-row
+    cellular table. Junk (None, a string, a bool, a negative) is a no-op —
+    this value crosses a process boundary from a daemon that may be older or
+    newer than us, and a floor that cannot be read must weaken, never break.
+    """
+    if not isinstance(location_level, int) or isinstance(location_level, bool):
+        return level
+    if location_level <= 0:
+        return level
+    return max(level, min(location_level, len(table) - 1))
+
+
 def apply_mode(mode, adaptive_ratio, fixed_ratio=DEFAULT_FIXED_RATIO,
                floor_ratio=DEFAULT_FLOOR_RATIO):
     """Map (mode, adaptive_ratio) → the ratio actually sent to UDPspeeder.
