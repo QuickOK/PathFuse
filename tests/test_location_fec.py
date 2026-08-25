@@ -347,3 +347,46 @@ def test_example_config_loads():
     assert cfg.wans == ["wan1", "wan2"]
     assert len(cfg.zones) == 2
     assert all(z["lat"] == 0.0 and z["lon"] == 0.0 for z in cfg.zones)
+
+
+def test_episode_begins_once_and_ends_once():
+    # A condition that persists across ticks must be announced once, not once
+    # per tick: the daemon polls at 1 Hz and this repo has flooded a journal
+    # once already.
+    ep = M.Episode()
+    assert ep.begin() is True
+    assert ep.begin() is False
+    assert ep.begin() is False
+    assert ep.end() is True
+    assert ep.end() is False
+
+
+def test_episode_reopens_after_it_ends():
+    ep = M.Episode()
+    ep.begin()
+    ep.end()
+    assert ep.begin() is True
+
+
+def test_rate_limited_log_swallows_a_repeat_inside_the_window():
+    r = M.RateLimitedLog(60.0)
+    assert r.due("poll error: boom", now_mono=0.0) == "poll error: boom"
+    assert r.due("poll error: boom", now_mono=1.0) is None
+    assert r.due("poll error: boom", now_mono=59.9) is None
+
+
+def test_rate_limited_log_re_logs_with_the_suppressed_count():
+    r = M.RateLimitedLog(60.0)
+    r.due("poll error: boom", now_mono=0.0)
+    for i in range(1, 60):
+        r.due("poll error: boom", now_mono=float(i))
+    assert r.due("poll error: boom", now_mono=60.0) == \
+        "poll error: boom (repeated 59× in the last 60 s)"
+
+
+def test_rate_limited_log_passes_a_different_message_immediately():
+    r = M.RateLimitedLog(60.0)
+    assert r.due("poll error: boom", now_mono=0.0) == "poll error: boom"
+    assert r.due("poll error: other", now_mono=1.0) == "poll error: other"
+    # ...and the new message now owns the window
+    assert r.due("poll error: other", now_mono=2.0) is None

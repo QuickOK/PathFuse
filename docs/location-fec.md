@@ -84,10 +84,10 @@ and changing them needs a restart.
 
 | Condition | Behaviour |
 |---|---|
-| gpsd down or no fix | explicit withdrawal; learning pauses |
+| gpsd down or no fix | explicit withdrawal; learning pauses; one log line per outage, one on recovery |
 | `state.json` stale | learning skipped that tick; the floor still resolves |
 | daemon dies | floor withdrawn by `stale_after_s` |
-| daemon alive but blind for `withdraw.max_stale_s` | already withdrawn (no fix ⇒ withdrawal is immediate); logs a warning so the blindness is visible in the journal |
+| daemon alive but blind for `withdraw.max_stale_s` | already withdrawn (no fix ⇒ withdrawal is immediate); logs one warning per blind episode, not one per tick, so the blindness is visible in the journal without flooding it |
 | corrupt store | starts empty, one log line |
 | invalid zone | logged and skipped |
 

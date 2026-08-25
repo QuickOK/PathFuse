@@ -156,6 +156,60 @@ class ExitHold:
         return (self._held.get(wan) or {}).get("reason", "")
 
 
+class Episode:
+    """A condition that persists across ticks, announced once at each edge.
+
+    The loop runs at 1 Hz, so anything logged unconditionally while a fault
+    lasts is a log line per second for as long as the fault lasts. `begin()`
+    is true only on the tick that opens the episode and `end()` only on the
+    tick that closes it; every tick in between is silent."""
+
+    def __init__(self):
+        self.active = False
+
+    def begin(self):
+        if self.active:
+            return False
+        self.active = True
+        return True
+
+    def end(self):
+        if not self.active:
+            return False
+        self.active = False
+        return True
+
+
+class RateLimitedLog:
+    """One line per interval_s for a REPEATING message, with a repeat count.
+
+    For a fault whose text carries detail worth keeping (an exception message)
+    an episode flag is too coarse — a different failure must be visible at
+    once. So: a new message logs immediately and takes the window; the same
+    message inside the window is counted and swallowed, and the count rides
+    the next line out. `now_mono` is injected — durations are monotonic and
+    this stays a pure helper."""
+
+    def __init__(self, interval_s):
+        self.interval_s = float(interval_s)
+        self._msg = None
+        self._at = None
+        self._suppressed = 0
+
+    def due(self, msg, now_mono):
+        """The text to log, or None to stay quiet."""
+        if msg == self._msg and self._at is not None \
+                and now_mono - self._at < self.interval_s:
+            self._suppressed += 1
+            return None
+        repeats = self._suppressed if msg == self._msg else 0
+        self._msg, self._at, self._suppressed = msg, now_mono, 0
+        if repeats:
+            return (f"{msg} (repeated {repeats}\u00d7 in the last "
+                    f"{self.interval_s:.0f} s)")
+        return msg
+
+
 @dataclass
 class LocationConfig:
     gpsd_host: str = "127.0.0.1"
@@ -372,6 +426,11 @@ def main():
     store = tile_store.TileStore.load(cfg.store_path, **cfg.learning)
     log.info("tile store: %d tiles loaded", len(store.tiles))
     hold = ExitHold(cfg.exit_hold_s)
+    # Every 1 Hz fault the loop can hit gets an edge-triggered or rate-limited
+    # voice: a fault that lasts an hour must not cost 3600 journal lines.
+    blind = Episode()               # blind for longer than max_stale_s
+    gpsd_out = Episode()            # gpsd handed us nothing at all
+    poll_errors = RateLimitedLog(60.0)
     last_save = last_prune = time.time()
     last_good = time.monotonic()
     last_published = None
@@ -383,14 +442,29 @@ def main():
                 _reload = False
                 cfg = load_location_config(args.config)
                 log.info("config reloaded: %d zones", len(cfg.zones))
-            fix = fresh_fix(environ_ctl.get_fix(cfg.gpsd_host, cfg.gpsd_port, timeout=1.5),
-                            now_wall, cfg.max_fix_age_s)
+            # quiet=True: environ_ctl's own warning is written for a caller
+            # polling once a minute. One line per outage is ours to write.
+            raw_fix = environ_ctl.get_fix(cfg.gpsd_host, cfg.gpsd_port,
+                                          timeout=1.5, quiet=True)
+            if raw_fix is None:
+                if gpsd_out.begin():
+                    # gpsd answers with nothing whether the daemon is down or
+                    # simply has no sky, and get_fix cannot tell us which.
+                    log.warning("gpsd unreachable or without a fix (%s:%s)",
+                                cfg.gpsd_host, cfg.gpsd_port)
+            elif gpsd_out.end():
+                log.info("gpsd reachable again")
+            fix = fresh_fix(raw_fix, now_wall, cfg.max_fix_age_s)
             state = read_state(cfg.state_path, now_wall, cfg.max_state_age_s)
             if fix is not None:
+                blind_for = now_mono - last_good
                 last_good = now_mono
-            elif now_mono - last_good > cfg.max_stale_s:
+                if blind.end():
+                    log.info("fix recovered after %.0f s", blind_for)
+            elif now_mono - last_good > cfg.max_stale_s and blind.begin():
                 # Alive but blind for long enough that any held floor is a guess
-                # about a place we cannot confirm we are still in.
+                # about a place we cannot confirm we are still in. Once per
+                # blind episode: the condition can last for hours.
                 log.warning("no usable fix for %.0f s; withdrawing",
                             now_mono - last_good)
             record = poll_once(cfg, store, hold, fix, state, now_mono, now_wall)
@@ -408,7 +482,11 @@ def main():
                 if dropped:
                     log.info("pruned %d tiles (%d remain)", dropped, len(store.tiles))
         except Exception as e:  # noqa: BLE001 - keep the daemon alive
-            log.error("poll error: %s", e)
+            # A permanent failure (an unwritable output path, say) repeats
+            # every tick; rate-limit the repeat, but never delay a NEW message.
+            line = poll_errors.due(f"poll error: {e}", now_mono)
+            if line:
+                log.error("%s", line)
         end = now_mono + cfg.poll_interval_s
         while _running and time.monotonic() < end:
             time.sleep(min(0.2, max(0.0, end - time.monotonic())))

@@ -529,3 +529,29 @@ def test_poll_once_publishes_points_file(tmp_path, monkeypatch):
     rec = _json.loads(Path(cfg.points_path).read_text())
     assert rec["points"][0]["lat"] == 10.0
     assert rec["points"][0]["values"]["precip"] == 0.9
+
+
+def _closed_port():
+    """A port nothing is listening on: bind it, read it back, close it."""
+    import socket as _socket
+    s = _socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_get_fix_warns_on_a_failed_connect_by_default(caplog):
+    with caplog.at_level("WARNING", logger="environ_ctl"):
+        assert M.get_fix("127.0.0.1", _closed_port(), timeout=0.2) is None
+    assert any("gpsd connect failed" in r.message for r in caplog.records)
+
+
+def test_get_fix_quiet_returns_none_without_logging(caplog):
+    """location_fec polls at 1 Hz, not at environ_ctl's minute cadence: one
+    warning per failed connect is one per second for as long as gpsd is down.
+    The quiet caller reports the outage once itself."""
+    with caplog.at_level("DEBUG", logger="environ_ctl"):
+        assert M.get_fix("127.0.0.1", _closed_port(), timeout=0.2,
+                         quiet=True) is None
+    assert caplog.records == []
