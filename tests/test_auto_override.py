@@ -658,6 +658,20 @@ def test_load_location_floor_stale_is_none(tmp_path):
     assert M.load_location_floor(c, 1031.0) is None
 
 
+def test_load_location_floor_staleness_boundary_is_inclusive(tmp_path):
+    """age == stale_after_s is still FRESH; anything past it is not.
+
+    The daemon writes at 1 Hz and sbfd-ctl reads on its own tick, so the two
+    clocks land on the boundary regularly -- an off-by-one here drops a live
+    floor for one tick and the ratio visibly flaps."""
+    c = _loc_cfg(tmp_path)                        # stale_after_s = 30.0
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0, "wans": {"wan1": {"level": 3, "reason": "learned x"}}}))
+    assert M.load_location_floor(c, 1030.0) == {"wan1": {"level": 3,
+                                                         "reason": "learned x"}}
+    assert M.load_location_floor(c, 1030.5) is None
+
+
 def test_load_location_floor_drops_junk_entries(tmp_path):
     c = _loc_cfg(tmp_path)
     Path(c.location.state_path).write_text(json.dumps({

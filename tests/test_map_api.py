@@ -210,6 +210,12 @@ def test_map_location_layer_tolerates_a_malformed_residual(tmp_path):
     out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
     assert out["tiles"][0]["residual"] is None
 
+    # bool is a subclass of int: without the explicit bool guard `true` would
+    # sail through the numeric check and reach the map as a residual of 1.
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": {tile: {"ewma": True}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["residual"] is None
+
 
 def test_map_location_layer_tolerates_a_non_dict_tiles(tmp_path):
     store = tmp_path / "store.json"

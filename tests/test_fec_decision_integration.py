@@ -141,6 +141,27 @@ def test_full_mode_backoff_suppresses_signal_floor_stacking():
     assert _gated_ratio("full", fc, table, hyst, sf_fec, engaged) == "8:0"
 
 
+def test_full_mode_backoff_does_not_suppress_the_location_floor():
+    """The location floor is NOT gated by full-redundancy backoff.
+
+    The signal floor is (test above): in full mode with two links up engarde is
+    already duplicating, so stacking parity on top wastes headroom on a guess
+    about ONE modem's radio. A learned place is not a guess about one radio --
+    it is a place known to drop both links at once, which duplication cannot
+    repair and parity can. Mirrors the tick's ordering: apply_signal_floor
+    under the gate, then apply_location_floor outside it."""
+    fc = _fec_cfg_with_profile()
+    name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
+    sfl = F.SignalFloor()
+    engaged = sfl.update(rsrq=-13.0, rsrp=None)
+    assert engaged is True
+    fec_full_backoff = True                       # full mode, 2 WANs UP
+    level = F.apply_signal_floor(0, engaged and not fec_full_backoff,
+                                 table, sf_fec)
+    assert level == 0                             # signal floor suppressed
+    assert F.apply_location_floor(level, 3, table) == 3
+
+
 def test_master_backup_signal_floor_still_applies():
     fc = _fec_cfg_with_profile()
     name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
