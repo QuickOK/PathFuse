@@ -1967,23 +1967,30 @@ def location_floor_for_driver(floors, enabled, driver, table):
     return level, (entry.get("reason", "") if level > 0 else "")
 
 
-def location_floor_active(ratio_on_wire, ratio_without_location):
+def location_floor_active(ratio_on_wire, ratio_with_location,
+                          ratio_without_location):
     """Did the location floor actually change the parity on the wire?
 
-    The honest test is the RATIO THE ACTUATOR HOLDS, not the level and not the
-    ratio we wanted: every way the floor can ask and get nothing collapses into
-    one comparison. `off` and `fixed` discard the adaptive ratio outright; a
-    signal floor may already stand higher; a min_adaptive config floor of 8:8
-    lifts every level to the same top rung; and a refused FIFO write leaves the
-    old ratio flowing however high the floor reached. So the caller passes
-    fec_current_ratio — what the FIFO took — against the ratio this tick would
-    have sent had the location floor said nothing.
+    Two things must both hold, and each catches cases the other misses.
+
+    The floor must have changed this tick's DECISION — `off` and `fixed`
+    discard the adaptive ratio outright, a signal floor may already stand
+    higher, and a min_adaptive config floor of 8:8 lifts every level to the
+    same top rung, so in all of those the floor asked and changed nothing.
+
+    And that decision must be what the actuator actually HOLDS. A refused FIFO
+    write leaves an older ratio flowing, and an older ratio earns the location
+    floor no credit even when it happens to differ from today's baseline: a
+    tick that accepted 8:2 off real loss, followed by the loss clearing, leaves
+    8:2 on the wire against a baseline of 8:0 for reasons that are entirely
+    historical.
 
     A None ratio_on_wire means nothing has ever been written, so there is no
     parity to credit the floor with."""
     if ratio_on_wire is None:
         return False
-    return ratio_on_wire != ratio_without_location
+    return (ratio_with_location != ratio_without_location
+            and ratio_on_wire == ratio_with_location)
 
 
 def pinned_ladder_level(backoff_ratio, table, location_level):
@@ -3112,10 +3119,12 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                                  sorted(currently_active))
             # AFTER the write, and against what the actuator actually holds:
             # `active` claims parity is on the wire, so a refused FIFO write
-            # must retract the claim. Same rule the ladder below states for its
-            # dots — keyed on fec_current_ratio, never on what we wanted.
+            # must retract the claim — and a refusal that leaves an OLDER ratio
+            # flowing must not earn the floor credit for it either. Same rule
+            # the ladder below states for its dots: keyed on fec_current_ratio,
+            # never on what we wanted.
             fec_location_applied = location_floor_active(
-                fec_current_ratio, _ratio_without_location)
+                fec_current_ratio, _fec_ratio, _ratio_without_location)
 
             # Ladder for the UI's pip row. Keyed on fec_current_ratio (what the
             # actuator accepted), not _fec_ratio (what we wanted): a failed FIFO

@@ -327,7 +327,7 @@ def _floor_active(mode, level_before, location_level, floor="8:0", fixed="20:1",
                                fixed_ratio=fixed, floor_ratio=floor)
     on_wire = with_loc if write_ok else (
         prev_accepted if prev_accepted is not None else without_loc)
-    return M.location_floor_active(on_wire, without_loc)
+    return M.location_floor_active(on_wire, with_loc, without_loc)
 
 
 def test_location_floor_active_only_when_it_lifts_the_ratio():
@@ -372,7 +372,24 @@ def test_location_floor_answers_to_the_actuator_not_to_the_decision():
 def test_location_floor_claims_nothing_before_the_first_accepted_write():
     # fec_current_ratio is None until a write lands. Nothing is known to be on
     # the wire, so nothing can be credited to the floor.
-    assert M.location_floor_active(None, "8:1") is False
+    assert M.location_floor_active(None, "8:6", "8:1") is False
+
+
+def test_location_floor_gets_no_credit_for_a_stale_ratio_on_the_wire():
+    """A refused write can leave a ratio that differs from today's baseline
+    for reasons that have nothing to do with location.
+
+    Tick A accepted 8:2 off real loss; the loss then cleared, so the baseline
+    is now 8:0 and the floor asks 8:6 — and the FIFO refuses. The wire still
+    carries 8:2, which is neither what the floor asked for nor today's
+    baseline. Crediting location for it hands the badge to yesterday's loss."""
+    assert M.location_floor_active("8:2", "8:6", "8:0") is False
+    # The wire holding the very ratio the floor asked for is the only thing
+    # that earns the credit, whichever tick actually wrote it.
+    assert M.location_floor_active("8:6", "8:6", "8:0") is True
+    # ...and a wire still on an older location-lifted ratio while the floor now
+    # asks for MORE is again historical, not what this tick achieved.
+    assert M.location_floor_active("8:6", "8:8", "8:0") is False
 
 
 # ---------- pinned ladder: the location floor widens the pin ----------
