@@ -306,3 +306,25 @@ def test_location_floor_for_driver_clamps_to_the_active_table():
     floors = {"wan1": {"level": 4, "reason": "x"}}
     level, _ = M.location_floor_for_driver(floors, True, "wan1", F.DEFAULT_CELL_LOSS_TABLE)
     assert level == len(F.DEFAULT_CELL_LOSS_TABLE) - 1
+
+
+# ---------- location floor: did it actually change the applied ratio? ----------
+
+def test_location_floor_active_only_when_it_lifts_the_level():
+    # It asked for more than the engine had: the extra parity is on the wire.
+    assert M.location_floor_active(F.MODE_ADAPTIVE, 3, 1) is True
+    # The signal floor already stands higher, so the location floor changed
+    # nothing — reporting it as active credits it with the other floor's work.
+    assert M.location_floor_active(F.MODE_ADAPTIVE, 2, 3) is False
+    assert M.location_floor_active(F.MODE_ADAPTIVE, 0, 0) is False
+
+
+def test_location_floor_inactive_in_modes_that_discard_the_adaptive_ratio():
+    # apply_mode returns OFF_RATIO / the fixed ratio regardless of the level the
+    # floor lifted, so an "active" badge here promises parity nothing is sending.
+    assert M.location_floor_active(F.MODE_OFF, 3, 0) is False
+    assert M.location_floor_active(F.MODE_FIXED, 3, 0) is False
+
+
+def test_location_floor_active_in_min_adaptive():
+    assert M.location_floor_active(F.MODE_MIN_ADAPTIVE, 3, 0) is True
