@@ -131,12 +131,14 @@ class ExitHold:
         for wan, level in levels.items():
             held = self._held.get(wan)
             if held is None or level >= held["level"]:
-                self._held[wan] = {"level": level, "since": now_mono}
+                self._held[wan] = {"level": level, "since": None}
                 out[wan] = level
                 continue
+            if held["since"] is None:
+                held["since"] = now_mono
             if now_mono - held["since"] < self.hold_s:
                 out[wan] = held["level"]
             else:
-                self._held[wan] = {"level": level, "since": now_mono}
+                self._held[wan] = {"level": level, "since": None}
                 out[wan] = level
         return out

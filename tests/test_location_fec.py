@@ -147,8 +147,18 @@ def test_exit_hold_delays_a_drop_then_releases():
     h = M.ExitHold(hold_s=20.0)
     h.update({"wan1": 3}, now_mono=0.0)
     assert h.update({"wan1": 0}, now_mono=5.0) == {"wan1": 3}
-    assert h.update({"wan1": 0}, now_mono=19.0) == {"wan1": 3}
-    assert h.update({"wan1": 0}, now_mono=21.0) == {"wan1": 0}
+    assert h.update({"wan1": 0}, now_mono=24.0) == {"wan1": 3}
+    assert h.update({"wan1": 0}, now_mono=26.0) == {"wan1": 0}
+
+
+def test_exit_hold_runs_from_the_drop_not_from_adoption():
+    # A tile occupied for longer than hold_s still gets the full hold on exit.
+    h = M.ExitHold(hold_s=20.0)
+    h.update({"wan1": 3}, now_mono=0.0)
+    assert h.update({"wan1": 3}, now_mono=100.0) == {"wan1": 3}
+    assert h.update({"wan1": 0}, now_mono=100.0) == {"wan1": 3}
+    assert h.update({"wan1": 0}, now_mono=119.0) == {"wan1": 3}
+    assert h.update({"wan1": 0}, now_mono=121.0) == {"wan1": 0}
 
 
 def test_exit_hold_abandons_the_hold_when_the_level_climbs_again():
