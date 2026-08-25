@@ -2275,42 +2275,50 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
     import station_tracker
     out = {"tiles": [], "zones": []}
     raw = _read_json_file(store_path)
-    tiles = (raw or {}).get("tiles") if isinstance(raw, dict) else None
-    residual = (raw or {}).get("residual") if isinstance(raw, dict) else None
-    if not isinstance(residual, dict):
-        residual = {}
-    if isinstance(tiles, dict):
-        rows = []
-        for tid, per_wan in tiles.items():
-            if not isinstance(per_wan, dict):
-                continue
-            try:
-                lat, lon = tile_store.center(tid)
-                box = list(tile_store.bbox(tid))
-            except ValueError:
-                continue
-            dist = (station_tracker.haversine_m(fix[0], fix[1], lat, lon)
-                    if fix else 0.0)
-            r = residual.get(tid)
-            res = r.get("ewma") if isinstance(r, dict) else None
-            if isinstance(res, bool) or not isinstance(res, (int, float)):
-                res = None
-            rows.append((dist, {
-                "id": tid, "bbox": box, "wans": per_wan, "residual": res}))
-        rows.sort(key=lambda r: r[0])
-        out["tiles"] = [r[1] for r in rows[:max_tiles]]
+    # Parse through the store's OWN validator rather than passing per-WAN
+    # entries through raw: it drops malformed entries and coerces the numbers,
+    # and it never raises. The map page does arithmetic on these values
+    # (`(v.ewma_loss || 0).toFixed(1)`), so a string here is a client-side
+    # exception, not a cosmetic wart. from_dict on a non-dict logs and starts
+    # empty, so only call it when there is something to parse.
+    store = (tile_store.TileStore.from_dict(raw) if isinstance(raw, dict)
+             else tile_store.TileStore())
+    residual = store.residual
+    rows = []
+    for tid, per_wan in store.tiles.items():
+        try:
+            lat, lon = tile_store.center(tid)
+            box = list(tile_store.bbox(tid))
+        except ValueError:
+            continue
+        dist = (station_tracker.haversine_m(fix[0], fix[1], lat, lon)
+                if fix else 0.0)
+        r = residual.get(tid)
+        res = r.get("ewma") if isinstance(r, dict) else None
+        if isinstance(res, bool) or not isinstance(res, (int, float)):
+            res = None
+        rows.append((dist, {
+            "id": tid, "bbox": box, "wans": per_wan, "residual": res}))
+    rows.sort(key=lambda r: r[0])
+    out["tiles"] = [r[1] for r in rows[:max_tiles]]
     zcfg = _read_json_file(zones_path)
     zones = (zcfg or {}).get("zones") if isinstance(zcfg, dict) else None
     if isinstance(zones, list):
         for z in zones:
             if not isinstance(z, dict):
                 continue
+            # `wans` reaches the page as `z.wans.join(", ")`; anything but a
+            # list of names is emitted as null, which the page already handles.
+            names = z.get("wans")
+            if not (isinstance(names, list)
+                    and all(isinstance(w, str) for w in names)):
+                names = None
             try:
                 out["zones"].append({
                     "label": str(z.get("label") or "zone"),
                     "lat": float(z["lat"]), "lon": float(z["lon"]),
                     "radius_m": float(z["radius_m"]), "level": int(z["level"]),
-                    "wans": z.get("wans")})
+                    "wans": names})
             except (KeyError, TypeError, ValueError):
                 continue
     return out

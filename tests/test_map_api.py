@@ -249,6 +249,42 @@ def test_map_location_layer_tolerates_non_list_zones_and_a_zone_missing_a_key(tm
     assert out["zones"][0]["label"] == "ok"
 
 
+def test_map_location_layer_drops_a_per_wan_entry_with_a_bad_type(tmp_path):
+    """The map page does `(v.ewma_loss || 0).toFixed(1)`, which THROWS on a
+    string -- and drawLocation runs inside the same tick that moves the vehicle
+    marker. The server must not hand the page a value of a type it does not
+    validate; TileStore.from_dict is the validator that already exists."""
+    tile = T.encode(41.1, -73.5, 7)
+    store = tmp_path / "store.json"
+
+    store.write_text(_json.dumps({"tiles": {tile: {
+        "wan1": {"passes": 3, "ewma_loss": "bad", "last_seen": 1.0}}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"] == []           # the only WAN was junk: no tile at all
+
+    store.write_text(_json.dumps({"tiles": {tile: {
+        "wan1": {"passes": 3, "ewma_loss": "bad", "last_seen": 1.0},
+        "wan2": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1.0}}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert list(out["tiles"][0]["wans"]) == ["wan2"]
+    assert out["tiles"][0]["wans"]["wan2"]["ewma_loss"] == 6.0
+
+
+def test_map_location_layer_emits_zone_wans_only_as_a_list_of_names(tmp_path):
+    """`z.wans.join(", ")` throws on a string, and the config is hand-edited."""
+    store = tmp_path / "absent.json"
+    zones = tmp_path / "zones.json"
+    zones.write_text(_json.dumps({"zones": [
+        {"label": "a", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1,
+         "wans": "wan1"},
+        {"label": "b", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1,
+         "wans": ["wan1", 7]},
+        {"label": "c", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1,
+         "wans": ["wan1", "wan2"]}]}))
+    out = M.map_location_layer(str(store), str(zones), None, max_tiles=10)
+    assert [z["wans"] for z in out["zones"]] == [None, None, ["wan1", "wan2"]]
+
+
 def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
     m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
                            "labels_path": str(tmp_path / "l.json"),
