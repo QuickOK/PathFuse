@@ -1981,7 +1981,19 @@ def location_floor_for_driver(floors, enabled, driver, table):
 
 def location_floor_active(ratio_on_wire, ratio_with_location,
                           ratio_without_location):
-    """Did the location floor actually change the parity on the wire?
+    """Is the location floor the reason the wire carries the parity it does?
+
+    THE SEMANTIC, stated once so it is not re-litigated: `active` is about the
+    ratio standing on the wire THIS TICK, not about which tick caused the last
+    transition. It answers "if the location floor said nothing right now, would
+    the controller write something lower?" — so a wire already holding 8:6 from
+    an earlier loss-driven decision, with loss since fallen to a 8:0 baseline
+    and the floor asking 8:6, IS active even though no write happened and
+    location did not cause the actuator's current state. The floor is the only
+    thing holding that parity up; the moment it released, 8:0 would go out.
+    Attributing by who caused the last write would show the operator "not
+    active" for a floor that is doing all the work, which is the reading that
+    matters when a vehicle is standing in a known bad place.
 
     Two things must both hold, and each catches cases the other misses.
 

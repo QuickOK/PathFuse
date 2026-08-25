@@ -88,6 +88,9 @@ restart, and the reload says so.
   withdraws the floor immediately; the daemon keeps learning.
 - `location_fec.enabled` in `sbfd-ctl.json` is the boot-time default.
 - The FEC card names the floor when it binds: `· location floor (learned …)`.
+- *active* means the location floor is currently why the wire carries more
+  parity than the loss-driven decision alone would send, whether or not it
+  triggered the most recent write; a refused write is never counted.
 - The map draws learned tiles as loss-coloured squares and zones as circles.
 
 ## Fail-safe
