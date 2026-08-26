@@ -155,13 +155,23 @@ class FecState:
             self._pushed_link_ts = ts
 
     def get_pushed_link(self, now, stale_after_s):
-        """(profile, signal_floor, location_level), or (None, False, 0) when
-        never pushed or stale — stale MUST also drop the signal floor and the
-        location level, not just the table."""
+        """(profile, signal_floor, location_level). Stale, or never pushed at
+        all, drops all three — a client that stopped talking vouches for
+        nothing.
+
+        Fresh with NO profile still carries the location level, and this is the
+        one place the two floors deliberately part company. The signal floor's
+        rung is looked up IN the profile's table (sf_fec), so without a profile
+        it names nothing and stays dropped. The location level is an index the
+        resolved table merely clamps — the default table when nothing was
+        pushed — so it means exactly the same thing with or without a profile,
+        and withholding it would make the floor silently inert for anyone
+        running without wan_profiles."""
         with self._lock:
-            if self._pushed_profile is None or \
-                    (now - self._pushed_link_ts) > stale_after_s:
+            if (now - self._pushed_link_ts) > stale_after_s:
                 return None, False, 0
+            if self._pushed_profile is None:
+                return None, False, self._pushed_location_level
             return (self._pushed_profile, self._pushed_signal_floor,
                     self._pushed_location_level)
 
@@ -249,7 +259,8 @@ def start_fec_http(listen, state, stop_event=None):
                 self._json(400, {"error": "mode, enabled, client_loss_pct, "
                                           "fixed_ratio, floor_ratio, wan_profile, "
                                           "signal_floor or location_level "
-                                          "required"}); return
+                                          "required"})
+                return
             if mode_in is not None and mode_in not in fec_control.ALL_MODES:
                 self._json(400, {"error": f"mode must be one of "
                                           f"{sorted(fec_control.ALL_MODES)}"}); return
@@ -269,7 +280,8 @@ def start_fec_http(listen, state, stop_event=None):
                     isinstance(location_in, bool)
                     or not isinstance(location_in, int) or location_in < 0):
                 self._json(400, {"error": "location_level must be a "
-                                          "non-negative integer"}); return
+                                          "non-negative integer"})
+                return
             # Resolve every field BEFORE mutating any of it. A payload that
             # carries a good ratio and a bad client_loss_pct must leave the
             # relay untouched, not half-applied behind a 400.
@@ -296,8 +308,16 @@ def start_fec_http(listen, state, stop_event=None):
                 state.set_pushed_loss(loss_in, time.time())
             if (profile_in is not None or signal_in is not None
                     or location_in is not None):
-                state.set_pushed_link(profile_in, signal_in, time.time(),
-                                      location_level=location_in)
+                # An absent level on a LINK-POLICY update means zero, not
+                # "unchanged": a client rolled back to a build that knows
+                # nothing of location_level keeps pushing profile/signal_floor,
+                # and that refreshes the timestamp — so preserving the last
+                # level here would pin a location floor that can never expire.
+                # A location-only push always has a level, so one expression
+                # covers both cases.
+                state.set_pushed_link(
+                    profile_in, signal_in, time.time(),
+                    location_level=(0 if location_in is None else location_in))
             self._json(200, {"ok": True, "mode": mode_now,
                              "fixed_ratio": fixed_now,
                              "floor_ratio": floor_now,

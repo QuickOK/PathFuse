@@ -842,11 +842,12 @@ def test_run_once_location_level_is_clamped_to_the_pushed_profile_table(tmp_path
     assert ratio == F.level_to_ratio(3, F.DEFAULT_CELL_LOSS_TABLE) == "8:1"
 
 
-def _published_location_level(tmp_path, push, settle_on):
+def _published_after_push(tmp_path, push, settle_on):
     """Run the relay control loop behind a live /fec server, POST `push`, and
-    return the location_level it publishes. `settle_on` is only the value the
-    poll waits for — the assertion belongs to the caller. The snapshot and GET
-    /fec must agree, so a reader of either sees the same thing."""
+    return the snapshot it publishes once location_level settles. `settle_on`
+    is only the value the poll waits for — the assertion belongs to the caller.
+    The snapshot and GET /fec must agree, so a reader of either sees the same
+    thing."""
     import threading as _t, time as _time
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps(
@@ -885,9 +886,11 @@ def _published_location_level(tmp_path, push, settle_on):
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
         settled = await_level(settle_on)
+        snap = st.snapshot()
+        assert snap["location_level"] == settled
         with urllib.request.urlopen(f"http://{host}:{port}/fec", timeout=5) as r:
             assert json.loads(r.read())["location_level"] == settled
-        return settled
+        return snap
     finally:
         stop.set()
         th.join(timeout=2)
@@ -898,8 +901,9 @@ def _published_location_level(tmp_path, push, settle_on):
 def test_run_publishes_the_pushed_location_level(tmp_path):
     """GET /fec must show the level the relay leg is holding, so the operator
     can see the two legs agree."""
-    assert _published_location_level(
-        tmp_path, {"wan_profile": "wan1", "location_level": 2}, 2) == 2
+    snap = _published_after_push(
+        tmp_path, {"wan_profile": "wan1", "location_level": 2}, 2)
+    assert snap["location_level"] == 2
 
 
 def test_run_publishes_the_location_level_clamped_to_its_own_table(tmp_path):
@@ -909,5 +913,72 @@ def test_run_publishes_the_location_level_clamped_to_its_own_table(tmp_path):
     ever disagree about a profile's table, echoing the raw request would have
     the client's card claim a rung the relay is not holding. The cellular table
     is 4 rows, so a pushed level 4 is applied — and must be reported — as 3."""
-    assert _published_location_level(
-        tmp_path, {"wan_profile": "wan1", "location_level": 4}, 3) == 3
+    snap = _published_after_push(
+        tmp_path, {"wan_profile": "wan1", "location_level": 4}, 3)
+    assert snap["location_level"] == 3
+
+
+def test_run_applies_a_location_level_pushed_without_a_profile(tmp_path):
+    """The level does not depend on a profile: it is clamped to whatever table
+    the relay resolves, which is the default table when nothing is pushed. A
+    client that sends only a level must still lift this leg — otherwise the
+    floor is silently inert on every deployment with no wan_profiles."""
+    snap = _published_after_push(tmp_path, {"location_level": 3}, 3)
+    assert snap["location_level"] == 3
+    # Zero loss, so level 3 on the default table is the floor's work alone.
+    assert snap["ratio"] == F.level_to_ratio(3, F.DEFAULT_LOSS_TABLE) == "8:6"
+    assert snap["profile"] == "default"
+
+
+def test_a_lone_location_level_survives_without_a_profile():
+    """The twin of test_lone_signal_floor_accepted_but_inert_by_design, and
+    deliberately the opposite ruling: the signal floor's rung is looked up IN
+    the profile's table, so it means nothing without one, while the location
+    level is an index the resolved table merely clamps."""
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+    try:
+        host, port = httpd.server_address[:2]
+        body = json.dumps({"location_level": 3}).encode()
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == (None, False, 3)
+        # Still expires with the link it rode in on.
+        assert st.get_pushed_link(now=time.time() + 500.0, stale_after_s=90.0) \
+            == (None, False, 0)
+    finally:
+        httpd.shutdown()
+
+
+def test_a_link_policy_update_without_a_level_clears_it():
+    """A client rolled back to a build that knows nothing of location_level
+    keeps pushing wan_profile/signal_floor, which refreshes the pushed link's
+    timestamp. Preserving the last level there would pin a location floor
+    forever — the floor must be dropped by the very same update instead."""
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+
+    def post(obj):
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=json.dumps(obj).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+
+    try:
+        host, port = httpd.server_address[:2]
+        assert post({"wan_profile": "wan1", "location_level": 3}) == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == ("wan1", False, 3)
+        # The legacy payload: profile and signal floor, no level.
+        assert post({"wan_profile": "default", "signal_floor": False}) == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == ("default", False, 0)
+    finally:
+        httpd.shutdown()
