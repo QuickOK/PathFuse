@@ -4,6 +4,7 @@ import os
 import socket
 from pathlib import Path
 
+import fec_control as FC
 import sbfd_ctl as M
 import tile_store as T
 
@@ -192,7 +193,10 @@ def test_assemble_map_payload_carries_location_fec(tmp_path):
                            "location_store_path": str(tmp_path / "store.json"),
                            "location_config_path": str(tmp_path / "lf.json")})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
-    assert out["location_fec"] == {"tiles": [], "zones": []}
+    # The level keys ride along even with no FEC config to describe; the page
+    # reads them unconditionally.
+    assert out["location_fec"]["tiles"] == []
+    assert out["location_fec"]["zones"] == []
 
 
 def test_map_location_layer_tolerates_a_malformed_residual(tmp_path):
@@ -296,7 +300,8 @@ def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
                            "location_config_path": str(tmp_path / "lf.json"),
                            "max_location_tiles": "lots"})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
-    assert out["location_fec"] == {"tiles": [], "zones": []}
+    assert out["location_fec"]["tiles"] == []
+    assert out["location_fec"]["zones"] == []
 
 
 def test_map_location_layer_drops_a_non_finite_residual(tmp_path):
@@ -674,3 +679,120 @@ def test_apply_location_zone_fails_open_on_an_unreadable_file(tmp_path):
     _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
     zones = M.apply_location_zone(str(p), z)
     assert [z["id"] for z in zones] == ["z1"]
+
+
+# -- what the page needs to offer a level --------------------------------------
+
+
+def _levels_cfg(tmp_path, **over):
+    m = M.resolve_map_cfg({
+        "stations_path": str(tmp_path / "s.json"),
+        "labels_path": str(tmp_path / "l.json"),
+        "environ_points_path": str(tmp_path / "e.json"),
+        "location_store_path": str(tmp_path / "store.json"),
+        "location_config_path": str(tmp_path / "lf.json"),
+        "location_zones_path": str(tmp_path / "location_zones.json")})
+    m.update(over)
+    return m
+
+
+def _fec_cfg(profiles=None):
+    return M.FecCfg(enabled=True, fifo="/dev/null",
+                    loss_table=FC.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
+                    ramp_down_hold_s=0, full_mode_backoff_fec="8:0",
+                    full_min_up_wans=2, floor_ratio="20:1",
+                    wan_profiles=profiles or {})
+
+
+def test_map_location_layer_tags_both_zone_sources(tmp_path):
+    """A config zone is not editable from the map and an operator zone is, so
+    the page has to be able to tell them apart without guessing."""
+    cfgz = tmp_path / "lf.json"
+    cfgz.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}]}))
+    opz = tmp_path / "location_zones.json"
+    opz.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "dock", "lat": 41.2, "lon": -73.6,
+         "radius_m": 150, "level": 3, "wans": ["wan1"],
+         "suppress_learned": True}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(cfgz), None,
+                               10, operator_zones_path=str(opz))
+    assert [z["source"] for z in out["zones"]] == ["config", "operator"]
+    assert "id" not in out["zones"][0]
+    assert out["zones"][1]["id"] == "z1"
+    assert out["zones"][1]["label"] == "dock"
+    assert out["zones"][1]["wans"] == ["wan1"]
+
+
+def test_map_location_layer_without_an_operator_file_is_config_only(tmp_path):
+    cfgz = tmp_path / "lf.json"
+    cfgz.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(cfgz), None,
+                               10, operator_zones_path=str(tmp_path / "no.json"))
+    assert [z["source"] for z in out["zones"]] == ["config"]
+
+
+def test_map_payload_levels_describe_the_driving_profiles_table(tmp_path):
+    m = _levels_cfg(tmp_path)
+    pub = tmp_path / "pub.json"
+    pub.write_text(_json.dumps({"fec": {"floor_ratio": "8:4",
+                                        "profile": {"driver_wan": "wan1"}},
+                                "wan_labels": {"wan1": "Cell",
+                                               "wan2": "Satellite"}}))
+    out = M.assemble_map_payload(m, str(pub), None, 1000.0,
+                                 fec_cfg=_fec_cfg())
+    loc = out["location_fec"]
+    assert [lv["level"] for lv in loc["levels"]] == [0, 1, 2, 3, 4]
+    assert [lv["ratio"] for lv in loc["levels"]] == ["8:0", "8:2", "8:4",
+                                                   "8:6", "8:8"]
+    assert [lv["overhead_pct"] for lv in loc["levels"]] == [0.0, 25.0, 50.0,
+                                                          75.0, 100.0]
+    # 8:4 is 50% overhead, which is the third rung of this table.
+    assert loc["floor_level"] == 2
+    assert loc["wans"] == {"wan1": "Cell", "wan2": "Satellite"}
+
+
+def test_map_payload_levels_follow_the_driver_onto_a_shorter_table(tmp_path):
+    m = _levels_cfg(tmp_path)
+    pub = tmp_path / "pub.json"
+    pub.write_text(_json.dumps({"fec": {"floor_ratio": "20:1",
+                                        "profile": {"driver_wan": "wan1"}}}))
+    fec = _fec_cfg({"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=FC.DEFAULT_CELL_LOSS_TABLE, ramp_up_ticks=1,
+        ramp_down_hold_s=0, floor_ratio="8:0", signal_floor_fec="12:1")})
+    loc = M.assemble_map_payload(m, str(pub), None, 1000.0,
+                                 fec_cfg=fec)["location_fec"]
+    assert [lv["ratio"] for lv in loc["levels"]] == ["8:0", "20:1", "12:1",
+                                                   "8:1"]
+    assert loc["floor_level"] == 1                 # 20:1 = 5%, the second rung
+    assert loc["wans"] == {}                       # no wan_labels published
+
+
+def test_map_payload_levels_fall_back_to_the_default_table_without_a_driver(tmp_path):
+    """A snapshot that names no driver is the state right after a restart;
+    the page still has to be able to offer a level."""
+    m = _levels_cfg(tmp_path)
+    pub = tmp_path / "pub.json"
+    pub.write_text(_json.dumps({"fec": {"floor_ratio": "20:1"}}))
+    fec = _fec_cfg({"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=FC.DEFAULT_CELL_LOSS_TABLE, ramp_up_ticks=1,
+        ramp_down_hold_s=0, floor_ratio="8:0", signal_floor_fec="12:1")})
+    loc = M.assemble_map_payload(m, str(pub), None, 1000.0,
+                                 fec_cfg=fec)["location_fec"]
+    assert len(loc["levels"]) == len(FC.DEFAULT_LOSS_TABLE)
+    assert loc["floor_level"] == 0                 # 20:1 is below every rung
+
+
+def test_map_payload_without_a_fec_cfg_degrades_but_never_omits(tmp_path):
+    """The map page reads location_fec.levels unconditionally; the keys have
+    to be there even on a box with no FEC configured at all."""
+    m = _levels_cfg(tmp_path)
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    loc = out["location_fec"]
+    assert loc["levels"] == [] and loc["floor_level"] is None
+    assert loc["wans"] == {}
+    assert loc["tiles"] == [] and loc["zones"] == []
+    assert out["fix"] is None and out["stations"] == []

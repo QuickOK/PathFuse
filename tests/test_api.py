@@ -1602,3 +1602,32 @@ def test_api_post_location_zone_uses_the_driving_profiles_table(cfg_with_fec, tm
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_api_map_explains_every_fec_level(cfg_with_fec, tmp_path):
+    """The zone editor cannot ask for "level 3" intuitively without being told
+    what level 3 is on the link driving FEC, so /api/map has to pass cfg.fec."""
+    cfg_with_fec.map = {"location_zones_path":
+                        str(tmp_path / "location_zones.json"),
+                        "location_store_path": str(tmp_path / "store.json"),
+                        "location_config_path": str(tmp_path / "lf.json"),
+                        "stations_path": str(tmp_path / "s.json"),
+                        "labels_path": str(tmp_path / "l.json"),
+                        "environ_points_path": str(tmp_path / "e.json")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"floor_ratio": "8:2", "profile": {"driver_wan": "wan2"}},
+         "wan_labels": {"wan1": "T-Mo", "wan2": "Satellite"}}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            loc = json.loads(r.read())["location_fec"]
+        assert [lv["ratio"] for lv in loc["levels"]] == [
+            row["fec"] for row in fec_control.DEFAULT_LOSS_TABLE]
+        assert loc["floor_level"] == 1
+        assert loc["wans"] == {"wan1": "T-Mo", "wan2": "Satellite"}
+    finally:
+        stop.set()
+        httpd.shutdown()

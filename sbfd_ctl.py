@@ -2494,11 +2494,53 @@ def active_fec_table(fec_cfg, published_state_path):
 _STORE_MEMO = {"path": None, "stat": None, "store": None}
 
 
-def map_location_layer(store_path, zones_path, fix, max_tiles):
-    """Learned tiles (nearest the fix first, capped) and operator zones for
-    the map. Degrades to empty lists: a broken source must never 500 the
-    endpoint. Lazy import keeps the failover daemon free of a hard dependency
-    on the location module."""
+def _map_zone_rows(zones_path, source):
+    """The drawable rows of one zone file, tagged with where they came from.
+
+    Both files hold the same shape, and both are read the same defensive way:
+    the config one is hand-edited and the operator one is written by an
+    endpoint whose atomic write can still be interrupted. `source` is what
+    lets the page know which circles it may edit — a config zone ships with
+    the box and is not the map's to change."""
+    out = []
+    raw = _read_json_file(zones_path)
+    zones = raw.get("zones") if isinstance(raw, dict) else None
+    if not isinstance(zones, list):
+        return out
+    for z in zones:
+        if not isinstance(z, dict):
+            continue
+        # `wans` reaches the page as `z.wans.join(", ")`; anything but a
+        # list of names is emitted as null, which the page already handles.
+        names = z.get("wans")
+        if not (isinstance(names, list)
+                and all(isinstance(w, str) for w in names)):
+            names = None
+        try:
+            row = {"label": str(z.get("label") or "zone"),
+                   "lat": float(z["lat"]), "lon": float(z["lon"]),
+                   "radius_m": float(z["radius_m"]), "level": int(z["level"]),
+                   "wans": names, "source": source}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if source == "operator":
+            zid = z.get("id")
+            # No id, no edit: the page addresses a zone by id, and a row
+            # without one could only be saved back as a new zone.
+            if not (isinstance(zid, str) and _ZID_RE.match(zid)):
+                continue
+            row["id"] = zid
+            row["suppress_learned"] = bool(z.get("suppress_learned", False))
+        out.append(row)
+    return out
+
+
+def map_location_layer(store_path, zones_path, fix, max_tiles,
+                       operator_zones_path=None):
+    """Learned tiles (nearest the fix first, capped) and zones for the map,
+    from both zone sources. Degrades to empty lists: a broken source must
+    never 500 the endpoint. Lazy import keeps the failover daemon free of a
+    hard dependency on the location module."""
     import tile_store
     import station_tracker
     out = {"tiles": [], "zones": []}
@@ -2554,32 +2596,42 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
             "id": tid, "bbox": box, "wans": per_wan, "residual": res}))
     rows.sort(key=lambda r: r[0])
     out["tiles"] = [r[1] for r in rows[:max_tiles]]
-    zcfg = _read_json_file(zones_path)
-    zones = (zcfg or {}).get("zones") if isinstance(zcfg, dict) else None
-    if isinstance(zones, list):
-        for z in zones:
-            if not isinstance(z, dict):
-                continue
-            # `wans` reaches the page as `z.wans.join(", ")`; anything but a
-            # list of names is emitted as null, which the page already handles.
-            names = z.get("wans")
-            if not (isinstance(names, list)
-                    and all(isinstance(w, str) for w in names)):
-                names = None
-            try:
-                out["zones"].append({
-                    "label": str(z.get("label") or "zone"),
-                    "lat": float(z["lat"]), "lon": float(z["lon"]),
-                    "radius_m": float(z["radius_m"]), "level": int(z["level"]),
-                    "wans": names})
-            except (KeyError, TypeError, ValueError):
-                continue
+    out["zones"] = _map_zone_rows(zones_path, "config")
+    if operator_zones_path:
+        out["zones"] += _map_zone_rows(operator_zones_path, "operator")
     return out
 
 
-def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
+def map_fec_levels(table):
+    """What each level on this table costs, for the editor's level list.
+
+    A level is meaningless to an operator on its own — it is an index into a
+    table they cannot see. Degrades per row rather than raising: a display
+    helper on a hand-written table must not be the thing that 500s /api/map."""
+    out = []
+    for i, row in enumerate(table or ()):
+        ratio = row.get("fec") if isinstance(row, dict) else None
+        pct = None
+        try:
+            a, b = fec_control.parse_ratio(ratio)
+            if fec_control.validate_ratio(a, b):
+                pct = round(fec_control.ratio_overhead_pct(a, b), 1)
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            pass
+        out.append({"level": i,
+                    "ratio": ratio if isinstance(ratio, str) else None,
+                    "overhead_pct": pct})
+    return out
+
+
+def assemble_map_payload(map_cfg, published_state_path, fix, now,
+                         fec_cfg=None) -> dict:
     """Aggregate every map data source; each degrades independently to
-    null/empty — a broken source must never 500 the endpoint."""
+    null/empty — a broken source must never 500 the endpoint.
+
+    `fec_cfg` is what lets the page explain a level to the operator drawing a
+    zone. It is optional so a caller that only wants positions need not have
+    one; without it the level keys are present but empty, never absent."""
     st = _read_json_file(map_cfg["stations_path"]) or {}
     labels = _read_json_file(map_cfg["labels_path"])
     labels = labels if isinstance(labels, dict) else {}
@@ -2603,6 +2655,21 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
         max_tiles = max(0, int(map_cfg.get("max_location_tiles", 2000)))
     except (TypeError, ValueError):
         max_tiles = 2000
+    location = map_location_layer(
+        map_cfg["location_store_path"], map_cfg["location_config_path"],
+        (fix[0], fix[1]) if fix is not None else None, max_tiles,
+        operator_zones_path=map_cfg.get("location_zones_path"))
+    # What a level MEANS on the link currently driving FEC. The editor greys
+    # out the levels at or below the floor, so a floor the page cannot see
+    # would have it offering rungs that change nothing.
+    table = active_fec_table(fec_cfg, published_state_path) if fec_cfg else None
+    fec_snap = snap.get("fec") if isinstance(snap.get("fec"), dict) else {}
+    labels = snap.get("wan_labels")
+    location["levels"] = map_fec_levels(table) if table else []
+    location["floor_level"] = (
+        fec_control.ratio_rung(fec_snap.get("floor_ratio"), table)
+        if table else None)
+    location["wans"] = (labels if table and isinstance(labels, dict) else {})
     return {"ts": now,
             "fix": out_fix,
             "stations": stations,
@@ -2610,10 +2677,7 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
             "environ": _read_json_file(map_cfg["environ_points_path"]),
             "mode": snap.get("mode"),
             "active": snap.get("active_wans"),
-            "location_fec": map_location_layer(
-                map_cfg["location_store_path"], map_cfg["location_config_path"],
-                (fix[0], fix[1]) if fix is not None else None,
-                max_tiles)}
+            "location_fec": location}
 
 
 _GPS_MEMO = {"ts": 0.0, "fix": None}
@@ -2857,7 +2921,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 g = map_cfg["gpsd"]
                 fix = get_map_fix(g["host"], g["port"])
                 self._send_json(200, assemble_map_payload(
-                    map_cfg, cfg.published_state, fix, time.time()))
+                    map_cfg, cfg.published_state, fix, time.time(),
+                    fec_cfg=cfg.fec))
             elif (m := _TILE_RE.match(self.path)):
                 self._serve_tile(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             else:
