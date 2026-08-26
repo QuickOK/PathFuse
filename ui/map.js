@@ -190,22 +190,32 @@ const el = (id) => document.getElementById(id);
 let editing = null;       // {lat, lon, id?} being edited, or null when closed
 let preview = null;       // the circle that follows the radius slider
 
-// This page saves to the zone file sbfd-ctl is configured with; the daemon
+// This page writes the zone file sbfd-ctl is configured with; the daemon
 // reads the one ITS own config names, and nothing ties the two settings
 // together. Diverged, every save here returns 200 and draws its circle while
 // no floor ever moves. The server proves the divergence (null unless the
 // daemon's own record says otherwise) and the panel names the file the
-// operator has to go and fix, because a Save that cannot work must not look
-// like one that did.
+// operator has to go and fix, because a mutation that cannot work must not
+// look like one that did.
+//
+// BOTH mutations are blocked, not just Save. The map draws the zones in the
+// file this page writes, so on a mismatch a delete SUCCEEDS: the circle
+// disappears while the daemon carries on applying the floor from the file it
+// actually reads. "I deleted it and the parity is still there" is the worst
+// version of this failure, which makes Delete the more dangerous of the two,
+// not the lesser. Reading is untouched -- a zone can still be opened and
+// looked at.
 function syncZonesPathWarning() {
   const theirs = lastLoc ? lastLoc.zones_path_mismatch : null;
   const warn = el("z-path-warn");
   // textContent: a path is server-supplied text, never markup.
   warn.textContent = theirs
     ? "the location daemon is reading " + theirs
-      + " - saves here will not take effect"
+      + " - saving and deleting here will not take effect until the two"
+      + " paths agree"
     : "";
   el("z-save").disabled = !!theirs;
+  el("z-delete").disabled = !!theirs;
 }
 
 function zoneLevels() {

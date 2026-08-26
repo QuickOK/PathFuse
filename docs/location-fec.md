@@ -106,9 +106,13 @@ which is where the map SAVES, and `operator_zones_path` in
 `location-fec.json`, which is what the daemon READS. They default to the same
 file and nothing ties them together, so the daemon publishes the path it is
 reading and the map compares the two. Diverged, the editor names the daemon's
-file and refuses to save — a save that cannot take effect must not look like
-one that did. The map says nothing unless it can prove the divergence: a
-record that is absent, stale or from an older daemon leaves the editor alone.
+file and goes read-only: a zone can still be opened and looked at, but Save
+and Delete are both disabled, because a mutation that cannot take effect must
+not look like one that did. Delete especially — the map draws the file it
+writes, so a delete there would succeed, the circle would vanish, and the
+daemon would carry on applying that floor from the file it actually reads.
+The map says nothing unless it can prove the divergence: a record that is
+absent, stale or from an older daemon leaves the editor alone.
 An `operator_zones_path` that is not a path at all (a `null`, a number) is
 logged and treated as the default rather than taking the poll down with it.
 
@@ -190,7 +194,7 @@ restart, and the reload says so.
 | invalid zone | logged and skipped |
 | drawn-zone file missing or corrupt | no drawn zones, one log line; config zones and learning are unaffected |
 | `operator_zones_path` not a path | one log line, the default path is used; floors keep publishing |
-| map and daemon pointed at different zone files | the map names the daemon's file and disables Save; floors are unaffected |
+| map and daemon pointed at different zone files | the map names the daemon's file and goes read-only (Save and Delete both disabled); floors are unaffected |
 
 Known hole: in a tunnel the fix dies where the link does, so nothing is learned
 there. The approach tiles usually still learn; a manual zone covers the rest.
