@@ -1,5 +1,6 @@
 import json as _json
 import logging as _logging
+import os
 from pathlib import Path
 
 import fec_control as F
@@ -537,3 +538,151 @@ def test_rate_limited_log_passes_a_different_message_immediately():
     assert r.due("poll error: other", now_mono=1.0) == "poll error: other"
     # ...and the new message now owns the window
     assert r.due("poll error: other", now_mono=2.0) is None
+
+
+# -- operator-drawn zones ------------------------------------------------------
+
+_YARD = {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}
+
+
+def _operator_file(tmp_path, *zones, name="location_zones.json"):
+    p = tmp_path / name
+    p.write_text(_json.dumps({"zones": list(zones)}))
+    return p
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records
+            if r.name == "location_fec" and r.levelno >= _logging.WARNING]
+
+
+def test_operator_zones_path_defaults_and_is_configurable(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    assert cfg.operator_zones_path == "/var/lib/sbfd-ctl/location_zones.json"
+    cfg = M.load_location_config(
+        _cfg_raw(tmp_path, operator_zones_path=str(tmp_path / "drawn.json")))
+    assert cfg.operator_zones_path == str(tmp_path / "drawn.json")
+
+
+def test_load_operator_zones_is_empty_and_quiet_when_the_file_is_missing(
+        tmp_path, caplog):
+    # Nothing drawn yet is the NORMAL state of a fresh box, not a fault: a
+    # warning here would be one line per reload for the life of the daemon.
+    with caplog.at_level(_logging.WARNING, logger="location_fec"):
+        assert M.load_operator_zones(str(tmp_path / "absent.json"), 5) == []
+    assert _warnings(caplog) == []
+
+
+def test_load_operator_zones_warns_once_for_malformed_json(tmp_path, caplog):
+    p = tmp_path / "location_zones.json"
+    p.write_text("{not json at all")
+    with caplog.at_level(_logging.WARNING, logger="location_fec"):
+        assert M.load_operator_zones(str(p), 5) == []
+    assert len(_warnings(caplog)) == 1
+
+
+def test_load_operator_zones_keeps_the_good_zone_and_warns_for_the_bad(
+        tmp_path, caplog):
+    p = _operator_file(tmp_path, _YARD,
+                       {"label": "past the table", "lat": 41.1, "lon": -73.5,
+                        "radius_m": 300, "level": 99})
+    with caplog.at_level(_logging.WARNING, logger="location_fec"):
+        zones = M.load_operator_zones(str(p), 5)
+    assert [z["label"] for z in zones] == ["yard"]
+    assert any("past the table" in r.getMessage() for r in _warnings(caplog))
+
+
+def test_load_operator_zones_tolerates_a_non_list_zones_key(tmp_path, caplog):
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": "nope"}))
+    with caplog.at_level(_logging.WARNING, logger="location_fec"):
+        assert M.load_operator_zones(str(p), 5) == []
+    assert len(_warnings(caplog)) == 1
+
+
+def test_zone_file_parses_once_until_the_file_changes(tmp_path, monkeypatch):
+    """The loop runs at 1 Hz and the operator draws a zone once a month:
+    re-parsing (and re-warning about) an unchanged file every tick is waste."""
+    calls = []
+    real = M.load_operator_zones
+
+    def counting(path, table_len):
+        calls.append(path)
+        return real(path, table_len)
+
+    monkeypatch.setattr(M, "load_operator_zones", counting)
+    p = _operator_file(tmp_path, _YARD)
+    zf = M.ZoneFile()
+    assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["yard"]
+    assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["yard"]
+    assert len(calls) == 1
+
+    p.write_text(_json.dumps({"zones": [dict(_YARD, label="dock", level=3)]}))
+    # Force a distinct mtime_ns so this does not depend on the filesystem's
+    # timestamp resolution.
+    st = os.stat(str(p))
+    os.utime(str(p), ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["dock"]
+    assert len(calls) == 2
+
+
+def test_zone_file_forgets_everything_when_the_file_vanishes(tmp_path):
+    p = _operator_file(tmp_path, _YARD)
+    zf = M.ZoneFile()
+    assert zf.maybe_reload(str(p), 5)
+    p.unlink()
+    assert zf.maybe_reload(str(p), 5) == []
+    # The memo must be cleared too, or a file recreated with the same size and
+    # a coarse mtime would be served from the stale cache.
+    _operator_file(tmp_path, dict(_YARD, label="dock"))
+    assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["dock"]
+
+
+def test_an_operator_zone_raises_the_floor_like_a_configured_one(tmp_path):
+    cfg = M.load_location_config(_cfg_raw(tmp_path, zones=[]))
+    store = T.TileStore()
+    hold = M.ExitHold(cfg.exit_hold_s)
+    drawn = M.load_operator_zones(
+        str(_operator_file(tmp_path, dict(_YARD, label="dock", level=3))),
+        len(cfg.table))
+    rec = M.poll_once(cfg, store, hold, fix=(41.1, -73.5, 0.0, None),
+                      state=None, now_mono=0.0, now_wall=1000.0,
+                      operator_zones=drawn)
+    assert rec["wans"]["wan1"]["level"] == 3
+    assert rec["wans"]["wan1"]["reason"] == "zone dock"
+
+
+def test_configured_and_operator_zones_combine_by_max(tmp_path):
+    # The configured zone in _cfg_raw is "yard" at level 2 on this spot.
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    store = T.TileStore()
+    higher = M.load_operator_zones(
+        str(_operator_file(tmp_path, dict(_YARD, label="dock", level=4))),
+        len(cfg.table))
+    rec = M.poll_once(cfg, store, M.ExitHold(cfg.exit_hold_s),
+                      fix=(41.1, -73.5, 0.0, None), state=None,
+                      now_mono=0.0, now_wall=1000.0, operator_zones=higher)
+    assert rec["wans"]["wan1"]["level"] == 4
+
+    lower = M.load_operator_zones(
+        str(_operator_file(tmp_path, dict(_YARD, label="dock", level=1),
+                           name="lower.json")),
+        len(cfg.table))
+    rec = M.poll_once(cfg, store, M.ExitHold(cfg.exit_hold_s),
+                      fix=(41.1, -73.5, 0.0, None), state=None,
+                      now_mono=0.0, now_wall=1000.0, operator_zones=lower)
+    assert rec["wans"]["wan1"]["level"] == 2
+
+
+def test_an_operator_zone_can_name_a_wan_the_config_never_mentions(tmp_path):
+    """poll_once unions the zones' WANs into the published set; an operator
+    zone must widen that set exactly as a configured one does."""
+    cfg = M.load_location_config(_cfg_raw(tmp_path, wans=[], zones=[]))
+    drawn = M.load_operator_zones(
+        str(_operator_file(tmp_path, dict(_YARD, wans=["wan5"], level=3))),
+        len(cfg.table))
+    rec = M.poll_once(cfg, T.TileStore(), M.ExitHold(cfg.exit_hold_s),
+                      fix=(41.1, -73.5, 0.0, None), state=None,
+                      now_mono=0.0, now_wall=1000.0, operator_zones=drawn)
+    assert rec["wans"]["wan5"]["level"] == 3

@@ -263,6 +263,10 @@ class LocationConfig:
     wans: list = field(default_factory=list)
     learning: dict = field(default_factory=dict)
     zones: list = field(default_factory=list)
+    # Zones the operator drew on the map. sbfd-ctl owns this file; we only
+    # read it, and we re-read it when it changes rather than on SIGHUP — a
+    # zone drawn on the map must take effect without a signal.
+    operator_zones_path: str = "/var/lib/sbfd-ctl/location_zones.json"
     table: list = field(default_factory=lambda: list(fec_control.DEFAULT_LOSS_TABLE))
 
 
@@ -302,6 +306,62 @@ def validate_zone(raw, table_len):
             "suppress_learned": bool(raw.get("suppress_learned", False))}
 
 
+def load_operator_zones(path, table_len):
+    """The zones sbfd-ctl wrote from the map, validated exactly as the
+    configured ones are.
+
+    Fail-open in every direction: a missing file is the normal state of a box
+    nobody has drawn on yet and says nothing; anything else unusable costs one
+    warning and yields no zones. This must never raise — the caller is the 1 Hz
+    poll loop, and an operator zone is an addition to the floor, never a
+    prerequisite for it."""
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        log.warning("operator zones %s unreadable: %s", path, e)
+        return []
+    zones = raw.get("zones") if isinstance(raw, dict) else None
+    if not isinstance(zones, list):
+        log.warning("operator zones %s ignored: no zones list", path)
+        return []
+    return [z for z in (validate_zone(z, table_len) for z in zones) if z]
+
+
+class ZoneFile:
+    """The operator zone file, re-read only when it actually changes.
+
+    Same memo shape as sbfd-ctl's tile-store memo, and for the same reason:
+    the loop runs at 1 Hz and the operator draws a zone once in a while, so
+    re-parsing an unchanged file every tick is pure waste — and a malformed
+    file would log its warning once a second forever. The inode is in the key
+    because mtime_ns + size alone cannot tell a rewrite that reproduces both
+    from no change at all; sbfd-ctl's tmp + os.replace always lands a new
+    one."""
+
+    def __init__(self):
+        self._key = None
+        self._zones = []
+
+    def maybe_reload(self, path, table_len):
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime_ns, st.st_size, st.st_ino)
+        except (OSError, ValueError):
+            # Gone, unreadable, or an unusable path (os.stat raises ValueError
+            # on an embedded NUL). Clear the memo as well as the list, or a
+            # file recreated at the same size under a coarse mtime would be
+            # served from a cache of zones that no longer exist.
+            self._key, self._zones = None, []
+            return self._zones
+        if key != self._key:
+            self._key = key
+            self._zones = load_operator_zones(path, table_len)
+        return self._zones
+
+
 def load_location_config(path) -> LocationConfig:
     with open(path) as f:
         raw = json.load(f)
@@ -335,6 +395,8 @@ def load_location_config(path) -> LocationConfig:
                   ("min_passes", "alpha", "pass_gap_s", "max_tiles",
                    "max_age_days", "clean_drop_days") if k in learn},
         zones=zones,
+        operator_zones_path=raw.get("operator_zones_path",
+                                    "/var/lib/sbfd-ctl/location_zones.json"),
         table=table,
     )
 
@@ -473,24 +535,30 @@ def write_record(path, record):
     os.replace(tmp, path)
 
 
-def poll_once(cfg, store, hold, fix, state, now_mono, now_wall):
+def poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
+              operator_zones=()):
     """One tick: learn from state (if fresh), resolve from position, publish.
-    Returns the record; the caller writes it."""
+    Returns the record; the caller writes it.
+
+    `operator_zones` are the map-drawn ones. They are simply appended to the
+    configured list: downstream a zone is a zone, and the two sources combine
+    by max like any other pair of terms."""
     if fix is None:
         store.observe(None, {}, None, now_mono, now_wall)
         return build_record({}, now_wall)
     tile = tile_store.encode(fix[0], fix[1], cfg.precision)
+    zones = list(cfg.zones) + list(operator_zones or ())
     wans = set(cfg.wans)
     if state is not None:
         per_wan_loss, residual = state
         store.observe(tile, per_wan_loss, residual, now_mono, now_wall)
         wans |= set(per_wan_loss)
-    for zone in cfg.zones:
+    for zone in zones:
         wans |= set(zone.get("wans") or [])
     wans = sorted(wans)
     if not wans:
         return build_record({}, now_wall)
-    levels = resolve(store, fix, cfg.zones, wans, cfg.table,
+    levels = resolve(store, fix, zones, wans, cfg.table,
                      precision=cfg.precision, lookahead_s=cfg.lookahead_s,
                      min_speed_ms=cfg.min_speed_ms,
                      sample_step_m=cfg.sample_step_m)
@@ -536,6 +604,8 @@ def main():
     store = tile_store.TileStore.load(cfg.store_path, **cfg.learning)
     log.info("tile store: %d tiles loaded", len(store.tiles))
     hold = ExitHold(cfg.exit_hold_s)
+    zone_file = ZoneFile()
+    last_operator_count = None
     # Every 1 Hz fault the loop can hit gets an edge-triggered or rate-limited
     # voice: a fault that lasts an hour must not cost 3600 journal lines.
     blind = Episode()               # blind for longer than max_stale_s
@@ -584,7 +654,15 @@ def main():
                 # blind episode: the condition can last for hours.
                 log.warning("no usable fix for %.0f s; withdrawing",
                             now_mono - last_good)
-            record = poll_once(cfg, store, hold, fix, state, now_mono, now_wall)
+            # No signal: a zone drawn on the map is live within a poll, so
+            # this is keyed off the file's own mtime rather than SIGHUP.
+            operator_zones = zone_file.maybe_reload(cfg.operator_zones_path,
+                                                    len(cfg.table))
+            if len(operator_zones) != last_operator_count:
+                last_operator_count = len(operator_zones)
+                log.info("operator zones -> %d", last_operator_count)
+            record = poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
+                               operator_zones=operator_zones)
             write_record(cfg.output_path, record)
             published = {w: v["level"] for w, v in record["wans"].items()}
             if published != last_published:
