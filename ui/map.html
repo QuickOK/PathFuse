@@ -26,6 +26,9 @@
     border-radius: 8px; }
   #zone-editor .row { display: flex; align-items: center; gap: 6px;
     margin-bottom: 6px; }
+  /* display:flex above outranks the UA sheet's [hidden] rule, so a row that
+     hides itself needs to say so here. */
+  #zone-editor .row[hidden] { display: none; }
   #zone-editor .k { width: 52px; color: #aaa; flex: none; }
   #zone-editor input[type=text], #zone-editor input[type=number],
   #zone-editor select {
@@ -77,7 +80,7 @@
     <span class="k">WANs</span>
     <span id="z-wans"></span>
   </div>
-  <div class="row hint">all WANs when none checked</div>
+  <div class="row hint" id="z-wans-hint">all WANs when none checked</div>
   <div class="row">
     <label><input id="z-suppress" type="checkbox"> ignore learned loss here</label>
   </div>

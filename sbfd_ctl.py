@@ -2348,7 +2348,7 @@ def _zone_number(value):
 
 
 def validate_zone_payload(payload, wan_names, table_len,
-                          keep_level=None) -> tuple:
+                          keep_level=None, keep_wans=None) -> tuple:
     """(ok, zone_or_id, err) for one operator-drawn location zone. Pure.
 
     location_fec.validate_zone stays the authority on what a zone IS, and
@@ -2359,7 +2359,8 @@ def validate_zone_payload(payload, wan_names, table_len,
 
     `keep_level` is the level this zone is ALREADY stored at, when it is an
     update. A level equal to it is accepted whatever the driving table says;
-    the bound below says why."""
+    the bound below says why. `keep_wans` is the same idea for the WAN scope:
+    a payload that never mentions `wans` keeps it."""
     if not isinstance(payload, dict):
         return (False, None, "payload must be an object")
     zid = payload.get("id")
@@ -2402,20 +2403,36 @@ def validate_zone_payload(payload, wan_names, table_len,
     # Same treatment as validate_label, plus a default: this label is
     # published as the REASON a floor was raised, so it has to name something.
     label = "".join(ch for ch in label if ch.isprintable()).strip()[:48] or "zone"
-    wans = payload.get("wans")
-    if wans is None or wans == []:
-        # Absent, null and empty all mean the same thing, and the daemon
-        # spells it None: this zone applies to every WAN.
-        wans = None
-    elif not isinstance(wans, list):
-        return (False, None, "wans must be a list of WAN names")
+    if "wans" not in payload:
+        # ABSENT is not empty. The page draws one checkbox per WAN the map
+        # payload names and can publish none at all (no FEC table, or no
+        # wan_labels in the snapshot yet); a zone scoped to one link, opened
+        # in that state, used to save back as `wans: []` -- which is every
+        # WAN. So the key a payload never mentions keeps whatever is stored.
+        # Deliberately NOT re-checked against wan_names, for keep_level's
+        # reason: preserving a scope can only narrow this zone, never widen
+        # it, and a WAN renamed out of the config must not make its zone
+        # uneditable. Only a list of names can be preserved, whatever the
+        # caller hands us.
+        wans = (list(keep_wans)
+                if isinstance(keep_wans, list)
+                and keep_wans and all(isinstance(w, str) for w in keep_wans)
+                else None)
     else:
-        for w in wans:
-            if not isinstance(w, str):
-                return (False, None, "wans must be a list of WAN names")
-            if w not in wan_names:
-                return (False, None, "unknown wan %s" % w)
-        wans = list(wans)
+        wans = payload.get("wans")
+        if wans is None or wans == []:
+            # Null and empty are how the page asks for every WAN, and the
+            # daemon spells that None.
+            wans = None
+        elif not isinstance(wans, list):
+            return (False, None, "wans must be a list of WAN names")
+        else:
+            for w in wans:
+                if not isinstance(w, str):
+                    return (False, None, "wans must be a list of WAN names")
+                if w not in wan_names:
+                    return (False, None, "unknown wan %s" % w)
+            wans = list(wans)
     suppress = payload.get("suppress_learned", False)
     if not isinstance(suppress, bool):
         return (False, None, "suppress_learned must be true or false")
@@ -2525,6 +2542,31 @@ def stored_zone_level(zones_path, zid):
     return None
 
 
+def stored_zone_wans(zones_path, zid):
+    """The WAN scope a drawn zone is already stored at, or None for "every
+    WAN" -- which is also the answer for a zone that is not there, or stored
+    with a scope that is not a list of names.
+
+    That conflation is safe HERE and only here: the one caller uses this to
+    decide what an update leaves alone, and an id that is not in the file is
+    refused by the write a moment later. Read without _ZONES_LOCK for
+    stored_zone_level's reason: the caller whose write depends on the answer
+    already holds it, and the lock is not reentrant."""
+    raw = _read_json_file(zones_path)
+    zones = raw.get("zones") if isinstance(raw, dict) else None
+    if not isinstance(zones, list):
+        return None
+    for z in zones:
+        if not isinstance(z, dict) or z.get("id") != zid:
+            continue
+        names = z.get("wans")
+        if (isinstance(names, list) and names
+                and all(isinstance(w, str) for w in names)):
+            return list(names)
+        return None
+    return None
+
+
 def _zone_watermark(zones, stored_next):
     """The lowest zone number that has never been handed out.
 
@@ -2620,10 +2662,12 @@ def validate_and_apply_location_zone(zones_path, payload, wan_names,
     with _ZONES_LOCK:
         zid = payload.get("id") if isinstance(payload, dict) else None
         # Only an update can carry a kept level; a create has no id to look up.
-        keep = (stored_zone_level(zones_path, zid)
-                if isinstance(zid, str) and _ZID_RE.match(zid) else None)
+        is_update = isinstance(zid, str) and bool(_ZID_RE.match(zid))
+        keep = stored_zone_level(zones_path, zid) if is_update else None
+        keep_wans = stored_zone_wans(zones_path, zid) if is_update else None
         ok, zone, err = validate_zone_payload(payload, wan_names, table_len,
-                                              keep_level=keep)
+                                              keep_level=keep,
+                                              keep_wans=keep_wans)
         if not ok:
             return (False, None, None, err)
         return (True, zone, _apply_location_zone_locked(zones_path, zone),

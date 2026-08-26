@@ -254,10 +254,32 @@ function buildLevels(chosen) {
   }
 }
 
+// True when the server published no WAN names at all, so there are no boxes
+// to check and `checkedWans()` would answer [] -- which the endpoint reads as
+// EVERY wan. Save omits the key entirely in that state and the server keeps
+// what is stored, rather than silently widening a zone scoped to one link.
+let wansUnavailable = false;
+
 function buildWans(chosen) {
   const row = el("z-wans");
   const wans = (lastLoc && lastLoc.wans) || {};
   row.textContent = "";
+  wansUnavailable = Object.keys(wans).length === 0;
+  // "all WANs when none checked" describes checkboxes that are not there.
+  el("z-wans-hint").hidden = wansUnavailable;
+  if (wansUnavailable) {
+    // No table or no wan_labels in the snapshot yet. Show the stored scope as
+    // text so the operator can still see it, and say why it cannot be edited
+    // here -- an empty row would read as "no WANs", which is the opposite of
+    // what an empty list means.
+    const note = document.createElement("span");
+    note.textContent = (chosen && chosen.length ? chosen.join(", ")
+                                                : "all WANs")
+      + " - WAN list unavailable; a save leaves this unchanged";
+    note.className = "hint";
+    row.appendChild(note);
+    return;
+  }
   Object.keys(wans).forEach((name) => {
     const label = document.createElement("label");
     const box = document.createElement("input");
@@ -438,9 +460,11 @@ el("z-save").onclick = () => {
     radius_m: radiusValue(),
     level: Number(el("z-level").value),
     label: el("z-label").value,
-    wans: checkedWans(),
     suppress_learned: el("z-suppress").checked,
   };
+  // Absent, not empty: [] means every WAN to the endpoint, and with no boxes
+  // rendered that is not something the operator asked for.
+  if (!wansUnavailable) body.wans = checkedWans();
   if (editing.id) body.id = editing.id;
   postZone(body);
 };

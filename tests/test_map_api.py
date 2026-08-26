@@ -1186,3 +1186,67 @@ def test_zones_path_mismatch_is_null_when_it_cannot_be_proved(tmp_path):
     # And the payload always carries the key, so the page never has to guess.
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     assert out["location_fec"]["zones_path_mismatch"] is None
+
+
+# -- round 5: a save must not widen a zone to every WAN ------------------------
+
+
+def test_validate_zone_payload_preserves_wans_the_payload_never_mentions():
+    """Absent is not empty. The page renders one checkbox per WAN the payload
+    names, and publishes none at all when it cannot resolve the WAN labels --
+    so a zone scoped to wan1, opened in that state, used to save back as
+    `wans: []`, which the endpoint reads as EVERY wan. A floor the operator
+    scoped to one link silently applied to all of them.
+
+    An omitted key now keeps what is stored; null and [] still mean all WANs,
+    because that is the only way the page can ask for all of them."""
+    p = _zone_payload(id="z1")
+    p.pop("wans", None)
+    ok, zone, _ = M.validate_zone_payload(p, _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] == ["wan1"]
+    # Explicit still wins in both directions.
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=[]), _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] is None
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=None), _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] is None
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=["wan2"]), _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] == ["wan2"]
+    # Nothing stored (a create): an absent key is still all WANs.
+    p = _zone_payload()
+    p.pop("wans", None)
+    ok, zone, _ = M.validate_zone_payload(p, _WANS, 5)
+    assert ok and zone["wans"] is None
+
+
+def test_a_preserved_wan_list_is_not_re_validated_against_the_live_names():
+    """Like keep_level: preserving what is already stored can never introduce
+    a scope, only keep one. A WAN renamed out of the config would otherwise
+    make its zone uneditable -- or, worse, widen it on the next save."""
+    p = _zone_payload(id="z1")
+    p.pop("wans", None)
+    ok, zone, _ = M.validate_zone_payload(p, _WANS, 5, keep_wans=["wan9"])
+    assert ok and zone["wans"] == ["wan9"]
+    # But naming it explicitly is still refused.
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=["wan9"]), _WANS, 5, keep_wans=["wan9"])
+    assert not ok and "wan9" in err
+
+
+def test_stored_zone_wans_reads_only_a_usable_list(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": [
+        {"id": "z1", "wans": ["wan1"]},
+        {"id": "z2", "wans": None},
+        {"id": "z3", "wans": "wan1"},
+        {"id": "z4", "wans": ["wan1", 7]},
+        {"id": "z5"}]}))
+    assert M.stored_zone_wans(str(p), "z1") == ["wan1"]
+    assert M.stored_zone_wans(str(p), "z2") is None
+    assert M.stored_zone_wans(str(p), "z3") is None
+    assert M.stored_zone_wans(str(p), "z4") is None
+    assert M.stored_zone_wans(str(p), "z5") is None
+    assert M.stored_zone_wans(str(p), "z9") is None
+    assert M.stored_zone_wans(str(tmp_path / "absent.json"), "z1") is None

@@ -2069,3 +2069,36 @@ def test_api_map_reports_no_mismatch_when_the_daemon_agrees(cfg, tmp_path):
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_api_post_location_zone_keeps_the_wan_scope_it_is_not_sent(cfg, tmp_path):
+    """The scope of a live FEC floor may only be widened deliberately. An
+    update that never mentions `wans` keeps the stored list; only an explicit
+    null or [] means every WAN."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+            "label": "dock", "wans": ["wan1"]})
+        assert status == 200 and body["zones"][0]["wans"] == ["wan1"]
+
+        # A label change with no `wans` key at all: the scope survives.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 3, "label": "dock north"})
+        assert body["zones"][0]["label"] == "dock north"
+        assert body["zones"][0]["wans"] == ["wan1"]
+        assert (json.loads(Path(zones_path).read_text())["zones"][0]["wans"]
+                == ["wan1"])
+
+        # Widening is still one explicit save away.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 3, "label": "dock north", "wans": []})
+        assert body["zones"][0]["wans"] is None
+    finally:
+        stop.set()
+        httpd.shutdown()
