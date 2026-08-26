@@ -1739,7 +1739,11 @@ def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
     if now - set_ts > env.auto_override_ttl_s:
         return None
     return AutoOverride(
-        force_full=bool(raw.get("force_full", False)),
+        # Only a real bool may actuate: bool() of any non-empty string is True,
+        # so a hand-edited or corrupt "false" would buy full redundancy — and
+        # full redundancy puts the metered link into the bundle. The record
+        # still loads, so source/reason still reach the readout.
+        force_full=(raw.get("force_full") is True),
         source=str(raw.get("source", "")),
         reason=str(raw.get("reason", "")),
         set_ts=set_ts,

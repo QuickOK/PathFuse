@@ -122,6 +122,44 @@ def test_load_auto_override_live_at_exact_ttl_boundary(tmp_path):
     assert M.load_auto_override(cfg, now=1000.0 + 180.0) is not None
 
 
+def test_load_auto_override_ignores_a_non_bool_force_full(tmp_path):
+    """force_full is the only ACTUATED field in this record, and bool() of any
+    non-empty string is True — so a hand-edited or corrupt file holding the
+    string "false" would have raised the effective mode to full, putting the
+    metered link into the bundle. Only a real bool counts."""
+    cfg = base_cfg(environmental=_env_cfg(tmp_path))
+    for junk in ("false", "true", "0", 1, 0.5, [1], {"x": 1}, None):
+        _write_override(cfg.environmental.auto_override_path,
+                        set_ts=1000.0, force_full=junk)
+        ao = M.load_auto_override(cfg, now=1050.0)
+        assert ao is not None, junk
+        assert ao.force_full is False, junk
+        # ...and the mode-application path agrees: no forced full redundancy.
+        assert M.apply_auto_override("master_backup", env_enabled=True,
+                                     auto=ao) == ("master_backup", None), junk
+
+
+def test_load_auto_override_keeps_source_and_reason_on_a_bad_flag(tmp_path):
+    """Fail-open, not fail-closed: the record still loads so the readout can
+    still say who wrote it and why. Only the actuated flag is neutralized."""
+    cfg = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(cfg.environmental.auto_override_path, set_ts=1000.0,
+                    force_full="false")
+    ao = M.load_auto_override(cfg, now=1050.0)
+    assert ao.source == "environ_ctl" and ao.reason == "precip ahead"
+    assert ao.set_ts == 1000.0
+
+
+def test_load_auto_override_still_forces_full_for_a_real_true(tmp_path):
+    cfg = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(cfg.environmental.auto_override_path, set_ts=1000.0,
+                    force_full=True)
+    ao = M.load_auto_override(cfg, now=1050.0)
+    assert ao.force_full is True
+    assert M.apply_auto_override("master_backup", env_enabled=True,
+                                 auto=ao) == ("full", ao)
+
+
 def test_effective_environmental_enabled_false_when_unconfigured():
     cfg = base_cfg()  # environmental None
     ov = M.RuntimeOverlay()
