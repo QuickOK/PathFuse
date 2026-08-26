@@ -685,3 +685,51 @@ def test_driver_bootstraps_to_the_raw_ranking():
     assert (d, c, s) == ("wan2", None, None)
     assert M.fec_driver_pick({}, set(), None, None, None, DWELL, 1.0) == \
         (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Location floor on the relay leg: the level we resolved for this place has to
+# reach the relay, and what the relay says it is holding has to come back.
+# ---------------------------------------------------------------------------
+
+def test_post_relay_fec_includes_the_location_level(monkeypatch):
+    seen = fake_relay(monkeypatch)
+    ok = M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                          "8:0", 1.0, client_loss_pct=0.4,
+                          wan_profile="wan1", signal_floor=False,
+                          location_level=3)
+    assert ok
+    assert seen["body"]["location_level"] == 3
+
+
+def test_post_relay_fec_serializes_a_zero_location_level(monkeypatch):
+    # 0 is the release, and it must go on the wire: omitting it would leave a
+    # relay holding the last level it was told until the push went stale.
+    seen = fake_relay(monkeypatch)
+    assert M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                            "8:0", 1.0, wan_profile="wan1", location_level=0)
+    assert seen["body"]["location_level"] == 0
+
+
+def test_post_relay_fec_omits_the_location_level_when_none(monkeypatch):
+    # Rolling upgrade: with no level to send the payload must be byte-for-byte
+    # what an older relay already understands.
+    seen = fake_relay(monkeypatch)
+    assert M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                            "20:1", 1.0, client_loss_pct=0.4)
+    assert "location_level" not in seen["body"]
+
+
+def test_relay_fec_direction_echoes_the_location_level():
+    fetch = {"ok": True, "error": None,
+             "data": {"ratio": "8:2", "location_level": 2}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5,
+                              desired=True, last_acked=True)
+    assert d["location_level"] == 2
+
+
+def test_relay_fec_direction_location_level_none_from_an_older_relay():
+    fetch = {"ok": True, "error": None, "data": {"ratio": "8:2"}}
+    d = M.relay_fec_direction(fetch, fetched_at=100.0, now=100.5,
+                              desired=True, last_acked=True)
+    assert d["location_level"] is None

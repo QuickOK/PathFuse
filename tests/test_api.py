@@ -659,7 +659,7 @@ def test_run_controller_publishes_per_direction_fec(cfg_with_fec, monkeypatch):
                                  "driving_loss_pct": 1.2, "since": 5.0}})
     pushed = []
     def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
-                  wan_profile=None, signal_floor=None):
+                  wan_profile=None, signal_floor=None, location_level=None):
         pushed.append((floor_ratio, client_loss_pct))
         return True
     monkeypatch.setattr(M, "post_relay_fec", fake_post)
@@ -746,7 +746,7 @@ def test_run_controller_pushes_wan_profile_and_signal_floor_to_relay(tmp_path, m
                                  "driving_loss_pct": 1.2, "since": 5.0}})
     pushed = []
     def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
-                  wan_profile=None, signal_floor=None):
+                  wan_profile=None, signal_floor=None, location_level=None):
         pushed.append({"wan_profile": wan_profile, "signal_floor": signal_floor})
         return True
     monkeypatch.setattr(M, "post_relay_fec", fake_post)
@@ -824,7 +824,7 @@ def test_run_controller_suppresses_signal_floor_when_full_mode_backoff_gate_clos
                                  "driving_loss_pct": 1.2, "since": 5.0}})
     pushed = []
     def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
-                  wan_profile=None, signal_floor=None):
+                  wan_profile=None, signal_floor=None, location_level=None):
         pushed.append({"wan_profile": wan_profile, "signal_floor": signal_floor})
         return True
     monkeypatch.setattr(M, "post_relay_fec", fake_post)
@@ -913,7 +913,7 @@ def test_run_controller_handoff_window_forces_full_and_publishes(tmp_path, monke
                                  "driving_loss_pct": 0.0, "since": 5.0}})
     monkeypatch.setattr(M, "post_relay_fec",
         lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
-               wan_profile=None, signal_floor=None: True)
+               wan_profile=None, signal_floor=None, location_level=None: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
     Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
@@ -981,7 +981,7 @@ def test_run_controller_disabled_and_relay_unreachable(cfg_with_fec, monkeypatch
         lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec",
         lambda url, t: {"ok": False, "data": None, "error": "transport: unreachable"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None, wan_profile=None, signal_floor=None: False)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None, wan_profile=None, signal_floor=None, location_level=None: False)
     captured = []
     monkeypatch.setattr(M.fec_control, "write_fifo",
         lambda path, ratio, logger=None: (captured.append(ratio), True)[1])
@@ -1027,7 +1027,7 @@ def test_run_controller_publishes_client_wire(cfg_with_fec, monkeypatch):
     monkeypatch.setattr(M, "fetch_relay_fec",
         lambda url, t: {"ok": True, "error": None,
                         "data": {"rx": {"delivered_per_s": 111.0}}})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None, wan_profile=None, signal_floor=None: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None, wan_profile=None, signal_floor=None, location_level=None: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
 
     class FakeTracker:
@@ -1064,7 +1064,7 @@ def test_run_controller_client_wire_none_without_tracker(cfg_with_fec, monkeypat
                                                         "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
     monkeypatch.setattr(M, "fetch_remote_sbfd_state", lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
     monkeypatch.setattr(M, "fetch_relay_fec", lambda url, t: {"ok": False, "data": None, "error": "x"})
-    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None, wan_profile=None, signal_floor=None: True)
+    monkeypatch.setattr(M, "post_relay_fec", lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None, wan_profile=None, signal_floor=None, location_level=None: True)
     monkeypatch.setattr(M.fec_control, "write_fifo", lambda path, ratio, logger=None: True)
     Path(cfg_with_fec.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
     Path(cfg_with_fec.sbfd_local_state).write_text("{}")
@@ -1334,7 +1334,7 @@ def _run_with_location_floor(cfg, tmp_path, monkeypatch, write_ok):
         lambda url, t: {"ok": False, "data": None, "error": "unreachable"})
     monkeypatch.setattr(M, "post_relay_fec",
         lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
-               wan_profile=None, signal_floor=None: False)
+               wan_profile=None, signal_floor=None, location_level=None: False)
     monkeypatch.setattr(M.fec_control, "write_fifo",
                         lambda path, ratio, logger=None: write_ok)
 
@@ -1381,3 +1381,103 @@ def test_location_floor_active_when_the_fifo_took_the_write(
                                    write_ok=True)
     assert fec["location_floor"]["active"] is True
     assert fec["directions"]["client_to_relay"]["ratio"] == "8:6"
+
+
+def _write_location_floor(cfg, level, when=None):
+    import time as _time
+    Path(cfg.location.state_path).write_text(json.dumps({
+        "set_ts": when if when is not None else _time.time(),
+        "wans": {"wan1": {"level": level, "reason": "learned dr79z6n"},
+                 "wan2": {"level": level, "reason": "learned dr79z6n"}}}))
+
+
+def _capture_relay_pushes(cfg, tmp_path, monkeypatch, run_s=0.6, mutate=None):
+    """Run the controller with zero loss everywhere and return the kwargs
+    every post_relay_fec call was handed. `mutate` (a callable) runs on its own
+    thread alongside the loop, so a test can change the floor mid-run."""
+    import threading as _t, time as _time
+    monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda c: set())
+    monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda a: None)
+    monkeypatch.setattr(M, "read_engarde_table_default",
+                        lambda table: {"via": None, "dev": "wg0"})
+    # Zero loss: the quantized loss level in relay_desired stays put, so the
+    # only thing that can trigger a second POST is the location level itself.
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+        lambda p, m: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 0.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+                        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
+    monkeypatch.setattr(M, "fetch_relay_fec",
+        lambda url, t: {"ok": False, "data": None, "error": "unreachable"})
+    pushed = []
+
+    def fake_post(url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
+                  wan_profile=None, signal_floor=None, location_level=None):
+        pushed.append({"wan_profile": wan_profile, "signal_floor": signal_floor,
+                       "location_level": location_level})
+        return True
+
+    monkeypatch.setattr(M, "post_relay_fec", fake_post)
+    monkeypatch.setattr(M.fec_control, "write_fifo",
+                        lambda path, ratio, logger=None: True)
+    Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).write_text("{}")
+
+    stop = _t.Event()
+    _t.Thread(target=lambda: (_time.sleep(run_s), stop.set()), daemon=True).start()
+    if mutate is not None:
+        _t.Thread(target=mutate, daemon=True).start()
+    M.run_controller(cfg, stop_event=stop)
+    return pushed
+
+
+def test_run_controller_pushes_the_location_level_to_the_relay(
+        cfg_with_fec, tmp_path, monkeypatch):
+    """The relay->client leg can only lift itself for a bad place if the level
+    reaches it — this is the loop-level pin that it does."""
+    cfg_with_fec.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    _write_location_floor(cfg_with_fec, 3)
+    pushed = _capture_relay_pushes(cfg_with_fec, tmp_path, monkeypatch)
+    assert pushed, "expected at least one relay POST"
+    assert all(p["location_level"] == 3 for p in pushed)
+
+
+def test_run_controller_pushes_zero_location_level_when_the_toggle_is_off(
+        cfg_with_fec, tmp_path, monkeypatch):
+    """Toggled off, location_floor_for_driver returns level 0 — and 0 must be
+    pushed, not withheld: it is what releases the relay's floor."""
+    cfg_with_fec.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=False,
+        stale_after_s=30.0)
+    _write_location_floor(cfg_with_fec, 3)
+    pushed = _capture_relay_pushes(cfg_with_fec, tmp_path, monkeypatch)
+    assert pushed, "expected at least one relay POST"
+    assert all(p["location_level"] == 0 for p in pushed)
+
+
+def test_run_controller_reposts_when_only_the_location_level_changes(
+        cfg_with_fec, tmp_path, monkeypatch):
+    """The level belongs in relay_desired, or a change would sit unsent until
+    the 30 s heartbeat. Nothing else in the desired tuple moves here."""
+    import time as _time
+    cfg_with_fec.relay = M.RelayCfg("http://x/state", fetch_interval_s=0.5,
+                                    fec_url="http://relay:9276/fec")
+    cfg_with_fec.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    _write_location_floor(cfg_with_fec, 3)
+
+    def drop_to_level_1():
+        _time.sleep(0.8)
+        _write_location_floor(cfg_with_fec, 1)
+
+    pushed = _capture_relay_pushes(cfg_with_fec, tmp_path, monkeypatch,
+                                   run_s=1.8, mutate=drop_to_level_1)
+    levels = [p["location_level"] for p in pushed]
+    assert levels[0] == 3
+    assert levels[-1] == 1, f"expected a re-post at the new level, got {levels}"
