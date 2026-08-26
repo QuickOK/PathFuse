@@ -832,3 +832,27 @@ def test_load_location_floor_rejects_future_set_ts(tmp_path):
     Path(c.location.state_path).write_text(json.dumps(
         {"set_ts": 1005.0, "wans": {"wan1": {"level": 9, "reason": ""}}}))
     assert M.load_location_floor(c, 1001.0) == {"wan1": {"level": 9, "reason": ""}}
+
+
+def test_load_auto_override_rejects_nan_set_ts(tmp_path):
+    """json.loads accepts the bareword NaN, and every comparison against NaN is
+    False — so `now - set_ts > ttl` would call it fresh forever."""
+    c = base_cfg(environmental=_env_cfg(tmp_path))
+    Path(c.environmental.auto_override_path).write_text(
+        '{"set_ts": NaN, "force_full": true}')
+    assert M.load_auto_override(c, 1001.0) is None
+
+
+def test_load_auto_override_rejects_a_future_set_ts(tmp_path):
+    c = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(c.environmental.auto_override_path, set_ts=9999999.0)
+    assert M.load_auto_override(c, 1001.0) is None
+
+
+def test_load_auto_override_allows_small_clock_skew(tmp_path):
+    """Inside the 5 s skew band a slightly-ahead writer is still trusted."""
+    c = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(c.environmental.auto_override_path, set_ts=1005.0,
+                    force_full=True)
+    ao = M.load_auto_override(c, 1001.0)
+    assert ao is not None and ao.force_full is True

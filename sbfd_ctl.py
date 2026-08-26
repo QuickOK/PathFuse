@@ -1746,6 +1746,12 @@ def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
     except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
             OverflowError):
         return None
+    # Same guard, same reason as load_cell_handoff: json.loads accepts the
+    # bareword NaN/Infinity, and the staleness test below is a comparison that
+    # either defeats — holding forced full mode open with no expiry. A far-
+    # future set_ts does the same, so reject it past a clock-skew band.
+    if not math.isfinite(set_ts) or set_ts > now + 5.0:
+        return None
     if now - set_ts > env.auto_override_ttl_s:
         return None
     return AutoOverride(
