@@ -28,6 +28,34 @@ def test_resolve_map_cfg_overrides_merge():
     assert m["tile_cache"]["max_zoom"] == 17
 
 
+def test_resolve_map_cfg_coerces_an_unusable_location_zones_path(caplog):
+    """`Path(map_cfg["location_zones_path"])` reaches the POST handler at
+    /api/location-zone with whatever this function hands back. A non-string
+    (None from `"location_zones_path": null`, or an int), an empty string, or
+    a path with an embedded NUL all raise out of Path()/open() as a TypeError
+    or ValueError the handler does not catch -- an uncaught 500 on a value
+    that /api/map already tolerates (it just yields no operator zones).
+    Coerced here, every consumer -- the endpoint and /api/map -- agrees on
+    what's usable, mirroring location_fec.py's _zones_path for
+    operator_zones_path."""
+    default = "/var/lib/sbfd-ctl/location_zones.json"
+    for bad in (None, 7, "", "/var/lib/zo\0nes.json"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            m = M.resolve_map_cfg({"location_zones_path": bad})
+        assert m["location_zones_path"] == default
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "location_zones_path" in warnings[0].getMessage()
+
+
+def test_resolve_map_cfg_leaves_a_normal_location_zones_path_untouched(caplog):
+    with caplog.at_level(logging.WARNING):
+        m = M.resolve_map_cfg({"location_zones_path": "/mnt/zones.json"})
+    assert m["location_zones_path"] == "/mnt/zones.json"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 def test_validate_label_happy_path():
     ok, sid, label, err = M.validate_label({"id": "s3", "label": "Depot 7"})
     assert ok and sid == "s3" and label == "Depot 7"

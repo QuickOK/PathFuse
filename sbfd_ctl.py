@@ -2303,7 +2303,18 @@ _ZID_RE = re.compile(r"^z[0-9]+$")
 
 def resolve_map_cfg(raw) -> dict:
     """Merge the optional config `map` section over deployment defaults
-    (one level deep — the nested gpsd/tile_cache dicts merge key-wise)."""
+    (one level deep — the nested gpsd/tile_cache dicts merge key-wise).
+
+    `location_zones_path` is coerced back to its default here when it is not
+    a usable path -- not a string, empty, or carrying an embedded NUL -- the
+    same test location_fec.py's `_zones_path` applies to
+    `operator_zones_path`, and for the same reason: a non-string reaches
+    `Path(...)` in the /api/location-zone POST handler as an uncaught
+    TypeError (a 500), while /api/map merely yields no operator-zone rows for
+    the same value. Coercing it here, once, at resolve time means every
+    consumer of this dict agrees on what's usable instead of each guarding
+    (or failing to guard) it separately. Called once per server start, so the
+    warning fires at most once per bad config, not once per request."""
     out = {k: (dict(v) if isinstance(v, dict) else v)
            for k, v in _MAP_DEFAULTS.items()}
     if isinstance(raw, dict):
@@ -2312,6 +2323,13 @@ def resolve_map_cfg(raw) -> dict:
                 out[k].update(v)
             else:
                 out[k] = v
+    lzp = out.get("location_zones_path")
+    if not (isinstance(lzp, str) and lzp and "\0" not in lzp):
+        default = _MAP_DEFAULTS["location_zones_path"]
+        logging.warning(
+            "map.location_zones_path %r is not a usable path; using %s",
+            lzp, default)
+        out["location_zones_path"] = default
     return out
 
 
