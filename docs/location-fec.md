@@ -18,7 +18,8 @@ Every second the daemon reads the vehicle's position from gpsd and the loss
 
 ```json
 {"set_ts": 1750000000.0, "source": "location_fec",
- "wans": {"wan1": {"level": 3, "reason": "learned dr79z6n (4 passes)"}}}
+ "wans": {"wan1": {"level": 3, "reason": "learned dr79z6n (4 passes)"}},
+ "operator_zones_path": "/var/lib/sbfd-ctl/location_zones.json"}
 ```
 
 `sbfd-ctl` reads it every tick. For the WAN currently **driving** FEC, the
@@ -68,7 +69,14 @@ Open the `:8081` map, press **Zones**, and click where the bad stretch is. The
 editor opens at that point: name it, drag the radius until the circle covers
 the place, choose a level, tick the WANs it applies to, and Save. Click a zone
 you drew to edit or delete it; Escape cancels. Leave every WAN unticked to
-cover all of them.
+cover all of them. Deleting asks first, and names the zone: ids are never
+reused, so the zone you delete can only be drawn again, never restored.
+
+The WAN boxes come from the labels in the published state. Where that is not
+available yet — no FEC section, or no snapshot — the panel shows the zone's
+stored WAN scope as plain text and says so, and a save leaves that scope
+exactly as it is. An empty list means *every* WAN, so a panel with no boxes to
+tick must never be able to send one.
 
 Each level in the list names its ratio and what it costs — `level 3 — 8:6 (75%
 overhead)` — on the loss table of the link **currently driving FEC**, so the
@@ -92,6 +100,17 @@ Drawn zones live in `/var/lib/sbfd-ctl/location_zones.json`. `sbfd-ctl` writes
 it and `location_fec` re-reads it whenever the file changes, so a zone takes
 effect within a poll — no signal, no restart. A missing file simply means no
 drawn zones; an unusable one is logged once and treated the same way.
+
+Two settings name that file: `map.location_zones_path` in `sbfd-ctl.json`,
+which is where the map SAVES, and `operator_zones_path` in
+`location-fec.json`, which is what the daemon READS. They default to the same
+file and nothing ties them together, so the daemon publishes the path it is
+reading and the map compares the two. Diverged, the editor names the daemon's
+file and refuses to save — a save that cannot take effect must not look like
+one that did. The map says nothing unless it can prove the divergence: a
+record that is absent, stale or from an older daemon leaves the editor alone.
+An `operator_zones_path` that is not a path at all (a `null`, a number) is
+logged and treated as the default rather than taking the poll down with it.
 
 At most 200 zones can be drawn. Every zone is walked once per look-ahead point
 in the 1 Hz loop and rides in every map poll, so the collection is bounded;
@@ -170,6 +189,8 @@ restart, and the reload says so.
 | corrupt store | starts empty, one log line |
 | invalid zone | logged and skipped |
 | drawn-zone file missing or corrupt | no drawn zones, one log line; config zones and learning are unaffected |
+| `operator_zones_path` not a path | one log line, the default path is used; floors keep publishing |
+| map and daemon pointed at different zone files | the map names the daemon's file and disables Save; floors are unaffected |
 
 Known hole: in a tunnel the fix dies where the link does, so nothing is learned
 there. The approach tiles usually still learn; a manual zone covers the rest.
