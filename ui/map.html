@@ -20,6 +20,27 @@
   #ctl button.on { border-color: #7c7; color: #cfc; }
   .veh-icon { color: #4af; font-size: 26px; text-shadow: 0 0 4px #000; }
   .stn-tip { font: 12px system-ui, sans-serif; }
+  #zone-editor { position: absolute; right: 14px; bottom: 14px; z-index: 1000;
+    width: 300px; background: rgba(17,17,17,.92); color: #eee;
+    font: 13px/1.5 system-ui, sans-serif; padding: 10px 12px;
+    border-radius: 8px; }
+  #zone-editor .row { display: flex; align-items: center; gap: 6px;
+    margin-bottom: 6px; }
+  #zone-editor .k { width: 52px; color: #aaa; flex: none; }
+  #zone-editor input[type=text], #zone-editor select {
+    flex: 1; min-width: 0; background: #222; color: #eee;
+    border: 1px solid #555; border-radius: 4px; padding: 3px 5px;
+    font: 13px system-ui, sans-serif; }
+  #zone-editor input[type=range] { flex: 1; min-width: 0; }
+  #zone-editor button { background: #222; color: #eee; border: 1px solid #555;
+    border-radius: 6px; padding: 5px 10px; margin-right: 6px;
+    font: 13px system-ui, sans-serif; }
+  #zone-editor #z-delete { border-color: #a44; color: #faa; }
+  #zone-editor option.dim { color: #888; }
+  #z-wans { display: flex; flex-wrap: wrap; gap: 8px; }
+  #z-radius-m, .hint { color: #aaa; }
+  #z-error { color: #f99; }
+  #z-error:empty { display: none; }
 </style>
 </head>
 <body>
@@ -28,6 +49,36 @@
 <div id="ctl">
   <button id="follow" class="on">Follow</button>
   <button id="radar" class="on">Radar</button>
+  <button id="zones">Zones</button>
+</div>
+<div id="zone-editor" hidden>
+  <div class="row">
+    <span class="k">Label</span>
+    <input id="z-label" type="text" maxlength="48" placeholder="zone">
+  </div>
+  <div class="row">
+    <span class="k">Radius</span>
+    <input id="z-radius" type="range" min="50" max="2000" step="25" value="300">
+    <span id="z-radius-m">300 m</span>
+  </div>
+  <div class="row">
+    <span class="k">Level</span>
+    <select id="z-level"></select>
+  </div>
+  <div class="row">
+    <span class="k">WANs</span>
+    <span id="z-wans"></span>
+  </div>
+  <div class="row hint">all WANs when none checked</div>
+  <div class="row">
+    <label><input id="z-suppress" type="checkbox"> ignore learned loss here</label>
+  </div>
+  <div class="row" id="z-error"></div>
+  <div class="row">
+    <button id="z-save">Save</button>
+    <button id="z-delete">Delete</button>
+    <button id="z-cancel">Cancel</button>
+  </div>
 </div>
 <script src="/vendor/leaflet.js"></script>
 <script src="/map.js"></script>
