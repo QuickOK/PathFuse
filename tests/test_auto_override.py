@@ -122,6 +122,44 @@ def test_load_auto_override_live_at_exact_ttl_boundary(tmp_path):
     assert M.load_auto_override(cfg, now=1000.0 + 180.0) is not None
 
 
+def test_load_auto_override_ignores_a_non_bool_force_full(tmp_path):
+    """force_full is the only ACTUATED field in this record, and bool() of any
+    non-empty string is True — so a hand-edited or corrupt file holding the
+    string "false" would have raised the effective mode to full, putting the
+    metered link into the bundle. Only a real bool counts."""
+    cfg = base_cfg(environmental=_env_cfg(tmp_path))
+    for junk in ("false", "true", "0", 1, 0.5, [1], {"x": 1}, None):
+        _write_override(cfg.environmental.auto_override_path,
+                        set_ts=1000.0, force_full=junk)
+        ao = M.load_auto_override(cfg, now=1050.0)
+        assert ao is not None, junk
+        assert ao.force_full is False, junk
+        # ...and the mode-application path agrees: no forced full redundancy.
+        assert M.apply_auto_override("master_backup", env_enabled=True,
+                                     auto=ao) == ("master_backup", None), junk
+
+
+def test_load_auto_override_keeps_source_and_reason_on_a_bad_flag(tmp_path):
+    """Fail-open, not fail-closed: the record still loads so the readout can
+    still say who wrote it and why. Only the actuated flag is neutralized."""
+    cfg = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(cfg.environmental.auto_override_path, set_ts=1000.0,
+                    force_full="false")
+    ao = M.load_auto_override(cfg, now=1050.0)
+    assert ao.source == "environ_ctl" and ao.reason == "precip ahead"
+    assert ao.set_ts == 1000.0
+
+
+def test_load_auto_override_still_forces_full_for_a_real_true(tmp_path):
+    cfg = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(cfg.environmental.auto_override_path, set_ts=1000.0,
+                    force_full=True)
+    ao = M.load_auto_override(cfg, now=1050.0)
+    assert ao.force_full is True
+    assert M.apply_auto_override("master_backup", env_enabled=True,
+                                 auto=ao) == ("full", ao)
+
+
 def test_effective_environmental_enabled_false_when_unconfigured():
     cfg = base_cfg()  # environmental None
     ov = M.RuntimeOverlay()
@@ -737,6 +775,31 @@ def test_runtime_overlay_still_honours_a_real_bool_location_fec_enabled(tmp_path
     assert M.effective_location_fec_enabled(c, ov) is True
 
 
+def test_runtime_overlay_ignores_a_non_bool_environmental_enabled(tmp_path):
+    """Same hand-edit hazard as location_fec_enabled: bool("false") is True, so
+    a persist file saying the operator turned environmental off would have
+    turned it on. An unusable value means "no operator opinion"."""
+    c = base_cfg(environmental=_env_cfg(tmp_path, enabled=False),
+                 runtime_state=str(tmp_path / "r.json"),
+                 persist_state=str(tmp_path / "p.json"))
+    Path(c.persist_state).write_text(json.dumps({
+        "set_by": "hand", "set_ts": 1.0, "environmental_enabled": "false"}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.environmental_enabled is None
+    assert M.effective_environmental_enabled(c, ov) is False   # config default
+
+
+def test_runtime_overlay_still_honours_a_real_bool_environmental_enabled(tmp_path):
+    c = base_cfg(environmental=_env_cfg(tmp_path, enabled=False),
+                 runtime_state=str(tmp_path / "r.json"),
+                 persist_state=str(tmp_path / "p.json"))
+    Path(c.persist_state).write_text(json.dumps({
+        "set_by": "ui", "set_ts": 1.0, "environmental_enabled": True}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.environmental_enabled is True
+    assert M.effective_environmental_enabled(c, ov) is True
+
+
 def _oversized_set_ts_json(extra=""):
     """A JSON integer with more digits than a double can hold. json.loads keeps
     it as a Python int, and float() on it raises OverflowError rather than
@@ -807,3 +870,27 @@ def test_load_location_floor_rejects_future_set_ts(tmp_path):
     Path(c.location.state_path).write_text(json.dumps(
         {"set_ts": 1005.0, "wans": {"wan1": {"level": 9, "reason": ""}}}))
     assert M.load_location_floor(c, 1001.0) == {"wan1": {"level": 9, "reason": ""}}
+
+
+def test_load_auto_override_rejects_nan_set_ts(tmp_path):
+    """json.loads accepts the bareword NaN, and every comparison against NaN is
+    False — so `now - set_ts > ttl` would call it fresh forever."""
+    c = base_cfg(environmental=_env_cfg(tmp_path))
+    Path(c.environmental.auto_override_path).write_text(
+        '{"set_ts": NaN, "force_full": true}')
+    assert M.load_auto_override(c, 1001.0) is None
+
+
+def test_load_auto_override_rejects_a_future_set_ts(tmp_path):
+    c = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(c.environmental.auto_override_path, set_ts=9999999.0)
+    assert M.load_auto_override(c, 1001.0) is None
+
+
+def test_load_auto_override_allows_small_clock_skew(tmp_path):
+    """Inside the 5 s skew band a slightly-ahead writer is still trusted."""
+    c = base_cfg(environmental=_env_cfg(tmp_path))
+    _write_override(c.environmental.auto_override_path, set_ts=1005.0,
+                    force_full=True)
+    ao = M.load_auto_override(c, 1001.0)
+    assert ao is not None and ao.force_full is True

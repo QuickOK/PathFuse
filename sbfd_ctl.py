@@ -946,25 +946,9 @@ def resolve_fec_profile(fec_cfg, driver_wan):
 
 
 def fec_reseed_runtime(rt, old_table, new_table, now):
-    """Re-base the adaptive runtime onto a new profile's table on a driver swap.
-
-    Carries the ADAPTIVE level's ratio, never the ratio actually applied: under
-    min_adaptive the applied value is floor-lifted, so reseeding from it hands
-    the engine a level it never chose. Live case (2026-08-04): the default
-    profile was applying the 8:1 config floor over an idle level 0, and 8:1 is
-    the TOP rung of the cellular table — so entering full redundancy reseeded
-    the wan1 profile at maximum parity against 0% loss, and its 60s ramp-down
-    hold pinned 8:1 for a full minute before the profile's own 12:1 floor could
-    take effect. A ratio the new table has no rung for still lands at 0 and
-    re-ramps (one tick on cellular).
-
-    The ramp-down clock restarts at the swap by design: the incoming profile's
-    hold is its own, not something the outgoing one has already served.
-    """
-    ratio = fec_control.level_to_ratio(rt.current_level,
-                                       old_table or new_table)
-    return fec_control.FecRuntime(
-        fec_control.ratio_to_level(ratio, new_table), 0, now)
+    """Client-side name for fec_control.reseed_runtime, which both legs share.
+    The rationale (and the live incident behind it) lives with the helper."""
+    return fec_control.reseed_runtime(rt, old_table, new_table, now)
 
 
 def fec_profile_candidates(cfg: Config, ov: RuntimeOverlay):
@@ -1664,12 +1648,15 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_mode=loaded_fec_mode,
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
                 fec_floor_ratio=raw.get("fec_floor_ratio"),
-                environmental_enabled=raw.get("environmental_enabled"),
                 # Only a real bool is an operator opinion. The API path
                 # already refuses anything else, but this file can be hand
                 # edited, and bool("false") is True — so "off" written by hand
-                # would have switched the floor ON. None lets the config
+                # would have switched the feature ON. None lets the config
                 # default stand, which is what an unusable value means.
+                environmental_enabled=(
+                    raw.get("environmental_enabled")
+                    if isinstance(raw.get("environmental_enabled"), bool)
+                    else None),
                 location_fec_enabled=(
                     raw.get("location_fec_enabled")
                     if isinstance(raw.get("location_fec_enabled"), bool)
@@ -1743,10 +1730,20 @@ def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
     except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
             OverflowError):
         return None
+    # Same guard, same reason as load_cell_handoff: json.loads accepts the
+    # bareword NaN/Infinity, and the staleness test below is a comparison that
+    # either defeats — holding forced full mode open with no expiry. A far-
+    # future set_ts does the same, so reject it past a clock-skew band.
+    if not math.isfinite(set_ts) or set_ts > now + 5.0:
+        return None
     if now - set_ts > env.auto_override_ttl_s:
         return None
     return AutoOverride(
-        force_full=bool(raw.get("force_full", False)),
+        # Only a real bool may actuate: bool() of any non-empty string is True,
+        # so a hand-edited or corrupt "false" would buy full redundancy — and
+        # full redundancy puts the metered link into the bundle. The record
+        # still loads, so source/reason still reach the readout.
+        force_full=(raw.get("force_full") is True),
         source=str(raw.get("source", "")),
         reason=str(raw.get("reason", "")),
         set_ts=set_ts,
@@ -2342,6 +2339,13 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+# Parsed tile store, keyed by (path, mtime_ns, size, inode). The map polls every 3s
+# and the store changes at walking pace, so re-reading and re-validating it per
+# request is pure waste — and a malformed store logged its "dropped N malformed
+# entries" warning on every one of those polls.
+_STORE_MEMO = {"path": None, "stat": None, "store": None}
+
+
 def map_location_layer(store_path, zones_path, fix, max_tiles):
     """Learned tiles (nearest the fix first, capped) and operator zones for
     the map. Degrades to empty lists: a broken source must never 500 the
@@ -2350,15 +2354,36 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
     import tile_store
     import station_tracker
     out = {"tiles": [], "zones": []}
-    raw = _read_json_file(store_path)
-    # Parse through the store's OWN validator rather than passing per-WAN
-    # entries through raw: it drops malformed entries and coerces the numbers,
-    # and it never raises. The map page does arithmetic on these values
-    # (`(v.ewma_loss || 0).toFixed(1)`), so a string here is a client-side
-    # exception, not a cosmetic wart. from_dict on a non-dict logs and starts
-    # empty, so only call it when there is something to parse.
-    store = (tile_store.TileStore.from_dict(raw) if isinstance(raw, dict)
-             else tile_store.TileStore())
+    try:
+        st = os.stat(store_path)
+        # The inode is in the key because mtime_ns + size alone cannot tell a
+        # rewrite that reproduces both from no change at all; the writer's
+        # tmp + os.replace always lands a new one.
+        stat_key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except (OSError, ValueError):
+        # No store, unreadable, or an unusable path (os.stat raises ValueError,
+        # not OSError, on an embedded NUL — the read below used to absorb that
+        # one): an empty layer, and nothing to memoize.
+        _STORE_MEMO.update({"path": None, "stat": None, "store": None})
+        stat_key = None
+    if stat_key is not None and (_STORE_MEMO["path"] == store_path
+                                 and _STORE_MEMO["stat"] == stat_key):
+        store = _STORE_MEMO["store"]
+    elif stat_key is None:
+        store = tile_store.TileStore()
+    else:
+        raw = _read_json_file(store_path)
+        # Parse through the store's OWN validator rather than passing per-WAN
+        # entries through raw: it drops malformed entries and coerces the
+        # numbers, and it never raises. The map page does arithmetic on these
+        # values (`(v.ewma_loss || 0).toFixed(1)`), so a string here is a
+        # client-side exception, not a cosmetic wart. from_dict on a non-dict
+        # logs and starts empty, so only call it when there is something to
+        # parse.
+        store = (tile_store.TileStore.from_dict(raw) if isinstance(raw, dict)
+                 else tile_store.TileStore())
+        _STORE_MEMO.update({"path": store_path, "stat": stat_key,
+                            "store": store})
     residual = store.residual
     rows = []
     for tid, per_wan in store.tiles.items():
@@ -2455,7 +2480,9 @@ def get_map_fix(host, port):
     fix = None
     try:
         import environ_ctl
-        fix = environ_ctl.get_fix(host, port, timeout=1.5)
+        # quiet=True: the map polls every 3s, so a down gpsd would otherwise
+        # write a WARNING per poll for as long as a page stays open.
+        fix = environ_ctl.get_fix(host, port, timeout=1.5, quiet=True)
     except Exception as e:  # noqa: BLE001 - map shows "no gps" instead
         logging.debug("map gpsd read failed: %s", e)
     _GPS_MEMO["ts"] = now
