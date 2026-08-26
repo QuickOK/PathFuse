@@ -3,7 +3,7 @@ import sbfd_ctl as M
 
 def cfg():
     return M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),

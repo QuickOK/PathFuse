@@ -12,7 +12,7 @@ import fec_control
 @pytest.fixture
 def cfg(tmp_path: Path):
     return M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -420,7 +420,7 @@ def test_validate_runtime_payload_rejects_bad_fec_enabled():
 @pytest.fixture
 def cfg_with_fec(tmp_path: Path):
     return M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -701,7 +701,7 @@ def test_run_controller_pushes_wan_profile_and_signal_floor_to_relay(tmp_path, m
     import threading as _t
     cell_state = tmp_path / "cell.json"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -778,7 +778,7 @@ def test_run_controller_suppresses_signal_floor_when_full_mode_backoff_gate_clos
     import threading as _t
     cell_state = tmp_path / "cell.json"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -857,7 +857,7 @@ def test_run_controller_handoff_window_forces_full_and_publishes(tmp_path, monke
     cell_state = tmp_path / "cell.json"
     handoff_path = tmp_path / "cell_handoff.json"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
