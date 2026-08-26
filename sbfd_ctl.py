@@ -1815,20 +1815,23 @@ def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
     return out
 
 
-def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
-    """{wan: {level, reason}} from location_fec.py, or None when unconfigured,
-    missing, malformed, or older than stale_after_s. Fail-open like
-    load_auto_override: a floor that cannot be read is no floor. Only `level`
-    is trusted, and only as a non-bool int — it crosses a process boundary.
+def fresh_location_record(loc_cfg, now: float) -> Optional[dict]:
+    """The record location_fec.py published, or None when it is unconfigured,
+    missing, malformed, or older than stale_after_s.
 
-    Finiteness and future-timestamp guards match load_cell_handoff's
+    Fail-open like load_auto_override: a record that cannot be read is no
+    record. Finiteness and future-timestamp guards match load_cell_handoff's
     precedent below: json.loads accepts the bareword NaN, and
     `now - set_ts > stale_after_s` is False forever against it, making the
-    staleness gate inert -- a dead daemon's floor would hold forever."""
-    if cfg.location is None:
+    staleness gate inert -- a dead daemon's floor would hold forever.
+
+    Split out from load_location_floor because a second reader wants the same
+    record under the same freshness rule: whichever zone file the daemon says
+    it is reading is worth nothing if the daemon that said it is gone."""
+    if loc_cfg is None:
         return None
     try:
-        raw = _json.loads(Path(cfg.location.state_path).read_text())
+        raw = _json.loads(Path(loc_cfg.state_path).read_text())
         set_ts = float(raw["set_ts"])
     except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
             OverflowError):
@@ -1837,7 +1840,17 @@ def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
         return None
     if set_ts > now + 5.0:
         return None
-    if now - set_ts > cfg.location.stale_after_s:
+    if now - set_ts > loc_cfg.stale_after_s:
+        return None
+    return raw
+
+
+def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
+    """{wan: {level, reason}} from location_fec.py, or None when unconfigured,
+    missing, malformed, or older than stale_after_s. Only `level` is trusted,
+    and only as a non-bool int — it crosses a process boundary."""
+    raw = fresh_location_record(cfg.location, now)
+    if raw is None:
         return None
     wans_raw = raw.get("wans")
     if wans_raw is None:
@@ -2796,14 +2809,42 @@ def map_fec_levels(table):
     return out
 
 
+def location_zones_path_mismatch(loc_cfg, map_cfg, now) -> Optional[str]:
+    """The drawn-zone file location_fec says it is READING, when that is not
+    the file this process writes; None when they agree or we cannot tell.
+
+    There is no config file shared between the two processes:
+    `map.location_zones_path` here and `operator_zones_path` in
+    location-fec.json default to the same file and are set independently.
+    Diverged, every save returns 200 and draws its circle while the daemon
+    reads a file nobody writes — the feature simply appears not to work. This
+    is what makes that loud, so the answer must be evidence: a record that is
+    absent, stale, unparseable, or from a daemon too old to publish the key
+    proves nothing and reports nothing. Compared through normpath, because
+    two spellings of one file are not a mismatch either.
+
+    Never raises: it is called while building /api/map."""
+    raw = fresh_location_record(loc_cfg, now)
+    theirs = raw.get("operator_zones_path") if isinstance(raw, dict) else None
+    ours = map_cfg.get("location_zones_path") if isinstance(map_cfg, dict) else None
+    if not (isinstance(theirs, str) and theirs
+            and isinstance(ours, str) and ours):
+        return None
+    if os.path.normpath(theirs) == os.path.normpath(ours):
+        return None
+    return theirs
+
+
 def assemble_map_payload(map_cfg, published_state_path, fix, now,
-                         fec_cfg=None) -> dict:
+                         fec_cfg=None, location_cfg=None) -> dict:
     """Aggregate every map data source; each degrades independently to
     null/empty — a broken source must never 500 the endpoint.
 
     `fec_cfg` is what lets the page explain a level to the operator drawing a
     zone. It is optional so a caller that only wants positions need not have
-    one; without it the level keys are present but empty, never absent."""
+    one; without it the level keys are present but empty, never absent.
+    `location_cfg` is optional on the same terms: without it the page is told
+    nothing about the daemon's zone file rather than told it disagrees."""
     st = _read_json_file(map_cfg["stations_path"]) or {}
     labels = _read_json_file(map_cfg["labels_path"])
     labels = labels if isinstance(labels, dict) else {}
@@ -2844,6 +2885,11 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now,
         if table else None)
     location["wans"] = (wan_labels
                         if table and isinstance(wan_labels, dict) else {})
+    # Null unless we can PROVE the daemon is reading some other file. The page
+    # disables Save on this, so a guess here would take the editor away from
+    # an operator whose box is working perfectly.
+    location["zones_path_mismatch"] = location_zones_path_mismatch(
+        location_cfg, map_cfg, now)
     return {"ts": now,
             "fix": out_fix,
             "stations": stations,
@@ -3096,7 +3142,7 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 fix = get_map_fix(g["host"], g["port"])
                 self._send_json(200, assemble_map_payload(
                     map_cfg, cfg.published_state, fix, time.time(),
-                    fec_cfg=cfg.fec))
+                    fec_cfg=cfg.fec, location_cfg=cfg.location))
             elif (m := _TILE_RE.match(self.path)):
                 self._serve_tile(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             else:

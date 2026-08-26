@@ -558,15 +558,26 @@ def fresh_fix(fix, now_wall, max_age_s):
     return fix
 
 
-def build_record(levels, now_wall):
+def build_record(levels, now_wall, operator_zones_path=None):
     """The published contract. LEVEL is the actuated field — each WAN profile
     has its own loss table, so a ratio resolved here could mean something
     different by the time sbfd-ctl applies it. Only non-zero levels are
-    published; an empty `wans` is an explicit withdrawal."""
-    return {"set_ts": now_wall,
-            "source": "location_fec",
-            "wans": {w: {"level": v["level"], "reason": v["reason"]}
-                     for w, v in levels.items() if v["level"] > 0}}
+    published; an empty `wans` is an explicit withdrawal.
+
+    `operator_zones_path` is the drawn-zone file this daemon is READING. It
+    rides along because sbfd-ctl writes the map's zones to a path configured
+    separately, in a different file, in a different process: when the two
+    diverge the save returns 200, the map draws the circle, and no floor ever
+    moves. Saying which file we read is what lets the map name the mismatch.
+    Additive and optional — an older reader ignores unknown keys, and a value
+    that is not a path is left out rather than published as a lie."""
+    out = {"set_ts": now_wall,
+           "source": "location_fec",
+           "wans": {w: {"level": v["level"], "reason": v["reason"]}
+                    for w, v in levels.items() if v["level"] > 0}}
+    if isinstance(operator_zones_path, str) and operator_zones_path:
+        out["operator_zones_path"] = operator_zones_path
+    return out
 
 
 def write_record(path, record):
@@ -585,9 +596,10 @@ def poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
     `operator_zones` are the map-drawn ones. They are simply appended to the
     configured list: downstream a zone is a zone, and the two sources combine
     by max like any other pair of terms."""
+    zones_path = cfg.operator_zones_path
     if fix is None:
         store.observe(None, {}, None, now_mono, now_wall)
-        return build_record({}, now_wall)
+        return build_record({}, now_wall, operator_zones_path=zones_path)
     tile = tile_store.encode(fix[0], fix[1], cfg.precision)
     zones = list(cfg.zones) + list(operator_zones or ())
     wans = set(cfg.wans)
@@ -599,7 +611,7 @@ def poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
         wans |= set(zone.get("wans") or [])
     wans = sorted(wans)
     if not wans:
-        return build_record({}, now_wall)
+        return build_record({}, now_wall, operator_zones_path=zones_path)
     levels = resolve(store, fix, zones, wans, cfg.table,
                      precision=cfg.precision, lookahead_s=cfg.lookahead_s,
                      min_speed_ms=cfg.min_speed_ms,
@@ -610,7 +622,7 @@ def poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
         if level != levels[wan]["level"]:
             levels[wan] = {"level": level,
                            "reason": f"exit hold ({hold.reason_for(wan)})"}
-    return build_record(levels, now_wall)
+    return build_record(levels, now_wall, operator_zones_path=zones_path)
 
 
 _running = True

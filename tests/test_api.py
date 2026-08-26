@@ -2020,3 +2020,52 @@ def test_validate_zone_payload_only_deletes_on_a_real_true():
         {"id": "z1", "delete": False, "lat": 41.1, "lon": -73.5,
          "radius_m": 300, "level": 2}, {"wan1"}, 5)
     assert ok and zone["id"] == "z1" and "delete" not in zone
+
+
+def test_api_map_names_a_zone_file_the_daemon_is_not_reading(cfg, tmp_path):
+    """End to end: the daemon publishes the path it reads, /api/map compares
+    it against the path this process writes, and the page is told which file
+    to go and look at. Without cfg.location reaching the payload the operator
+    gets a 200, a drawn circle, and no floor."""
+    import time as _time
+    _zone_cfg(cfg, tmp_path)
+    cfg.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    Path(cfg.location.state_path).write_text(json.dumps({
+        "set_ts": _time.time(), "source": "location_fec", "wans": {},
+        "operator_zones_path": theirs}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            loc = json.loads(r.read())["location_fec"]
+        assert loc["zones_path_mismatch"] == theirs
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_map_reports_no_mismatch_when_the_daemon_agrees(cfg, tmp_path):
+    import time as _time
+    zones_path = _zone_cfg(cfg, tmp_path)
+    cfg.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    Path(cfg.location.state_path).write_text(json.dumps({
+        "set_ts": _time.time(), "source": "location_fec", "wans": {},
+        "operator_zones_path": zones_path}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            loc = json.loads(r.read())["location_fec"]
+        assert loc["zones_path_mismatch"] is None
+    finally:
+        stop.set()
+        httpd.shutdown()

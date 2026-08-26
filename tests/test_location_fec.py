@@ -792,3 +792,31 @@ def test_floors_still_publish_when_the_zone_path_is_unusable(tmp_path):
                       fix=(41.1, -73.5, 0.0, None), state=None,
                       now_mono=0.0, now_wall=1000.0, operator_zones=drawn)
     assert rec["wans"]["wan1"]["level"] == 2
+
+
+def test_the_published_record_names_the_zone_file_it_is_reading(tmp_path):
+    """sbfd-ctl writes the drawn zones to ITS configured path and this daemon
+    reads THIS one; nothing shares the two settings. Publishing the path we
+    actually read is what lets the map say so, instead of drawing a zone that
+    silently steers nothing."""
+    drawn = tmp_path / "drawn.json"
+    cfg = M.load_location_config(
+        _cfg_raw(tmp_path, operator_zones_path=str(drawn)))
+    rec = M.poll_once(cfg, T.TileStore(), M.ExitHold(cfg.exit_hold_s),
+                      fix=(41.1, -73.5, 0.0, None), state=None,
+                      now_mono=0.0, now_wall=1000.0)
+    assert rec["operator_zones_path"] == str(drawn)
+    # And on the ticks that publish nothing: a daemon with no fix is exactly
+    # when the operator is most likely to be looking at the map.
+    blind = M.poll_once(cfg, T.TileStore(), M.ExitHold(cfg.exit_hold_s),
+                        fix=None, state=None, now_mono=0.0, now_wall=1000.0)
+    assert blind["wans"] == {}
+    assert blind["operator_zones_path"] == str(drawn)
+
+
+def test_the_record_omits_the_zone_path_rather_than_publishing_a_non_path():
+    """build_record is the published contract: a key present but not a string
+    would have the reader comparing a path against a number."""
+    assert "operator_zones_path" not in M.build_record({}, 1000.0)
+    assert "operator_zones_path" not in M.build_record({}, 1000.0,
+                                                       operator_zones_path=7)

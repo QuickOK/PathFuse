@@ -57,6 +57,7 @@ let lastLoc = null;
 function drawLocation(loc) {
   locationLayer.clearLayers();
   lastLoc = loc || null;
+  syncZonesPathWarning();
   if (!loc) return;
   // One bad value must cost the location layer alone. tick() draws this
   // in the same pass that moves the vehicle marker, so an exception
@@ -189,6 +190,24 @@ const el = (id) => document.getElementById(id);
 let editing = null;       // {lat, lon, id?} being edited, or null when closed
 let preview = null;       // the circle that follows the radius slider
 
+// This page saves to the zone file sbfd-ctl is configured with; the daemon
+// reads the one ITS own config names, and nothing ties the two settings
+// together. Diverged, every save here returns 200 and draws its circle while
+// no floor ever moves. The server proves the divergence (null unless the
+// daemon's own record says otherwise) and the panel names the file the
+// operator has to go and fix, because a Save that cannot work must not look
+// like one that did.
+function syncZonesPathWarning() {
+  const theirs = lastLoc ? lastLoc.zones_path_mismatch : null;
+  const warn = el("z-path-warn");
+  // textContent: a path is server-supplied text, never markup.
+  warn.textContent = theirs
+    ? "the location daemon is reading " + theirs
+      + " - saves here will not take effect"
+    : "";
+  el("z-save").disabled = !!theirs;
+}
+
 function zoneLevels() {
   const levels = (lastLoc && lastLoc.levels) || [];
   if (levels.length) return levels;
@@ -314,6 +333,7 @@ function openEditor(zone) {
   buildWans(zone.wans);
   el("z-suppress").checked = !!zone.suppress_learned;
   el("z-error").textContent = "";
+  syncZonesPathWarning();
   el("z-delete").hidden = !zone.id;
   el("zone-editor").hidden = false;
   updatePreview();

@@ -1125,3 +1125,64 @@ def test_stored_zone_level_reads_only_a_usable_level(tmp_path):
     assert M.stored_zone_level(str(p), "z3") is None
     assert M.stored_zone_level(str(p), "z9") is None
     assert M.stored_zone_level(str(tmp_path / "absent.json"), "z1") is None
+
+
+# -- round 5: the map and the daemon must be reading one file ------------------
+
+
+def _record(tmp_path, **over):
+    """What location_fec publishes, at a timestamp the reader calls fresh."""
+    rec = {"set_ts": 1000.0, "source": "location_fec", "wans": {}}
+    rec.update(over)
+    (tmp_path / "location_fec.json").write_text(_json.dumps(rec))
+    return M.LocationFecCfg(state_path=str(tmp_path / "location_fec.json"),
+                            enabled=True, stale_after_s=30.0)
+
+
+def test_no_zones_path_mismatch_when_both_sides_read_one_file(tmp_path):
+    m = _levels_cfg(tmp_path)
+    loc = _record(tmp_path, operator_zones_path=m["location_zones_path"])
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+    # Spelt differently, still the same file: a mismatch we cannot prove is
+    # not a mismatch, and a false one would disable Save on a working box.
+    loc = _record(tmp_path,
+                  operator_zones_path=str(tmp_path) + "/./location_zones.json")
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+
+
+def test_zones_path_mismatch_names_the_file_the_daemon_reads(tmp_path):
+    """The map saves to its own configured path and the daemon reads its own;
+    nothing ties the two settings together. Diverged, the save returns 200 and
+    no floor ever moves -- so the payload has to carry the daemon's path, the
+    one thing the operator has to go and fix."""
+    m = _levels_cfg(tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    loc = _record(tmp_path, operator_zones_path=theirs)
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) == theirs
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0,
+                                 location_cfg=loc)
+    assert out["location_fec"]["zones_path_mismatch"] == theirs
+
+
+def test_zones_path_mismatch_is_null_when_it_cannot_be_proved(tmp_path):
+    """Absent, stale, unparseable, or simply from a daemon too old to publish
+    the key: none of those are evidence of a mismatch, and claiming one would
+    disable Save on a box that is working."""
+    m = _levels_cfg(tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    absent = M.LocationFecCfg(state_path=str(tmp_path / "gone.json"),
+                              enabled=True, stale_after_s=30.0)
+    assert M.location_zones_path_mismatch(absent, m, 1000.0) is None
+    assert M.location_zones_path_mismatch(None, m, 1000.0) is None
+    stale = _record(tmp_path, set_ts=100.0, operator_zones_path=theirs)
+    assert M.location_zones_path_mismatch(stale, m, 1000.0) is None
+    old = _record(tmp_path)                       # no such key in the record
+    assert M.location_zones_path_mismatch(old, m, 1000.0) is None
+    for bad in (7, None, ""):
+        rec = _record(tmp_path, operator_zones_path=bad)
+        assert M.location_zones_path_mismatch(rec, m, 1000.0) is None
+    (tmp_path / "location_fec.json").write_text("{not json")
+    assert M.location_zones_path_mismatch(old, m, 1000.0) is None
+    # And the payload always carries the key, so the page never has to guess.
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"]["zones_path_mismatch"] is None

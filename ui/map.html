@@ -39,6 +39,9 @@
     font: 13px system-ui, sans-serif; }
   #zone-editor #z-delete { border-color: #a44; color: #faa; }
   #zone-editor option.dim { color: #888; }
+  #zone-editor button[disabled] { opacity: .45; }
+  #z-path-warn { color: #fc6; }
+  #z-path-warn:empty { display: none; }
   #z-wans { display: flex; flex-wrap: wrap; gap: 8px; }
   #z-radius-m, .hint { color: #aaa; }
   #z-error { color: #f99; }
@@ -54,6 +57,7 @@
   <button id="zones">Zones</button>
 </div>
 <div id="zone-editor" hidden>
+  <div class="row" id="z-path-warn"></div>
   <div class="row">
     <span class="k">Label</span>
     <input id="z-label" type="text" maxlength="48" placeholder="zone">
