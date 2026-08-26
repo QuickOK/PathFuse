@@ -1671,11 +1671,26 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
 
 def _atomic_write_text(path: str, body: str) -> None:
     """Write via a temp file + os.replace so a concurrent reader never sees a
-    truncated/partial file. os.replace is atomic within a filesystem."""
+    truncated/partial file. os.replace is atomic within a filesystem.
+
+    The temp path is unique per writer. A FIXED `<name>.tmp` is one inode
+    shared by every concurrent writer: thread B opens it while A is between
+    write and replace, A's replace moves that inode to the live path, and B's
+    remaining writes land directly in the LIVE file -- unsynchronised and not
+    atomic. The UI server is threaded, so that is reachable from two POSTs."""
     p = Path(path)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(body)
-    os.replace(tmp, p)
+    tmp = Path("%s.%d.%d.tmp" % (p, os.getpid(), threading.get_ident()))
+    try:
+        tmp.write_text(body)
+        os.replace(tmp, p)
+    except BaseException:
+        # Otherwise a permanently failing write leaves one orphan per attempt,
+        # and the callers here retry on a 1 Hz loop.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
@@ -2425,6 +2440,12 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+# The UI server is threaded, and apply_location_zone is a read-modify-write of
+# one file. Without this two POSTs interleave and the later read wins: the
+# other operator's zone is simply gone, with a 200 telling them it was saved.
+_ZONES_LOCK = threading.Lock()
+
+
 def _zone_watermark(zones, stored_next):
     """The lowest zone number that has never been handed out.
 
@@ -2453,7 +2474,15 @@ def apply_location_zone(zones_path: str, zone: dict):
     zones drawn so far rather than the operator's ability to draw new ones.
     NOT fail-open on the write — OSError propagates so the handler answers
     500 instead of telling the operator a floor was saved that was not.
-    Mirrors apply_station_label."""
+    Mirrors apply_station_label, plus the lock: labels are a dict keyed by an
+    id the caller supplies, so a lost update there costs one label; here the
+    whole COLLECTION is rewritten, so a lost update silently deletes somebody
+    else's zone."""
+    with _ZONES_LOCK:
+        return _apply_location_zone_locked(zones_path, zone)
+
+
+def _apply_location_zone_locked(zones_path: str, zone: dict):
     raw = _read_json_file(zones_path)
     existing = raw.get("zones") if isinstance(raw, dict) else None
     zones = ([z for z in existing if isinstance(z, dict)]

@@ -1677,3 +1677,129 @@ def test_api_map_shows_a_zone_the_map_cannot_edit(cfg, tmp_path):
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_api_post_location_zone_survives_concurrent_writers(cfg, tmp_path):
+    """apply_location_zone is a read-modify-write and the UI server is
+    threaded, so two operators (or one impatient one) can have two handler
+    threads inside it at once. Unsynchronised, writes are lost; worse, a
+    SHARED temp path means the second thread's writes land in the live file
+    after the first has replaced it -- and a torn file reads back as no zones
+    at all, silently withdrawing every drawn floor."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    writers, per_writer = 12, 5
+    failures, torn = [], []
+    done = threading.Event()
+
+    def writer(n):
+        try:
+            for i in range(per_writer):
+                status, body = _post_zone(port, {
+                    "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2,
+                    "label": "w%d-%d" % (n, i)})
+                if status != 200 or not body.get("ok"):
+                    failures.append((status, body))
+        except Exception as e:                       # noqa: BLE001
+            failures.append(repr(e))
+
+    def reader():
+        # The live path must never be observed as anything but a complete
+        # file: that is what os.replace buys, and what a shared tmp lost.
+        while not done.is_set():
+            try:
+                text = Path(zones_path).read_text()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                torn.append(repr(e))
+                continue
+            try:
+                json.loads(text)
+            except ValueError as e:
+                torn.append("%s: %r" % (e, text[:80]))
+
+    try:
+        port = httpd.server_address[1]
+        watcher = threading.Thread(target=reader, daemon=True)
+        watcher.start()
+        threads = [threading.Thread(target=writer, args=(n,))
+                   for n in range(writers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        done.set()
+        watcher.join(timeout=5)
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+    assert failures == []
+    assert torn == []
+    body = json.loads(Path(zones_path).read_text())
+    zones = body["zones"]
+    expected = writers * per_writer
+    assert len(zones) == expected                      # no lost update
+    ids = [z["id"] for z in zones]
+    assert len(set(ids)) == expected                   # no id handed out twice
+    assert body["next_id"] == expected + 1
+    labels = {"w%d-%d" % (n, i)
+              for n in range(writers) for i in range(per_writer)}
+    assert {z["label"] for z in zones} == labels
+
+
+def test_atomic_write_text_does_not_share_one_temp_path(tmp_path):
+    """A fixed `<name>.tmp` is one inode shared by every concurrent writer.
+    Thread B opens it while A is between write and replace, A's replace moves
+    it to the live path, and B's remaining writes go straight into the live
+    file -- unsynchronised and non-atomic."""
+    target = tmp_path / "shared.json"
+    seen = []
+    barrier = threading.Barrier(4)
+
+    real_replace = M.os.replace
+
+    def watching_replace(src, dst):
+        seen.append(str(src))
+        return real_replace(src, dst)
+
+    def write(n):
+        barrier.wait(timeout=10)
+        M._atomic_write_text(str(target), json.dumps({"writer": n}))
+
+    orig = M.os.replace
+    M.os.replace = watching_replace
+    try:
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+    finally:
+        M.os.replace = orig
+
+    assert len(seen) == 4
+    assert len(set(seen)) == 4, "every writer must own its temp path"
+    assert json.loads(target.read_text())["writer"] in range(4)
+    # Nothing left behind beside the target.
+    assert [p.name for p in tmp_path.iterdir()] == ["shared.json"]
+
+
+def test_atomic_write_text_removes_its_temp_file_when_the_replace_fails(tmp_path):
+    """One orphaned temp per failed write would accumulate forever on a
+    permanently unwritable path -- and the 1 Hz loop retries every tick."""
+    target = tmp_path / "doomed.json"
+    orig = M.os.replace
+
+    def boom(src, dst):
+        raise OSError("no")
+
+    M.os.replace = boom
+    try:
+        with pytest.raises(OSError):
+            M._atomic_write_text(str(target), "{}")
+    finally:
+        M.os.replace = orig
+    assert list(tmp_path.iterdir()) == []
