@@ -4,6 +4,7 @@ import os
 import socket
 from pathlib import Path
 
+import pytest
 import fec_control as FC
 import sbfd_ctl as M
 import tile_store as T
@@ -913,3 +914,130 @@ def test_apply_location_zone_ignores_an_unusable_counter(tmp_path):
                                             _WANS, 5)
         zones = M.apply_location_zone(str(p), z)
         assert [z["id"] for z in zones] == ["z1", "z2"], bad
+
+
+# -- round 3: one bad zone must not cost the page the whole map ---------------
+
+
+def test_map_location_layer_drops_a_zone_with_a_non_finite_position(tmp_path):
+    """json.dumps writes NaN and Infinity as bare tokens and JSON.parse throws
+    on them, so ONE poisoned zone costs the page the entire payload -- the
+    same class already fixed for a tile's residual."""
+    zones = tmp_path / "location_zones.json"
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        zones.write_text(
+            '{"zones": [{"label": "poison", "lat": %s, "lon": -73.5,'
+            ' "radius_m": 300, "level": 2},'
+            ' {"label": "good", "lat": 41.1, "lon": -73.5,'
+            ' "radius_m": 300, "level": 2}]}' % bad)
+        out = M.map_location_layer(str(tmp_path / "absent.json"),
+                                   str(tmp_path / "absent-cfg.json"), None, 10,
+                                   operator_zones_path=str(zones))
+        assert [z["label"] for z in out["zones"]] == ["good"], bad
+        _json.dumps(out, allow_nan=False)     # what the browser must parse
+
+
+def test_map_location_layer_drops_a_zone_with_a_non_finite_radius(tmp_path):
+    zones = tmp_path / "lf.json"
+    zones.write_text(
+        '{"zones": [{"label": "poison", "lat": 41.1, "lon": -73.5,'
+        ' "radius_m": Infinity, "level": 2},'
+        ' {"label": "good", "lat": 41.1, "lon": -73.5,'
+        ' "radius_m": 300, "level": 2}]}')
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(zones),
+                               None, 10)
+    assert [z["label"] for z in out["zones"]] == ["good"]
+    _json.dumps(out, allow_nan=False)
+
+
+def test_map_payload_stays_parseable_with_a_poisoned_zone(tmp_path):
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(tmp_path / "store.json"),
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "location_zones_path": str(tmp_path / "op.json")})
+    Path(m["location_zones_path"]).write_text(
+        '{"zones": [{"id": "z1", "label": "poison", "lat": NaN,'
+        ' "lon": -73.5, "radius_m": 300, "level": 2}]}')
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"]["zones"] == []
+    _json.dumps(out, allow_nan=False)
+
+
+# -- round 3: the file cannot grow without bound -------------------------------
+
+
+def test_apply_location_zone_refuses_a_create_past_the_cap(tmp_path):
+    """Every zone is walked once per look-ahead point in the 1 Hz loop and
+    rides in every 3 s map payload; the per-request byte cap bounds one POST,
+    nothing bounded the file."""
+    p = str(tmp_path / "location_zones.json")
+    for i in range(M._MAX_OPERATOR_ZONES):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label="z%d" % i),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    assert len(_json.loads(Path(p).read_text())["zones"]) == 200
+
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="one too many"),
+                                        _WANS, 5)
+    with pytest.raises(M.ZoneLimitError) as ei:
+        M.apply_location_zone(p, z)
+    assert "200" in str(ei.value)
+    assert len(_json.loads(Path(p).read_text())["zones"]) == 200
+
+
+def test_apply_location_zone_still_edits_and_deletes_at_the_cap(tmp_path):
+    """The cap must never trap the operator: the way back under it is an
+    update or a delete, so those stay allowed."""
+    p = str(tmp_path / "location_zones.json")
+    for i in range(M._MAX_OPERATOR_ZONES):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label="z%d" % i),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    _ok, z, _ = M.validate_zone_payload(
+        _zone_payload(id="z7", label="renamed at the cap"), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert len(zones) == 200
+    assert [x for x in zones if x["id"] == "z7"][0]["label"] \
+        == "renamed at the cap"
+    assert len(M.apply_location_zone(p, {"id": "z7", "delete": True})) == 199
+
+
+# -- round 3: a level the driving table has lost --------------------------------
+
+
+def test_validate_zone_payload_keeps_a_level_the_driving_table_has_lost():
+    """A zone stored at level 4 opened while a 4-rung cellular profile drives
+    must save back at 4. Refusing it would make the zone uneditable; snapping
+    it to 3 would quietly rewrite a floor the operator set."""
+    ok, zone, err = M.validate_zone_payload(
+        _zone_payload(id="z1", level=4), _WANS, 4, keep_level=4)
+    assert ok and err is None and zone["level"] == 4
+    # It only ever PRESERVES: a different level past the table is still out.
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(id="z1", level=4), _WANS, 4, keep_level=2)
+    assert not ok and "level" in err
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(id="z1", level=4), _WANS, 4)
+    assert not ok and "level" in err
+    # And a level below the table's top is unaffected either way.
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", level=2), _WANS, 4, keep_level=4)
+    assert ok and zone["level"] == 2
+
+
+def test_stored_zone_level_reads_only_a_usable_level(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "a", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 4},
+        {"id": "z2", "label": "b", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": True},
+        {"id": "z3", "label": "c", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": "4"}]}))
+    assert M.stored_zone_level(str(p), "z1") == 4
+    assert M.stored_zone_level(str(p), "z2") is None     # bool is not a level
+    assert M.stored_zone_level(str(p), "z3") is None
+    assert M.stored_zone_level(str(p), "z9") is None
+    assert M.stored_zone_level(str(tmp_path / "absent.json"), "z1") is None

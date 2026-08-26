@@ -2334,14 +2334,19 @@ def _zone_number(value):
     return float(value) if math.isfinite(value) else None
 
 
-def validate_zone_payload(payload, wan_names, table_len) -> tuple:
+def validate_zone_payload(payload, wan_names, table_len,
+                          keep_level=None) -> tuple:
     """(ok, zone_or_id, err) for one operator-drawn location zone. Pure.
 
     location_fec.validate_zone stays the authority on what a zone IS, and
     everything accepted here satisfies it. This adds only what an API needs
     and a hand-edited config file does not: an id, an explicit delete, a
     radius ceiling, and a named error instead of a silent skip — the operator
-    is standing at the map waiting to be told why the save was refused."""
+    is standing at the map waiting to be told why the save was refused.
+
+    `keep_level` is the level this zone is ALREADY stored at, when it is an
+    update. A level equal to it is accepted whatever the driving table says;
+    the bound below says why."""
     if not isinstance(payload, dict):
         return (False, None, "payload must be an object")
     zid = payload.get("id")
@@ -2365,8 +2370,16 @@ def validate_zone_payload(payload, wan_names, table_len) -> tuple:
     level = payload.get("level")
     # bool first: int(True) is 1, so an unguarded check would turn
     # `"level": true` into a real floor of level 1 on a live vehicle.
-    if (isinstance(level, bool) or not isinstance(level, int)
-            or not (0 <= level <= table_len - 1)):
+    if isinstance(level, bool) or not isinstance(level, int) or level < 0:
+        return (False, None, "level must be 0..%d" % (table_len - 1))
+    if level > table_len - 1 and level != keep_level:
+        # Above the top rung of the table driving right now. Refused for a
+        # new level, but a level the zone ALREADY has is kept: profiles swap
+        # under us, and a zone set to 4 on the base table would otherwise be
+        # either uneditable while a 4-rung cellular profile drives, or
+        # silently rewritten to 3 the next time its label is changed. This
+        # can only preserve a level, never introduce one, so raise-only is
+        # untouched.
         return (False, None, "level must be 0..%d" % (table_len - 1))
     label = payload.get("label", "")
     if not isinstance(label, str):
@@ -2440,10 +2453,42 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+# Every drawn zone is walked once per look-ahead point in location_fec's 1 Hz
+# loop and rides in every 3 s map payload, so the collection needs a bound of
+# its own -- the 4096-byte cap bounds one request, not the file. 200 is far
+# past any real deployment and still cheap on both counts.
+_MAX_OPERATOR_ZONES = 200
+
+
+class ZoneLimitError(Exception):
+    """More drawn zones than the loop and the map payload should carry."""
+
+
 # The UI server is threaded, and apply_location_zone is a read-modify-write of
 # one file. Without this two POSTs interleave and the later read wins: the
 # other operator's zone is simply gone, with a 200 telling them it was saved.
 _ZONES_LOCK = threading.Lock()
+
+
+def stored_zone_level(zones_path, zid):
+    """The level a drawn zone is already stored at, or None.
+
+    Read separately from apply_location_zone so the validator can stay pure.
+    A racing edit between this read and that write is harmless: the worst
+    outcome is a save refused for a level that changed underneath the
+    operator, which is what a refusal is for."""
+    raw = _read_json_file(zones_path)
+    zones = raw.get("zones") if isinstance(raw, dict) else None
+    if not isinstance(zones, list):
+        return None
+    for z in zones:
+        if not isinstance(z, dict) or z.get("id") != zid:
+            continue
+        level = z.get("level")
+        if isinstance(level, bool) or not isinstance(level, int) or level < 0:
+            return None
+        return level
+    return None
 
 
 def _zone_watermark(zones, stored_next):
@@ -2504,6 +2549,12 @@ def _apply_location_zone_locked(zones_path: str, zone: dict):
         else:
             return None
     else:
+        if len(zones) >= _MAX_OPERATOR_ZONES:
+            # Only a CREATE is refused: an update or a delete is the way back
+            # under the cap, and refusing those would trap the operator above
+            # it with no way down from the map.
+            raise ZoneLimitError("too many zones (max %d)"
+                                 % _MAX_OPERATOR_ZONES)
         zones = zones + [dict(zone, id="z%d" % watermark)]
         watermark += 1
     p = Path(zones_path)
@@ -2567,12 +2618,21 @@ def _map_zone_rows(zones_path, source):
         try:
             # Geometry is the one thing worth dropping a row over: without a
             # position and a radius there is no circle to draw at all.
-            row = {"label": str(z.get("label") or "zone"),
-                   "lat": float(z["lat"]), "lon": float(z["lon"]),
-                   "radius_m": float(z["radius_m"]), "level": int(z["level"]),
-                   "wans": names, "source": source, "editable": False}
+            lat, lon = float(z["lat"]), float(z["lon"])
+            radius, level = float(z["radius_m"]), int(z["level"])
         except (KeyError, TypeError, ValueError):
             continue
+        # NaN and inf ARE floats, so they clear the conversion above, and
+        # json.dumps writes them as the bare tokens NaN/Infinity -- which
+        # JSON.parse rejects. One poisoned zone would cost the page the whole
+        # map payload, not just its own circle. Same class as the tile
+        # residual guard below.
+        if not (math.isfinite(lat) and math.isfinite(lon)
+                and math.isfinite(radius)):
+            continue
+        row = {"label": str(z.get("label") or "zone"),
+               "lat": lat, "lon": lon, "radius_m": radius, "level": level,
+               "wans": names, "source": source, "editable": False}
         if source == "operator":
             row["suppress_learned"] = bool(z.get("suppress_learned", False))
             zid = z.get("id")
@@ -3009,13 +3069,23 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 # The level is an index into the table of whichever profile is
                 # driving right now, so the bound is resolved per request.
                 table_len = len(active_fec_table(cfg.fec, cfg.published_state))
+                # ...except for a level the zone already has, which is kept
+                # rather than snapped down onto a table that has since got
+                # shorter. Only an update can carry one.
+                pid = payload.get("id") if isinstance(payload, dict) else None
+                keep = (stored_zone_level(map_cfg["location_zones_path"], pid)
+                        if isinstance(pid, str) and _ZID_RE.match(pid)
+                        else None)
                 ok, zone, err = validate_zone_payload(payload, wan_names,
-                                                      table_len)
+                                                      table_len,
+                                                      keep_level=keep)
                 if not ok:
                     self._send_json(400, {"error": err}); return
                 try:
                     zones = apply_location_zone(
                         map_cfg["location_zones_path"], zone)
+                except ZoneLimitError as e:
+                    self._send_json(400, {"error": str(e)}); return
                 except OSError as e:
                     self._send_json(500, {"error": f"persist failed: {e}"}); return
                 if zones is None:

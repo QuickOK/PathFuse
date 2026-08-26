@@ -1803,3 +1803,72 @@ def test_atomic_write_text_removes_its_temp_file_when_the_replace_fails(tmp_path
     finally:
         M.os.replace = orig
     assert list(tmp_path.iterdir()) == []
+
+
+def test_api_post_location_zone_400_past_the_zone_cap(cfg, tmp_path):
+    zones_path = Path(_zone_cfg(cfg, tmp_path))
+    zones_path.write_text(json.dumps({"next_id": 201, "zones": [
+        {"id": "z%d" % (i + 1), "label": "z%d" % i, "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1} for i in range(M._MAX_OPERATOR_ZONES)]}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 2, "label": "one too many"})
+        assert ei.value.code == 400
+        assert "too many zones" in json.loads(ei.value.read())["error"]
+        # The way back under the cap must still work.
+        status, body = _post_zone(port, {"id": "z1", "delete": True})
+        assert status == 200 and len(body["zones"]) == 199
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_keeps_a_level_off_the_driving_table(cfg_with_fec, tmp_path):
+    """The stored level is 4; the cellular profile driving right now has four
+    rungs (0..3). Editing the label must not rewrite that floor to 3, and must
+    not be refused outright either -- the zone would be uneditable."""
+    zones_path = tmp_path / "location_zones.json"
+    cfg_with_fec.map = {"location_zones_path": str(zones_path)}
+    cfg_with_fec.fec.wan_profiles = {"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+        ramp_up_ticks=1, ramp_down_hold_s=0, floor_ratio="8:0",
+        signal_floor_fec="12:1")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"profile": {"driver_wan": "wan1"}}}))
+    zones_path.write_text(json.dumps({"next_id": 2, "zones": [
+        {"id": "z1", "label": "long tunnel", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 4, "wans": None,
+         "suppress_learned": False}]}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 4, "label": "long tunnel, renamed"})
+        assert status == 200
+        assert body["zones"][0]["level"] == 4
+        assert body["zones"][0]["label"] == "long tunnel, renamed"
+
+        # It preserves, it never introduces: a DIFFERENT zone cannot be
+        # raised to a rung this table does not have.
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 4, "label": "new one"})
+        assert ei.value.code == 400
+        # Nor can an existing zone be pushed there from below.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 2, "label": "lowered"})
+        assert status == 200 and body["zones"][0]["level"] == 2
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"id": "z1", "lat": 41.1, "lon": -73.5,
+                              "radius_m": 300, "level": 4, "label": "raised"})
+        assert ei.value.code == 400
+    finally:
+        stop.set()
+        httpd.shutdown()

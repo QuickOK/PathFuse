@@ -219,7 +219,20 @@ function buildLevels(chosen) {
     sel.appendChild(o);
   });
   sel.value = String(chosen);
-  if (!sel.value) sel.selectedIndex = sel.options.length - 1;
+  if (sel.value !== String(chosen)) {
+    // The zone is stored on a rung the table driving RIGHT NOW does not have
+    // -- level 4 was set while the five-rung base profile drove, and a
+    // four-rung cellular one drives today. Snapping to the nearest option
+    // would rewrite that floor to 3 the next time the operator saves so much
+    // as a label change, and they would never see it happen. Carry the stored
+    // value instead; the server accepts a level a zone already has.
+    const kept = document.createElement("option");
+    kept.value = String(chosen);
+    kept.textContent = `level ${chosen} — not on the current table (kept)`;
+    kept.className = "dim";
+    sel.appendChild(kept);
+    sel.value = String(chosen);
+  }
 }
 
 function buildWans(chosen) {
