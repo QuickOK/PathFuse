@@ -503,6 +503,10 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     current_ratio = None
     since = None
     last_profile = "default"
+    # The table the runtime's level currently means something against. Until a
+    # push names a profile, run_once resolves with pushed_profile=None, so the
+    # base config's table is the one in force.
+    last_table, _, _ = resolve_relay_profile(cfg, None)
     last_location_level = 0
     pushed_stale_after = float(cfg.get("pushed_loss_stale_after_s", 90.0))
     while not stop_event.is_set():
@@ -515,14 +519,18 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
             # Translate the runtime's level across the profile switch: the OLD
             # level index means something different on the NEW table (e.g.
             # level 2 is 8:4 on the base table but 12:1 on the cell table), so
-            # re-derive it from the ratio actually on the wire rather than
-            # carrying the raw index forward.
+            # re-derive it from the old table's ratio for that level. NOT from
+            # current_ratio: that is the ON-WIRE value, which carries the
+            # min_adaptive floor and the signal/location lifts, so a lifted
+            # ratio that happens to be a rung of the new table would seed the
+            # engine at a level it never chose (the client-side incident of
+            # 2026-08-04, in reseed_runtime's docstring).
             new_table, _, _ = resolve_relay_profile(cfg, profile_name)
-            rt = fec_control.FecRuntime(
-                fec_control.ratio_to_level(current_ratio or "8:0", new_table),
-                0, time.time())
+            rt = fec_control.reseed_runtime(rt, last_table, new_table,
+                                            time.time())
             logging.info("fec profile -> %s", profile_name)
             last_profile = profile_name
+            last_table = new_table
         prev = current_ratio
         rt, current_ratio = run_once(cfg, rt, current_ratio,
                                      mode=mode, fixed_ratio=fixed_ratio,

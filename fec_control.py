@@ -427,6 +427,26 @@ def step_level(target_level, rt, hyst, now):
     return FecRuntime(cur, 0, rt.last_change_ts), False
 
 
+def reseed_runtime(rt, old_table, new_table, now):
+    """Re-base the adaptive runtime onto a new profile's table on a driver swap.
+
+    Carries the ADAPTIVE level's ratio, never the ratio actually applied: under
+    min_adaptive the applied value is floor-lifted, so reseeding from it hands
+    the engine a level it never chose. Live case (2026-08-04): the default
+    profile was applying the 8:1 config floor over an idle level 0, and 8:1 is
+    the TOP rung of the cellular table — so entering full redundancy reseeded
+    the wan1 profile at maximum parity against 0% loss, and its 60s ramp-down
+    hold pinned 8:1 for a full minute before the profile's own 12:1 floor could
+    take effect. A ratio the new table has no rung for still lands at 0 and
+    re-ramps (one tick on cellular).
+
+    The ramp-down clock restarts at the swap by design: the incoming profile's
+    hold is its own, not something the outgoing one has already served.
+    """
+    ratio = level_to_ratio(rt.current_level, old_table or new_table)
+    return FecRuntime(ratio_to_level(ratio, new_table), 0, now)
+
+
 @dataclass
 class SignalThresholds:
     """RSRQ is primary with an explicit hysteresis pair; RSRP is consulted

@@ -646,3 +646,20 @@ def test_apply_location_floor_ignores_junk():
     assert F.apply_location_floor(2, "3", F.DEFAULT_LOSS_TABLE) == 2
     assert F.apply_location_floor(2, True, F.DEFAULT_LOSS_TABLE) == 2
     assert F.apply_location_floor(2, -1, F.DEFAULT_LOSS_TABLE) == 2
+
+
+def test_reseed_runtime_maps_a_shared_rung_onto_the_new_table():
+    # The level's ratio (8:4, level 2 on the default table) is level 1 on this
+    # table, and reseeding must land there.
+    new_table = [{"max_loss_pct": 0.5, "fec": "8:0"},
+                 {"max_loss_pct": 100.0, "fec": "8:4"}]
+    rt = F.reseed_runtime(F.FecRuntime(2, 0, 100.0), F.DEFAULT_LOSS_TABLE,
+                          new_table, now=200.0)
+    assert rt.current_level == 1
+    assert rt.up_streak == 0 and rt.last_change_ts == 200.0
+
+
+def test_reseed_runtime_falls_to_zero_for_a_rung_the_new_table_lacks():
+    rt = F.reseed_runtime(F.FecRuntime(2, 0, 100.0), F.DEFAULT_LOSS_TABLE,
+                          F.DEFAULT_CELL_LOSS_TABLE, now=200.0)
+    assert rt.current_level == 0

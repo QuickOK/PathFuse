@@ -982,3 +982,60 @@ def test_a_link_policy_update_without_a_level_clears_it():
             == ("default", False, 0)
     finally:
         httpd.shutdown()
+
+
+def test_run_reseeds_a_profile_switch_from_the_level_not_the_lifted_wire(tmp_path):
+    """The wire ratio carries the min_adaptive floor; the level does not.
+
+    Here the leg is idle (level 0) with the wire lifted to 8:6 by the floor,
+    and 8:6 IS a rung of the incoming profile's table. Reseeding from the wire
+    would hand the engine level 1 - maximum parity on that table against 0%
+    loss - and the profile's 60s ramp-down hold would pin it there. This is the
+    relay-side twin of the client bug fixed on 2026-08-04.
+    """
+    import threading as _t, time as _time
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(
+        {"sessions": {"a": {"session_id": 1, "state": "UP", "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cell_table = [{"max_loss_pct": 0.5, "fec": "8:0"},
+                  {"max_loss_pct": 100.0, "fec": "8:6"}]
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state_path),
+           "poll_interval_s": 0.01, "loss_table": F.DEFAULT_LOSS_TABLE,
+           "ramp_up_ticks": 1, "ramp_down_hold_s": 0,
+           "wan_profiles": {"wan1": {"loss_table": cell_table}}}
+    st = U.FecState(mode=F.MODE_MIN_ADAPTIVE, floor_ratio="8:6",
+                    profile_names=frozenset({"default", "wan1"}))
+    stop = _t.Event()
+    th = _t.Thread(target=lambda: U.run(cfg, stop, st), daemon=True)
+
+    def await_snap(pred, deadline_s=5.0):
+        end = _time.monotonic() + deadline_s
+        seen = None
+        while _time.monotonic() < end:
+            seen = st.snapshot()
+            if pred(seen):
+                return seen
+            _time.sleep(0.01)
+        return seen
+
+    try:
+        th.start()
+        # Idle, but the floor is on the wire.
+        idle = await_snap(lambda s: s.get("ratio") == "8:6")
+        assert idle["ratio"] == "8:6" and idle["level"] == 0
+        st.set_pushed_link(profile="wan1", signal_floor=False,
+                           ts=time.time())
+        after = await_snap(lambda s: s.get("profile") == "wan1")
+        assert after["profile"] == "wan1"
+        assert after["level"] == 0        # not 1: the floor is not a level
+        # And it stays there - the profile's own ramp-down hold has nothing to
+        # hold against, so a wrong seed would still be visible ticks later.
+        held = await_snap(lambda s: s.get("level") != 0, deadline_s=0.3)
+        assert held["level"] == 0
+    finally:
+        stop.set()
+        th.join(timeout=2)
+        os.close(rfd)
