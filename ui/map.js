@@ -192,11 +192,17 @@ let preview = null;       // the circle that follows the radius slider
 
 // This page writes the zone file sbfd-ctl is configured with; the daemon
 // reads the one ITS own config names, and nothing ties the two settings
-// together. Diverged, every save here returns 200 and draws its circle while
-// no floor ever moves. The server proves the divergence (null unless the
-// daemon's own record says otherwise) and the panel names the file the
-// operator has to go and fix, because a mutation that cannot work must not
-// look like one that did.
+// together. Diverged, a save would draw its circle while no floor ever moves.
+// The server proves the divergence (null unless the daemon's own record says
+// otherwise) and the panel names the file the operator has to go and fix,
+// because a mutation that cannot work must not look like one that did.
+//
+// Belt and braces: the endpoint itself now refuses a proven mismatch with a
+// 409 naming the daemon's path, so a hand-rolled client is not lied to
+// either. This stays because it is the better message -- it disables the
+// buttons and explains the box BEFORE the operator types a zone, rather than
+// after -- and because it is the only half that can act on a mismatch which
+// appears between two polls, where the 409 is the backstop.
 //
 // BOTH mutations are blocked, not just Save. The map draws the zones in the
 // file this page writes, so on a mismatch a delete SUCCEEDS: the circle

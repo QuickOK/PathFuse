@@ -105,16 +105,26 @@ Two settings name that file: `map.location_zones_path` in `sbfd-ctl.json`,
 which is where the map SAVES, and `operator_zones_path` in
 `location-fec.json`, which is what the daemon READS. They default to the same
 file and nothing ties them together, so the daemon publishes the path it is
-reading and the map compares the two. Diverged, the editor names the daemon's
-file and goes read-only: a zone can still be opened and looked at, but Save
-and Delete are both disabled, because a mutation that cannot take effect must
-not look like one that did. Delete especially — the map draws the file it
-writes, so a delete there would succeed, the circle would vanish, and the
-daemon would carry on applying that floor from the file it actually reads.
-The map says nothing unless it can prove the divergence: a record that is
-absent, stale or from an older daemon leaves the editor alone. The two paths
-are compared through `realpath`, so a relative spelling or a symlinked parent
-naming one file is not a disagreement.
+reading and `sbfd-ctl` compares the two. Diverged, the editor names the
+daemon's file and goes read-only: a zone can still be opened and looked at,
+but Save and Delete are both disabled, because a mutation that cannot take
+effect must not look like one that did. Delete especially — the map draws the
+file it writes, so a delete there would succeed, the circle would vanish, and
+the daemon would carry on applying that floor from the file it actually reads.
+
+The endpoint enforces the same thing, so the page is not the only client
+protected: a create, an update or a delete posted while the paths disagree is
+refused with `409` and `the location daemon is reading <path>; saving here
+would not take effect`. Answering `200` there would be the API confirming a
+change it knows cannot move the floor.
+
+Neither half acts unless the divergence can be PROVED. A record that is
+absent, stale, unparseable, or from a daemon too old to publish the path
+proves nothing: the editor is left alone and the save goes through. A stopped
+daemon must never be able to lock the operator out of drawing zones. The two
+paths are compared through `realpath`, so a relative spelling or a symlinked
+parent naming one file is not a disagreement.
+
 An `operator_zones_path` that is unusable — not a path at all (a `null`, a
 number), empty, or carrying an embedded NUL — is logged and treated as the
 default rather than taking the poll down or silently reading nothing.
@@ -197,7 +207,8 @@ restart, and the reload says so.
 | invalid zone | logged and skipped |
 | drawn-zone file missing or corrupt | no drawn zones, one log line; config zones and learning are unaffected |
 | `operator_zones_path` unusable (not a path, empty, embedded NUL) | one log line, the default path is used; floors keep publishing |
-| map and daemon pointed at different zone files | the map names the daemon's file and goes read-only (Save and Delete both disabled); floors are unaffected |
+| map and daemon pointed at different zone files | the map names the daemon's file and goes read-only (Save and Delete both disabled), and the endpoint refuses every mutation with 409; floors are unaffected |
+| daemon stopped, or its record stale or unreadable | no mismatch is proven, so zone editing stays available |
 
 Known hole: in a tunnel the fix dies where the link does, so nothing is learned
 there. The approach tiles usually still learn; a manual zone covers the rest.

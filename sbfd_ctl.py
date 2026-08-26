@@ -2902,7 +2902,9 @@ def location_zones_path_mismatch(loc_cfg, map_cfg, now) -> Optional[str]:
     The path that comes BACK is the configured spelling, not the resolved
     one: that is the string in the config the operator has to go and fix.
 
-    Never raises: it is called while building /api/map."""
+    Never raises: it is called while building /api/map, and the zone POST
+    path refuses on it -- so an answer we cannot stand behind would take the
+    editor away from an operator whose box is working perfectly."""
     raw = fresh_location_record(loc_cfg, now)
     theirs = raw.get("operator_zones_path") if isinstance(raw, dict) else None
     ours = (map_cfg.get("location_zones_path")
@@ -3279,6 +3281,35 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                     payload = _json.loads(self.rfile.read(length) or b"{}")
                 except ValueError:
                     self._send_json(400, {"error": "invalid JSON"}); return
+                # A save into a file the daemon is not reading cannot move a
+                # floor, so answering 200 would be this API confirming a
+                # change it KNOWS has no effect -- and the page is not the
+                # only client. The delete is refused too: the map draws the
+                # file this process writes, so a delete would succeed here
+                # while the daemon carried on applying that floor from the
+                # file it actually reads.
+                #
+                # Outside _ZONES_LOCK on purpose. That lock exists to make the
+                # look-up, the validation and the write of ONE file a single
+                # critical section; the daemon's record is a different file,
+                # written by a different process, and holding our lock across
+                # it buys no atomicity against a config that can change
+                # between any two requests anyway. It would only park other
+                # operators' saves behind a second file read.
+                #
+                # Null unless the mismatch is PROVEN -- daemon down, record
+                # stale or keyless, either path unset, realpath unusable all
+                # answer None and the write goes ahead. Refusing on an
+                # unproven mismatch would lock the operator out of editing
+                # zones whenever the daemon is stopped, which is worse than
+                # the bug being fixed here.
+                theirs = location_zones_path_mismatch(
+                    cfg.location, map_cfg, time.time())
+                if theirs is not None:
+                    self._send_json(409, {
+                        "error": f"the location daemon is reading {theirs}; "
+                                 "saving here would not take effect"})
+                    return
                 # The level is an index into the table of whichever profile is
                 # driving right now, so the bound is resolved per request.
                 table_len = len(active_fec_table(cfg.fec, cfg.published_state))

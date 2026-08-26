@@ -2071,6 +2071,120 @@ def test_api_map_reports_no_mismatch_when_the_daemon_agrees(cfg, tmp_path):
         httpd.shutdown()
 
 
+# -- round 7: the endpoint refuses while the daemon reads another file ---------
+
+
+def _mismatch_cfg(cfg, tmp_path):
+    """A zone file with one drawn zone in it, and a daemon record to publish.
+
+    The zone is there so update and delete have something real to address:
+    the refusal has to cover all three mutations, not just the create."""
+    zones_path = Path(_zone_cfg(cfg, tmp_path))
+    zones_path.write_text(json.dumps({"next_id": 2, "zones": [
+        {"id": "z1", "label": "dock", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 2, "wans": None,
+         "suppress_learned": False}]}))
+    cfg.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    return zones_path
+
+
+def _publish_record(cfg, **over):
+    import time as _time
+    rec = {"set_ts": _time.time(), "source": "location_fec", "wans": {}}
+    rec.update(over)
+    Path(cfg.location.state_path).write_text(json.dumps(rec))
+
+
+_ZONE_MUTATIONS = (
+    {"lat": 41.2, "lon": -73.6, "radius_m": 400, "level": 1,
+     "label": "new one"},
+    {"id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+     "label": "dock, raised"},
+    {"id": "z1", "delete": True},
+)
+
+
+def test_api_post_location_zone_refuses_while_the_daemon_reads_another_file(
+        cfg, tmp_path):
+    """The page is not the only client, and a lie to any client is still a
+    lie. With a FRESH record proving the daemon reads a different file, a
+    200 {"ok": true} would be the API confirming a change it knows cannot
+    move the FEC floor -- so create, update and delete are all refused, and
+    the body names the file the operator has to go and fix."""
+    zones_path = _mismatch_cfg(cfg, tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    _publish_record(cfg, operator_zones_path=theirs)
+    before = zones_path.read_text()
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for payload in _ZONE_MUTATIONS:
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                _post_zone(port, payload)
+            assert ei.value.code == 409
+            assert theirs in json.loads(ei.value.read())["error"]
+        assert zones_path.read_text() == before
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_writes_when_the_daemon_agrees(cfg, tmp_path):
+    """The refusal is narrow: one file, two settings that agree, everything
+    works exactly as before."""
+    zones_path = _mismatch_cfg(cfg, tmp_path)
+    _publish_record(cfg, operator_zones_path=str(zones_path))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for payload in _ZONE_MUTATIONS:
+            status, body = _post_zone(port, payload)
+            assert status == 200 and body["ok"] is True
+        assert [z["id"] for z in json.loads(
+            zones_path.read_text())["zones"]] == ["z2"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+@pytest.mark.parametrize("unprovable", ["absent", "stale", "keyless",
+                                        "malformed"])
+def test_api_post_location_zone_writes_when_a_mismatch_is_unproven(
+        cfg, tmp_path, unprovable):
+    """FAIL-OPEN, the property that matters most here. A mismatch may only be
+    acted on when it is PROVEN: a daemon that is stopped, a record that has
+    gone stale, a daemon too old to publish the key, or a record that will not
+    parse are each evidence of nothing. Refusing on any of them would take
+    zone editing away from the operator exactly when the daemon is down --
+    strictly worse than the bug this refusal fixes."""
+    zones_path = _mismatch_cfg(cfg, tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    if unprovable == "absent":
+        pass                                   # the daemon never wrote one
+    elif unprovable == "stale":
+        _publish_record(cfg, operator_zones_path=theirs, set_ts=1000.0)
+    elif unprovable == "keyless":
+        _publish_record(cfg)                   # a daemon that predates the key
+    else:
+        Path(cfg.location.state_path).write_text("{not json")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for payload in _ZONE_MUTATIONS:
+            status, body = _post_zone(port, payload)
+            assert status == 200 and body["ok"] is True
+        assert [z["id"] for z in json.loads(
+            zones_path.read_text())["zones"]] == ["z2"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
 def test_api_post_location_zone_keeps_the_wan_scope_it_is_not_sent(cfg, tmp_path):
     """The scope of a live FEC floor may only be widened deliberately. An
     update that never mentions `wans` keeps the stored list; only an explicit
