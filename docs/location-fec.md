@@ -27,10 +27,14 @@ table) — never lowered. A record older than `location_fec.stale_after_s`
 (default 30 s) is ignored, so a stopped daemon withdraws its floor with no
 cleanup. An empty `wans` is an explicit withdrawal.
 
-The floor lifts the **client→relay leg only** — the parity this box sends. The
-relay→client leg keeps its own profile and config floor, untouched by
-location: pushing the location level to the relay is a planned follow-up, so a
-place known to hurt the downstream direction is not yet protected in it.
+The floor lifts **both legs**. On the client it lifts the parity this box
+sends; the level is also pushed to the relay over `/fec` as `location_level`,
+where it is applied raise-only against the table of the profile that push
+selected, so a level learned on a longer table cannot index past a shorter
+one. It rides the same record as the pushed profile and signal floor, so it
+expires with them — a client that stops talking withdraws its floor from the
+relay too. A relay too old to know the key ignores it and keeps its own
+profile and config floor.
 
 ## Learning
 
