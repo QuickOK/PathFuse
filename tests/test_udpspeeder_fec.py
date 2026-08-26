@@ -842,9 +842,11 @@ def test_run_once_location_level_is_clamped_to_the_pushed_profile_table(tmp_path
     assert ratio == F.level_to_ratio(3, F.DEFAULT_CELL_LOSS_TABLE) == "8:1"
 
 
-def test_run_publishes_the_pushed_location_level(tmp_path):
-    """GET /fec must show the level the relay leg is holding, so the operator
-    can see the two legs agree."""
+def _published_location_level(tmp_path, push, settle_on):
+    """Run the relay control loop behind a live /fec server, POST `push`, and
+    return the location_level it publishes. `settle_on` is only the value the
+    poll waits for — the assertion belongs to the caller. The snapshot and GET
+    /fec must agree, so a reader of either sees the same thing."""
     import threading as _t, time as _time
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps(
@@ -863,31 +865,49 @@ def test_run_publishes_the_pushed_location_level(tmp_path):
     stop = _t.Event()
     th = _t.Thread(target=lambda: U.run(cfg, stop, st), daemon=True)
 
-    def await_field(name, expected, deadline_s=5.0):
+    def await_level(want, deadline_s=5.0):
         end = _time.monotonic() + deadline_s
         seen = None
         while _time.monotonic() < end:
-            seen = st.snapshot().get(name)
-            if seen == expected:
+            seen = st.snapshot().get("location_level")
+            if seen == want:
                 return seen
             _time.sleep(0.01)
         return seen
 
     try:
         th.start()
-        assert await_field("location_level", 0) == 0
+        assert await_level(0) == 0          # nothing pushed yet
         host, port = httpd.server_address[:2]
-        body = json.dumps({"wan_profile": "wan1", "location_level": 2}).encode()
         req = urllib.request.Request(
-            f"http://{host}:{port}/fec", data=body,
+            f"http://{host}:{port}/fec", data=json.dumps(push).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
-        assert await_field("location_level", 2) == 2
+        settled = await_level(settle_on)
         with urllib.request.urlopen(f"http://{host}:{port}/fec", timeout=5) as r:
-            assert json.loads(r.read())["location_level"] == 2
+            assert json.loads(r.read())["location_level"] == settled
+        return settled
     finally:
         stop.set()
         th.join(timeout=2)
         httpd.shutdown()
         os.close(rfd)
+
+
+def test_run_publishes_the_pushed_location_level(tmp_path):
+    """GET /fec must show the level the relay leg is holding, so the operator
+    can see the two legs agree."""
+    assert _published_location_level(
+        tmp_path, {"wan_profile": "wan1", "location_level": 2}, 2) == 2
+
+
+def test_run_publishes_the_location_level_clamped_to_its_own_table(tmp_path):
+    """What is published is what the leg APPLIES, not what was asked for.
+
+    run_once clamps the pushed level to the table it resolves; if the two boxes
+    ever disagree about a profile's table, echoing the raw request would have
+    the client's card claim a rung the relay is not holding. The cellular table
+    is 4 rows, so a pushed level 4 is applied — and must be reported — as 3."""
+    assert _published_location_level(
+        tmp_path, {"wan_profile": "wan1", "location_level": 4}, 3) == 3

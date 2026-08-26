@@ -490,9 +490,6 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
         pushed = state.get_pushed_loss(time.time(), pushed_stale_after)
         pushed_profile, pushed_sf, pushed_loc = state.get_pushed_link(
             time.time(), pushed_stale_after)
-        if pushed_loc != last_location_level:
-            logging.info("fec location level -> %d", pushed_loc)
-            last_location_level = pushed_loc
         profile_name = pushed_profile or "default"
         if profile_name != last_profile:
             # Translate the runtime's level across the profile switch: the OLD
@@ -524,6 +521,16 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
         # resolves it internally and the table is dict lookups, so re-resolving
         # is cheaper than threading it back out through the return tuple.
         pub_table, _, _ = resolve_relay_profile(cfg, pushed_profile)
+        # What this leg APPLIES, not what was asked for: run_once clamps the
+        # pushed level to this same table, so echoing the raw request would
+        # claim a rung the leg is not holding whenever the client's table for
+        # the profile is taller than ours. Logged on the applied value for the
+        # same reason — and a profile switch that re-clamps it is a real change
+        # in what the leg holds, so it belongs in the log too.
+        applied_loc = fec_control.apply_location_floor(0, pushed_loc, pub_table)
+        if applied_loc != last_location_level:
+            logging.info("fec location level -> %d", applied_loc)
+            last_location_level = applied_loc
         ladder = fec_control.ladder_state(
             mode, current_ratio,
             # Coerce as run_once does: an unusable floor is applied as the
@@ -543,7 +550,7 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
                       profile=profile_name,
                       profile_source=("pushed" if pushed_profile else "default"),
                       signal_floor_active=pushed_sf,
-                      location_level=pushed_loc,
+                      location_level=applied_loc,
                       wire=(wire_tracker.snapshot(now) if wire_tracker else None),
                       rx=(wire_tracker.rx_snapshot(now) if wire_tracker else None))
         stop_event.wait(cfg["poll_interval_s"])

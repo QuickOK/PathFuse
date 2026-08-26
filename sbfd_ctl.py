@@ -1072,8 +1072,9 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
         "floor_ratio": data.get("floor_ratio"),
         "ratio": data.get("ratio"),
         "level": data.get("level"),
-        # The location floor the relay says it is holding. None from a relay
-        # too old to report it — the two legs may legitimately differ mid-push,
+        # The level the relay is applying, clamped to its own table — not the
+        # one we asked for. None from a relay too old to report it. The two
+        # legs legitimately differ mid-push, and differ for good after a clamp,
         # so this is the relay's own value, never ours echoed back.
         "location_level": data.get("location_level"),
         # Absent from a relay older than the ladder field; the UI falls back to
