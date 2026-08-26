@@ -1481,3 +1481,124 @@ def test_run_controller_reposts_when_only_the_location_level_changes(
     levels = [p["location_level"] for p in pushed]
     assert levels[0] == 3
     assert levels[-1] == 1, f"expected a re-post at the new level, got {levels}"
+
+
+def _zone_cfg(cfg, tmp_path):
+    cfg.map = {"location_zones_path": str(tmp_path / "location_zones.json")}
+    Path(cfg.published_state).write_text("{}")
+    return str(tmp_path / "location_zones.json")
+
+
+def _post_zone(port, payload):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/location-zone",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=2) as r:
+        return r.status, json.loads(r.read())
+
+
+def test_api_post_location_zone_round_trip(cfg, tmp_path):
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+            "label": "dock", "wans": ["wan1"]})
+        assert status == 200 and body["ok"] is True
+        assert [z["id"] for z in body["zones"]] == ["z1"]
+        assert body["zones"][0]["label"] == "dock"
+        assert body["zones"][0]["wans"] == ["wan1"]
+
+        # Update in place, then delete: the response is always the whole list,
+        # because the page redraws from it rather than patching its own layer.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.2, "lon": -73.5, "radius_m": 500,
+            "level": 4, "label": "dock north"})
+        assert body["zones"][0]["label"] == "dock north"
+        assert body["zones"][0]["radius_m"] == 500.0
+
+        status, body = _post_zone(port, {"id": "z1", "delete": True})
+        assert body["zones"] == []
+        assert json.loads(Path(zones_path).read_text()) == {"zones": []}
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_an_unknown_wan(cfg, tmp_path):
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 3, "wans": ["wan9"]})
+        assert ei.value.code == 400
+        assert "wan9" in json.loads(ei.value.read())["error"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_a_level_past_the_active_table(cfg, tmp_path):
+    """table_len comes from the profile actually driving FEC, so the endpoint
+    can never accept a level the daemon would then clamp or drop."""
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 9})
+        assert ei.value.code == 400
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_deleting_an_id_that_is_not_there(cfg, tmp_path):
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"id": "z4", "delete": True})
+        assert ei.value.code == 400
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_uses_the_driving_profiles_table(cfg_with_fec, tmp_path):
+    """The cellular profile's table is shorter than the base one; a level that
+    is legal on the base table must be refused while that profile drives."""
+    cfg_with_fec.map = {"location_zones_path":
+                        str(tmp_path / "location_zones.json")}
+    cfg_with_fec.fec.wan_profiles = {"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+        ramp_up_ticks=1, ramp_down_hold_s=0, floor_ratio="8:0",
+        signal_floor_fec="12:1")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"profile": {"driver_wan": "wan1"}}}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+        # level 4 exists on the base table (5 rows) but not on the cellular
+        # one (4 rows), and wan1 is driving.
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 4})
+        assert ei.value.code == 400
+        status, body = _post_zone(port, {"lat": 41.1, "lon": -73.5,
+                                         "radius_m": 300, "level": 3})
+        assert status == 200 and body["zones"][0]["level"] == 3
+    finally:
+        stop.set()
+        httpd.shutdown()

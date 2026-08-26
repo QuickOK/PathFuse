@@ -444,3 +444,233 @@ def test_map_location_layer_survives_a_nul_in_the_store_path(tmp_path):
     out = M.map_location_layer(bad, str(tmp_path / "absent.json"), None,
                                max_tiles=10)
     assert out == {"tiles": [], "zones": []}
+
+
+# -- operator zone editing -----------------------------------------------------
+
+_WANS = {"wan1", "wan2"}
+
+
+def _zone_payload(**over):
+    p = {"lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+         "label": "dock"}
+    p.update(over)
+    return p
+
+
+def test_map_defaults_name_the_operator_zone_file():
+    m = M.resolve_map_cfg(None)
+    assert m["location_zones_path"] == "/var/lib/sbfd-ctl/location_zones.json"
+
+
+def test_validate_zone_payload_accepts_a_new_zone():
+    ok, zone, err = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    assert ok and err is None
+    assert zone == {"label": "dock", "lat": 41.1, "lon": -73.5,
+                    "radius_m": 300.0, "level": 3, "wans": None,
+                    "suppress_learned": False}
+    assert "id" not in zone                    # no id means create
+
+
+def test_validate_zone_payload_keeps_an_id_for_an_update():
+    ok, zone, _ = M.validate_zone_payload(_zone_payload(id="z7"), _WANS, 5)
+    assert ok and zone["id"] == "z7"
+
+
+def test_validate_zone_payload_accepts_a_delete():
+    ok, zone, err = M.validate_zone_payload({"id": "z2", "delete": True},
+                                            _WANS, 5)
+    assert ok and err is None
+    assert zone == {"id": "z2", "delete": True}
+
+
+def test_validate_zone_payload_rejects_a_delete_without_a_usable_id():
+    for bad in (None, "", "zone1", "z", "../etc", 3, True):
+        ok, _z, err = M.validate_zone_payload({"id": bad, "delete": True},
+                                              _WANS, 5)
+        assert not ok and err
+
+
+def test_validate_zone_payload_rejects_a_bad_id_format_on_an_update():
+    ok, _z, err = M.validate_zone_payload(_zone_payload(id="s1"), _WANS, 5)
+    assert not ok and "id" in err
+
+
+def test_validate_zone_payload_rejects_a_non_object():
+    for bad in ([], "zone", 4, None):
+        ok, _z, err = M.validate_zone_payload(bad, _WANS, 5)
+        assert not ok and "object" in err
+
+
+def test_validate_zone_payload_rejects_coordinates_out_of_range():
+    for over in ({"lat": 91.0}, {"lat": -90.5}, {"lon": 180.5},
+                 {"lon": -181.0}):
+        ok, _z, err = M.validate_zone_payload(_zone_payload(**over), _WANS, 5)
+        assert not ok and err
+
+
+def test_validate_zone_payload_rejects_a_non_finite_coordinate():
+    """json.loads accepts the barewords NaN and Infinity, and this file has
+    been bitten twice by a non-finite number reaching something that only
+    range-checks. NaN fails every comparison, so the bounds test alone lets it
+    straight through."""
+    for text in ('{"lat": NaN, "lon": -73.5, "radius_m": 300, "level": 3}',
+                 '{"lat": 41.1, "lon": Infinity, "radius_m": 300, "level": 3}',
+                 '{"lat": 41.1, "lon": -73.5, "radius_m": NaN, "level": 3}'):
+        ok, _z, err = M.validate_zone_payload(_json.loads(text), _WANS, 5)
+        assert not ok and err
+
+
+def test_validate_zone_payload_rejects_a_radius_outside_its_bounds():
+    for radius in (0, -10, 50001, "300", None, True):
+        ok, _z, err = M.validate_zone_payload(
+            _zone_payload(radius_m=radius), _WANS, 5)
+        assert not ok and "radius" in err
+
+
+def test_validate_zone_payload_rejects_a_level_past_the_table():
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=5), _WANS, 5)
+    assert not ok and "level" in err
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=-1), _WANS, 5)
+    assert not ok and "level" in err
+    # The shorter cellular table means the same level is out of range there.
+    ok, _z, _err = M.validate_zone_payload(_zone_payload(level=3), _WANS, 5)
+    assert ok
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=3), _WANS, 3)
+    assert not ok and "level" in err
+
+
+def test_validate_zone_payload_rejects_a_boolean_level():
+    # bool is a subclass of int: int(True) is 1, so an unguarded check would
+    # turn `"level": true` into a real floor of level 1.
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=True), _WANS, 5)
+    assert not ok and "level" in err
+
+
+def test_validate_zone_payload_rejects_an_unknown_wan_by_name():
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(wans=["wan1", "wan9"]), _WANS, 5)
+    assert not ok and "wan9" in err
+    ok, _z, err = M.validate_zone_payload(_zone_payload(wans="wan1"), _WANS, 5)
+    assert not ok and "wans" in err
+
+
+def test_validate_zone_payload_treats_an_absent_wans_as_all_wans():
+    for payload in (_zone_payload(), _zone_payload(wans=None),
+                    _zone_payload(wans=[])):
+        ok, zone, _ = M.validate_zone_payload(payload, _WANS, 5)
+        assert ok and zone["wans"] is None
+
+
+def test_validate_zone_payload_rejects_a_non_bool_suppress_learned():
+    for bad in (1, "true", None, []):
+        ok, _z, err = M.validate_zone_payload(
+            _zone_payload(suppress_learned=bad), _WANS, 5)
+        assert not ok and "suppress_learned" in err
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(suppress_learned=True), _WANS, 5)
+    assert ok and zone["suppress_learned"] is True
+
+
+def test_validate_zone_payload_sanitises_the_label():
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(label="a\x07b" + "x" * 100), _WANS, 5)
+    assert ok and zone["label"].startswith("ab") and len(zone["label"]) == 48
+    # An empty (or all-control-character) label still has to name something:
+    # the resolver publishes it as the reason a floor was raised.
+    for empty in ("", "   ", "\x07\x00"):
+        ok, zone, _ = M.validate_zone_payload(
+            _zone_payload(label=empty), _WANS, 5)
+        assert ok and zone["label"] == "zone"
+    ok, _z, err = M.validate_zone_payload(_zone_payload(label=7), _WANS, 5)
+    assert not ok and "label" in err
+
+
+def test_validated_zone_survives_the_daemons_own_validator():
+    """The endpoint and location_fec must agree about what a zone is, or the
+    map could write a zone the daemon then silently drops."""
+    import location_fec as LF
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(wans=["wan1"], suppress_learned=True), _WANS, 5)
+    assert ok
+    assert LF.validate_zone(zone, 5) is not None
+
+
+def test_apply_location_zone_assigns_ids_in_sequence(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    ok, zone, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    zones = M.apply_location_zone(p, zone)
+    assert [z["id"] for z in zones] == ["z1"]
+    ok, zone, _ = M.validate_zone_payload(_zone_payload(label="yard"),
+                                          _WANS, 5)
+    zones = M.apply_location_zone(p, zone)
+    assert [z["id"] for z in zones] == ["z1", "z2"]
+    assert [z["label"] for z in zones] == ["dock", "yard"]
+    assert _json.loads(Path(p).read_text())["zones"] == zones
+
+
+def test_apply_location_zone_numbers_a_new_id_above_every_existing_one(tmp_path):
+    """max+1, not count+1: with z1 deleted, the next zone must not be handed
+    z2 while a live z2 is still in the file."""
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    M.apply_location_zone(p, {"id": "z1", "delete": True})
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="c"), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert [z["id"] for z in zones] == ["z2", "z3"]
+
+
+def test_apply_location_zone_updates_in_place_and_keeps_the_id(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    _ok, z, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", label="renamed", level=4), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert [z["id"] for z in zones] == ["z1", "z2"]          # order kept
+    assert zones[0]["label"] == "renamed" and zones[0]["level"] == 4
+
+
+def test_apply_location_zone_deletes_by_id(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    zones = M.apply_location_zone(p, {"id": "z1", "delete": True})
+    assert [z["id"] for z in zones] == ["z2"]
+
+
+def test_apply_location_zone_reports_an_unknown_id(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    M.apply_location_zone(p, z)
+    assert M.apply_location_zone(p, {"id": "z9", "delete": True}) is None
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(id="z9"), _WANS, 5)
+    assert M.apply_location_zone(p, z) is None
+    # A refused change must not have touched the file.
+    assert [z["id"] for z in
+            _json.loads(Path(p).read_text())["zones"]] == ["z1"]
+
+
+def test_apply_location_zone_leaves_valid_json_with_no_zones_left(tmp_path):
+    """The daemon re-reads this file on every change; deleting the last zone
+    must leave it parseable, not empty or absent."""
+    p = str(tmp_path / "location_zones.json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    M.apply_location_zone(p, z)
+    assert M.apply_location_zone(p, {"id": "z1", "delete": True}) == []
+    assert _json.loads(Path(p).read_text()) == {"zones": []}
+
+
+def test_apply_location_zone_fails_open_on_an_unreadable_file(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text("{not json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    zones = M.apply_location_zone(str(p), z)
+    assert [z["id"] for z in zones] == ["z1"]

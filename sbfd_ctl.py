@@ -2262,10 +2262,15 @@ _MAP_DEFAULTS = {
                    "max_mb": 512, "max_zoom": 17},
     "location_store_path": "/var/lib/sbfd-ctl/location_fec_store.json",
     "location_config_path": "/etc/sbfd-ctl/location-fec.json",
+    # Zones the operator drew on the map. We write it; location_fec reads it,
+    # keyed off its mtime, so a drawn zone is live within a poll. Distinct
+    # from location_config_path, which ships with the box.
+    "location_zones_path": "/var/lib/sbfd-ctl/location_zones.json",
     "max_location_tiles": 2000,
 }
 
 _SID_RE = re.compile(r"^s[0-9]+$")
+_ZID_RE = re.compile(r"^z[0-9]+$")
 
 
 def resolve_map_cfg(raw) -> dict:
@@ -2295,6 +2300,87 @@ def validate_label(payload) -> tuple:
         return (False, None, None, "label must be a string")
     label = "".join(ch for ch in label if ch.isprintable())[:48]
     return (True, sid, label, None)
+
+
+# A zone is a FEC floor, not a region: 50 km of raised parity is far more
+# likely to be a slipped decimal point than an intention.
+_ZONE_MAX_RADIUS_M = 50000.0
+
+
+def _zone_number(value):
+    """A real, finite number as a float, or None.
+
+    bool is a subclass of int, and json.loads accepts the barewords NaN and
+    Infinity. NaN in particular fails EVERY comparison, so a range check alone
+    passes it straight through — which is how this file has twice let a
+    non-finite number reach something that only bounds-checked it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def validate_zone_payload(payload, wan_names, table_len) -> tuple:
+    """(ok, zone_or_id, err) for one operator-drawn location zone. Pure.
+
+    location_fec.validate_zone stays the authority on what a zone IS, and
+    everything accepted here satisfies it. This adds only what an API needs
+    and a hand-edited config file does not: an id, an explicit delete, a
+    radius ceiling, and a named error instead of a silent skip — the operator
+    is standing at the map waiting to be told why the save was refused."""
+    if not isinstance(payload, dict):
+        return (False, None, "payload must be an object")
+    zid = payload.get("id")
+    has_id = zid is not None
+    if has_id and not (isinstance(zid, str) and _ZID_RE.match(zid)):
+        return (False, None, "invalid zone id")
+    if payload.get("delete"):
+        if not has_id:
+            return (False, None, "invalid zone id")
+        return (True, {"id": zid, "delete": True}, None)
+    lat = _zone_number(payload.get("lat"))
+    if lat is None or not (-90.0 <= lat <= 90.0):
+        return (False, None, "lat must be a number in -90..90")
+    lon = _zone_number(payload.get("lon"))
+    if lon is None or not (-180.0 <= lon <= 180.0):
+        return (False, None, "lon must be a number in -180..180")
+    radius = _zone_number(payload.get("radius_m"))
+    if radius is None or not (0 < radius <= _ZONE_MAX_RADIUS_M):
+        return (False, None, "radius_m must be a number in 0..%d"
+                % int(_ZONE_MAX_RADIUS_M))
+    level = payload.get("level")
+    # bool first: int(True) is 1, so an unguarded check would turn
+    # `"level": true` into a real floor of level 1 on a live vehicle.
+    if (isinstance(level, bool) or not isinstance(level, int)
+            or not (0 <= level <= table_len - 1)):
+        return (False, None, "level must be 0..%d" % (table_len - 1))
+    label = payload.get("label", "")
+    if not isinstance(label, str):
+        return (False, None, "label must be a string")
+    # Same treatment as validate_label, plus a default: this label is
+    # published as the REASON a floor was raised, so it has to name something.
+    label = "".join(ch for ch in label if ch.isprintable()).strip()[:48] or "zone"
+    wans = payload.get("wans")
+    if wans is None or wans == []:
+        # Absent, null and empty all mean the same thing, and the daemon
+        # spells it None: this zone applies to every WAN.
+        wans = None
+    elif not isinstance(wans, list):
+        return (False, None, "wans must be a list of WAN names")
+    else:
+        for w in wans:
+            if not isinstance(w, str):
+                return (False, None, "wans must be a list of WAN names")
+            if w not in wan_names:
+                return (False, None, "unknown wan %s" % w)
+        wans = list(wans)
+    suppress = payload.get("suppress_learned", False)
+    if not isinstance(suppress, bool):
+        return (False, None, "suppress_learned must be true or false")
+    zone = {"label": label, "lat": lat, "lon": lon, "radius_m": radius,
+            "level": level, "wans": wans, "suppress_learned": suppress}
+    if has_id:
+        zone["id"] = zid
+    return (True, zone, None)
 
 
 def predict_from_stations(data: dict, n: int = 2) -> list:
@@ -2337,6 +2423,68 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     tmp.write_text(_json.dumps(labels))
     tmp.replace(p)
     return labels
+
+
+def apply_location_zone(zones_path: str, zone: dict):
+    """Apply one create / update / delete to the operator zone file; atomic
+    write; returns the resulting list, or None when the id it was told to
+    change is not in the file.
+
+    Fail-open on the READ, exactly as location_fec is: an unreadable or
+    corrupt file is treated as no zones, so a botched hand-edit costs the
+    zones drawn so far rather than the operator's ability to draw new ones.
+    NOT fail-open on the write — OSError propagates so the handler answers
+    500 instead of telling the operator a floor was saved that was not.
+    Mirrors apply_station_label."""
+    raw = _read_json_file(zones_path)
+    existing = raw.get("zones") if isinstance(raw, dict) else None
+    zones = ([z for z in existing if isinstance(z, dict)]
+             if isinstance(existing, list) else [])
+    zid = zone.get("id")
+    if zone.get("delete"):
+        kept = [z for z in zones if z.get("id") != zid]
+        if len(kept) == len(zones):
+            return None
+        zones = kept
+    elif zid:
+        for i, z in enumerate(zones):
+            if z.get("id") == zid:
+                zones[i] = dict(zone)
+                break
+        else:
+            return None
+    else:
+        # max + 1, not count + 1: a fresh zone must never be handed the id of
+        # one still in the file, or the next update would rewrite the wrong
+        # circle.
+        highest = 0
+        for z in zones:
+            i = z.get("id")
+            if isinstance(i, str) and _ZID_RE.match(i):
+                highest = max(highest, int(i[1:]))
+        zones = zones + [dict(zone, id="z%d" % (highest + 1))]
+    p = Path(zones_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(zones_path, _json.dumps({"zones": zones}, indent=2))
+    return zones
+
+
+def active_fec_table(fec_cfg, published_state_path):
+    """The loss table of the profile currently driving FEC.
+
+    A zone's `level` is an index into THIS table, so the endpoint that accepts
+    a level and the payload that tells the page what each level means have to
+    resolve it the same way — otherwise the map offers a rung the daemon would
+    clamp. Degrades to the base table: with no FEC section, or no driver named
+    in the snapshot, that is the table sbfd-ctl would use anyway."""
+    if fec_cfg is None:
+        return list(fec_control.DEFAULT_LOSS_TABLE)
+    snap = _read_json_file(published_state_path)
+    fec = snap.get("fec") if isinstance(snap, dict) else None
+    profile = fec.get("profile") if isinstance(fec, dict) else None
+    driver = profile.get("driver_wan") if isinstance(profile, dict) else None
+    return resolve_fec_profile(fec_cfg,
+                               driver if isinstance(driver, str) else None)[1]
 
 
 # Parsed tile store, keyed by (path, mtime_ns, size, inode). The map polls every 3s
@@ -2732,6 +2880,32 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 except OSError as e:
                     self._send_json(500, {"error": f"persist failed: {e}"}); return
                 self._send_json(200, {"ok": True, "labels": labels})
+                return
+            if self.path == "/api/location-zone":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                if length > 4096:
+                    self.send_error(413, "payload too large"); return
+                try:
+                    payload = _json.loads(self.rfile.read(length) or b"{}")
+                except ValueError:
+                    self._send_json(400, {"error": "invalid JSON"}); return
+                # The level is an index into the table of whichever profile is
+                # driving right now, so the bound is resolved per request.
+                table_len = len(active_fec_table(cfg.fec, cfg.published_state))
+                ok, zone, err = validate_zone_payload(payload, wan_names,
+                                                      table_len)
+                if not ok:
+                    self._send_json(400, {"error": err}); return
+                try:
+                    zones = apply_location_zone(
+                        map_cfg["location_zones_path"], zone)
+                except OSError as e:
+                    self._send_json(500, {"error": f"persist failed: {e}"}); return
+                if zones is None:
+                    self._send_json(400,
+                                    {"error": f"unknown zone {zone['id']}"})
+                    return
+                self._send_json(200, {"ok": True, "zones": zones})
                 return
             if self.path != "/api/runtime":
                 self.send_error(404); return
