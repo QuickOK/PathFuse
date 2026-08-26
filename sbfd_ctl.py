@@ -2351,6 +2351,13 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+# Parsed tile store, keyed by (path, mtime_ns, size). The map polls every 3s
+# and the store changes at walking pace, so re-reading and re-validating it per
+# request is pure waste — and a malformed store logged its "dropped N malformed
+# entries" warning on every one of those polls.
+_STORE_MEMO = {"path": None, "stat": None, "store": None}
+
+
 def map_location_layer(store_path, zones_path, fix, max_tiles):
     """Learned tiles (nearest the fix first, capped) and operator zones for
     the map. Degrades to empty lists: a broken source must never 500 the
@@ -2359,15 +2366,31 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
     import tile_store
     import station_tracker
     out = {"tiles": [], "zones": []}
-    raw = _read_json_file(store_path)
-    # Parse through the store's OWN validator rather than passing per-WAN
-    # entries through raw: it drops malformed entries and coerces the numbers,
-    # and it never raises. The map page does arithmetic on these values
-    # (`(v.ewma_loss || 0).toFixed(1)`), so a string here is a client-side
-    # exception, not a cosmetic wart. from_dict on a non-dict logs and starts
-    # empty, so only call it when there is something to parse.
-    store = (tile_store.TileStore.from_dict(raw) if isinstance(raw, dict)
-             else tile_store.TileStore())
+    try:
+        st = os.stat(store_path)
+        stat_key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        # No store (or unreadable): an empty layer, and nothing to memoize.
+        _STORE_MEMO.update({"path": None, "stat": None, "store": None})
+        stat_key = None
+    if stat_key is not None and (_STORE_MEMO["path"] == store_path
+                                 and _STORE_MEMO["stat"] == stat_key):
+        store = _STORE_MEMO["store"]
+    elif stat_key is None:
+        store = tile_store.TileStore()
+    else:
+        raw = _read_json_file(store_path)
+        # Parse through the store's OWN validator rather than passing per-WAN
+        # entries through raw: it drops malformed entries and coerces the
+        # numbers, and it never raises. The map page does arithmetic on these
+        # values (`(v.ewma_loss || 0).toFixed(1)`), so a string here is a
+        # client-side exception, not a cosmetic wart. from_dict on a non-dict
+        # logs and starts empty, so only call it when there is something to
+        # parse.
+        store = (tile_store.TileStore.from_dict(raw) if isinstance(raw, dict)
+                 else tile_store.TileStore())
+        _STORE_MEMO.update({"path": store_path, "stat": stat_key,
+                            "store": store})
     residual = store.residual
     rows = []
     for tid, per_wan in store.tiles.items():

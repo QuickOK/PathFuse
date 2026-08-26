@@ -1,5 +1,6 @@
 import json as _json
 import logging
+import os
 import socket
 from pathlib import Path
 
@@ -361,3 +362,75 @@ def test_get_map_fix_does_not_warn_when_gpsd_is_down(caplog):
     with caplog.at_level(logging.DEBUG):
         assert M.get_map_fix("127.0.0.1", port) is None
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def _one_tile_store(path, tile, ewma_loss=6.0):
+    path.write_text(_json.dumps({"version": 1, "tiles": {
+        tile: {"wan1": {"passes": 4, "ewma_loss": ewma_loss,
+                        "last_seen": 1000.0}}}}))
+
+
+def _count_from_dict(monkeypatch):
+    """Wrap TileStore.from_dict with a call counter."""
+    calls = []
+    real = T.TileStore.from_dict
+
+    def counting(raw, **kw):
+        calls.append(1)
+        return real(raw, **kw)
+
+    monkeypatch.setattr(T.TileStore, "from_dict", staticmethod(counting))
+    M._STORE_MEMO.update({"path": None, "stat": None, "store": None})
+    return calls
+
+
+def test_map_location_layer_parses_the_store_once_per_change(tmp_path, monkeypatch):
+    """/api/map polls every 3s; re-parsing an unchanged store on every poll is
+    wasted work and (for a malformed store) a warning per poll."""
+    calls = _count_from_dict(monkeypatch)
+    store = tmp_path / "store.json"
+    tile = T.encode(41.1, -73.5, 7)
+    _one_tile_store(store, tile)
+    absent = str(tmp_path / "absent.json")
+
+    first = M.map_location_layer(str(store), absent, None, max_tiles=10)
+    second = M.map_location_layer(str(store), absent, None, max_tiles=10)
+    assert first["tiles"][0]["id"] == tile
+    assert second["tiles"][0]["id"] == tile
+    assert len(calls) == 1
+
+    # A rewrite must be picked up. Force a distinct mtime_ns so the test does
+    # not depend on the filesystem's clock resolution.
+    _one_tile_store(store, tile, ewma_loss=9.0)
+    st = os.stat(str(store))
+    os.utime(str(store), ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    third = M.map_location_layer(str(store), absent, None, max_tiles=10)
+    assert len(calls) == 2
+    assert third["tiles"][0]["wans"]["wan1"]["ewma_loss"] == 9.0
+
+
+def test_map_location_layer_survives_the_store_vanishing(tmp_path, monkeypatch):
+    _count_from_dict(monkeypatch)
+    store = tmp_path / "store.json"
+    _one_tile_store(store, T.encode(41.1, -73.5, 7))
+    absent = str(tmp_path / "absent.json")
+    assert M.map_location_layer(str(store), absent, None, max_tiles=10)["tiles"]
+    store.unlink()
+    assert M.map_location_layer(str(store), absent, None,
+                                max_tiles=10) == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_warns_once_for_a_malformed_store(tmp_path, caplog):
+    M._STORE_MEMO.update({"path": None, "stat": None, "store": None})
+    store = tmp_path / "store.json"
+    tile = T.encode(41.1, -73.5, 7)
+    store.write_text(_json.dumps({"version": 1, "tiles": {
+        tile: {"wan1": {"passes": "lots", "ewma_loss": 6.0,
+                        "last_seen": 1000.0}}}}))
+    absent = str(tmp_path / "absent.json")
+    with caplog.at_level(logging.WARNING, logger="tile_store"):
+        for _ in range(3):
+            M.map_location_layer(str(store), absent, None, max_tiles=10)
+    warns = [r for r in caplog.records
+             if r.name == "tile_store" and "malformed" in r.getMessage()]
+    assert len(warns) == 1
