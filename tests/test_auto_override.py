@@ -737,6 +737,31 @@ def test_runtime_overlay_still_honours_a_real_bool_location_fec_enabled(tmp_path
     assert M.effective_location_fec_enabled(c, ov) is True
 
 
+def test_runtime_overlay_ignores_a_non_bool_environmental_enabled(tmp_path):
+    """Same hand-edit hazard as location_fec_enabled: bool("false") is True, so
+    a persist file saying the operator turned environmental off would have
+    turned it on. An unusable value means "no operator opinion"."""
+    c = base_cfg(environmental=_env_cfg(tmp_path, enabled=False),
+                 runtime_state=str(tmp_path / "r.json"),
+                 persist_state=str(tmp_path / "p.json"))
+    Path(c.persist_state).write_text(json.dumps({
+        "set_by": "hand", "set_ts": 1.0, "environmental_enabled": "false"}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.environmental_enabled is None
+    assert M.effective_environmental_enabled(c, ov) is False   # config default
+
+
+def test_runtime_overlay_still_honours_a_real_bool_environmental_enabled(tmp_path):
+    c = base_cfg(environmental=_env_cfg(tmp_path, enabled=False),
+                 runtime_state=str(tmp_path / "r.json"),
+                 persist_state=str(tmp_path / "p.json"))
+    Path(c.persist_state).write_text(json.dumps({
+        "set_by": "ui", "set_ts": 1.0, "environmental_enabled": True}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.environmental_enabled is True
+    assert M.effective_environmental_enabled(c, ov) is True
+
+
 def _oversized_set_ts_json(extra=""):
     """A JSON integer with more digits than a double can hold. json.loads keeps
     it as a Python int, and float() on it raises OverflowError rather than

@@ -1664,12 +1664,15 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_mode=loaded_fec_mode,
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
                 fec_floor_ratio=raw.get("fec_floor_ratio"),
-                environmental_enabled=raw.get("environmental_enabled"),
                 # Only a real bool is an operator opinion. The API path
                 # already refuses anything else, but this file can be hand
                 # edited, and bool("false") is True — so "off" written by hand
-                # would have switched the floor ON. None lets the config
+                # would have switched the feature ON. None lets the config
                 # default stand, which is what an unusable value means.
+                environmental_enabled=(
+                    raw.get("environmental_enabled")
+                    if isinstance(raw.get("environmental_enabled"), bool)
+                    else None),
                 location_fec_enabled=(
                     raw.get("location_fec_enabled")
                     if isinstance(raw.get("location_fec_enabled"), bool)
