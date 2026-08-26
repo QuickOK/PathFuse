@@ -2880,7 +2880,8 @@ def location_zones_path_mismatch(loc_cfg, map_cfg, now) -> Optional[str]:
     Never raises: it is called while building /api/map."""
     raw = fresh_location_record(loc_cfg, now)
     theirs = raw.get("operator_zones_path") if isinstance(raw, dict) else None
-    ours = map_cfg.get("location_zones_path") if isinstance(map_cfg, dict) else None
+    ours = (map_cfg.get("location_zones_path")
+            if isinstance(map_cfg, dict) else None)
     if not (isinstance(theirs, str) and theirs
             and isinstance(ours, str) and ours):
         return None

@@ -369,13 +369,13 @@ class ZoneFile:
             st = os.stat(path)
             key = (path, table_len, st.st_mtime_ns, st.st_size, st.st_ino)
         except (OSError, TypeError, ValueError):
-            # Gone, unreadable, or an unusable path (os.stat raises ValueError
-            # on an embedded NUL and TypeError on a non-path, and a TypeError
-            # out of here skipped the whole poll: every published floor gone
-            # while the daemon kept running). Clear the memo as well as the
-            # list, or a
-            # file recreated at the same size under a coarse mtime would be
-            # served from a cache of zones that no longer exist.
+            # Gone, unreadable, or an unusable path (os.stat raises
+            # ValueError on an embedded NUL and TypeError on a non-path, and
+            # a TypeError out of here skipped the whole poll: every published
+            # floor gone while the daemon kept running). Clear the memo as
+            # well as the list, or a file recreated at the same size under a
+            # coarse mtime would be served from a cache of zones that no
+            # longer exist.
             self._key, self._zones = None, []
             return self._zones
         if key != self._key:
