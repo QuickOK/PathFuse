@@ -1,4 +1,6 @@
 import json as _json
+import logging
+import socket
 from pathlib import Path
 
 import sbfd_ctl as M
@@ -345,3 +347,17 @@ def test_assemble_map_payload_clamps_a_negative_max_location_tiles(tmp_path):
                            "max_location_tiles": -5})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     assert out["location_fec"]["tiles"] == []
+
+
+def test_get_map_fix_does_not_warn_when_gpsd_is_down(caplog):
+    """The map polls every 3 s; environ_ctl.get_fix warns on every failed
+    connect. A dead gpsd plus one open map page would fill the journal."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()                      # nothing is listening there now
+    M._GPS_MEMO["ts"] = 0.0        # defeat the 2 s memo
+    M._GPS_MEMO["fix"] = None
+    with caplog.at_level(logging.DEBUG):
+        assert M.get_map_fix("127.0.0.1", port) is None
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []

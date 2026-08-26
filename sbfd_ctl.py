@@ -2458,7 +2458,9 @@ def get_map_fix(host, port):
     fix = None
     try:
         import environ_ctl
-        fix = environ_ctl.get_fix(host, port, timeout=1.5)
+        # quiet=True: the map polls every 3s, so a down gpsd would otherwise
+        # write a WARNING per poll for as long as a page stays open.
+        fix = environ_ctl.get_fix(host, port, timeout=1.5, quiet=True)
     except Exception as e:  # noqa: BLE001 - map shows "no gps" instead
         logging.debug("map gpsd read failed: %s", e)
     _GPS_MEMO["ts"] = now
