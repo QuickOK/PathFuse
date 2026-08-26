@@ -77,10 +77,23 @@ below the current floor say `already covered by the floor` and are dimmed;
 they remain selectable, because a zone chosen there still holds if the floor
 later drops.
 
+The radius has a slider for quick adjustment and a number beside it for exact
+or large values. The slider stops at 2 km; the number accepts anything the
+endpoint does, up to 50 km. Opening a wider zone shows its real radius and
+keeps it — the editor never shrinks a zone you only opened to look at.
+
 Drawn zones live in `/var/lib/sbfd-ctl/location_zones.json`. `sbfd-ctl` writes
 it and `location_fec` re-reads it whenever the file changes, so a zone takes
 effect within a poll — no signal, no restart. A missing file simply means no
 drawn zones; an unusable one is logged once and treated the same way.
+
+Each zone in that file carries an `id`, and the file carries a `next_id`
+counter beside them. Ids are handed out from the counter and never reused, so
+an editor panel left open on a zone that has since been deleted cannot save
+over a different zone that came later. A zone edited into the file by hand
+without an `id` still works — the daemon never asked for one — but the map
+cannot address it, so it is drawn dashed and says so in its tooltip. Delete it
+and redraw it to make it editable again.
 
 ### Declare it in the config file
 
@@ -127,8 +140,10 @@ restart, and the reload says so.
 - *active* means the location floor is currently why the wire carries more
   parity than the loss-driven decision alone would send, whether or not it
   triggered the most recent write; a refused write is never counted.
-- The map draws learned tiles as loss-coloured squares and zones as
-  circles: dashed for a config zone, solid for one drawn on the map.
+- The map draws learned tiles as loss-coloured squares and zones as circles:
+  solid for a zone it can edit, dashed for one it cannot. Every zone the
+  daemon is acting on is drawn, and a dashed one's tooltip says why it is not
+  editable here.
 - **Zones** on the map page opens the zone editor. With it off the map
   behaves exactly as it did before, and config zones stay read-only in
   either state.

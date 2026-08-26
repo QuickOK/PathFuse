@@ -670,7 +670,7 @@ def test_apply_location_zone_leaves_valid_json_with_no_zones_left(tmp_path):
     _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
     M.apply_location_zone(p, z)
     assert M.apply_location_zone(p, {"id": "z1", "delete": True}) == []
-    assert _json.loads(Path(p).read_text()) == {"zones": []}
+    assert _json.loads(Path(p).read_text())["zones"] == []
 
 
 def test_apply_location_zone_fails_open_on_an_unreadable_file(tmp_path):
@@ -796,3 +796,120 @@ def test_map_payload_without_a_fec_cfg_degrades_but_never_omits(tmp_path):
     assert loc["wans"] == {}
     assert loc["tiles"] == [] and loc["zones"] == []
     assert out["fix"] is None and out["stations"] == []
+
+
+# -- round 2: every live zone visible, ids never reused ------------------------
+
+
+def test_map_location_layer_shows_an_operator_zone_with_no_id(tmp_path):
+    """A zone with no id is still a zone the daemon acts on -- validate_zone
+    never asked for one. Hiding it would mean the map omits a circle that is
+    steering real parity; show it, and say it cannot be edited from here."""
+    opz = tmp_path / "location_zones.json"
+    opz.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "dock", "lat": 41.2, "lon": -73.6,
+         "radius_m": 150, "level": 3},
+        {"label": "hand written", "lat": 41.3, "lon": -73.7,
+         "radius_m": 200, "level": 1},
+        {"id": "not-a-zone-id", "label": "also hand written", "lat": 41.4,
+         "lon": -73.8, "radius_m": 250, "level": 2}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"),
+                               str(tmp_path / "absent-cfg.json"), None, 10,
+                               operator_zones_path=str(opz))
+    assert [z["label"] for z in out["zones"]] == [
+        "dock", "hand written", "also hand written"]
+    assert [z["source"] for z in out["zones"]] == ["operator"] * 3
+    assert [z["editable"] for z in out["zones"]] == [True, False, False]
+    assert out["zones"][0]["id"] == "z1"
+    assert "id" not in out["zones"][1]
+    assert "id" not in out["zones"][2]      # an unusable id is no id at all
+
+
+def test_map_location_layer_still_drops_a_zone_with_unusable_geometry(tmp_path):
+    """An id-less row is editable elsewhere, not unusable. A row with no
+    position is unusable, and stays dropped."""
+    opz = tmp_path / "location_zones.json"
+    opz.write_text(_json.dumps({"zones": [
+        {"label": "no position", "radius_m": 200, "level": 1},
+        {"label": "no radius", "lat": 41.3, "lon": -73.7, "level": 1},
+        {"label": "keeps its place", "lat": 41.3, "lon": -73.7,
+         "radius_m": 200, "level": 1}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"),
+                               str(tmp_path / "absent-cfg.json"), None, 10,
+                               operator_zones_path=str(opz))
+    assert [z["label"] for z in out["zones"]] == ["keeps its place"]
+
+
+def test_config_zones_are_never_editable(tmp_path):
+    cfgz = tmp_path / "lf.json"
+    cfgz.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(cfgz), None,
+                               10)
+    assert out["zones"][0]["editable"] is False
+    assert out["zones"][0]["source"] == "config"
+
+
+def test_apply_location_zone_never_reuses_an_id_after_a_delete(tmp_path):
+    """A stale editor panel still holding z2 must never be able to save over a
+    DIFFERENT z2 handed out later. The counter is persisted for that reason."""
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    M.apply_location_zone(p, {"id": "z2", "delete": True})   # the highest
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="c"), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert [z["id"] for z in zones] == ["z1", "z3"]
+    assert _json.loads(Path(p).read_text())["next_id"] == 4
+
+
+def test_apply_location_zone_keeps_the_counter_past_an_empty_file(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    M.apply_location_zone(p, z)
+    assert M.apply_location_zone(p, {"id": "z1", "delete": True}) == []
+    body = _json.loads(Path(p).read_text())
+    assert body["zones"] == [] and body["next_id"] == 2
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    assert [z["id"] for z in M.apply_location_zone(p, z)] == ["z2"]
+
+
+def test_apply_location_zone_allocates_without_a_stored_counter(tmp_path):
+    """Files written before the counter existed, and hand-edited ones, still
+    have to allocate a free id."""
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "a", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1},
+        {"id": "z2", "label": "b", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1}]}))
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="c"), _WANS, 5)
+    zones = M.apply_location_zone(str(p), z)
+    assert [z["id"] for z in zones] == ["z1", "z2", "z3"]
+
+
+def test_apply_location_zone_never_collides_with_a_stale_counter(tmp_path):
+    """A hand-edited counter below an id already in the file must not hand out
+    that id again: the watermark is the max of the two."""
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"next_id": 2, "zones": [
+        {"id": "z5", "label": "a", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1}]}))
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="b"), _WANS, 5)
+    zones = M.apply_location_zone(str(p), z)
+    assert [z["id"] for z in zones] == ["z5", "z6"]
+
+
+def test_apply_location_zone_ignores_an_unusable_counter(tmp_path):
+    for n, bad in enumerate(("3", True, -1, 0, None, 2.5, [])):
+        p = tmp_path / ("counter-%d.json" % n)
+        p.write_text(_json.dumps({"next_id": bad, "zones": [
+            {"id": "z1", "label": "a", "lat": 41.1, "lon": -73.5,
+             "radius_m": 300, "level": 1}]}))
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label="b"),
+                                            _WANS, 5)
+        zones = M.apply_location_zone(str(p), z)
+        assert [z["id"] for z in zones] == ["z1", "z2"], bad

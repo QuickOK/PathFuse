@@ -88,21 +88,25 @@ function drawLocation(loc) {
     (loc.zones || []).forEach((z) => {
       try {
         const drawn = z.source === "operator";
+        // Every zone the daemon is acting on is drawn; `editable` is a
+        // separate question. A config zone ships with the box, and an
+        // operator zone with no id cannot be addressed by the endpoint --
+        // both are shown, and both say why they cannot be changed here.
         const c = L.circle([z.lat, z.lon], {
           radius: z.radius_m, color: "#fff", weight: 2,
-          // Dashed = declared in the config file and not ours to change;
-          // solid = drawn here, and editable while zone mode is on.
-          dashArray: drawn ? null : "6 4",
-          fillColor: levelColor(z.level), fillOpacity: drawn ? 0.3 : 0.2,
-          interactive: drawn && zoneMode,
+          dashArray: z.editable ? null : "6 4",
+          fillColor: levelColor(z.level), fillOpacity: z.editable ? 0.3 : 0.2,
+          interactive: !!z.editable && zoneMode,
         }).addTo(locationLayer);
         const tip = document.createElement("span");
         tip.className = "stn-tip";
         tip.textContent = `${z.label}: level ${z.level}`
           + (z.wans ? ` (${z.wans.join(", ")})` : "")
-          + (drawn ? "" : " - from the config file");
+          + (z.editable ? ""
+             : drawn ? " - no id: edit the file, or delete and redraw"
+                     : " - from the config file");
         c.bindTooltip(tip, { permanent: true, direction: "center" });
-        if (drawn && zoneMode) c.on("click", (e) => {
+        if (z.editable && zoneMode) c.on("click", (e) => {
           // Without this the map's own click handler also fires and opens a
           // NEW zone on top of the one just asked for.
           L.DomEvent.stopPropagation(e);
@@ -245,10 +249,34 @@ function checkedWans() {
   return out;
 }
 
+// The number input is the authoritative radius; the slider is a quick way to
+// move it and only spans the radii worth dragging. A hand-written 5 km zone
+// therefore opens at 5000 and stays 5000 unless the operator actually moves
+// the slider -- the editor must never quietly shrink a zone it was only
+// opened to look at.
+function radiusValue() {
+  return Number(el("z-radius-m").value);
+}
+
+function syncFromSlider() {
+  el("z-radius-m").value = el("z-radius").value;
+  updatePreview();
+}
+
+function syncFromNumber() {
+  const r = radiusValue();
+  if (Number.isFinite(r)) {
+    el("z-radius").value = String(Math.min(2000, Math.max(50, r)));
+  }
+  updatePreview();
+}
+
 function updatePreview() {
-  el("z-radius-m").textContent = el("z-radius").value + " m";
   if (!editing) return;
-  const radius = Number(el("z-radius").value);
+  const radius = radiusValue();
+  // A half-typed or emptied number is not a circle. Leave the preview where
+  // it was; the server names the problem if they save it anyway.
+  if (!Number.isFinite(radius) || radius <= 0) return;
   const color = levelColor(Number(el("z-level").value));
   const at = [editing.lat, editing.lon];
   if (!preview) {
@@ -266,9 +294,8 @@ function updatePreview() {
 function openEditor(zone) {
   editing = { lat: zone.lat, lon: zone.lon, id: zone.id };
   el("z-label").value = zone.label || "";
-  // The slider spans the radii worth drawing by hand; a wider zone written
-  // through the API is clamped into it, and the preview shows the clamp.
   const radius = Number(zone.radius_m) || 300;
+  el("z-radius-m").value = String(radius);
   el("z-radius").value = String(Math.min(2000, Math.max(50, radius)));
   buildLevels(zone.level != null ? zone.level : 2);
   buildWans(zone.wans);
@@ -367,14 +394,15 @@ map.on("click", (e) => {
   openEditor({ lat: e.latlng.lat, lon: e.latlng.lng, level: 2 });
 });
 
-el("z-radius").oninput = updatePreview;
+el("z-radius").oninput = syncFromSlider;
+el("z-radius-m").oninput = syncFromNumber;
 el("z-level").onchange = updatePreview;
 el("z-cancel").onclick = closeEditor;
 el("z-save").onclick = () => {
   if (!editing) return;
   const body = {
     lat: editing.lat, lon: editing.lon,
-    radius_m: Number(el("z-radius").value),
+    radius_m: radiusValue(),
     level: Number(el("z-level").value),
     label: el("z-label").value,
     wans: checkedWans(),

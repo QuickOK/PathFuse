@@ -2425,6 +2425,24 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+def _zone_watermark(zones, stored_next):
+    """The lowest zone number that has never been handed out.
+
+    Stored in the file as `next_id`, because deriving it from the zones alone
+    reuses an id the moment the highest zone is deleted — and a stale editor
+    panel still holding that id would then save over a DIFFERENT zone. The
+    stored value is only ever a floor: an id already in the file always wins,
+    so a hand-edited or missing counter cannot cause a collision either."""
+    highest = 0
+    for z in zones:
+        zid = z.get("id") if isinstance(z, dict) else None
+        if isinstance(zid, str) and _ZID_RE.match(zid):
+            highest = max(highest, int(zid[1:]))
+    if isinstance(stored_next, bool) or not isinstance(stored_next, int):
+        stored_next = 0
+    return max(stored_next, highest + 1)
+
+
 def apply_location_zone(zones_path: str, zone: dict):
     """Apply one create / update / delete to the operator zone file; atomic
     write; returns the resulting list, or None when the id it was told to
@@ -2440,6 +2458,9 @@ def apply_location_zone(zones_path: str, zone: dict):
     existing = raw.get("zones") if isinstance(raw, dict) else None
     zones = ([z for z in existing if isinstance(z, dict)]
              if isinstance(existing, list) else [])
+    # Taken BEFORE the change, so a delete can never lower it.
+    watermark = _zone_watermark(zones, (raw or {}).get("next_id")
+                                if isinstance(raw, dict) else None)
     zid = zone.get("id")
     if zone.get("delete"):
         kept = [z for z in zones if z.get("id") != zid]
@@ -2454,18 +2475,14 @@ def apply_location_zone(zones_path: str, zone: dict):
         else:
             return None
     else:
-        # max + 1, not count + 1: a fresh zone must never be handed the id of
-        # one still in the file, or the next update would rewrite the wrong
-        # circle.
-        highest = 0
-        for z in zones:
-            i = z.get("id")
-            if isinstance(i, str) and _ZID_RE.match(i):
-                highest = max(highest, int(i[1:]))
-        zones = zones + [dict(zone, id="z%d" % (highest + 1))]
+        zones = zones + [dict(zone, id="z%d" % watermark)]
+        watermark += 1
     p = Path(zones_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(zones_path, _json.dumps({"zones": zones}, indent=2))
+    # next_id rides out on every write, delete included: that is the whole
+    # point of persisting it.
+    _atomic_write_text(zones_path, _json.dumps(
+        {"zones": zones, "next_id": watermark}, indent=2))
     return zones
 
 
@@ -2499,9 +2516,11 @@ def _map_zone_rows(zones_path, source):
 
     Both files hold the same shape, and both are read the same defensive way:
     the config one is hand-edited and the operator one is written by an
-    endpoint whose atomic write can still be interrupted. `source` is what
-    lets the page know which circles it may edit — a config zone ships with
-    the box and is not the map's to change."""
+    endpoint whose atomic write can still be interrupted. `source` says where
+    a row came from and `editable` whether this page may change it: a config
+    zone ships with the box, and an operator row with no usable id cannot be
+    addressed by the endpoint. Both are still DRAWN — a zone the daemon is
+    steering parity with must never be missing from the map."""
     out = []
     raw = _read_json_file(zones_path)
     zones = raw.get("zones") if isinstance(raw, dict) else None
@@ -2517,20 +2536,24 @@ def _map_zone_rows(zones_path, source):
                 and all(isinstance(w, str) for w in names)):
             names = None
         try:
+            # Geometry is the one thing worth dropping a row over: without a
+            # position and a radius there is no circle to draw at all.
             row = {"label": str(z.get("label") or "zone"),
                    "lat": float(z["lat"]), "lon": float(z["lon"]),
                    "radius_m": float(z["radius_m"]), "level": int(z["level"]),
-                   "wans": names, "source": source}
+                   "wans": names, "source": source, "editable": False}
         except (KeyError, TypeError, ValueError):
             continue
         if source == "operator":
-            zid = z.get("id")
-            # No id, no edit: the page addresses a zone by id, and a row
-            # without one could only be saved back as a new zone.
-            if not (isinstance(zid, str) and _ZID_RE.match(zid)):
-                continue
-            row["id"] = zid
             row["suppress_learned"] = bool(z.get("suppress_learned", False))
+            zid = z.get("id")
+            # No id, no EDIT — but still a draw. location_fec.validate_zone
+            # never asked for an id, so a hand-written row without one is live
+            # in the daemon; leaving it off the map would hide a zone that is
+            # actually steering parity. The page says so instead.
+            if isinstance(zid, str) and _ZID_RE.match(zid):
+                row["id"] = zid
+                row["editable"] = True
         out.append(row)
     return out
 

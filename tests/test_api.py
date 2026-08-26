@@ -1522,7 +1522,7 @@ def test_api_post_location_zone_round_trip(cfg, tmp_path):
 
         status, body = _post_zone(port, {"id": "z1", "delete": True})
         assert body["zones"] == []
-        assert json.loads(Path(zones_path).read_text()) == {"zones": []}
+        assert json.loads(Path(zones_path).read_text())["zones"] == []
     finally:
         stop.set()
         httpd.shutdown()
@@ -1628,6 +1628,52 @@ def test_api_map_explains_every_fec_level(cfg_with_fec, tmp_path):
             row["fec"] for row in fec_control.DEFAULT_LOSS_TABLE]
         assert loc["floor_level"] == 1
         assert loc["wans"] == {"wan1": "T-Mo", "wan2": "Satellite"}
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_keeps_a_wide_radius_through_an_update(cfg, tmp_path):
+    """The editor's slider stops at 2 km; the API accepts up to 50 km. Saving a
+    wide zone back unchanged must not shrink it."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 5000, "level": 2,
+            "label": "long tunnel"})
+        assert status == 200 and body["zones"][0]["radius_m"] == 5000.0
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 5000,
+            "level": 3, "label": "long tunnel"})
+        assert body["zones"][0]["radius_m"] == 5000.0
+        assert body["zones"][0]["level"] == 3
+        assert json.loads(
+            Path(zones_path).read_text())["zones"][0]["radius_m"] == 5000.0
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_map_shows_a_zone_the_map_cannot_edit(cfg, tmp_path):
+    """A hand-written zone with no id steers parity like any other; /api/map
+    has to carry it, marked as not this page's to change."""
+    zones_path = Path(_zone_cfg(cfg, tmp_path))
+    zones_path.write_text(json.dumps({"zones": [
+        {"label": "hand written", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 2}]}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            zones = json.loads(r.read())["location_fec"]["zones"]
+        assert [z["label"] for z in zones] == ["hand written"]
+        assert zones[0]["source"] == "operator"
+        assert zones[0]["editable"] is False
     finally:
         stop.set()
         httpd.shutdown()
