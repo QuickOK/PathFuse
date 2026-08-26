@@ -333,8 +333,12 @@ def load_operator_zones(path, table_len):
             raw = json.load(f)
     except FileNotFoundError:
         return []
-    except (OSError, ValueError) as e:
-        log.warning("operator zones %s unreadable: %s", path, e)
+    # TypeError, because open() raises it (not OSError) on a path that is not
+    # a path at all -- `"operator_zones_path": null` in the config. This is
+    # the 1 Hz poll's helper: it fails open on the TYPE of the path as well as
+    # on the contents of the file.
+    except (OSError, TypeError, ValueError) as e:
+        log.warning("operator zones %r unreadable: %s", path, e)
         return []
     zones = raw.get("zones") if isinstance(raw, dict) else None
     if not isinstance(zones, list):
@@ -364,9 +368,12 @@ class ZoneFile:
         try:
             st = os.stat(path)
             key = (path, table_len, st.st_mtime_ns, st.st_size, st.st_ino)
-        except (OSError, ValueError):
+        except (OSError, TypeError, ValueError):
             # Gone, unreadable, or an unusable path (os.stat raises ValueError
-            # on an embedded NUL). Clear the memo as well as the list, or a
+            # on an embedded NUL and TypeError on a non-path, and a TypeError
+            # out of here skipped the whole poll: every published floor gone
+            # while the daemon kept running). Clear the memo as well as the
+            # list, or a
             # file recreated at the same size under a coarse mtime would be
             # served from a cache of zones that no longer exist.
             self._key, self._zones = None, []
@@ -375,6 +382,26 @@ class ZoneFile:
             self._key = key
             self._zones = load_operator_zones(path, table_len)
         return self._zones
+
+
+_DEFAULT_OPERATOR_ZONES_PATH = "/var/lib/sbfd-ctl/location_zones.json"
+
+
+def _zones_path(raw):
+    """The configured operator-zone path, or the default when it is not a path.
+
+    os.stat raises TypeError on a null or a number, and that TypeError used to
+    reach the 1 Hz poll -- one mistyped config line and NO location floor was
+    published at all, with the daemon still running and saying nothing about
+    it. Unusable is therefore loud AND survivable. The caller passes the
+    default for an ABSENT key, which is the normal state of every shipped
+    config and must stay silent; a key that is present and unusable is the
+    only thing worth a warning."""
+    if isinstance(raw, str):
+        return raw
+    log.warning("operator_zones_path %r is not a path; using %s",
+                raw, _DEFAULT_OPERATOR_ZONES_PATH)
+    return _DEFAULT_OPERATOR_ZONES_PATH
 
 
 def load_location_config(path) -> LocationConfig:
@@ -410,8 +437,8 @@ def load_location_config(path) -> LocationConfig:
                   ("min_passes", "alpha", "pass_gap_s", "max_tiles",
                    "max_age_days", "clean_drop_days") if k in learn},
         zones=zones,
-        operator_zones_path=raw.get("operator_zones_path",
-                                    "/var/lib/sbfd-ctl/location_zones.json"),
+        operator_zones_path=_zones_path(
+            raw.get("operator_zones_path", _DEFAULT_OPERATOR_ZONES_PATH)),
         table=table,
     )
 

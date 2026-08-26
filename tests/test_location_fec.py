@@ -753,3 +753,42 @@ def test_zone_file_revalidates_when_the_table_changes(tmp_path):
     assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["deep"]
     assert zf.maybe_reload(str(p), 4) == []
     assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["deep"]
+
+
+def test_a_non_string_operator_zones_path_becomes_the_default_and_warns(
+        tmp_path, caplog):
+    """`"operator_zones_path": null` handed os.stat a None and raised
+    TypeError out of the poll, so NO floor was published at all for as long as
+    the typo stayed in the config -- every location zone silently gone while
+    the daemon kept running. The value is coerced where it is read."""
+    for bad in (None, 7, ["/tmp/zones.json"]):
+        caplog.clear()
+        with caplog.at_level(_logging.WARNING, logger="location_fec"):
+            cfg = M.load_location_config(
+                _cfg_raw(tmp_path, operator_zones_path=bad))
+        assert cfg.operator_zones_path == "/var/lib/sbfd-ctl/location_zones.json"
+        assert len(_warnings(caplog)) == 1
+
+
+def test_the_zone_file_never_raises_on_an_unusable_path(tmp_path):
+    """Belt as well as braces: the coercion above fixes the config, and these
+    two stay fail-open whatever they are handed -- they run inside the 1 Hz
+    poll, where one TypeError costs every published floor."""
+    zf = M.ZoneFile()
+    # No bare integer here on purpose: os.stat and open both read one as a
+    # FILE DESCRIPTOR, so the test itself would go rummaging through pytest's.
+    for bad in (None, ["/tmp/zones.json"], {"path": "/tmp/zones.json"}):
+        assert M.load_operator_zones(bad, 5) == []
+        assert zf.maybe_reload(bad, 5) == []
+
+
+def test_floors_still_publish_when_the_zone_path_is_unusable(tmp_path):
+    """The configured zones are a separate source from the drawn ones: an
+    unusable operator path must cost the drawn zones alone."""
+    cfg = M.load_location_config(_cfg_raw(tmp_path))
+    zf = M.ZoneFile()
+    drawn = zf.maybe_reload(None, len(cfg.table))
+    rec = M.poll_once(cfg, T.TileStore(), M.ExitHold(cfg.exit_hold_s),
+                      fix=(41.1, -73.5, 0.0, None), state=None,
+                      now_mono=0.0, now_wall=1000.0, operator_zones=drawn)
+    assert rec["wans"]["wan1"]["level"] == 2
