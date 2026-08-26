@@ -113,8 +113,9 @@ writes, so a delete there would succeed, the circle would vanish, and the
 daemon would carry on applying that floor from the file it actually reads.
 The map says nothing unless it can prove the divergence: a record that is
 absent, stale or from an older daemon leaves the editor alone.
-An `operator_zones_path` that is not a path at all (a `null`, a number) is
-logged and treated as the default rather than taking the poll down with it.
+An `operator_zones_path` that is unusable — not a path at all (a `null`, a
+number), empty, or carrying an embedded NUL — is logged and treated as the
+default rather than taking the poll down or silently reading nothing.
 
 At most 200 zones can be drawn. Every zone is walked once per look-ahead point
 in the 1 Hz loop and rides in every map poll, so the collection is bounded;
@@ -193,7 +194,7 @@ restart, and the reload says so.
 | corrupt store | starts empty, one log line |
 | invalid zone | logged and skipped |
 | drawn-zone file missing or corrupt | no drawn zones, one log line; config zones and learning are unaffected |
-| `operator_zones_path` not a path | one log line, the default path is used; floors keep publishing |
+| `operator_zones_path` unusable (not a path, empty, embedded NUL) | one log line, the default path is used; floors keep publishing |
 | map and daemon pointed at different zone files | the map names the daemon's file and goes read-only (Save and Delete both disabled); floors are unaffected |
 
 Known hole: in a tunnel the fix dies where the link does, so nothing is learned

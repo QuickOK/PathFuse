@@ -755,13 +755,19 @@ def test_zone_file_revalidates_when_the_table_changes(tmp_path):
     assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["deep"]
 
 
-def test_a_non_string_operator_zones_path_becomes_the_default_and_warns(
+def test_an_unusable_operator_zones_path_becomes_the_default_and_warns(
         tmp_path, caplog):
     """`"operator_zones_path": null` handed os.stat a None and raised
     TypeError out of the poll, so NO floor was published at all for as long as
     the typo stayed in the config -- every location zone silently gone while
-    the daemon kept running. The value is coerced where it is read."""
-    for bad in (None, 7, ["/tmp/zones.json"]):
+    the daemon kept running. The value is coerced where it is read.
+
+    A string can be just as unusable: `""` and a path with an embedded NUL
+    load no zones at all, and the empty one also drops the path out of the
+    published record -- so the map cannot even see the disagreement, and
+    drawn zones silently stop working. Unusable is unusable; take the
+    default and say so."""
+    for bad in (None, 7, ["/tmp/zones.json"], "", "/var/lib/zo\0nes.json"):
         caplog.clear()
         with caplog.at_level(_logging.WARNING, logger="location_fec"):
             cfg = M.load_location_config(

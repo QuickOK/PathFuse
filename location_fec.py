@@ -396,10 +396,16 @@ def _zones_path(raw):
     it. Unusable is therefore loud AND survivable. The caller passes the
     default for an ABSENT key, which is the normal state of every shipped
     config and must stay silent; a key that is present and unusable is the
-    only thing worth a warning."""
-    if isinstance(raw, str):
+    only thing worth a warning.
+
+    A string is not automatically usable: `""` and a path carrying a NUL name
+    no file ZoneFile can ever stat, and the empty one is also dropped from the
+    published record -- so the map cannot see the disagreement either, and
+    drawn zones just stop working. Both take the default like any other
+    unusable value."""
+    if isinstance(raw, str) and raw and "\0" not in raw:
         return raw
-    log.warning("operator_zones_path %r is not a path; using %s",
+    log.warning("operator_zones_path %r is not a usable path; using %s",
                 raw, _DEFAULT_OPERATOR_ZONES_PATH)
     return _DEFAULT_OPERATOR_ZONES_PATH
 
