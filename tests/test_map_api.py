@@ -434,3 +434,13 @@ def test_map_location_layer_warns_once_for_a_malformed_store(tmp_path, caplog):
     warns = [r for r in caplog.records
              if r.name == "tile_store" and "malformed" in r.getMessage()]
     assert len(warns) == 1
+
+
+def test_map_location_layer_survives_a_nul_in_the_store_path(tmp_path):
+    """os.stat raises ValueError - not OSError - on an embedded NUL, and the
+    endpoint must degrade rather than 500 on any broken source."""
+    M._STORE_MEMO.update({"path": None, "stat": None, "store": None})
+    bad = str(tmp_path / "sto\x00re.json")
+    out = M.map_location_layer(bad, str(tmp_path / "absent.json"), None,
+                               max_tiles=10)
+    assert out == {"tiles": [], "zones": []}

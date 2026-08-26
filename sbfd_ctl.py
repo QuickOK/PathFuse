@@ -2335,7 +2335,7 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
-# Parsed tile store, keyed by (path, mtime_ns, size). The map polls every 3s
+# Parsed tile store, keyed by (path, mtime_ns, size, inode). The map polls every 3s
 # and the store changes at walking pace, so re-reading and re-validating it per
 # request is pure waste — and a malformed store logged its "dropped N malformed
 # entries" warning on every one of those polls.
@@ -2352,9 +2352,14 @@ def map_location_layer(store_path, zones_path, fix, max_tiles):
     out = {"tiles": [], "zones": []}
     try:
         st = os.stat(store_path)
-        stat_key = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        # No store (or unreadable): an empty layer, and nothing to memoize.
+        # The inode is in the key because mtime_ns + size alone cannot tell a
+        # rewrite that reproduces both from no change at all; the writer's
+        # tmp + os.replace always lands a new one.
+        stat_key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except (OSError, ValueError):
+        # No store, unreadable, or an unusable path (os.stat raises ValueError,
+        # not OSError, on an embedded NUL — the read below used to absorb that
+        # one): an empty layer, and nothing to memoize.
         _STORE_MEMO.update({"path": None, "stat": None, "store": None})
         stat_key = None
     if stat_key is not None and (_STORE_MEMO["path"] == store_path
