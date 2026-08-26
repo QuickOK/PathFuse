@@ -62,18 +62,18 @@
 <div id="zone-editor" hidden>
   <div class="row" id="z-path-warn"></div>
   <div class="row">
-    <span class="k">Label</span>
+    <label class="k" for="z-label">Label</label>
     <input id="z-label" type="text" maxlength="48" placeholder="zone">
   </div>
   <div class="row">
-    <span class="k">Radius</span>
+    <label class="k" for="z-radius">Radius</label>
     <input id="z-radius" type="range" min="50" max="2000" step="25" value="300">
     <input id="z-radius-m" type="number" min="1" max="50000" step="25"
-           value="300">
+           value="300" aria-label="radius in metres">
     <span class="hint">m</span>
   </div>
   <div class="row">
-    <span class="k">Level</span>
+    <label class="k" for="z-level">Level</label>
     <select id="z-level"></select>
   </div>
   <div class="row">

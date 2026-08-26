@@ -368,16 +368,21 @@ function closeEditor() {
 }
 
 async function postZone(body) {
-  let resp, data;
+  let resp;
   try {
     resp = await fetch("/api/location-zone", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body) });
-    data = await resp.json();
   } catch (e) {
     el("z-error").textContent = "save failed: " + e;
     return;
   }
+  // Parsed separately, because not every refusal is JSON: send_error answers
+  // an unusable Content-Length or an oversized body with HTML, and parsing
+  // that inside the try above showed the operator "save failed: SyntaxError"
+  // while hiding the status that would have explained it.
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
   if (!resp.ok || !data || !data.ok) {
     // Leave the panel open on a refusal: the operator has to see which field
     // the server rejected, with what they typed still in front of them.
@@ -469,7 +474,13 @@ el("z-save").onclick = () => {
   postZone(body);
 };
 el("z-delete").onclick = () => {
-  if (editing && editing.id) postZone({ id: editing.id, delete: true });
+  if (!editing || !editing.id) return;
+  // One click removes a live FEC floor, and ids are never reused: this exact
+  // zone cannot be put back, only drawn again.
+  const name = el("z-label").value || editing.id;
+  if (!window.confirm('Delete zone "' + name + '"? Its FEC floor stops '
+                      + "applying and it cannot be restored.")) return;
+  postZone({ id: editing.id, delete: true });
 };
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeEditor();
