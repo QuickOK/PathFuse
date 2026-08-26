@@ -711,6 +711,39 @@ def test_load_operator_zones_drops_a_non_finite_radius_from_the_file(tmp_path):
     assert [z["label"] for z in M.load_operator_zones(str(p), 5)] == ["yard"]
 
 
+def test_validate_zone_rejects_numbers_that_overflow_a_float_or_an_int(tmp_path):
+    """float() and int() raise OverflowError, not ValueError, on an integer
+    too large for a float and on an infinite level. Zone validation is
+    fail-open by design -- log and skip -- but OverflowError was in neither
+    except tuple, so it came straight out of the 1 Hz poll instead, once a
+    second for as long as the hand-edited file stayed poisoned."""
+    base = {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 2}
+    big = 10 ** 400
+    for key, bad in (("lat", big), ("lon", big), ("radius_m", big),
+                     ("level", float("inf")), ("level", float("-inf"))):
+        assert M.validate_zone(dict(base, **{key: bad}), 5) is None, (key, bad)
+    assert M.validate_zone(base, 5) is not None
+
+    # And through the file the daemon actually re-reads on a poll.
+    p = tmp_path / "location_zones.json"
+    p.write_text('{"zones": [{"label": "poison", "lat": %d, "lon": -73.5,'
+                 ' "radius_m": 300, "level": 2},'
+                 ' {"label": "huge", "lat": 41.1, "lon": -73.5,'
+                 ' "radius_m": 300, "level": Infinity},'
+                 ' {"label": "yard", "lat": 41.1, "lon": -73.5,'
+                 ' "radius_m": 300, "level": 2}]}' % big)
+    assert [z["label"] for z in M.load_operator_zones(str(p), 5)] == ["yard"]
+    cfg = M.load_location_config(_cfg_raw(tmp_path, zones=[]))
+    zf = M.ZoneFile()
+    drawn = zf.maybe_reload(str(p), len(cfg.table))
+    assert [z["label"] for z in drawn] == ["yard"]
+    rec = M.poll_once(cfg, T.TileStore(), M.ExitHold(cfg.exit_hold_s),
+                      fix=(41.1, -73.5, 0.0, None), state=None,
+                      now_mono=0.0, now_wall=1000.0, operator_zones=drawn)
+    assert rec["wans"]["wan1"]["level"] == 2
+
+
 def test_zone_file_revalidates_when_the_table_changes(tmp_path):
     """A SIGHUP can swap the loss table under the daemon. A zone at level 4 is
     valid on a five-rung table and not on a four-rung one, so the memo has to

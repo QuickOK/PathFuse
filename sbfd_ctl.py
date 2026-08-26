@@ -2676,7 +2676,11 @@ def _map_zone_rows(zones_path, source):
             # position and a radius there is no circle to draw at all.
             lat, lon = float(z["lat"]), float(z["lon"])
             radius, level = float(z["radius_m"]), int(z["level"])
-        except (KeyError, TypeError, ValueError):
+        # OverflowError joins them because it is neither: float() raises it on
+        # an integer literal too large for a float (JSON integers are
+        # unbounded) and int() on an infinite level. One hand-edited config
+        # zone would otherwise 500 the whole /api/map response.
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
         # NaN and inf ARE floats, so they clear the conversion above, and
         # json.dumps writes them as the bare tokens NaN/Infinity -- which

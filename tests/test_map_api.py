@@ -1009,6 +1009,31 @@ def test_map_location_layer_drops_a_zone_with_a_non_finite_radius(tmp_path):
     _json.dumps(out, allow_nan=False)
 
 
+def test_map_location_layer_drops_a_zone_whose_numbers_overflow(tmp_path):
+    """float() and int() raise OverflowError -- not ValueError -- on an
+    integer literal too large for a float and on an infinite level, and
+    OverflowError was in neither except tuple.
+
+    The endpoint refuses both, so this is not reachable through the map; the
+    CONFIG zone file is hand-edited by design and feeds the same rows, and one
+    poisoned character there took out the whole /api/map response."""
+    big = "1" + "0" * 400
+    good = ('{"label": "good", "lat": 41.1, "lon": -73.5,'
+            ' "radius_m": 300, "level": 2}')
+    zones = tmp_path / "location-fec.json"
+    for key, bad in (("lat", big), ("lon", big), ("radius_m", big),
+                     ("level", "Infinity")):
+        fields = {"label": '"poison"', "lat": "41.1", "lon": "-73.5",
+                  "radius_m": "300", "level": "2"}
+        fields[key] = bad
+        poison = "{%s}" % ", ".join('"%s": %s' % kv for kv in fields.items())
+        zones.write_text('{"zones": [%s, %s]}' % (poison, good))
+        out = M.map_location_layer(str(tmp_path / "absent.json"), str(zones),
+                                   None, 10)
+        assert [z["label"] for z in out["zones"]] == ["good"], key
+        _json.dumps(out, allow_nan=False)     # what the browser must parse
+
+
 def test_map_payload_stays_parseable_with_a_poisoned_zone(tmp_path):
     m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
                            "labels_path": str(tmp_path / "l.json"),

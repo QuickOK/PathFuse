@@ -286,7 +286,11 @@ def validate_zone(raw, table_len):
         if isinstance(raw["level"], bool):
             raise TypeError("level must be a number")
         level = int(raw["level"])
-    except (KeyError, TypeError, ValueError):
+    # OverflowError, because it is neither of the other two: float() raises it
+    # on an integer literal too large for a float (JSON integers are unbounded)
+    # and int() on an infinite level. Uncaught it left this fail-open validator
+    # by raising into the 1 Hz poll, once a second while the file stayed bad.
+    except (KeyError, TypeError, ValueError, OverflowError):
         log.warning("zone %r ignored: needs lat, lon, radius_m and level", label)
         return None
     # Finiteness first, and separately: `radius <= 0` is False for inf, and
