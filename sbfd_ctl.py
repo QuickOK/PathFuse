@@ -2156,8 +2156,11 @@ def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
         payload["wan_profile"] = wan_profile
     if signal_floor is not None:
         payload["signal_floor"] = bool(signal_floor)
-    if location_level is not None:
-        payload["location_level"] = int(location_level)
+    # Coerce nothing: int() on a bad value would raise from OUTSIDE the try
+    # below and take the controller tick with it. A level that is not a plain
+    # int (bool included — the relay 400s it) costs us the key, not the push.
+    if isinstance(location_level, int) and not isinstance(location_level, bool):
+        payload["location_level"] = location_level
     body = _json.dumps(payload).encode()
     try:
         status, _reason, resp_body = _relay_request(

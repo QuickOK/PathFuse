@@ -720,6 +720,21 @@ def test_post_relay_fec_omits_the_location_level_when_none(monkeypatch):
     assert "location_level" not in seen["body"]
 
 
+def test_post_relay_fec_drops_a_junk_location_level_without_raising(monkeypatch):
+    # This module is fail-open and runs inside the controller tick: a level
+    # that is not a plain int must cost us the KEY, never the push (and never
+    # an exception out of int()). A bool would be a guaranteed 400 at the
+    # relay, so it goes the same way.
+    seen = fake_relay(monkeypatch)
+    for junk in ("3", 3.5, True, object()):
+        seen.clear()
+        assert M.post_relay_fec("http://192.0.2.9/fec", "min_adaptive", "20:1",
+                                "8:0", 1.0, wan_profile="wan1",
+                                location_level=junk) is True
+        assert "location_level" not in seen["body"]
+        assert seen["body"]["wan_profile"] == "wan1"   # the push still went
+
+
 def test_relay_fec_direction_echoes_the_location_level():
     fetch = {"ok": True, "error": None,
              "data": {"ratio": "8:2", "location_level": 2}}
