@@ -2,6 +2,7 @@ import json as _json
 import logging
 import os
 import socket
+import threading
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,64 @@ def test_apply_station_label_set_and_delete(tmp_path):
     out = M.apply_station_label(lp, "s1", "")
     assert out == {"s2": "Yard"}
     assert _json.loads(Path(lp).read_text()) == {"s2": "Yard"}
+
+
+def test_apply_station_label_survives_concurrent_writers(tmp_path):
+    """station_labels.json is a read-modify-write on a threaded UI server,
+    exactly like the zone file, and it was neither locked nor written through
+    the unique-tmp helper.
+
+    Two effects, and the quiet one is the dangerous one. Unlocked, the later
+    read wins and labels are simply lost. Worse, every writer shares one
+    `<name>.tmp` inode: B is still writing into it when A's replace moves it
+    to the live path, so B's remaining bytes land in the LIVE file -- and a
+    torn station_labels.json reads back as no labels at all, blanking every
+    named station on the map at once."""
+    lp = str(tmp_path / "station_labels.json")
+    writers, per_writer = 8, 50
+    failures, torn = [], []
+    done = threading.Event()
+
+    def writer(n):
+        for i in range(per_writer):
+            try:
+                M.apply_station_label(lp, "s%d-%d" % (n, i), "L%d-%d" % (n, i))
+            except Exception as e:                       # noqa: BLE001
+                failures.append(repr(e))
+
+    def reader():
+        # The live path must never be observed as anything but a complete
+        # file: that is what a temp file plus os.replace buys.
+        while not done.is_set():
+            try:
+                text = Path(lp).read_text()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                torn.append(repr(e))
+                continue
+            try:
+                _json.loads(text)
+            except ValueError as e:
+                torn.append("%s: %r" % (e, text[:80]))
+
+    watcher = threading.Thread(target=reader, daemon=True)
+    watcher.start()
+    threads = [threading.Thread(target=writer, args=(n,))
+               for n in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    done.set()
+    watcher.join(timeout=5)
+
+    assert failures == []
+    assert torn == []
+    labels = _json.loads(Path(lp).read_text())
+    assert len(labels) == writers * per_writer
+    assert labels["s0-0"] == "L0-0"
+    assert labels["s7-49"] == "L7-49"
 
 
 def test_map_location_layer_reads_tiles_and_zones(tmp_path):

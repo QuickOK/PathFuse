@@ -2436,10 +2436,28 @@ def _read_json_file(path):
         return None
 
 
+# The label endpoint is a read-modify-write of one file on a threaded server,
+# the same shape as the zone one, so it needs the same treatment. Its OWN lock,
+# not one shared with _ZONES_LOCK: the two files are independent, and a shared
+# lock would only make a label save wait behind an unrelated zone save.
+_LABELS_LOCK = threading.Lock()
+
+
 def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     """Set (or delete, when label is empty) one label; atomic write; returns
     the resulting mapping. Labels live apart from stations.json on purpose —
-    the tracker rewrites that file periodically and would race us."""
+    the tracker rewrites that file periodically and would race us.
+
+    Locked, and written through _atomic_write_text, for the reason
+    apply_location_zone is. A lost update here costs one label, which is
+    survivable; a TORN file does not, because the whole mapping is rewritten
+    on every call and an unparseable one reads back as no labels at all —
+    every named station on the map blanked by one interleaved save."""
+    with _LABELS_LOCK:
+        return _apply_station_label_locked(labels_path, sid, label)
+
+
+def _apply_station_label_locked(labels_path: str, sid: str, label: str) -> dict:
     labels = _read_json_file(labels_path)
     if not isinstance(labels, dict):
         labels = {}
@@ -2447,11 +2465,11 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
         labels[sid] = label
     else:
         labels.pop(sid, None)
-    p = Path(labels_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(_json.dumps(labels))
-    tmp.replace(p)
+    Path(labels_path).parent.mkdir(parents=True, exist_ok=True)
+    # Not p.with_suffix(".tmp"): that is one shared inode, and a second writer
+    # still holding it after the first replace writes straight into the live
+    # file. The helper's temp path is unique per writer.
+    _atomic_write_text(labels_path, _json.dumps(labels))
     return labels
 
 
