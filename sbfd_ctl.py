@@ -2475,10 +2475,11 @@ _ZONES_LOCK = threading.Lock()
 def stored_zone_level(zones_path, zid):
     """The level a drawn zone is already stored at, or None.
 
-    Read separately from apply_location_zone so the validator can stay pure.
-    A racing edit between this read and that write is harmless: the worst
-    outcome is a save refused for a level that changed underneath the
-    operator, which is what a refusal is for."""
+    Read separately from apply_location_zone so the validator can stay pure,
+    and deliberately WITHOUT taking _ZONES_LOCK: the caller whose write
+    depends on the answer -- validate_and_apply_location_zone -- already holds
+    it, and the lock is not reentrant. Called on its own this is a snapshot,
+    which is all a read-only caller can ask for."""
     raw = _read_json_file(zones_path)
     zones = raw.get("zones") if isinstance(raw, dict) else None
     if not isinstance(zones, list):
@@ -2521,10 +2522,10 @@ def apply_location_zone(zones_path: str, zone: dict):
     zones drawn so far rather than the operator's ability to draw new ones.
     NOT fail-open on the write — OSError propagates so the handler answers
     500 instead of telling the operator a floor was saved that was not.
-    Mirrors apply_station_label, plus the lock: labels are a dict keyed by an
-    id the caller supplies, so a lost update there costs one label; here the
-    whole COLLECTION is rewritten, so a lost update silently deletes somebody
-    else's zone."""
+    Mirrors apply_station_label, which takes the same treatment under its own
+    lock. A caller that also needs the zone VALIDATED against the file this is
+    about to replace goes through validate_and_apply_location_zone, which
+    holds the lock across both; this entry point locks the write alone."""
     with _ZONES_LOCK:
         return _apply_location_zone_locked(zones_path, zone)
 
@@ -2566,6 +2567,36 @@ def _apply_location_zone_locked(zones_path: str, zone: dict):
     _atomic_write_text(zones_path, _json.dumps(
         {"zones": zones, "next_id": watermark}, indent=2))
     return zones
+
+
+def validate_and_apply_location_zone(zones_path, payload, wan_names,
+                                     table_len):
+    """Validate one POSTed zone against the file it is about to change, then
+    apply it. Returns (ok, zone, zones, err), where `zones` is the resulting
+    list -- or None when the id it was told to change is not in the file.
+
+    The look-up, the validation and the write are ONE critical section on
+    purpose. `keep_level` is read from this same file, so deciding outside the
+    lock decides against a copy the write will not see, and that race runs
+    both ways: a save refused for a level that changed underneath the operator
+    (an honest refusal), but also a save ACCEPTED for a level the zone no
+    longer has, because a racing lower landed after the look-up -- putting an
+    off-table floor back on a live vehicle with both requests answered 200.
+    Under one acquisition the decision and the write describe one file.
+
+    Only local file I/O runs under the lock: no network, no nested
+    acquisition, nothing that can park another operator's POST behind it."""
+    with _ZONES_LOCK:
+        zid = payload.get("id") if isinstance(payload, dict) else None
+        # Only an update can carry a kept level; a create has no id to look up.
+        keep = (stored_zone_level(zones_path, zid)
+                if isinstance(zid, str) and _ZID_RE.match(zid) else None)
+        ok, zone, err = validate_zone_payload(payload, wan_names, table_len,
+                                              keep_level=keep)
+        if not ok:
+            return (False, None, None, err)
+        return (True, zone, _apply_location_zone_locked(zones_path, zone),
+                None)
 
 
 def active_fec_table(fec_cfg, published_state_path, snap=None):
@@ -3101,23 +3132,18 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 table_len = len(active_fec_table(cfg.fec, cfg.published_state))
                 # ...except for a level the zone already has, which is kept
                 # rather than snapped down onto a table that has since got
-                # shorter. Only an update can carry one.
-                pid = payload.get("id") if isinstance(payload, dict) else None
-                keep = (stored_zone_level(map_cfg["location_zones_path"], pid)
-                        if isinstance(pid, str) and _ZID_RE.match(pid)
-                        else None)
-                ok, zone, err = validate_zone_payload(payload, wan_names,
-                                                      table_len,
-                                                      keep_level=keep)
-                if not ok:
-                    self._send_json(400, {"error": err}); return
+                # shorter. That look-up reads the zone file, so it happens
+                # under the same lock as the write it justifies.
                 try:
-                    zones = apply_location_zone(
-                        map_cfg["location_zones_path"], zone)
+                    ok, zone, zones, err = validate_and_apply_location_zone(
+                        map_cfg["location_zones_path"], payload, wan_names,
+                        table_len)
                 except ZoneLimitError as e:
                     self._send_json(400, {"error": str(e)}); return
                 except OSError as e:
                     self._send_json(500, {"error": f"persist failed: {e}"}); return
+                if not ok:
+                    self._send_json(400, {"error": err}); return
                 if zones is None:
                     self._send_json(400,
                                     {"error": f"unknown zone {zone['id']}"})

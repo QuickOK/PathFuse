@@ -1875,6 +1875,78 @@ def test_api_post_location_zone_keeps_a_level_off_the_driving_table(cfg_with_fec
         httpd.shutdown()
 
 
+def test_api_post_location_zone_will_not_keep_a_level_a_racing_edit_removed(
+        cfg_with_fec, tmp_path, monkeypatch):
+    """The kept level is read FROM the zone file, so the look-up, the
+    validation and the write have to see one version of it.
+
+    Looked up outside the lock, a racing edit fits in between: the lower is
+    accepted (200), and the first save is then validated against a level the
+    zone no longer has and writes it back -- putting an off-table floor
+    returned by one operator straight back on a live vehicle, with both
+    requests answered 200 and nothing to say so."""
+    zones_path = tmp_path / "location_zones.json"
+    cfg_with_fec.map = {"location_zones_path": str(zones_path)}
+    cfg_with_fec.fec.wan_profiles = {"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+        ramp_up_ticks=1, ramp_down_hold_s=0, floor_ratio="8:0",
+        signal_floor_fec="12:1")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"profile": {"driver_wan": "wan1"}}}))
+    zones_path.write_text(json.dumps({"next_id": 2, "zones": [
+        {"id": "z1", "label": "long tunnel", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 4, "wans": None,
+         "suppress_learned": False}]}))
+
+    started, released = threading.Event(), threading.Event()
+    real = M.validate_zone_payload
+
+    def wedged(*a, **kw):
+        # Fires once, on the first save to reach validation: it stands exactly
+        # where the racing edit used to fit. Under the fix this runs with the
+        # lock held, the other POST cannot get in, and the wait times out.
+        if not started.is_set():
+            started.set()
+            released.wait(1.0)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(M, "validate_zone_payload", wedged)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    lowered = []
+    try:
+        port = httpd.server_address[1]
+
+        def lower():
+            started.wait(10)
+            try:
+                lowered.append(_post_zone(port, {
+                    "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+                    "level": 2, "label": "lowered"}))
+            except Exception as e:                   # noqa: BLE001
+                lowered.append(repr(e))
+            released.set()
+
+        racer = threading.Thread(target=lower)
+        racer.start()
+        # The rename carries the level the zone is stored at, which is off the
+        # four-rung table driving now: legitimate only while that IS its level.
+        status, _body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 4, "label": "long tunnel, renamed"})
+        racer.join(timeout=15)
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+    assert status == 200
+    assert lowered and lowered[0][0] == 200, lowered
+    stored = json.loads(zones_path.read_text())["zones"][0]
+    # The lower was accepted, so it is the last word: the rename was decided
+    # before it and cannot be written after it. A 4 here is a stale keep_level.
+    assert stored["level"] == 2, stored
+
+
 def _raw_post(port, path, length_header, body=b"{}", timeout=3):
     """POST with a Content-Length we choose, which urllib will not allow."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
