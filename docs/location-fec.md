@@ -112,7 +112,9 @@ not look like one that did. Delete especially — the map draws the file it
 writes, so a delete there would succeed, the circle would vanish, and the
 daemon would carry on applying that floor from the file it actually reads.
 The map says nothing unless it can prove the divergence: a record that is
-absent, stale or from an older daemon leaves the editor alone.
+absent, stale or from an older daemon leaves the editor alone. The two paths
+are compared through `realpath`, so a relative spelling or a symlinked parent
+naming one file is not a disagreement.
 An `operator_zones_path` that is unusable — not a path at all (a `null`, a
 number), empty, or carrying an embedded NUL — is logged and treated as the
 default rather than taking the poll down or silently reading nothing.

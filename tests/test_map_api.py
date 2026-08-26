@@ -1188,6 +1188,58 @@ def test_zones_path_mismatch_is_null_when_it_cannot_be_proved(tmp_path):
     assert out["location_fec"]["zones_path_mismatch"] is None
 
 
+# -- round 7: two spellings of one file are not a mismatch ---------------------
+
+
+def test_zones_path_mismatch_resolves_symlinks_and_relative_spellings(
+        tmp_path, monkeypatch):
+    """normpath resolves neither, so one file named two ways compared unequal.
+    Cosmetic while the endpoint still wrote; now that a proven mismatch is a
+    409, a false one is a refusal to save on a box that works."""
+    m = _levels_cfg(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    # Relative to the daemon's working directory, absolute here.
+    loc = _record(tmp_path, operator_zones_path="location_zones.json")
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+    # A symlinked parent: /var/lib -> /mnt/state/lib and the like.
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    m2 = _levels_cfg(tmp_path,
+                     location_zones_path=str(real / "location_zones.json"))
+    loc = _record(tmp_path,
+                  operator_zones_path=str(tmp_path / "link"
+                                          / "location_zones.json"))
+    assert M.location_zones_path_mismatch(loc, m2, 1000.0) is None
+    # Genuinely two files, and neither of them exists: realpath absolutises
+    # without raising, so the answer is still the lexical one.
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    loc = _record(tmp_path, operator_zones_path=theirs)
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) == theirs
+    # ...and it is the CONFIGURED spelling that comes back, not the resolved
+    # one: that is the string the operator has to go and fix.
+    loc = _record(tmp_path, operator_zones_path="./somewhere-else/zones.json")
+    assert (M.location_zones_path_mismatch(loc, m, 1000.0)
+            == "./somewhere-else/zones.json")
+
+
+def test_zones_path_mismatch_falls_open_when_realpath_raises(tmp_path,
+                                                             monkeypatch):
+    """Fail-open all the way down: if the filesystem work cannot be done we
+    report no mismatch rather than guessing, because the guess now locks the
+    operator out of the editor."""
+    m = _levels_cfg(tmp_path)
+    loc = _record(tmp_path,
+                  operator_zones_path=str(tmp_path / "elsewhere.json"))
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is not None
+
+    def boom(_p):
+        raise OSError("ELOOP")
+
+    monkeypatch.setattr(M.os.path, "realpath", boom)
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+
+
 # -- round 5: a save must not widen a zone to every WAN ------------------------
 
 

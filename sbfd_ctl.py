@@ -2863,6 +2863,28 @@ def map_fec_levels(table):
     return out
 
 
+def _resolved_path(p) -> Optional[str]:
+    """os.path.realpath(p), or None when it cannot be computed.
+
+    normpath resolves neither symlinks nor relative paths, so two settings
+    naming ONE file compare unequal -- one side relative to a daemon's working
+    directory, or one naming a symlinked parent. realpath resolves both and
+    absolutises, and on a path that exists nowhere it still answers (without
+    raising), which leaves the caller with the lexical comparison it would
+    have made anyway.
+
+    None whenever realpath cannot answer -- OSError, ValueError, or a
+    TypeError the caller's own isinstance guard has already excluded -- so
+    that one caller can fall open on any of them. Both processes
+    share this host and this mount namespace -- PrivateTmp covers /tmp only,
+    and the zone file lives under /var/lib -- so a path resolves the same for
+    both of them."""
+    try:
+        return os.path.realpath(p)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def location_zones_path_mismatch(loc_cfg, map_cfg, now) -> Optional[str]:
     """The drawn-zone file location_fec says it is READING, when that is not
     the file this process writes; None when they agree or we cannot tell.
@@ -2874,8 +2896,11 @@ def location_zones_path_mismatch(loc_cfg, map_cfg, now) -> Optional[str]:
     reads a file nobody writes — the feature simply appears not to work. This
     is what makes that loud, so the answer must be evidence: a record that is
     absent, stale, unparseable, or from a daemon too old to publish the key
-    proves nothing and reports nothing. Compared through normpath, because
-    two spellings of one file are not a mismatch either.
+    proves nothing and reports nothing. Two spellings of one file are not a
+    mismatch either, so the comparison goes through realpath.
+
+    The path that comes BACK is the configured spelling, not the resolved
+    one: that is the string in the config the operator has to go and fix.
 
     Never raises: it is called while building /api/map."""
     raw = fresh_location_record(loc_cfg, now)
@@ -2885,7 +2910,11 @@ def location_zones_path_mismatch(loc_cfg, map_cfg, now) -> Optional[str]:
     if not (isinstance(theirs, str) and theirs
             and isinstance(ours, str) and ours):
         return None
+    # Cheap first: identical spellings need no filesystem work at all.
     if os.path.normpath(theirs) == os.path.normpath(ours):
+        return None
+    rt, ro = _resolved_path(theirs), _resolved_path(ours)
+    if rt is None or ro is None or rt == ro:
         return None
     return theirs
 
