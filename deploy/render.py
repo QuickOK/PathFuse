@@ -74,6 +74,9 @@ def render_all(values, out_dir):
     tvars = template_vars(values)
     # Role-aware computed blocks (the sbfd daemon's sessions are generated from wans).
     tvars["sbfd_sessions_json"] = json.dumps(sbfd_sessions(values, role))
+    # The location daemon takes a plain list of WAN NAMES, not the wans dict, so it
+    # publishes a floor for every link this node actually has.
+    tvars["wan_names_json"] = json.dumps(list(values["wans"]))
     results = []
     for entry in manifest():
         if role not in entry["roles"]:

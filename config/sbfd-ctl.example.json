@@ -101,6 +101,11 @@
     "handoff_path": "/run/sbfd-ctl/cell_handoff.json",
     "handoff_ttl_s": 30
   },
+  "location_fec": {
+    "enabled": true,
+    "state_path": "/run/sbfd-ctl/location_fec.json",
+    "stale_after_s": 30
+  },
   "maintenance_reboot": {
     "enabled": false,
     "hour": 0,

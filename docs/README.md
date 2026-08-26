@@ -7,6 +7,8 @@ automatic failover, cross-link redundancy, and adaptive forward error correction
 - **[architecture.md](architecture.md)** — components, data + control planes, failover/egress/FEC
   behavior, and the port map. Start here to understand how it works.
 - **[design-notes.md](design-notes.md)** — the key design decisions and their rationale.
+- **[location-fec.md](location-fec.md)** — the optional location-aware FEC floor daemon
+  (learned tiles + manual zones).
 
 Other entry points:
 - **Run / read the code** — the top-level [`../README.md`](../README.md) (quickstart + tests).

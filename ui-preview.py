@@ -81,25 +81,32 @@ def build_snapshot(cfg: Config, sid_to_wan: dict) -> dict:
             "desired_enabled": True,
             "desired_mode": "min_adaptive",
             "floor_ratio": "20:1",
+            "location_floor": {"configured": True, "enabled": True, "active": True,
+                               "level": 3, "reason": "learned dr79z6n (4 passes)",
+                               "wans": {"wan1": {"level": 3,
+                                                  "reason": "learned dr79z6n (4 passes)"}}},
             "directions": {
                 # Both ladders are the ones this example config actually
                 # produces (default_mode "full", full_min_up_wans 2, and the
                 # snapshot above reports both WANs active), so the preview shows
                 # the real asymmetry rather than an invented pair: the client
-                # leg is PINNED to its floor by full-redundancy backoff, while
-                # the relay leg — whose run_once never consults
-                # mode_aware_level — keeps its whole span at the same moment.
+                # leg is PINNED by full-redundancy backoff, while the relay leg
+                # — whose run_once never consults mode_aware_level — keeps its
+                # whole span at the same moment. The pin sits at the LOCATION
+                # floor's rung (8:6), not the backoff rung: backoff suppresses
+                # the signal floor, never the location floor, so the location
+                # level is what the leg can reach and the span says so.
                 "client_to_relay": {
-                    "enabled": True, "ratio": "20:1", "level": 0,
+                    "enabled": True, "ratio": "8:6", "level": 3,
                     "mode": "min_adaptive",
                     "ladder": {
                         "scale": ["8:0", "20:1", "12:1", "8:1",
                                   "8:2", "8:4", "8:6", "8:8"],
-                        "reach_lo": 1, "reach_hi": 1, "applied_index": 1,
+                        "reach_lo": 6, "reach_hi": 6, "applied_index": 6,
                         "floor_index": 1, "below_floor": False, "pinned": True},
                     "driving_loss_pct": 3.1, "driver_wan": cfg.policy.default_master_wan,
                     "since": now - 42, "actuator_ok": True,
-                    "wire": {"tx_mbps": 4.2, "overhead_pct": 16.7, "sample_age_s": 6.0, "stale": False},
+                    "wire": {"tx_mbps": 4.2, "overhead_pct": 75.0, "sample_age_s": 6.0, "stale": False},
                 },
                 "relay_to_client": {
                     "enabled": True, "ratio": "8:2", "level": 1,

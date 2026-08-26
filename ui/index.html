@@ -127,6 +127,18 @@
           </div>
         </div>
 
+        <div class="ctl-block" id="location-fec-block">
+          <div class="ctl-label">Location FEC
+            <span class="tip" title="Location-aware FEC floor from location_fec. When on, a place learned (or pinned by a zone) to degrade the driving WAN raises the FEC floor before arrival. Raise-only: it never lowers the ratio.">i</span>
+          </div>
+          <label class="ctl-radio"><input type="radio" name="location_fec_enabled" value="on"><span>Auto <em>learned + zones</em></span></label>
+          <label class="ctl-radio"><input type="radio" name="location_fec_enabled" value="off"><span>Off</span></label>
+          <div class="fec-effective">
+            <span id="location-effective">—</span>
+            <span class="tip" title="clear: no learned tile or zone ahead asks for more than the engine is applying. raising · reason: the floor is lifted for the named tile or zone. off: toggle disabled. not configured: location_fec not set up.">i</span>
+          </div>
+        </div>
+
         <div class="ctl-block" id="maintenance-block">
           <div class="ctl-label">Daily reboot
             <span class="tip" title="Reboots wan1 then wan2 once a day, one at a time, waiting for each to come back before touching the next. Alerts for those WANs are suppressed during the reboot; a WAN that fails to return still pages.">i</span>

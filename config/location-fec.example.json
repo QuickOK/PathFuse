@@ -1,0 +1,31 @@
+{
+  "gpsd": { "host": "127.0.0.1", "port": 2947, "max_fix_age_s": 30 },
+  "wans": ["wan1", "wan2"],
+  "state_path": "/run/sbfd-ctl/state.json",
+  "max_state_age_s": 10,
+  "store_path": "/var/lib/sbfd-ctl/location_fec_store.json",
+  "output_path": "/run/sbfd-ctl/location_fec.json",
+  "poll_interval_s": 1.0,
+  "tile": { "precision": 7 },
+  "learning": {
+    "min_passes": 3,
+    "alpha": 0.35,
+    "pass_gap_s": 30,
+    "max_tiles": 20000,
+    "max_age_days": 14,
+    "clean_drop_days": 7,
+    "save_interval_s": 60
+  },
+  "withdraw": { "max_stale_s": 600 },
+  "lookahead": {
+    "seconds": 25,
+    "min_speed_ms": 2.0,
+    "sample_step_m": 75,
+    "exit_hold_s": 20
+  },
+  "zones": [
+    { "label": "depot", "lat": 0.000, "lon": 0.000, "radius_m": 300, "level": 3 },
+    { "label": "underpass", "lat": 0.000, "lon": 0.000, "radius_m": 150,
+      "level": 4, "wans": ["wan1"], "suppress_learned": false }
+  ]
+}

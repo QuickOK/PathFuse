@@ -2,6 +2,7 @@ import json as _json
 from pathlib import Path
 
 import sbfd_ctl as M
+import tile_store as T
 
 
 def test_resolve_map_cfg_defaults():
@@ -144,3 +145,203 @@ def test_apply_station_label_set_and_delete(tmp_path):
     out = M.apply_station_label(lp, "s1", "")
     assert out == {"s2": "Yard"}
     assert _json.loads(Path(lp).read_text()) == {"s2": "Yard"}
+
+
+def test_map_location_layer_reads_tiles_and_zones(tmp_path):
+    tile = T.encode(41.1, -73.5, 7)
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"version": 1, "tiles": {
+        tile: {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}},
+        "residual": {tile: {"ewma": 1.5, "last_seen": 1000.0}}}))
+    zones = tmp_path / "location-fec.json"
+    zones.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2}]}))
+    out = M.map_location_layer(str(store), str(zones), (41.1, -73.5), max_tiles=100)
+    assert out["tiles"][0]["id"] == tile
+    assert out["tiles"][0]["bbox"] == list(T.bbox(tile))
+    assert out["tiles"][0]["wans"]["wan1"]["passes"] == 4
+    assert out["tiles"][0]["residual"] == 1.5
+    assert out["zones"][0]["label"] == "yard"
+
+
+def test_map_location_layer_keeps_the_nearest_tiles(tmp_path):
+    near, far = T.encode(41.1, -73.5, 7), T.encode(42.0, -73.5, 7)
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"version": 1, "tiles": {
+        far: {"wan1": {"passes": 3, "ewma_loss": 6.0, "last_seen": 1.0}},
+        near: {"wan1": {"passes": 3, "ewma_loss": 6.0, "last_seen": 1.0}}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"),
+                               (41.1, -73.5), max_tiles=1)
+    assert [t["id"] for t in out["tiles"]] == [near]
+
+
+def test_map_location_layer_degrades_to_empty(tmp_path):
+    (tmp_path / "store.json").write_text("{junk")
+    out = M.map_location_layer(str(tmp_path / "store.json"),
+                               str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out == {"tiles": [], "zones": []}
+
+
+def test_assemble_map_payload_carries_location_fec(tmp_path):
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(tmp_path / "store.json"),
+                           "location_config_path": str(tmp_path / "lf.json")})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"] == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_tolerates_a_malformed_residual(tmp_path):
+    tile = T.encode(41.1, -73.5, 7)
+    wan = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    store = tmp_path / "store.json"
+
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": "garbage"}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["id"] == tile
+    assert out["tiles"][0]["residual"] is None
+
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": {tile: 5}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["residual"] is None
+
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": {tile: {"ewma": "x"}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["residual"] is None
+
+    # bool is a subclass of int: without the explicit bool guard `true` would
+    # sail through the numeric check and reach the map as a residual of 1.
+    store.write_text(_json.dumps({"tiles": {tile: wan}, "residual": {tile: {"ewma": True}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"][0]["residual"] is None
+
+
+def test_map_location_layer_tolerates_a_non_dict_tiles(tmp_path):
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"tiles": "nope"}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_skips_a_tile_id_that_is_not_a_geohash(tmp_path):
+    good = T.encode(41.1, -73.5, 7)
+    wan = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"tiles": {"not a geohash!": wan, good: wan}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert [t["id"] for t in out["tiles"]] == [good]
+
+
+def test_map_location_layer_tolerates_non_list_zones_and_a_zone_missing_a_key(tmp_path):
+    store = tmp_path / "absent.json"
+    zones = tmp_path / "zones.json"
+
+    zones.write_text(_json.dumps({"zones": "nope"}))
+    out = M.map_location_layer(str(store), str(zones), None, max_tiles=10)
+    assert out["zones"] == []
+
+    zones.write_text(_json.dumps({"zones": [
+        {"label": "x"},
+        {"label": "ok", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1}]}))
+    out = M.map_location_layer(str(store), str(zones), None, max_tiles=10)
+    assert len(out["zones"]) == 1
+    assert out["zones"][0]["label"] == "ok"
+
+
+def test_map_location_layer_drops_a_per_wan_entry_with_a_bad_type(tmp_path):
+    """The map page does `(v.ewma_loss || 0).toFixed(1)`, which THROWS on a
+    string -- and drawLocation runs inside the same tick that moves the vehicle
+    marker. The server must not hand the page a value of a type it does not
+    validate; TileStore.from_dict is the validator that already exists."""
+    tile = T.encode(41.1, -73.5, 7)
+    store = tmp_path / "store.json"
+
+    store.write_text(_json.dumps({"tiles": {tile: {
+        "wan1": {"passes": 3, "ewma_loss": "bad", "last_seen": 1.0}}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert out["tiles"] == []           # the only WAN was junk: no tile at all
+
+    store.write_text(_json.dumps({"tiles": {tile: {
+        "wan1": {"passes": 3, "ewma_loss": "bad", "last_seen": 1.0},
+        "wan2": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1.0}}}}))
+    out = M.map_location_layer(str(store), str(tmp_path / "absent.json"), None, max_tiles=10)
+    assert list(out["tiles"][0]["wans"]) == ["wan2"]
+    assert out["tiles"][0]["wans"]["wan2"]["ewma_loss"] == 6.0
+
+
+def test_map_location_layer_emits_zone_wans_only_as_a_list_of_names(tmp_path):
+    """`z.wans.join(", ")` throws on a string, and the config is hand-edited."""
+    store = tmp_path / "absent.json"
+    zones = tmp_path / "zones.json"
+    zones.write_text(_json.dumps({"zones": [
+        {"label": "a", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1,
+         "wans": "wan1"},
+        {"label": "b", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1,
+         "wans": ["wan1", 7]},
+        {"label": "c", "lat": 41.1, "lon": -73.5, "radius_m": 10, "level": 1,
+         "wans": ["wan1", "wan2"]}]}))
+    out = M.map_location_layer(str(store), str(zones), None, max_tiles=10)
+    assert [z["wans"] for z in out["zones"]] == [None, None, ["wan1", "wan2"]]
+
+
+def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(tmp_path / "store.json"),
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "max_location_tiles": "lots"})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"] == {"tiles": [], "zones": []}
+
+
+def test_map_location_layer_drops_a_non_finite_residual(tmp_path):
+    # NaN and inf are floats, so they pass the numeric guard, and json.dumps
+    # writes them as bare NaN/Infinity tokens: JSON.parse throws and the page
+    # loses the WHOLE payload, not just one tile's residual.
+    tile = T.encode(41.1, -73.5, 7)
+    wan = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    store = tmp_path / "store.json"
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        store.write_text(
+            '{"tiles": %s, "residual": {"%s": {"ewma": %s, "last_seen": 1000.0}}}'
+            % (_json.dumps({tile: wan}), tile, bad))
+        out = M.map_location_layer(str(store), str(tmp_path / "absent.json"),
+                                   None, max_tiles=10)
+        assert out["tiles"][0]["residual"] is None
+        _json.dumps(out, allow_nan=False)      # what the browser must parse
+
+
+def test_map_payload_stays_parseable_with_a_non_finite_loss_in_the_store(tmp_path):
+    # _send_json's json.dumps would emit a bare NaN token for this, and the
+    # browser's JSON.parse rejects the whole body — not just the bad tile.
+    tile = T.encode(41.1, -73.5, 7)
+    store = tmp_path / "store.json"
+    store.write_text('{"tiles": {"%s": {"wan1": {"passes": 4, '
+                     '"ewma_loss": NaN, "last_seen": 1000.0}}}}' % tile)
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(store),
+                           "location_config_path": str(tmp_path / "lf.json")})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    _json.dumps(out, allow_nan=False)
+    assert out["location_fec"]["tiles"] == []
+
+
+def test_assemble_map_payload_clamps_a_negative_max_location_tiles(tmp_path):
+    # rows[:-5] is a NEGATIVE slice: it drops the five NEAREST tiles and keeps
+    # the rest, which is the exact opposite of a cap.
+    entry = {"wan1": {"passes": 4, "ewma_loss": 6.0, "last_seen": 1000.0}}
+    tiles = {T.encode(41.1 + 0.01 * i, -73.5, 7): entry for i in range(8)}
+    store = tmp_path / "store.json"
+    store.write_text(_json.dumps({"tiles": tiles}))
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(store),
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "max_location_tiles": -5})
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"]["tiles"] == []

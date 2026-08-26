@@ -254,15 +254,21 @@ def tpv_epoch(iso):
         return None
 
 
-def get_fix(host, port, timeout=5.0):
+def get_fix(host, port, timeout=5.0, quiet=False):
     """Return (lat, lon, speed_ms, track_deg, fix_epoch_or_None) from gpsd, or
     None on no fix. Opens a fresh gpsd connection each call (stateless; robust
     at minute cadence).
+
+    `quiet=True` returns None on a failed connect WITHOUT logging, for a caller
+    polling far faster than this module's own minute cadence: at 1 Hz a warning
+    per failed connect is a warning per second for as long as gpsd is down. A
+    quiet caller owes the journal its own once-per-outage line.
     """
     try:
         s = socket.create_connection((host, port), timeout=timeout)
     except OSError as e:
-        log.warning("gpsd connect failed: %s", e)
+        if not quiet:
+            log.warning("gpsd connect failed: %s", e)
         return None
     try:
         s.settimeout(timeout)

@@ -616,3 +616,194 @@ def test_load_cell_handoff_rejects_future_set_ts(tmp_path):
     (tmp_path / "handoff.json").write_text(json.dumps(
         {"set_ts": 100_000.0, "until_ts": 100_004.0, "reason": "x"}))
     assert M.load_cell_handoff(cfg, now=1000.0) is None
+
+
+def _loc_cfg(tmp_path, enabled=True):
+    return M.Config(
+        wans={"wan1": M.WanCfg("wan1", 1, "A"), "wan2": M.WanCfg("wan2", 2, "B")},
+        relay=M.RelayCfg("http://x"),
+        engarde=M.EngardeCfg("198.51.100.10", 59402),
+        nft=M.NftCfg(), policy=M.PolicyCfg(), ui_listen="127.0.0.1:0",
+        sbfd_local_state=str(tmp_path / "s.json"),
+        runtime_state=str(tmp_path / "r.json"),
+        persist_state=str(tmp_path / "p.json"),
+        published_state=str(tmp_path / "pub.json"),
+        location=M.LocationFecCfg(state_path=str(tmp_path / "location_fec.json"),
+                                  enabled=enabled, stale_after_s=30.0),
+    )
+
+
+def test_load_location_floor_unconfigured_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    c.location = None
+    assert M.load_location_floor(c, 1000.0) is None
+
+
+def test_load_location_floor_missing_file_is_none(tmp_path):
+    assert M.load_location_floor(_loc_cfg(tmp_path), 1000.0) is None
+
+
+def test_load_location_floor_reads_fresh_levels(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0, "wans": {"wan1": {"level": 3, "reason": "learned x"}}}))
+    out = M.load_location_floor(c, 1010.0)
+    assert out == {"wan1": {"level": 3, "reason": "learned x"}}
+
+
+def test_load_location_floor_stale_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0, "wans": {"wan1": {"level": 3, "reason": ""}}}))
+    assert M.load_location_floor(c, 1031.0) is None
+
+
+def test_load_location_floor_staleness_boundary_is_inclusive(tmp_path):
+    """age == stale_after_s is still FRESH; anything past it is not.
+
+    The daemon writes at 1 Hz and sbfd-ctl reads on its own tick, so the two
+    clocks land on the boundary regularly -- an off-by-one here drops a live
+    floor for one tick and the ratio visibly flaps."""
+    c = _loc_cfg(tmp_path)                        # stale_after_s = 30.0
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0, "wans": {"wan1": {"level": 3, "reason": "learned x"}}}))
+    assert M.load_location_floor(c, 1030.0) == {"wan1": {"level": 3,
+                                                         "reason": "learned x"}}
+    assert M.load_location_floor(c, 1030.5) is None
+
+
+def test_load_location_floor_drops_junk_entries(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({
+        "set_ts": 1000.0,
+        "wans": {"wan1": {"level": "3"}, "wan2": {"level": True},
+                 "wan3": {"level": 2, "reason": 7}, "wan4": "nope"}}))
+    out = M.load_location_floor(c, 1001.0)
+    assert out == {"wan3": {"level": 2, "reason": "7"}}
+
+
+def test_load_location_floor_corrupt_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text("{not json")
+    assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_effective_location_fec_enabled_false_when_unconfigured(tmp_path):
+    c = _loc_cfg(tmp_path)
+    c.location = None
+    assert M.effective_location_fec_enabled(c, M.RuntimeOverlay()) is False
+
+
+def test_effective_location_fec_enabled_uses_config_default(tmp_path):
+    assert M.effective_location_fec_enabled(_loc_cfg(tmp_path, enabled=False),
+                                            M.RuntimeOverlay()) is False
+    assert M.effective_location_fec_enabled(_loc_cfg(tmp_path, enabled=True),
+                                            M.RuntimeOverlay()) is True
+
+
+def test_effective_location_fec_enabled_operator_override_wins(tmp_path):
+    c = _loc_cfg(tmp_path, enabled=True)
+    assert M.effective_location_fec_enabled(
+        c, M.RuntimeOverlay(location_fec_enabled=False)) is False
+
+
+def test_runtime_overlay_roundtrips_location_fec_enabled(tmp_path):
+    c = _loc_cfg(tmp_path)
+    M.save_runtime_overlay(c, M.RuntimeOverlay(location_fec_enabled=False,
+                                               set_by="t", set_ts=1.0))
+    assert M.load_runtime_overlay(c).location_fec_enabled is False
+
+
+def test_runtime_overlay_ignores_a_non_bool_location_fec_enabled(tmp_path):
+    """The API path rejects a non-bool; the FILE path did not.
+
+    bool("false") is True, so a hand-edited persist file saying the operator
+    turned the floor off would have turned it on. An unusable value means "no
+    operator opinion", which lets the config default stand."""
+    c = _loc_cfg(tmp_path, enabled=False)
+    Path(c.runtime_state).write_text(json.dumps({
+        "set_by": "hand", "set_ts": 1.0, "location_fec_enabled": "false"}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.location_fec_enabled is None
+    assert M.effective_location_fec_enabled(c, ov) is False   # config default
+
+
+def test_runtime_overlay_still_honours_a_real_bool_location_fec_enabled(tmp_path):
+    c = _loc_cfg(tmp_path, enabled=False)
+    Path(c.runtime_state).write_text(json.dumps({
+        "set_by": "ui", "set_ts": 1.0, "location_fec_enabled": True}))
+    ov = M.load_runtime_overlay(c)
+    assert ov.location_fec_enabled is True
+    assert M.effective_location_fec_enabled(c, ov) is True
+
+
+def _oversized_set_ts_json(extra=""):
+    """A JSON integer with more digits than a double can hold. json.loads keeps
+    it as a Python int, and float() on it raises OverflowError rather than
+    returning inf — so the finiteness guards downstream never get a chance."""
+    return '{"set_ts": 1' + "0" * 400 + extra + '}'
+
+
+def test_load_location_floor_survives_an_oversized_set_ts(tmp_path):
+    # The controller tick calls this loader directly, so a raise here
+    # interrupts failover for as long as the poisoned file sits there.
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(_oversized_set_ts_json(', "wans": {}'))
+    assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_load_auto_override_survives_an_oversized_set_ts(tmp_path):
+    # Same idiom, same tick, same one-word fix.
+    c = base_cfg(environmental=M.EnvironmentalCfg(
+        enabled=True, auto_override_path=str(tmp_path / "auto.json"),
+        auto_override_ttl_s=180.0))
+    Path(c.environmental.auto_override_path).write_text(
+        _oversized_set_ts_json(', "mode": "full"'))
+    assert M.load_auto_override(c, 1001.0) is None
+
+
+def test_validate_runtime_payload_location_fec_enabled():
+    ok, _ = M.validate_runtime_payload({"location_fec_enabled": True},
+                                       wan_names={"wan1"})
+    assert ok
+    ok, err = M.validate_runtime_payload({"location_fec_enabled": "yes"},
+                                         wan_names={"wan1"})
+    assert not ok and "location_fec_enabled" in err
+
+
+def test_load_location_floor_non_dict_wans_is_none(tmp_path):
+    c = _loc_cfg(tmp_path)
+    for bad_wans in ("nope", [1, 2], 7):
+        Path(c.location.state_path).write_text(json.dumps(
+            {"set_ts": 1000.0, "wans": bad_wans}))
+        assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_load_location_floor_missing_wans_is_empty(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps({"set_ts": 1000.0}))
+    assert M.load_location_floor(c, 1001.0) == {}
+
+
+def test_load_location_floor_empty_wans_is_explicit_withdrawal(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps(
+        {"set_ts": 1000.0, "wans": {}}))
+    assert M.load_location_floor(c, 1001.0) == {}
+
+
+def test_load_location_floor_rejects_nan_set_ts(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(
+        '{"set_ts": NaN, "wans": {"wan1": {"level": 9, "reason": ""}}}')
+    assert M.load_location_floor(c, 1001.0) is None
+
+
+def test_load_location_floor_rejects_future_set_ts(tmp_path):
+    c = _loc_cfg(tmp_path)
+    Path(c.location.state_path).write_text(json.dumps(
+        {"set_ts": 9999999.0, "wans": {"wan1": {"level": 9, "reason": ""}}}))
+    assert M.load_location_floor(c, 1001.0) is None
+    Path(c.location.state_path).write_text(json.dumps(
+        {"set_ts": 1005.0, "wans": {"wan1": {"level": 9, "reason": ""}}}))
+    assert M.load_location_floor(c, 1001.0) == {"wan1": {"level": 9, "reason": ""}}

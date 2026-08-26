@@ -141,6 +141,27 @@ def test_full_mode_backoff_suppresses_signal_floor_stacking():
     assert _gated_ratio("full", fc, table, hyst, sf_fec, engaged) == "8:0"
 
 
+def test_full_mode_backoff_does_not_suppress_the_location_floor():
+    """The location floor is NOT gated by full-redundancy backoff.
+
+    The signal floor is (test above): in full mode with two links up engarde is
+    already duplicating, so stacking parity on top wastes headroom on a guess
+    about ONE modem's radio. A learned place is not a guess about one radio --
+    it is a place known to drop both links at once, which duplication cannot
+    repair and parity can. Mirrors the tick's ordering: apply_signal_floor
+    under the gate, then apply_location_floor outside it."""
+    fc = _fec_cfg_with_profile()
+    name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
+    sfl = F.SignalFloor()
+    engaged = sfl.update(rsrq=-13.0, rsrp=None)
+    assert engaged is True
+    fec_full_backoff = True                       # full mode, 2 WANs UP
+    level = F.apply_signal_floor(0, engaged and not fec_full_backoff,
+                                 table, sf_fec)
+    assert level == 0                             # signal floor suppressed
+    assert F.apply_location_floor(level, 3, table) == 3
+
+
 def test_master_backup_signal_floor_still_applies():
     fc = _fec_cfg_with_profile()
     name, table, hyst, prof_floor, sf_fec = M.resolve_fec_profile(fc, "wan1")
@@ -262,3 +283,128 @@ def test_leaving_full_redundancy_hands_the_profile_back_at_once():
         (0.0, {"wan1", "wan2"}, {"wan1": 0.0, "wan2": 0.0}),
         (0.5, {"wan2"}, {"wan1": 0.0, "wan2": 0.0}),
     ]) == ["wan1", "default"]
+
+
+# ---------- location floor: driver-WAN-only resolution ----------
+
+def test_location_floor_for_driver_picks_the_driver_wan():
+    floors = {"wan1": {"level": 3, "reason": "learned a"},
+              "wan2": {"level": 1, "reason": "learned b"}}
+    assert M.location_floor_for_driver(floors, True, "wan2", F.DEFAULT_LOSS_TABLE) \
+        == (1, "learned b")
+
+
+def test_location_floor_for_driver_is_zero_when_disabled_or_absent():
+    floors = {"wan1": {"level": 3, "reason": "x"}}
+    assert M.location_floor_for_driver(floors, False, "wan1", F.DEFAULT_LOSS_TABLE) == (0, "")
+    assert M.location_floor_for_driver(None, True, "wan1", F.DEFAULT_LOSS_TABLE) == (0, "")
+    assert M.location_floor_for_driver(floors, True, "wan2", F.DEFAULT_LOSS_TABLE) == (0, "")
+    assert M.location_floor_for_driver(floors, True, None, F.DEFAULT_LOSS_TABLE) == (0, "")
+
+
+def test_location_floor_for_driver_clamps_to_the_active_table():
+    floors = {"wan1": {"level": 4, "reason": "x"}}
+    level, _ = M.location_floor_for_driver(floors, True, "wan1", F.DEFAULT_CELL_LOSS_TABLE)
+    assert level == len(F.DEFAULT_CELL_LOSS_TABLE) - 1
+
+
+# ---------- location floor: did it actually change the applied ratio? ----------
+
+def _floor_active(mode, level_before, location_level, floor="8:0", fixed="20:1",
+                  write_ok=True, prev_accepted=None):
+    """Replay the tick's two ratios and ask the predicate which the wire got.
+
+    `active` is a claim about the RATIO THE ACTUATOR HOLDS, not about levels: a
+    level the floor lifted can still map to the ratio the leg was already
+    sending, and a refused FIFO write leaves the old ratio flowing however high
+    the floor reached. `write_ok=False` models that refusal, leaving the wire at
+    `prev_accepted` (by default whatever the leg was already sending)."""
+    table = F.DEFAULT_LOSS_TABLE
+    lifted = F.apply_location_floor(level_before, location_level, table)
+    with_loc = F.apply_mode(mode, F.level_to_ratio(lifted, table),
+                            fixed_ratio=fixed, floor_ratio=floor)
+    without_loc = F.apply_mode(mode, F.level_to_ratio(level_before, table),
+                               fixed_ratio=fixed, floor_ratio=floor)
+    on_wire = with_loc if write_ok else (
+        prev_accepted if prev_accepted is not None else without_loc)
+    return M.location_floor_active(on_wire, with_loc, without_loc)
+
+
+def test_location_floor_active_only_when_it_lifts_the_ratio():
+    # It asked for more than the engine had: the extra parity is on the wire.
+    assert _floor_active(F.MODE_ADAPTIVE, 1, 3) is True
+    # The signal floor already stands higher, so the location floor changed
+    # nothing — reporting it as active credits it with the other floor's work.
+    assert _floor_active(F.MODE_ADAPTIVE, 3, 2) is False
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 0) is False
+
+
+def test_location_floor_inactive_in_modes_that_discard_the_adaptive_ratio():
+    # apply_mode returns OFF_RATIO / the fixed ratio regardless of the level the
+    # floor lifted, so an "active" badge here promises parity nothing is sending.
+    assert _floor_active(F.MODE_OFF, 0, 3) is False
+    assert _floor_active(F.MODE_FIXED, 0, 3) is False
+
+
+def test_location_floor_active_in_min_adaptive():
+    assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3) is True
+
+
+def test_location_floor_inactive_under_a_config_floor_that_already_covers_it():
+    # A min_adaptive floor of 8:8 lifts EVERY level to the top rung, so the
+    # location floor's level 3 leaves the transmitted ratio exactly as it was.
+    # Same defect as crediting it for the signal floor's work, one floor along.
+    assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3, floor="8:8") is False
+    # ...and it is genuinely active once the config floor leaves room again.
+    assert _floor_active(F.MODE_MIN_ADAPTIVE, 0, 3, floor="8:2") is True
+
+
+def test_location_floor_answers_to_the_actuator_not_to_the_decision():
+    # The FIFO refused the lifted ratio, so the wire still carries the old one.
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 3, write_ok=False) is False
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 3, write_ok=True) is True
+    # A refusal does NOT retract a floor already flowing from an earlier tick:
+    # the parity is on the wire, whoever wrote it and whenever.
+    assert _floor_active(F.MODE_ADAPTIVE, 0, 3, write_ok=False,
+                         prev_accepted="8:6") is True
+
+
+def test_location_floor_claims_nothing_before_the_first_accepted_write():
+    # fec_current_ratio is None until a write lands. Nothing is known to be on
+    # the wire, so nothing can be credited to the floor.
+    assert M.location_floor_active(None, "8:6", "8:1") is False
+
+
+def test_location_floor_gets_no_credit_for_a_stale_ratio_on_the_wire():
+    """A refused write can leave a ratio that differs from today's baseline
+    for reasons that have nothing to do with location.
+
+    Tick A accepted 8:2 off real loss; the loss then cleared, so the baseline
+    is now 8:0 and the floor asks 8:6 — and the FIFO refuses. The wire still
+    carries 8:2, which is neither what the floor asked for nor today's
+    baseline. Crediting location for it hands the badge to yesterday's loss."""
+    assert M.location_floor_active("8:2", "8:6", "8:0") is False
+    # The wire holding the very ratio the floor asked for is the only thing
+    # that earns the credit, whichever tick actually wrote it.
+    assert M.location_floor_active("8:6", "8:6", "8:0") is True
+    # ...and a wire still on an older location-lifted ratio while the floor now
+    # asks for MORE is again historical, not what this tick achieved.
+    assert M.location_floor_active("8:6", "8:8", "8:0") is False
+
+
+# ---------- pinned ladder: the location floor widens the pin ----------
+
+def test_pinned_ladder_level_is_the_backoff_rung_without_a_location_floor():
+    base = F.DEFAULT_LOSS_TABLE
+    assert M.pinned_ladder_level("8:0", base, 0) == F.ratio_to_level("8:0", base)
+
+
+def test_pinned_ladder_level_rises_to_a_location_floor_above_the_backoff_rung():
+    # Backoff pins the engine at 8:0, but the location floor is not suppressed
+    # by backoff, so the applied ratio really is the level-3 rung. Pinning the
+    # span at the backoff rung would draw the applied dot outside its own span.
+    base = F.DEFAULT_LOSS_TABLE
+    assert M.pinned_ladder_level("8:0", base, 3) == 3
+    reach = F.reachable_ratios(F.MODE_ADAPTIVE, base, "8:0",
+                               pinned_level=M.pinned_ladder_level("8:0", base, 3))
+    assert reach == [F.level_to_ratio(3, base)]

@@ -133,6 +133,15 @@ class CellTelemetryCfg:
 
 
 @dataclass
+class LocationFecCfg:
+    """Reader side of location_fec.py's floor file. `enabled` is the boot-time
+    default; the operator's runtime toggle wins in either direction."""
+    state_path: str
+    enabled: bool = True
+    stale_after_s: float = 30.0
+
+
+@dataclass
 class MaintenanceCfg:
     """Nightly one-at-a-time WAN reboot. `enabled`/`hour` here are boot-time
     DEFAULTS only — the operator's runtime overlay wins in either direction.
@@ -160,6 +169,7 @@ class Config:
     environmental: Optional[EnvironmentalCfg] = None
     maintenance: Optional[MaintenanceCfg] = None
     cell: Optional[CellTelemetryCfg] = None
+    location: Optional[LocationFecCfg] = None
     notifications: Optional["notify.NotifyCfg"] = None
     map: object = None                 # raw `map` config section (dict | None)
 
@@ -1465,6 +1475,19 @@ def load_config(path: str) -> Config:
                 handoff_path=raw_cell.get("handoff_path", "/run/sbfd-ctl/cell_handoff.json"),
                 handoff_ttl_s=float(raw_cell.get("handoff_ttl_s", 30.0)))
 
+        raw_loc = raw.get("location_fec")
+        loc_cfg = None
+        if raw_loc is not None:
+            # bool("false") is True, so a string here would turn the operator's
+            # "off" into on. Absent still means on; present must be a boolean.
+            loc_enabled = raw_loc.get("enabled", True)
+            if not isinstance(loc_enabled, bool):
+                raise ValueError("location_fec.enabled must be true or false")
+            loc_cfg = LocationFecCfg(
+                state_path=raw_loc.get("state_path", "/run/sbfd-ctl/location_fec.json"),
+                enabled=loc_enabled,
+                stale_after_s=float(raw_loc.get("stale_after_s", 30.0)))
+
         raw_notif = raw.get("notifications")
         notif_cfg = None
         if raw_notif is not None:
@@ -1494,6 +1517,7 @@ def load_config(path: str) -> Config:
             environmental=env_cfg,
             maintenance=maint_cfg,
             cell=cell_cfg,
+            location=loc_cfg,
             notifications=notif_cfg,
             map=raw.get("map"),
         )
@@ -1554,6 +1578,12 @@ def load_config(path: str) -> Config:
                 f"cell_telemetry.wan {cell_cfg.wan!r} not in wans={list(wans)}")
         if cell_cfg.handoff_ttl_s <= 0:
             raise ValueError("cell_telemetry.handoff_ttl_s must be > 0")
+    if loc_cfg is not None:
+        # NaN is not <= 0 (every comparison against NaN is False), so it would
+        # sail through and make the staleness gate inert: a dead daemon's
+        # floor would hold forever.
+        if not math.isfinite(loc_cfg.stale_after_s) or loc_cfg.stale_after_s <= 0:
+            raise ValueError("location_fec.stale_after_s must be a finite number > 0")
     if fec_cfg is not None:
         for wname in fec_cfg.wan_profiles:
             if wname not in wans:
@@ -1596,6 +1626,7 @@ class RuntimeOverlay:
     fec_fixed_ratio: Optional[str] = None
     fec_floor_ratio: Optional[str] = None
     environmental_enabled: Optional[bool] = None
+    location_fec_enabled: Optional[bool] = None
     # First integer overlay field. Note hour 0 (midnight) is falsy and real, so
     # every read/write path here must test for None, never for truthiness.
     maintenance_enabled: Optional[bool] = None
@@ -1628,6 +1659,15 @@ def load_runtime_overlay(cfg: Config) -> RuntimeOverlay:
                 fec_fixed_ratio=raw.get("fec_fixed_ratio"),
                 fec_floor_ratio=raw.get("fec_floor_ratio"),
                 environmental_enabled=raw.get("environmental_enabled"),
+                # Only a real bool is an operator opinion. The API path
+                # already refuses anything else, but this file can be hand
+                # edited, and bool("false") is True — so "off" written by hand
+                # would have switched the floor ON. None lets the config
+                # default stand, which is what an unusable value means.
+                location_fec_enabled=(
+                    raw.get("location_fec_enabled")
+                    if isinstance(raw.get("location_fec_enabled"), bool)
+                    else None),
                 maintenance_enabled=raw.get("maintenance_enabled"),
                 maintenance_hour=raw.get("maintenance_hour"),
             )
@@ -1659,6 +1699,7 @@ def save_runtime_overlay(cfg: Config, ov: RuntimeOverlay):
         "fec_fixed_ratio": ov.fec_fixed_ratio,
         "fec_floor_ratio": ov.fec_floor_ratio,
         "environmental_enabled": ov.environmental_enabled,
+        "location_fec_enabled": ov.location_fec_enabled,
         "maintenance_enabled": ov.maintenance_enabled,
         "maintenance_hour": ov.maintenance_hour,
     }
@@ -1693,7 +1734,8 @@ def load_auto_override(cfg: Config, now: float) -> Optional[AutoOverride]:
     try:
         raw = _json.loads(Path(env.auto_override_path).read_text())
         set_ts = float(raw["set_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     if now - set_ts > env.auto_override_ttl_s:
         return None
@@ -1742,7 +1784,8 @@ def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
     try:
         raw = _json.loads(Path(cfg.cell.state_path).read_text())
         set_ts = float(raw["set_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     out = {"set_ts": set_ts}
     for k in ("rsrp", "rsrq", "sinr"):
@@ -1751,6 +1794,46 @@ def load_cell_sample(cfg: Config, now: float) -> Optional[dict]:
     for k in ("cell_id", "band"):
         v = raw.get(k)
         out[k] = str(v) if v is not None else None
+    return out
+
+
+def load_location_floor(cfg: Config, now: float) -> Optional[dict]:
+    """{wan: {level, reason}} from location_fec.py, or None when unconfigured,
+    missing, malformed, or older than stale_after_s. Fail-open like
+    load_auto_override: a floor that cannot be read is no floor. Only `level`
+    is trusted, and only as a non-bool int — it crosses a process boundary.
+
+    Finiteness and future-timestamp guards match load_cell_handoff's
+    precedent below: json.loads accepts the bareword NaN, and
+    `now - set_ts > stale_after_s` is False forever against it, making the
+    staleness gate inert -- a dead daemon's floor would hold forever."""
+    if cfg.location is None:
+        return None
+    try:
+        raw = _json.loads(Path(cfg.location.state_path).read_text())
+        set_ts = float(raw["set_ts"])
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
+        return None
+    if not math.isfinite(set_ts):
+        return None
+    if set_ts > now + 5.0:
+        return None
+    if now - set_ts > cfg.location.stale_after_s:
+        return None
+    wans_raw = raw.get("wans")
+    if wans_raw is None:
+        wans_raw = {}
+    if not isinstance(wans_raw, dict):
+        return None
+    out = {}
+    for wan, obj in wans_raw.items():
+        if not isinstance(obj, dict):
+            continue
+        level = obj.get("level")
+        if isinstance(level, bool) or not isinstance(level, int):
+            continue
+        out[wan] = {"level": level, "reason": str(obj.get("reason", ""))}
     return out
 
 
@@ -1780,7 +1863,8 @@ def load_cell_handoff(cfg: Config, now: float) -> Optional[HandoffWindow]:
         raw = _json.loads(Path(cfg.cell.handoff_path).read_text())
         set_ts = float(raw["set_ts"])
         until_ts = float(raw["until_ts"])
-    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+    except (FileNotFoundError, ValueError, OSError, KeyError, TypeError,
+            OverflowError):
         return None
     if not (math.isfinite(set_ts) and math.isfinite(until_ts)):
         return None
@@ -1870,6 +1954,76 @@ def effective_environmental_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
     if ov.environmental_enabled is not None:
         return ov.environmental_enabled
     return bool(cfg.environmental.enabled)
+
+
+def effective_location_fec_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
+    """Same shape as effective_environmental_enabled: config is the default,
+    the operator's runtime toggle wins, hard-off only when unconfigured."""
+    if cfg.location is None:
+        return False
+    if ov.location_fec_enabled is not None:
+        return ov.location_fec_enabled
+    return bool(cfg.location.enabled)
+
+
+def location_floor_for_driver(floors, enabled, driver, table):
+    """(level, reason) the location floor asks of the FEC DRIVER WAN only —
+    a place that kills cellular must not lift the floor while satellite is
+    driving. Clamped to the active profile's table. 0 means no opinion."""
+    if not enabled or not floors or not driver:
+        return 0, ""
+    entry = floors.get(driver)
+    if not entry:
+        return 0, ""
+    level = fec_control.apply_location_floor(0, entry.get("level"), table)
+    return level, (entry.get("reason", "") if level > 0 else "")
+
+
+def location_floor_active(ratio_on_wire, ratio_with_location,
+                          ratio_without_location):
+    """Is the location floor the reason the wire carries the parity it does?
+
+    THE SEMANTIC, stated once so it is not re-litigated: `active` is about the
+    ratio standing on the wire THIS TICK, not about which tick caused the last
+    transition. It answers "if the location floor said nothing right now, would
+    the controller write something lower?" — so a wire already holding 8:6 from
+    an earlier loss-driven decision, with loss since fallen to a 8:0 baseline
+    and the floor asking 8:6, IS active even though no write happened and
+    location did not cause the actuator's current state. The floor is the only
+    thing holding that parity up; the moment it released, 8:0 would go out.
+    Attributing by who caused the last write would show the operator "not
+    active" for a floor that is doing all the work, which is the reading that
+    matters when a vehicle is standing in a known bad place.
+
+    Two things must both hold, and each catches cases the other misses.
+
+    The floor must have changed this tick's DECISION — `off` and `fixed`
+    discard the adaptive ratio outright, a signal floor may already stand
+    higher, and a min_adaptive config floor of 8:8 lifts every level to the
+    same top rung, so in all of those the floor asked and changed nothing.
+
+    And that decision must be what the actuator actually HOLDS. A refused FIFO
+    write leaves an older ratio flowing, and an older ratio earns the location
+    floor no credit even when it happens to differ from today's baseline: a
+    tick that accepted 8:2 off real loss, followed by the loss clearing, leaves
+    8:2 on the wire against a baseline of 8:0 for reasons that are entirely
+    historical.
+
+    A None ratio_on_wire means nothing has ever been written, so there is no
+    parity to credit the floor with."""
+    if ratio_on_wire is None:
+        return False
+    return (ratio_with_location != ratio_without_location
+            and ratio_on_wire == ratio_with_location)
+
+
+def pinned_ladder_level(backoff_ratio, table, location_level):
+    """The single rung the ladder's span collapses to under full-redundancy
+    backoff. Backoff holds the ADAPTIVE ENGINE at one rung, but the location
+    floor is deliberately not suppressed by backoff, so it can lift the applied
+    ratio above that rung — and a span pinned to the backoff rung alone would
+    draw the applied dot outside the span it is meant to sit in."""
+    return max(fec_control.ratio_to_level(backoff_ratio, table), location_level)
 
 
 def effective_maintenance_enabled(cfg: Config, ov: RuntimeOverlay) -> bool:
@@ -2071,6 +2225,9 @@ def validate_runtime_payload(payload: dict, wan_names: set):
                 return False, f"{_key}: {e}"
     if "environmental_enabled" in payload and not isinstance(payload["environmental_enabled"], bool):
         return False, "environmental_enabled must be true or false"
+    if ("location_fec_enabled" in payload
+            and not isinstance(payload["location_fec_enabled"], bool)):
+        return False, "location_fec_enabled must be true or false"
     if ("maintenance_enabled" in payload
             and not isinstance(payload["maintenance_enabled"], bool)):
         return False, "maintenance_enabled must be true or false"
@@ -2094,6 +2251,9 @@ _MAP_DEFAULTS = {
     "gpsd": {"host": "127.0.0.1", "port": 2947},
     "tile_cache": {"path": "/var/lib/sbfd-ctl/tilecache",
                    "max_mb": 512, "max_zoom": 17},
+    "location_store_path": "/var/lib/sbfd-ctl/location_fec_store.json",
+    "location_config_path": "/etc/sbfd-ctl/location-fec.json",
+    "max_location_tiles": 2000,
 }
 
 _SID_RE = re.compile(r"^s[0-9]+$")
@@ -2170,6 +2330,68 @@ def apply_station_label(labels_path: str, sid: str, label: str) -> dict:
     return labels
 
 
+def map_location_layer(store_path, zones_path, fix, max_tiles):
+    """Learned tiles (nearest the fix first, capped) and operator zones for
+    the map. Degrades to empty lists: a broken source must never 500 the
+    endpoint. Lazy import keeps the failover daemon free of a hard dependency
+    on the location module."""
+    import tile_store
+    import station_tracker
+    out = {"tiles": [], "zones": []}
+    raw = _read_json_file(store_path)
+    # Parse through the store's OWN validator rather than passing per-WAN
+    # entries through raw: it drops malformed entries and coerces the numbers,
+    # and it never raises. The map page does arithmetic on these values
+    # (`(v.ewma_loss || 0).toFixed(1)`), so a string here is a client-side
+    # exception, not a cosmetic wart. from_dict on a non-dict logs and starts
+    # empty, so only call it when there is something to parse.
+    store = (tile_store.TileStore.from_dict(raw) if isinstance(raw, dict)
+             else tile_store.TileStore())
+    residual = store.residual
+    rows = []
+    for tid, per_wan in store.tiles.items():
+        try:
+            lat, lon = tile_store.center(tid)
+            box = list(tile_store.bbox(tid))
+        except ValueError:
+            continue
+        dist = (station_tracker.haversine_m(fix[0], fix[1], lat, lon)
+                if fix else 0.0)
+        r = residual.get(tid)
+        res = r.get("ewma") if isinstance(r, dict) else None
+        # NaN and inf ARE floats, and json.dumps writes them as bare
+        # NaN/Infinity tokens — JSON.parse throws on those, so one poisoned
+        # tile would cost the page the entire payload.
+        if (isinstance(res, bool) or not isinstance(res, (int, float))
+                or not math.isfinite(res)):
+            res = None
+        rows.append((dist, {
+            "id": tid, "bbox": box, "wans": per_wan, "residual": res}))
+    rows.sort(key=lambda r: r[0])
+    out["tiles"] = [r[1] for r in rows[:max_tiles]]
+    zcfg = _read_json_file(zones_path)
+    zones = (zcfg or {}).get("zones") if isinstance(zcfg, dict) else None
+    if isinstance(zones, list):
+        for z in zones:
+            if not isinstance(z, dict):
+                continue
+            # `wans` reaches the page as `z.wans.join(", ")`; anything but a
+            # list of names is emitted as null, which the page already handles.
+            names = z.get("wans")
+            if not (isinstance(names, list)
+                    and all(isinstance(w, str) for w in names)):
+                names = None
+            try:
+                out["zones"].append({
+                    "label": str(z.get("label") or "zone"),
+                    "lat": float(z["lat"]), "lon": float(z["lon"]),
+                    "radius_m": float(z["radius_m"]), "level": int(z["level"]),
+                    "wans": names})
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
 def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
     """Aggregate every map data source; each degrades independently to
     null/empty — a broken source must never 500 the endpoint."""
@@ -2190,13 +2412,23 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now) -> dict:
         age = round(now - fix_ts, 1) if fix_ts else None
         out_fix = {"lat": lat, "lon": lon, "speed": speed,
                    "track": track, "age_s": age}
+    try:
+        # Clamped at 0: rows[:-5] is a negative slice, which drops the five
+        # NEAREST tiles and keeps everything else — the opposite of a cap.
+        max_tiles = max(0, int(map_cfg.get("max_location_tiles", 2000)))
+    except (TypeError, ValueError):
+        max_tiles = 2000
     return {"ts": now,
             "fix": out_fix,
             "stations": stations,
             "predictions": predict_from_stations(st),
             "environ": _read_json_file(map_cfg["environ_points_path"]),
             "mode": snap.get("mode"),
-            "active": snap.get("active_wans")}
+            "active": snap.get("active_wans"),
+            "location_fec": map_location_layer(
+                map_cfg["location_store_path"], map_cfg["location_config_path"],
+                (fix[0], fix[1]) if fix is not None else None,
+                max_tiles)}
 
 
 _GPS_MEMO = {"ts": 0.0, "fix": None}
@@ -2514,6 +2746,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 ov.fec_floor_ratio = payload["fec_floor_ratio"]
             if "environmental_enabled" in payload:
                 ov.environmental_enabled = payload["environmental_enabled"]
+            if "location_fec_enabled" in payload:
+                ov.location_fec_enabled = payload["location_fec_enabled"]
             # `in payload`, never `payload.get(k) or default`: hour 0 is midnight
             # and falsy, and the `or` idiom would rewrite it to the config default.
             if "maintenance_enabled" in payload:
@@ -2576,6 +2810,7 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         if cfg.cell else None)
     fec_signal_engaged = False
     fec_signal_floor_applied = False
+    fec_location_level_prev = 0
     fec_current_ratio = None
     fec_ratio_since: Optional[float] = None
     fec_relay_last = {"ok": False, "data": None, "error": "not yet fetched"}
@@ -2616,6 +2851,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         mode, policy, master_wan, egress_mode = effective_policy(cfg, ov)
         env_auto = load_auto_override(cfg, loop_start)
         cell_sample = load_cell_sample(cfg, loop_start)
+        location_floors = load_location_floor(cfg, loop_start)
+        location_enabled = effective_location_fec_enabled(cfg, ov)
         env_enabled = effective_environmental_enabled(cfg, ov)
         mode, env_active = apply_auto_override(mode, env_enabled, env_auto)
         handoff_win = load_cell_handoff(cfg, loop_start)
@@ -2772,6 +3009,10 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         # ladder derived from the wrong one.
         fec_ladder = None
         fec_ladder_r2c = None
+        fec_location_level, fec_location_reason = 0, ""
+        # Whether the floor changed the ratio this tick actually sends. With no
+        # FEC config there is no ratio to change.
+        fec_location_applied = False
         relay_desired = (fec_mode_eff, fec_fixed_ratio_eff, fec_floor_ratio_eff)
         if cfg.fec:
             # Our TX leg repairs client->relay loss, which only the relay can
@@ -2852,9 +3093,33 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                 _fec_target, fec_rt, prof_hyst, loop_start)
             _fec_level = fec_control.apply_signal_floor(
                 fec_rt.current_level, fec_signal_floor_applied, prof_table, prof_sf_fec)
+            # Location floor: raise-only, driver WAN only, resolved against
+            # the ACTIVE profile's table. Unlike the signal floor it is NOT
+            # suppressed by full-redundancy backoff — a place known to drop
+            # both links at once is exactly where parity beats duplication.
+            fec_location_level, fec_location_reason = location_floor_for_driver(
+                location_floors, location_enabled, fec_driver, prof_table)
+            _level_before_location = _fec_level
+            _fec_level = fec_control.apply_location_floor(
+                _fec_level, fec_location_level, prof_table)
+            if fec_location_level != fec_location_level_prev:
+                logging.info("fec location floor -> level %d (%s)",
+                             fec_location_level, fec_location_reason or "released")
+                fec_location_level_prev = fec_location_level
             _adaptive_ratio = fec_control.level_to_ratio(_fec_level, prof_table)
             _fec_ratio = fec_control.apply_mode(
                 fec_mode_eff, _adaptive_ratio,
+                fixed_ratio=fec_fixed_ratio_eff,
+                floor_ratio=fec_floor_ratio_eff)
+            # The same ratio computed as if the location floor had said
+            # nothing. Comparing the two is the only honest way to report
+            # whether the floor changed the parity actually sent: a lifted
+            # LEVEL can still land on the ratio the leg was already sending
+            # (off/fixed ignore the level; a min_adaptive floor of 8:8 lifts
+            # every level to the same rung).
+            _ratio_without_location = fec_control.apply_mode(
+                fec_mode_eff,
+                fec_control.level_to_ratio(_level_before_location, prof_table),
                 fixed_ratio=fec_fixed_ratio_eff,
                 floor_ratio=fec_floor_ratio_eff)
             # Push our locally measured (relay->client) loss so the relay can
@@ -2876,6 +3141,14 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     logging.info("fec ratio -> %s (fec_mode=%s mode=%s active=%s)",
                                  _fec_ratio, fec_mode_eff, mode,
                                  sorted(currently_active))
+            # AFTER the write, and against what the actuator actually holds:
+            # `active` claims parity is on the wire, so a refused FIFO write
+            # must retract the claim — and a refusal that leaves an OLDER ratio
+            # flowing must not earn the floor credit for it either. Same rule
+            # the ladder below states for its dots: keyed on fec_current_ratio,
+            # never on what we wanted.
+            fec_location_applied = location_floor_active(
+                fec_current_ratio, _fec_ratio, _ratio_without_location)
 
             # Ladder for the UI's pip row. Keyed on fec_current_ratio (what the
             # actuator accepted), not _fec_ratio (what we wanted): a failed FIFO
@@ -2911,8 +3184,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             fec_pinned = fec_full_backoff and fec_mode_eff in (
                 fec_control.MODE_ADAPTIVE, fec_control.MODE_MIN_ADAPTIVE)
             fec_pinned_level = (
-                fec_control.ratio_to_level(cfg.fec.full_mode_backoff_fec,
-                                           prof_table)
+                pinned_ladder_level(cfg.fec.full_mode_backoff_fec, prof_table,
+                                    fec_location_level)
                 if fec_pinned else None)
             fec_ladder = fec_control.ladder_view(
                 fec_scale,
@@ -3042,6 +3315,18 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                         else 0.0),
                 },
                 "signal_floor_active": fec_signal_floor_applied,
+                "location_floor": {
+                    "configured": cfg.location is not None,
+                    "enabled": location_enabled,
+                    # Binding = it actually changed the ratio sent this tick.
+                    # level/reason/wans stay published in every mode (the
+                    # daemon's request is informative either way); only
+                    # `active` claims the parity reached the wire.
+                    "active": fec_location_applied,
+                    "level": fec_location_level,
+                    "reason": fec_location_reason,
+                    "wans": location_floors or {},
+                },
                 "directions": {
                     "client_to_relay": {
                         "enabled": fec_desired,

@@ -1309,3 +1309,75 @@ def test_api_engarde_includes_wan_ifaces(cfg):
         stop.set()
         httpd.shutdown()
         stub.shutdown()
+
+
+def _run_with_location_floor(cfg, tmp_path, monkeypatch, write_ok):
+    """Run the controller for a few ticks with a level-3 location floor
+    published and the FIFO either accepting or refusing the write. Returns the
+    published fec block."""
+    import threading as _t, time as _time
+    monkeypatch.setattr(M, "apply_nft_init", lambda c: None)
+    monkeypatch.setattr(M, "list_current_drops", lambda c: set())
+    monkeypatch.setattr(M, "apply_nft_diff", lambda c, a: None)
+    monkeypatch.setattr(M, "apply_engarde_table_action", lambda a: None)
+    monkeypatch.setattr(M, "read_engarde_table_default",
+                        lambda table: {"via": None, "dev": "wg0"})
+    # Zero loss everywhere: the adaptive engine sits at level 0, so anything
+    # above the config floor on the wire came from the location floor alone.
+    monkeypatch.setattr(M, "read_local_sbfd_state",
+        lambda p, m: M.StateSnapshot(ok=True, per_wan={
+            "wan1": M.WanSample("UP", 10.0, 0.0, 100.0),
+            "wan2": M.WanSample("UP", 12.0, 0.0, 100.0)}))
+    monkeypatch.setattr(M, "fetch_remote_sbfd_state",
+                        lambda *a, **k: M.StateSnapshot(ok=True, per_wan={}))
+    monkeypatch.setattr(M, "fetch_relay_fec",
+        lambda url, t: {"ok": False, "data": None, "error": "unreachable"})
+    monkeypatch.setattr(M, "post_relay_fec",
+        lambda url, mode, fixed_ratio, floor_ratio, t, client_loss_pct=None,
+               wan_profile=None, signal_floor=None: False)
+    monkeypatch.setattr(M.fec_control, "write_fifo",
+                        lambda path, ratio, logger=None: write_ok)
+
+    # Both WANs carry the same floor, so whichever one the driver pick lands on
+    # the floor applies and the test is not hostage to the driver heuristic.
+    Path(cfg.location.state_path).write_text(json.dumps({
+        "set_ts": _time.time(),
+        "wans": {"wan1": {"level": 3, "reason": "learned dr79z6n"},
+                 "wan2": {"level": 3, "reason": "learned dr79z6n"}}}))
+    Path(cfg.sbfd_local_state).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.sbfd_local_state).write_text("{}")
+
+    stop = _t.Event()
+    _t.Thread(target=lambda: (_time.sleep(0.6), stop.set()), daemon=True).start()
+    M.run_controller(cfg, stop_event=stop)
+    return json.loads(Path(cfg.published_state).read_text())["fec"]
+
+
+def test_location_floor_not_active_when_the_fifo_refused_the_write(
+        cfg_with_fec, tmp_path, monkeypatch):
+    """`active` is a claim about the wire, so it must answer to the actuator.
+
+    The ladder a few lines below already refuses to light dots for parity that
+    a failed FIFO write never sent; the location floor's badge has to hold to
+    the same standard, or the card says the vehicle is protected at exactly the
+    place it isn't."""
+    cfg_with_fec.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    fec = _run_with_location_floor(cfg_with_fec, tmp_path, monkeypatch,
+                                   write_ok=False)
+    assert fec["location_floor"]["level"] == 3      # still reported as asked
+    assert fec["location_floor"]["active"] is False
+    # Nothing the actuator took, so nothing on the wire to credit it with.
+    assert fec["directions"]["client_to_relay"]["ratio"] != "8:6"
+
+
+def test_location_floor_active_when_the_fifo_took_the_write(
+        cfg_with_fec, tmp_path, monkeypatch):
+    cfg_with_fec.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    fec = _run_with_location_floor(cfg_with_fec, tmp_path, monkeypatch,
+                                   write_ok=True)
+    assert fec["location_floor"]["active"] is True
+    assert fec["directions"]["client_to_relay"]["ratio"] == "8:6"

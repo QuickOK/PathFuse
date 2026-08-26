@@ -27,7 +27,7 @@ const dirtyFields = new Set();
 let lastState = null;
 let lastEngarde = null;
 
-const FORM_SELECTOR = 'input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #fec-fixed-custom, #fec-floor-ratio, #fec-floor-custom, input[name="environmental_enabled"], input[name="maintenance_enabled"], #maintenance-hour, #master-wan, #persist';
+const FORM_SELECTOR = 'input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #fec-fixed-custom, #fec-floor-ratio, #fec-floor-custom, input[name="environmental_enabled"], input[name="location_fec_enabled"], input[name="maintenance_enabled"], #maintenance-hour, #master-wan, #persist';
 
 /* A control's identity for dirty/focus tracking: radios share a name, the
    rest are unique ids. */
@@ -344,6 +344,8 @@ function render(s){
     }
     const env = s.environmental || {};
     if (env.configured) setRadio("environmental_enabled", env.enabled ? "on" : "off");
+    const loc = (s.fec || {}).location_floor || {};
+    if (loc.configured) setRadio("location_fec_enabled", loc.enabled ? "on" : "off");
     const maint = s.maintenance || {};
     if (maint.configured){
       setRadio("maintenance_enabled", maint.enabled ? "on" : "off");
@@ -366,6 +368,7 @@ function render(s){
   renderFec(s);
   renderCellSignal(s);
   renderEnvironmental(s);
+  renderLocationFec(s);
   renderMaintenance(s);
 
   /* Local-Direct + master-DOWN red badge */
@@ -686,7 +689,9 @@ function renderFec(s){
       const relayFloor = o.floor_ratio;
       const floorMismatch = desiredMode === "min_adaptive"
         && relayFloor && fec.floor_ratio && relayFloor !== fec.floor_ratio;
-      eff.textContent = `effective: ${effDesc} · ${relayTxt}`
+      const loc = fec.location_floor || {};
+      const locTxt = loc.active ? ` · location floor (${loc.reason || 'learned'})` : '';
+      eff.textContent = `effective: ${effDesc} · ${relayTxt}${locTxt}`
         + (floorMismatch ? ` · relay floor ${relayFloor}` : "");
       eff.classList.toggle("warn", !!floorMismatch);
     }
@@ -1507,6 +1512,39 @@ function renderEnvironmental(s){
   $$('input[name="environmental_enabled"]').forEach(r => r.disabled = !env.configured);
 }
 
+/* ---------- location FEC ---------- */
+function renderLocationFec(s){
+  const loc = ((s.fec || {}).location_floor) || {};
+  const mode = (s.fec || {}).desired_mode;
+  const ignores = mode === 'off' || mode === 'fixed';
+  const c2r = (((s.fec || {}).directions) || {}).client_to_relay || {};
+  const el = document.getElementById('location-effective');
+  if (el) {
+    if (!loc.configured)      el.textContent = 'not configured';
+    else if (!loc.enabled)    el.textContent = 'off';
+    else if (loc.active)      el.textContent = `raising to level ${loc.level} · ${loc.reason || 'location'}`;
+    // off and fixed throw the adaptive ratio away, so the floor is not losing
+    // to a higher engine level — it is not being consulted at all.
+    else if (loc.level > 0 && ignores)
+      el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (mode ${mode} ignores it)`;
+    // A refused FIFO write leaves the old ratio flowing however high the floor
+    // reached, so `active` is false through no fault of the floor OR the
+    // engine. Strict === false: an older cached page whose state has no
+    // actuator_ok must fall through to the branch below, not accuse the FIFO.
+    else if (loc.level > 0 && c2r.actuator_ok === false)
+      el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (actuator refused the write)`;
+    else if (loc.level > 0)   el.textContent = `level ${loc.level} asked · ${loc.reason || 'location'} (engine already higher)`;
+    else                      el.textContent = 'clear';
+  }
+  // Disabled is not unchecked: a radio that was checked before the daemon went
+  // away still submits its value, so Apply would post a toggle for a feature
+  // the node has no config for.
+  $$('input[name="location_fec_enabled"]').forEach(r => {
+    r.disabled = !loc.configured;
+    if (!loc.configured) r.checked = false;
+  });
+}
+
 /* ---------- maintenance reboot ---------- */
 function renderMaintenance(s){
   const m = s.maintenance || {};
@@ -1541,6 +1579,7 @@ async function apply(){
   const fecFixed = ratioOf("#fec-fixed-ratio", "#fec-fixed-custom");
   const fecFloor = ratioOf("#fec-floor-ratio", "#fec-floor-custom");
   const envSel = document.querySelector('input[name="environmental_enabled"]:checked')?.value;
+  const locSel = document.querySelector('input[name="location_fec_enabled"]:checked')?.value;
   const maintSel = document.querySelector('input[name="maintenance_enabled"]:checked')?.value;
   const maintHour = $("#maintenance-hour")?.value;
   const status    = $("#apply-status");
@@ -1563,6 +1602,7 @@ async function apply(){
         {mode, master_policy: policy, master_wan: masterWan, egress_mode: egressMode, persist},
         fecPayload,
         (envSel ? {environmental_enabled: envSel === "on"} : {}),
+        (locSel ? {location_fec_enabled: locSel === "on"} : {}),
         (maintSel ? {maintenance_enabled: maintSel === "on"} : {}),
         (maintSel === "on" && maintHour !== undefined
           ? {maintenance_hour: Number(maintHour)} : {})))
