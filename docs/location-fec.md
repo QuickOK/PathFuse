@@ -122,8 +122,12 @@ Neither half acts unless the divergence can be PROVED. A record that is
 absent, stale, unparseable, or from a daemon too old to publish the path
 proves nothing: the editor is left alone and the save goes through. A stopped
 daemon must never be able to lock the operator out of drawing zones. The two
-paths are compared through `realpath`, so a relative spelling or a symlinked
-parent naming one file is not a disagreement.
+paths are compared through `realpath`, which resolves a relative spelling
+against the *resolving process's* working directory — so a relative spelling
+or a symlinked parent naming one file is only reconciled when `sbfd-ctl` and
+`location_fec` share a working directory (both run under systemd with cwd `/`
+in practice, so this is academic in deployment, not a guarantee the code
+makes on its own).
 
 An `operator_zones_path` that is unusable — not a path at all (a `null`, a
 number), empty, or carrying an embedded NUL — is logged and treated as the

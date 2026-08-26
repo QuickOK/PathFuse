@@ -2887,9 +2887,12 @@ def _resolved_path(p) -> Optional[str]:
     normpath resolves neither symlinks nor relative paths, so two settings
     naming ONE file compare unequal -- one side relative to a daemon's working
     directory, or one naming a symlinked parent. realpath resolves both and
-    absolutises, and on a path that exists nowhere it still answers (without
-    raising), which leaves the caller with the lexical comparison it would
-    have made anyway.
+    absolutises -- but a relative path resolves against THIS process's
+    working directory, not the one it was configured for, so a relative
+    spelling in the other unit's config is only reconciled when the two units
+    happen to share a cwd (both run under systemd with cwd `/` in practice).
+    On a path that exists nowhere it still answers (without raising), which
+    leaves the caller with the lexical comparison it would have made anyway.
 
     None whenever realpath cannot answer -- OSError, ValueError, or a
     TypeError the caller's own isinstance guard has already excluded -- so
