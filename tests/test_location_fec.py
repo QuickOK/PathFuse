@@ -686,3 +686,37 @@ def test_an_operator_zone_can_name_a_wan_the_config_never_mentions(tmp_path):
                       fix=(41.1, -73.5, 0.0, None), state=None,
                       now_mono=0.0, now_wall=1000.0, operator_zones=drawn)
     assert rec["wans"]["wan5"]["level"] == 3
+
+
+def test_validate_zone_rejects_a_non_finite_position_or_radius():
+    """`radius <= 0` is False for inf, and every haversine comparison against
+    inf is True, so `"radius_m": Infinity` is a zone that matches EVERYWHERE
+    -- a floor over the whole world from one hand-edited character. NaN is the
+    mirror image: it fails every comparison, including the range check."""
+    base = {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 2}
+    for key in ("lat", "lon", "radius_m"):
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            assert M.validate_zone(dict(base, **{key: bad}), 5) is None, \
+                (key, bad)
+    assert M.validate_zone(base, 5) is not None
+
+
+def test_load_operator_zones_drops_a_non_finite_radius_from_the_file(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text('{"zones": [{"label": "everywhere", "lat": 41.1,'
+                 ' "lon": -73.5, "radius_m": Infinity, "level": 4},'
+                 ' {"label": "yard", "lat": 41.1, "lon": -73.5,'
+                 ' "radius_m": 300, "level": 2}]}')
+    assert [z["label"] for z in M.load_operator_zones(str(p), 5)] == ["yard"]
+
+
+def test_zone_file_revalidates_when_the_table_changes(tmp_path):
+    """A SIGHUP can swap the loss table under the daemon. A zone at level 4 is
+    valid on a five-rung table and not on a four-rung one, so the memo has to
+    be keyed on the table length as well as the file."""
+    p = _operator_file(tmp_path, dict(_YARD, label="deep", level=4))
+    zf = M.ZoneFile()
+    assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["deep"]
+    assert zf.maybe_reload(str(p), 4) == []
+    assert [z["label"] for z in zf.maybe_reload(str(p), 5)] == ["deep"]

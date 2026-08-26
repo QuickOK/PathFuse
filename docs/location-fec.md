@@ -77,6 +77,12 @@ below the current floor say `already covered by the floor` and are dimmed;
 they remain selectable, because a zone chosen there still holds if the floor
 later drops.
 
+Profiles swap under you: a zone set to level 4 on the five-rung base table
+opens as `level 4 — not on the current table (kept)` while a four-rung
+cellular profile is driving. It is kept, not snapped down — editing that
+zone's label never rewrites its floor. A NEW zone can only be given a rung the
+driving table actually has.
+
 The radius has a slider for quick adjustment and a number beside it for exact
 or large values. The slider stops at 2 km; the number accepts anything the
 endpoint does, up to 50 km. Opening a wider zone shows its real radius and
@@ -86,6 +92,11 @@ Drawn zones live in `/var/lib/sbfd-ctl/location_zones.json`. `sbfd-ctl` writes
 it and `location_fec` re-reads it whenever the file changes, so a zone takes
 effect within a poll — no signal, no restart. A missing file simply means no
 drawn zones; an unusable one is logged once and treated the same way.
+
+At most 200 zones can be drawn. Every zone is walked once per look-ahead point
+in the 1 Hz loop and rides in every map poll, so the collection is bounded;
+past the limit a new zone is refused with `too many zones (max 200)`, while
+editing and deleting stay available — that is the way back under it.
 
 Each zone in that file carries an `id`, and the file carries a `next_id`
 counter beside them. Ids are handed out from the counter and never reused, so

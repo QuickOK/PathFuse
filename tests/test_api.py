@@ -1,3 +1,4 @@
+import http.client
 import json
 import threading
 import urllib.request, urllib.error
@@ -1616,7 +1617,7 @@ def test_api_map_explains_every_fec_level(cfg_with_fec, tmp_path):
                         "environ_points_path": str(tmp_path / "e.json")}
     Path(cfg_with_fec.published_state).write_text(json.dumps(
         {"fec": {"floor_ratio": "8:2", "profile": {"driver_wan": "wan2"}},
-         "wan_labels": {"wan1": "T-Mo", "wan2": "Satellite"}}))
+         "wan_labels": {"wan1": "Cellular", "wan2": "Satellite"}}))
     stop = threading.Event()
     httpd = M.start_ui_server(cfg_with_fec, stop)
     try:
@@ -1627,7 +1628,7 @@ def test_api_map_explains_every_fec_level(cfg_with_fec, tmp_path):
         assert [lv["ratio"] for lv in loc["levels"]] == [
             row["fec"] for row in fec_control.DEFAULT_LOSS_TABLE]
         assert loc["floor_level"] == 1
-        assert loc["wans"] == {"wan1": "T-Mo", "wan2": "Satellite"}
+        assert loc["wans"] == {"wan1": "Cellular", "wan2": "Satellite"}
     finally:
         stop.set()
         httpd.shutdown()
@@ -1872,3 +1873,78 @@ def test_api_post_location_zone_keeps_a_level_off_the_driving_table(cfg_with_fec
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def _raw_post(port, path, length_header, body=b"{}", timeout=3):
+    """POST with a Content-Length we choose, which urllib will not allow."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.putrequest("POST", path, skip_accept_encoding=True)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", length_header)
+        conn.endheaders()
+        conn.send(body)
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    finally:
+        conn.close()
+
+
+def test_api_post_rejects_an_unusable_content_length(cfg, tmp_path):
+    """int() on a non-numeric header raised straight out of the handler, and a
+    NEGATIVE length passed the size cap and then blocked in rfile.read(-1)
+    until the peer closed -- one pinned thread per request. The timeout on
+    these calls is the assertion for the second half."""
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for path in ("/api/location-zone", "/api/station-label",
+                     "/api/runtime"):
+            # An EMPTY header is deliberately not here: `or "0"` has always
+            # read it as a bodyless POST, and that is a different question.
+            # (A whitespace-only one is stripped to empty before we see it.)
+            for bad in ("abc", "-1", "1.5", "0x10", "1 2", "+"):
+                assert _raw_post(port, path, bad) == 400, (path, bad)
+        # The server is still healthy afterwards.
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            assert r.status == 200
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_still_accepts_a_well_formed_length(cfg, tmp_path):
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2})
+        assert status == 200 and body["ok"] is True
+        # An oversized body is still 413, not 400.
+        assert _raw_post(port, "/api/location-zone", "99999") == 413
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_validate_zone_payload_only_deletes_on_a_real_true():
+    """`delete` is actuation, not a hint: a truthy string arriving from a
+    hand-rolled client must not remove a floor."""
+    for truthy in ("yes", 1, [1], "false"):
+        ok, _z, err = M.validate_zone_payload({"id": "z1", "delete": truthy},
+                                              {"wan1"}, 5)
+        assert not ok and err                    # falls through to full checks
+    ok, zone, _ = M.validate_zone_payload({"id": "z1", "delete": True},
+                                          {"wan1"}, 5)
+    assert ok and zone == {"id": "z1", "delete": True}
+    # A false delete is an ordinary update and still needs a whole zone.
+    ok, zone, _ = M.validate_zone_payload(
+        {"id": "z1", "delete": False, "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 2}, {"wan1"}, 5)
+    assert ok and zone["id"] == "z1" and "delete" not in zone

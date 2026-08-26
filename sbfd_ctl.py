@@ -2353,7 +2353,9 @@ def validate_zone_payload(payload, wan_names, table_len,
     has_id = zid is not None
     if has_id and not (isinstance(zid, str) and _ZID_RE.match(zid)):
         return (False, None, "invalid zone id")
-    if payload.get("delete"):
+    # `is True`, not truthiness: this removes a live FEC floor, so a stray
+    # "false" or 1 from a hand-rolled client must not actuate it.
+    if payload.get("delete") is True:
         if not has_id:
             return (False, None, "invalid zone id")
         return (True, {"id": zid, "delete": True}, None)
@@ -2566,17 +2568,22 @@ def _apply_location_zone_locked(zones_path: str, zone: dict):
     return zones
 
 
-def active_fec_table(fec_cfg, published_state_path):
+def active_fec_table(fec_cfg, published_state_path, snap=None):
     """The loss table of the profile currently driving FEC.
 
     A zone's `level` is an index into THIS table, so the endpoint that accepts
     a level and the payload that tells the page what each level means have to
     resolve it the same way — otherwise the map offers a rung the daemon would
     clamp. Degrades to the base table: with no FEC section, or no driver named
-    in the snapshot, that is the table sbfd-ctl would use anyway."""
+    in the snapshot, that is the table sbfd-ctl would use anyway.
+
+    `snap` lets a caller that has already read the published state pass it in,
+    so the table and anything else derived from that file describe the SAME
+    tick rather than two reads either side of a publish."""
     if fec_cfg is None:
         return list(fec_control.DEFAULT_LOSS_TABLE)
-    snap = _read_json_file(published_state_path)
+    if snap is None:
+        snap = _read_json_file(published_state_path)
     fec = snap.get("fec") if isinstance(snap, dict) else None
     profile = fec.get("profile") if isinstance(fec, dict) else None
     driver = profile.get("driver_wan") if isinstance(profile, dict) else None
@@ -2774,14 +2781,16 @@ def assemble_map_payload(map_cfg, published_state_path, fix, now,
     # What a level MEANS on the link currently driving FEC. The editor greys
     # out the levels at or below the floor, so a floor the page cannot see
     # would have it offering rungs that change nothing.
-    table = active_fec_table(fec_cfg, published_state_path) if fec_cfg else None
+    table = (active_fec_table(fec_cfg, published_state_path, snap=snap)
+             if fec_cfg else None)
     fec_snap = snap.get("fec") if isinstance(snap.get("fec"), dict) else {}
-    labels = snap.get("wan_labels")
+    wan_labels = snap.get("wan_labels")
     location["levels"] = map_fec_levels(table) if table else []
     location["floor_level"] = (
         fec_control.ratio_rung(fec_snap.get("floor_ratio"), table)
         if table else None)
-    location["wans"] = (labels if table and isinstance(labels, dict) else {})
+    location["wans"] = (wan_labels
+                        if table and isinstance(wan_labels, dict) else {})
     return {"ts": now,
             "fix": out_fix,
             "stations": stations,
@@ -3040,9 +3049,28 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
             else:
                 self.send_error(404)
 
+        def _body_length(self):
+            """The request body's length, or None if the header is unusable.
+
+            int() on a non-numeric header raised straight out of the handler,
+            and a NEGATIVE length passed the size cap and then blocked in
+            rfile.read(-1) until the peer closed -- one thread pinned per
+            request on a keep-alive connection."""
+            raw = self.headers.get("Content-Length", "0") or "0"
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                return None
+            return n if n >= 0 else None
+
         def do_POST(self):
             if self.path == "/api/station-label":
-                length = int(self.headers.get("Content-Length", "0") or "0")
+                length = self._body_length()
+                if length is None:
+                    # send_error, not _send_json: with no usable length we
+                    # cannot consume the body, so the connection must close or
+                    # that body is parsed as the next request.
+                    self.send_error(400, "invalid Content-Length"); return
                 if length > 4096:
                     self.send_error(413, "payload too large"); return
                 try:
@@ -3059,7 +3087,9 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 self._send_json(200, {"ok": True, "labels": labels})
                 return
             if self.path == "/api/location-zone":
-                length = int(self.headers.get("Content-Length", "0") or "0")
+                length = self._body_length()
+                if length is None:
+                    self.send_error(400, "invalid Content-Length"); return
                 if length > 4096:
                     self.send_error(413, "payload too large"); return
                 try:
@@ -3096,7 +3126,9 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
                 return
             if self.path != "/api/runtime":
                 self.send_error(404); return
-            length = int(self.headers.get("Content-Length", "0") or "0")
+            length = self._body_length()
+            if length is None:
+                self.send_error(400, "invalid Content-Length"); return
             if length > 4096:
                 self.send_error(413, "payload too large"); return
             try:

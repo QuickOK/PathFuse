@@ -289,6 +289,15 @@ def validate_zone(raw, table_len):
     except (KeyError, TypeError, ValueError):
         log.warning("zone %r ignored: needs lat, lon, radius_m and level", label)
         return None
+    # Finiteness first, and separately: `radius <= 0` is False for inf, and
+    # every haversine comparison against inf is True, so an infinite radius is
+    # a zone that matches EVERYWHERE. NaN is the mirror image -- it fails
+    # every comparison, so the range test below passes it too.
+    if not (math.isfinite(lat) and math.isfinite(lon)
+            and math.isfinite(radius)):
+        log.warning("zone %r ignored: position or radius is not a finite "
+                    "number", label)
+        return None
     if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or radius <= 0:
         log.warning("zone %r ignored: position or radius out of range", label)
         return None
@@ -339,7 +348,9 @@ class ZoneFile:
     file would log its warning once a second forever. The inode is in the key
     because mtime_ns + size alone cannot tell a rewrite that reproduces both
     from no change at all; sbfd-ctl's tmp + os.replace always lands a new
-    one."""
+    one. table_len is in the key because a SIGHUP can swap the loss table
+    under us, and a zone's level is only ever valid against a particular
+    table."""
 
     def __init__(self):
         self._key = None
@@ -348,7 +359,7 @@ class ZoneFile:
     def maybe_reload(self, path, table_len):
         try:
             st = os.stat(path)
-            key = (path, st.st_mtime_ns, st.st_size, st.st_ino)
+            key = (path, table_len, st.st_mtime_ns, st.st_size, st.st_ino)
         except (OSError, ValueError):
             # Gone, unreadable, or an unusable path (os.stat raises ValueError
             # on an embedded NUL). Clear the memo as well as the list, or a
