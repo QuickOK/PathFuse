@@ -263,6 +263,10 @@ class LocationConfig:
     wans: list = field(default_factory=list)
     learning: dict = field(default_factory=dict)
     zones: list = field(default_factory=list)
+    # Zones the operator drew on the map. sbfd-ctl owns this file; we only
+    # read it, and we re-read it when it changes rather than on SIGHUP — a
+    # zone drawn on the map must take effect without a signal.
+    operator_zones_path: str = "/var/lib/sbfd-ctl/location_zones.json"
     table: list = field(default_factory=lambda: list(fec_control.DEFAULT_LOSS_TABLE))
 
 
@@ -282,8 +286,21 @@ def validate_zone(raw, table_len):
         if isinstance(raw["level"], bool):
             raise TypeError("level must be a number")
         level = int(raw["level"])
-    except (KeyError, TypeError, ValueError):
+    # OverflowError, because it is neither of the other two: float() raises it
+    # on an integer literal too large for a float (JSON integers are unbounded)
+    # and int() on an infinite level. Uncaught it left this fail-open validator
+    # by raising into the 1 Hz poll, once a second while the file stayed bad.
+    except (KeyError, TypeError, ValueError, OverflowError):
         log.warning("zone %r ignored: needs lat, lon, radius_m and level", label)
+        return None
+    # Finiteness first, and separately: `radius <= 0` is False for inf, and
+    # every haversine comparison against inf is True, so an infinite radius is
+    # a zone that matches EVERYWHERE. NaN is the mirror image -- it fails
+    # every comparison, so the range test below passes it too.
+    if not (math.isfinite(lat) and math.isfinite(lon)
+            and math.isfinite(radius)):
+        log.warning("zone %r ignored: position or radius is not a finite "
+                    "number", label)
         return None
     if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or radius <= 0:
         log.warning("zone %r ignored: position or radius out of range", label)
@@ -300,6 +317,97 @@ def validate_zone(raw, table_len):
     return {"label": label, "lat": lat, "lon": lon, "radius_m": radius,
             "level": level, "wans": wans,
             "suppress_learned": bool(raw.get("suppress_learned", False))}
+
+
+def load_operator_zones(path, table_len):
+    """The zones sbfd-ctl wrote from the map, validated exactly as the
+    configured ones are.
+
+    Fail-open in every direction: a missing file is the normal state of a box
+    nobody has drawn on yet and says nothing; anything else unusable costs one
+    warning and yields no zones. This must never raise — the caller is the 1 Hz
+    poll loop, and an operator zone is an addition to the floor, never a
+    prerequisite for it."""
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    # TypeError, because open() raises it (not OSError) on a path that is not
+    # a path at all -- `"operator_zones_path": null` in the config. This is
+    # the 1 Hz poll's helper: it fails open on the TYPE of the path as well as
+    # on the contents of the file.
+    except (OSError, TypeError, ValueError) as e:
+        log.warning("operator zones %r unreadable: %s", path, e)
+        return []
+    zones = raw.get("zones") if isinstance(raw, dict) else None
+    if not isinstance(zones, list):
+        log.warning("operator zones %s ignored: no zones list", path)
+        return []
+    return [z for z in (validate_zone(z, table_len) for z in zones) if z]
+
+
+class ZoneFile:
+    """The operator zone file, re-read only when it actually changes.
+
+    Same memo shape as sbfd-ctl's tile-store memo, and for the same reason:
+    the loop runs at 1 Hz and the operator draws a zone once in a while, so
+    re-parsing an unchanged file every tick is pure waste — and a malformed
+    file would log its warning once a second forever. The inode is in the key
+    because mtime_ns + size alone cannot tell a rewrite that reproduces both
+    from no change at all; sbfd-ctl's tmp + os.replace always lands a new
+    one. table_len is in the key because a SIGHUP can swap the loss table
+    under us, and a zone's level is only ever valid against a particular
+    table."""
+
+    def __init__(self):
+        self._key = None
+        self._zones = []
+
+    def maybe_reload(self, path, table_len):
+        try:
+            st = os.stat(path)
+            key = (path, table_len, st.st_mtime_ns, st.st_size, st.st_ino)
+        except (OSError, TypeError, ValueError):
+            # Gone, unreadable, or an unusable path (os.stat raises
+            # ValueError on an embedded NUL and TypeError on a non-path, and
+            # a TypeError out of here skipped the whole poll: every published
+            # floor gone while the daemon kept running). Clear the memo as
+            # well as the list, or a file recreated at the same size under a
+            # coarse mtime would be served from a cache of zones that no
+            # longer exist.
+            self._key, self._zones = None, []
+            return self._zones
+        if key != self._key:
+            self._key = key
+            self._zones = load_operator_zones(path, table_len)
+        return self._zones
+
+
+_DEFAULT_OPERATOR_ZONES_PATH = "/var/lib/sbfd-ctl/location_zones.json"
+
+
+def _zones_path(raw):
+    """The configured operator-zone path, or the default when it is not a path.
+
+    os.stat raises TypeError on a null or a number, and that TypeError used to
+    reach the 1 Hz poll -- one mistyped config line and NO location floor was
+    published at all, with the daemon still running and saying nothing about
+    it. Unusable is therefore loud AND survivable. The caller passes the
+    default for an ABSENT key, which is the normal state of every shipped
+    config and must stay silent; a key that is present and unusable is the
+    only thing worth a warning.
+
+    A string is not automatically usable: `""` and a path carrying a NUL name
+    no file ZoneFile can ever stat, and the empty one is also dropped from the
+    published record -- so the map cannot see the disagreement either, and
+    drawn zones just stop working. Both take the default like any other
+    unusable value."""
+    if isinstance(raw, str) and raw and "\0" not in raw:
+        return raw
+    log.warning("operator_zones_path %r is not a usable path; using %s",
+                raw, _DEFAULT_OPERATOR_ZONES_PATH)
+    return _DEFAULT_OPERATOR_ZONES_PATH
 
 
 def load_location_config(path) -> LocationConfig:
@@ -335,6 +443,8 @@ def load_location_config(path) -> LocationConfig:
                   ("min_passes", "alpha", "pass_gap_s", "max_tiles",
                    "max_age_days", "clean_drop_days") if k in learn},
         zones=zones,
+        operator_zones_path=_zones_path(
+            raw.get("operator_zones_path", _DEFAULT_OPERATOR_ZONES_PATH)),
         table=table,
     )
 
@@ -454,15 +564,26 @@ def fresh_fix(fix, now_wall, max_age_s):
     return fix
 
 
-def build_record(levels, now_wall):
+def build_record(levels, now_wall, operator_zones_path=None):
     """The published contract. LEVEL is the actuated field — each WAN profile
     has its own loss table, so a ratio resolved here could mean something
     different by the time sbfd-ctl applies it. Only non-zero levels are
-    published; an empty `wans` is an explicit withdrawal."""
-    return {"set_ts": now_wall,
-            "source": "location_fec",
-            "wans": {w: {"level": v["level"], "reason": v["reason"]}
-                     for w, v in levels.items() if v["level"] > 0}}
+    published; an empty `wans` is an explicit withdrawal.
+
+    `operator_zones_path` is the drawn-zone file this daemon is READING. It
+    rides along because sbfd-ctl writes the map's zones to a path configured
+    separately, in a different file, in a different process: when the two
+    diverge the save returns 200, the map draws the circle, and no floor ever
+    moves. Saying which file we read is what lets the map name the mismatch.
+    Additive and optional — an older reader ignores unknown keys, and a value
+    that is not a path is left out rather than published as a lie."""
+    out = {"set_ts": now_wall,
+           "source": "location_fec",
+           "wans": {w: {"level": v["level"], "reason": v["reason"]}
+                    for w, v in levels.items() if v["level"] > 0}}
+    if isinstance(operator_zones_path, str) and operator_zones_path:
+        out["operator_zones_path"] = operator_zones_path
+    return out
 
 
 def write_record(path, record):
@@ -473,24 +594,31 @@ def write_record(path, record):
     os.replace(tmp, path)
 
 
-def poll_once(cfg, store, hold, fix, state, now_mono, now_wall):
+def poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
+              operator_zones=()):
     """One tick: learn from state (if fresh), resolve from position, publish.
-    Returns the record; the caller writes it."""
+    Returns the record; the caller writes it.
+
+    `operator_zones` are the map-drawn ones. They are simply appended to the
+    configured list: downstream a zone is a zone, and the two sources combine
+    by max like any other pair of terms."""
+    zones_path = cfg.operator_zones_path
     if fix is None:
         store.observe(None, {}, None, now_mono, now_wall)
-        return build_record({}, now_wall)
+        return build_record({}, now_wall, operator_zones_path=zones_path)
     tile = tile_store.encode(fix[0], fix[1], cfg.precision)
+    zones = list(cfg.zones) + list(operator_zones or ())
     wans = set(cfg.wans)
     if state is not None:
         per_wan_loss, residual = state
         store.observe(tile, per_wan_loss, residual, now_mono, now_wall)
         wans |= set(per_wan_loss)
-    for zone in cfg.zones:
+    for zone in zones:
         wans |= set(zone.get("wans") or [])
     wans = sorted(wans)
     if not wans:
-        return build_record({}, now_wall)
-    levels = resolve(store, fix, cfg.zones, wans, cfg.table,
+        return build_record({}, now_wall, operator_zones_path=zones_path)
+    levels = resolve(store, fix, zones, wans, cfg.table,
                      precision=cfg.precision, lookahead_s=cfg.lookahead_s,
                      min_speed_ms=cfg.min_speed_ms,
                      sample_step_m=cfg.sample_step_m)
@@ -500,7 +628,7 @@ def poll_once(cfg, store, hold, fix, state, now_mono, now_wall):
         if level != levels[wan]["level"]:
             levels[wan] = {"level": level,
                            "reason": f"exit hold ({hold.reason_for(wan)})"}
-    return build_record(levels, now_wall)
+    return build_record(levels, now_wall, operator_zones_path=zones_path)
 
 
 _running = True
@@ -536,6 +664,8 @@ def main():
     store = tile_store.TileStore.load(cfg.store_path, **cfg.learning)
     log.info("tile store: %d tiles loaded", len(store.tiles))
     hold = ExitHold(cfg.exit_hold_s)
+    zone_file = ZoneFile()
+    last_operator_count = None
     # Every 1 Hz fault the loop can hit gets an edge-triggered or rate-limited
     # voice: a fault that lasts an hour must not cost 3600 journal lines.
     blind = Episode()               # blind for longer than max_stale_s
@@ -584,7 +714,15 @@ def main():
                 # blind episode: the condition can last for hours.
                 log.warning("no usable fix for %.0f s; withdrawing",
                             now_mono - last_good)
-            record = poll_once(cfg, store, hold, fix, state, now_mono, now_wall)
+            # No signal: a zone drawn on the map is live within a poll, so
+            # this is keyed off the file's own mtime rather than SIGHUP.
+            operator_zones = zone_file.maybe_reload(cfg.operator_zones_path,
+                                                    len(cfg.table))
+            if len(operator_zones) != last_operator_count:
+                last_operator_count = len(operator_zones)
+                log.info("operator zones -> %d", last_operator_count)
+            record = poll_once(cfg, store, hold, fix, state, now_mono, now_wall,
+                               operator_zones=operator_zones)
             write_record(cfg.output_path, record)
             published = {w: v["level"] for w, v in record["wans"].items()}
             if published != last_published:

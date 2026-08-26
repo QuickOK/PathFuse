@@ -18,7 +18,8 @@ Every second the daemon reads the vehicle's position from gpsd and the loss
 
 ```json
 {"set_ts": 1750000000.0, "source": "location_fec",
- "wans": {"wan1": {"level": 3, "reason": "learned dr79z6n (4 passes)"}}}
+ "wans": {"wan1": {"level": 3, "reason": "learned dr79z6n (4 passes)"}},
+ "operator_zones_path": "/var/lib/sbfd-ctl/location_zones.json"}
 ```
 
 `sbfd-ctl` reads it every tick. For the WAN currently **driving** FEC, the
@@ -59,6 +60,94 @@ window the level is held for `exit_hold_s` before dropping.
 
 ## Manual zones
 
+A zone pins a minimum level to a place. There are two ways to make one, and
+the daemon treats them identically once they exist.
+
+### Draw it on the map
+
+Open the `:8081` map, press **Zones**, and click where the bad stretch is. The
+editor opens at that point: name it, drag the radius until the circle covers
+the place, choose a level, tick the WANs it applies to, and Save. Click a zone
+you drew to edit or delete it; Escape cancels. Leave every WAN unticked to
+cover all of them. Deleting asks first, and names the zone: ids are never
+reused, so the zone you delete can only be drawn again, never restored.
+
+The WAN boxes come from the labels in the published state. Where that is not
+available yet — no FEC section, or no snapshot — the panel shows the zone's
+stored WAN scope as plain text and says so, and a save leaves that scope
+exactly as it is. An empty list means *every* WAN, so a panel with no boxes to
+tick must never be able to send one.
+
+Each level in the list names its ratio and what it costs — `level 3 — 8:6 (75%
+overhead)` — on the loss table of the link **currently driving FEC**, so the
+choice is made against the ladder that will actually be applied. Levels at or
+below the current floor say `already covered by the floor` and are dimmed;
+they remain selectable, because a zone chosen there still holds if the floor
+later drops.
+
+Profiles swap under you: a zone set to level 4 on the five-rung base table
+opens as `level 4 — not on the current table (kept)` while a four-rung
+cellular profile is driving. It is kept, not snapped down — editing that
+zone's label never rewrites its floor. A NEW zone can only be given a rung the
+driving table actually has.
+
+The radius has a slider for quick adjustment and a number beside it for exact
+or large values. The slider stops at 2 km; the number accepts anything the
+endpoint does, up to 50 km. Opening a wider zone shows its real radius and
+keeps it — the editor never shrinks a zone you only opened to look at.
+
+Drawn zones live in `/var/lib/sbfd-ctl/location_zones.json`. `sbfd-ctl` writes
+it and `location_fec` re-reads it whenever the file changes, so a zone takes
+effect within a poll — no signal, no restart. A missing file simply means no
+drawn zones; an unusable one is logged once and treated the same way.
+
+Two settings name that file: `map.location_zones_path` in `sbfd-ctl.json`,
+which is where the map SAVES, and `operator_zones_path` in
+`location-fec.json`, which is what the daemon READS. They default to the same
+file and nothing ties them together, so the daemon publishes the path it is
+reading and `sbfd-ctl` compares the two. Diverged, the editor names the
+daemon's file and goes read-only: a zone can still be opened and looked at,
+but Save and Delete are both disabled, because a mutation that cannot take
+effect must not look like one that did. Delete especially — the map draws the
+file it writes, so a delete there would succeed, the circle would vanish, and
+the daemon would carry on applying that floor from the file it actually reads.
+
+The endpoint enforces the same thing, so the page is not the only client
+protected: a create, an update or a delete posted while the paths disagree is
+refused with `409` and `the location daemon is reading <path>; saving here
+would not take effect`. Answering `200` there would be the API confirming a
+change it knows cannot move the floor.
+
+Neither half acts unless the divergence can be PROVED. A record that is
+absent, stale, unparseable, or from a daemon too old to publish the path
+proves nothing: the editor is left alone and the save goes through. A stopped
+daemon must never be able to lock the operator out of drawing zones. The two
+paths are compared through `realpath`, which resolves a relative spelling
+against the *resolving process's* working directory — so a relative spelling
+or a symlinked parent naming one file is only reconciled when `sbfd-ctl` and
+`location_fec` share a working directory (both run under systemd with cwd `/`
+in practice, so this is academic in deployment, not a guarantee the code
+makes on its own).
+
+An `operator_zones_path` that is unusable — not a path at all (a `null`, a
+number), empty, or carrying an embedded NUL — is logged and treated as the
+default rather than taking the poll down or silently reading nothing.
+
+At most 200 zones can be drawn. Every zone is walked once per look-ahead point
+in the 1 Hz loop and rides in every map poll, so the collection is bounded;
+past the limit a new zone is refused with `too many zones (max 200)`, while
+editing and deleting stay available — that is the way back under it.
+
+Each zone in that file carries an `id`, and the file carries a `next_id`
+counter beside them. Ids are handed out from the counter and never reused, so
+an editor panel left open on a zone that has since been deleted cannot save
+over a different zone that came later. A zone edited into the file by hand
+without an `id` still works — the daemon never asked for one — but the map
+cannot address it, so it is drawn dashed and says so in its tooltip. Delete it
+and redraw it to make it editable again.
+
+### Declare it in the config file
+
 ```json
 "zones": [
   {"label": "depot", "lat": 0.000, "lon": 0.000, "radius_m": 300, "level": 3},
@@ -67,16 +156,23 @@ window the level is held for `exit_hold_s` before dropping.
 ]
 ```
 
+Zones in `/etc/sbfd-ctl/location-fec.json` are for places that should ship
+with the box: they are deployed with the rest of the config and take effect on
+a reload. That is the whole difference. Config zones need a deploy and a
+reload; map-drawn zones need neither. The map shows config zones as dashed
+circles it will not let you edit, and drawn ones as solid circles it will.
+
+### What a zone does
+
 A zone matches when its centre is within `radius_m` of the position or any
 look-ahead point. `level` is a guaranteed minimum for the listed `wans`
-(default: all); the learned value can only push above it, and the two combine
-by `max`. `suppress_learned: true` ignores the learned value inside that zone,
-for a place the learner has simply got wrong — inside it only: the tiles whose
-centres fall in the circle are dropped from the look-ahead, and a confirmed bad
-tile on the approach still raises the floor. Read a station's label off the
-`:8081` map and paste its centroid to name a place you already recognise.
+(default: all); the learned value can only push above it, and every source
+combines by `max`. `suppress_learned: true` ignores the learned value inside
+that zone, for a place the learner has simply got wrong — inside it only: the
+tiles whose centres fall in the circle are dropped from the look-ahead, and a
+confirmed bad tile on the approach still raises the floor.
 
-Edited zones are re-read on `SIGHUP`: `systemctl reload location-fec`, or
+Config zones are re-read on `SIGHUP`: `systemctl reload location-fec`, or
 `kill -HUP <pid>` where the daemon is not run under systemd. A reload re-reads
 the **whole** config file — zones, the gpsd host/port, `wans`, the intervals,
 the loss table — and re-applies `exit_hold_s` and the `learning` parameters to
@@ -95,7 +191,13 @@ restart, and the reload says so.
 - *active* means the location floor is currently why the wire carries more
   parity than the loss-driven decision alone would send, whether or not it
   triggered the most recent write; a refused write is never counted.
-- The map draws learned tiles as loss-coloured squares and zones as circles.
+- The map draws learned tiles as loss-coloured squares and zones as circles:
+  solid for a zone it can edit, dashed for one it cannot. Every zone the
+  daemon is acting on is drawn, and a dashed one's tooltip says why it is not
+  editable here.
+- **Zones** on the map page opens the zone editor. With it off the map
+  behaves exactly as it did before, and config zones stay read-only in
+  either state.
 
 ## Fail-safe
 
@@ -107,6 +209,10 @@ restart, and the reload says so.
 | daemon alive but blind for `withdraw.max_stale_s` | already withdrawn (no fix ⇒ withdrawal is immediate); logs one warning per blind episode, not one per tick, so the blindness is visible in the journal without flooding it |
 | corrupt store | starts empty, one log line |
 | invalid zone | logged and skipped |
+| drawn-zone file missing or corrupt | no drawn zones, one log line; config zones and learning are unaffected |
+| `operator_zones_path` unusable (not a path, empty, embedded NUL) | one log line, the default path is used; floors keep publishing |
+| map and daemon pointed at different zone files | the map names the daemon's file and goes read-only (Save and Delete both disabled), and the endpoint refuses every mutation with 409; floors are unaffected |
+| daemon stopped, or its record stale or unreadable | no mismatch is proven, so zone editing stays available |
 
 Known hole: in a tunnel the fix dies where the link does, so nothing is learned
 there. The approach tiles usually still learn; a manual zone covers the rest.

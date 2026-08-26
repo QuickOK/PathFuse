@@ -1,3 +1,4 @@
+import http.client
 import json
 import threading
 import urllib.request, urllib.error
@@ -11,7 +12,7 @@ import fec_control
 @pytest.fixture
 def cfg(tmp_path: Path):
     return M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -419,7 +420,7 @@ def test_validate_runtime_payload_rejects_bad_fec_enabled():
 @pytest.fixture
 def cfg_with_fec(tmp_path: Path):
     return M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -700,7 +701,7 @@ def test_run_controller_pushes_wan_profile_and_signal_floor_to_relay(tmp_path, m
     import threading as _t
     cell_state = tmp_path / "cell.json"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -777,7 +778,7 @@ def test_run_controller_suppresses_signal_floor_when_full_mode_backoff_gate_clos
     import threading as _t
     cell_state = tmp_path / "cell.json"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -856,7 +857,7 @@ def test_run_controller_handoff_window_forces_full_and_publishes(tmp_path, monke
     cell_state = tmp_path / "cell.json"
     handoff_path = tmp_path / "cell_handoff.json"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x/state", fec_url="http://relay:9276/fec"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
@@ -1481,3 +1482,762 @@ def test_run_controller_reposts_when_only_the_location_level_changes(
     levels = [p["location_level"] for p in pushed]
     assert levels[0] == 3
     assert levels[-1] == 1, f"expected a re-post at the new level, got {levels}"
+
+
+def _zone_cfg(cfg, tmp_path):
+    cfg.map = {"location_zones_path": str(tmp_path / "location_zones.json")}
+    Path(cfg.published_state).write_text("{}")
+    return str(tmp_path / "location_zones.json")
+
+
+def _post_zone(port, payload):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/location-zone",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=2) as r:
+        return r.status, json.loads(r.read())
+
+
+def test_api_post_location_zone_round_trip(cfg, tmp_path):
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+            "label": "dock", "wans": ["wan1"]})
+        assert status == 200 and body["ok"] is True
+        assert [z["id"] for z in body["zones"]] == ["z1"]
+        assert body["zones"][0]["label"] == "dock"
+        assert body["zones"][0]["wans"] == ["wan1"]
+
+        # Update in place, then delete: the response is always the whole list,
+        # because the page redraws from it rather than patching its own layer.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.2, "lon": -73.5, "radius_m": 500,
+            "level": 4, "label": "dock north"})
+        assert body["zones"][0]["label"] == "dock north"
+        assert body["zones"][0]["radius_m"] == 500.0
+
+        status, body = _post_zone(port, {"id": "z1", "delete": True})
+        assert body["zones"] == []
+        assert json.loads(Path(zones_path).read_text())["zones"] == []
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_an_unknown_wan(cfg, tmp_path):
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 3, "wans": ["wan9"]})
+        assert ei.value.code == 400
+        assert "wan9" in json.loads(ei.value.read())["error"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_a_level_past_the_active_table(cfg, tmp_path):
+    """table_len comes from the profile actually driving FEC, so the endpoint
+    can never accept a level the daemon would then clamp or drop."""
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 9})
+        assert ei.value.code == 400
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_deleting_an_id_that_is_not_there(cfg, tmp_path):
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"id": "z4", "delete": True})
+        assert ei.value.code == 400
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_uses_the_driving_profiles_table(cfg_with_fec, tmp_path):
+    """The cellular profile's table is shorter than the base one; a level that
+    is legal on the base table must be refused while that profile drives."""
+    cfg_with_fec.map = {"location_zones_path":
+                        str(tmp_path / "location_zones.json")}
+    cfg_with_fec.fec.wan_profiles = {"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+        ramp_up_ticks=1, ramp_down_hold_s=0, floor_ratio="8:0",
+        signal_floor_fec="12:1")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"profile": {"driver_wan": "wan1"}}}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+        # level 4 exists on the base table (5 rows) but not on the cellular
+        # one (4 rows), and wan1 is driving.
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 4})
+        assert ei.value.code == 400
+        status, body = _post_zone(port, {"lat": 41.1, "lon": -73.5,
+                                         "radius_m": 300, "level": 3})
+        assert status == 200 and body["zones"][0]["level"] == 3
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_map_explains_every_fec_level(cfg_with_fec, tmp_path):
+    """The zone editor cannot ask for "level 3" intuitively without being told
+    what level 3 is on the link driving FEC, so /api/map has to pass cfg.fec."""
+    cfg_with_fec.map = {"location_zones_path":
+                        str(tmp_path / "location_zones.json"),
+                        "location_store_path": str(tmp_path / "store.json"),
+                        "location_config_path": str(tmp_path / "lf.json"),
+                        "stations_path": str(tmp_path / "s.json"),
+                        "labels_path": str(tmp_path / "l.json"),
+                        "environ_points_path": str(tmp_path / "e.json")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"floor_ratio": "8:2", "profile": {"driver_wan": "wan2"}},
+         "wan_labels": {"wan1": "Cellular", "wan2": "Satellite"}}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            loc = json.loads(r.read())["location_fec"]
+        assert [lv["ratio"] for lv in loc["levels"]] == [
+            row["fec"] for row in fec_control.DEFAULT_LOSS_TABLE]
+        assert loc["floor_level"] == 1
+        assert loc["wans"] == {"wan1": "Cellular", "wan2": "Satellite"}
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_keeps_a_wide_radius_through_an_update(cfg, tmp_path):
+    """The editor's slider stops at 2 km; the API accepts up to 50 km. Saving a
+    wide zone back unchanged must not shrink it."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 5000, "level": 2,
+            "label": "long tunnel"})
+        assert status == 200 and body["zones"][0]["radius_m"] == 5000.0
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 5000,
+            "level": 3, "label": "long tunnel"})
+        assert body["zones"][0]["radius_m"] == 5000.0
+        assert body["zones"][0]["level"] == 3
+        assert json.loads(
+            Path(zones_path).read_text())["zones"][0]["radius_m"] == 5000.0
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_map_shows_a_zone_the_map_cannot_edit(cfg, tmp_path):
+    """A hand-written zone with no id steers parity like any other; /api/map
+    has to carry it, marked as not this page's to change."""
+    zones_path = Path(_zone_cfg(cfg, tmp_path))
+    zones_path.write_text(json.dumps({"zones": [
+        {"label": "hand written", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 2}]}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            zones = json.loads(r.read())["location_fec"]["zones"]
+        assert [z["label"] for z in zones] == ["hand written"]
+        assert zones[0]["source"] == "operator"
+        assert zones[0]["editable"] is False
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_survives_concurrent_writers(cfg, tmp_path):
+    """apply_location_zone is a read-modify-write and the UI server is
+    threaded, so two operators (or one impatient one) can have two handler
+    threads inside it at once. Unsynchronised, writes are lost; worse, a
+    SHARED temp path means the second thread's writes land in the live file
+    after the first has replaced it -- and a torn file reads back as no zones
+    at all, silently withdrawing every drawn floor."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    writers, per_writer = 12, 5
+    failures, torn = [], []
+    done = threading.Event()
+
+    def writer(n):
+        try:
+            for i in range(per_writer):
+                status, body = _post_zone(port, {
+                    "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2,
+                    "label": "w%d-%d" % (n, i)})
+                if status != 200 or not body.get("ok"):
+                    failures.append((status, body))
+        except Exception as e:                       # noqa: BLE001
+            failures.append(repr(e))
+
+    def reader():
+        # The live path must never be observed as anything but a complete
+        # file: that is what os.replace buys, and what a shared tmp lost.
+        while not done.is_set():
+            try:
+                text = Path(zones_path).read_text()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                torn.append(repr(e))
+                continue
+            try:
+                json.loads(text)
+            except ValueError as e:
+                torn.append("%s: %r" % (e, text[:80]))
+
+    try:
+        port = httpd.server_address[1]
+        watcher = threading.Thread(target=reader, daemon=True)
+        watcher.start()
+        threads = [threading.Thread(target=writer, args=(n,))
+                   for n in range(writers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        done.set()
+        watcher.join(timeout=5)
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+    assert failures == []
+    assert torn == []
+    body = json.loads(Path(zones_path).read_text())
+    zones = body["zones"]
+    expected = writers * per_writer
+    assert len(zones) == expected                      # no lost update
+    ids = [z["id"] for z in zones]
+    assert len(set(ids)) == expected                   # no id handed out twice
+    assert body["next_id"] == expected + 1
+    labels = {"w%d-%d" % (n, i)
+              for n in range(writers) for i in range(per_writer)}
+    assert {z["label"] for z in zones} == labels
+
+
+def test_atomic_write_text_does_not_share_one_temp_path(tmp_path):
+    """A fixed `<name>.tmp` is one inode shared by every concurrent writer.
+    Thread B opens it while A is between write and replace, A's replace moves
+    it to the live path, and B's remaining writes go straight into the live
+    file -- unsynchronised and non-atomic."""
+    target = tmp_path / "shared.json"
+    seen = []
+    barrier = threading.Barrier(4)
+
+    real_replace = M.os.replace
+
+    def watching_replace(src, dst):
+        seen.append(str(src))
+        return real_replace(src, dst)
+
+    def write(n):
+        barrier.wait(timeout=10)
+        M._atomic_write_text(str(target), json.dumps({"writer": n}))
+
+    orig = M.os.replace
+    M.os.replace = watching_replace
+    try:
+        threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+    finally:
+        M.os.replace = orig
+
+    assert len(seen) == 4
+    assert len(set(seen)) == 4, "every writer must own its temp path"
+    assert json.loads(target.read_text())["writer"] in range(4)
+    # Nothing left behind beside the target.
+    assert [p.name for p in tmp_path.iterdir()] == ["shared.json"]
+
+
+def test_atomic_write_text_removes_its_temp_file_when_the_replace_fails(tmp_path):
+    """One orphaned temp per failed write would accumulate forever on a
+    permanently unwritable path -- and the 1 Hz loop retries every tick."""
+    target = tmp_path / "doomed.json"
+    orig = M.os.replace
+
+    def boom(src, dst):
+        raise OSError("no")
+
+    M.os.replace = boom
+    try:
+        with pytest.raises(OSError):
+            M._atomic_write_text(str(target), "{}")
+    finally:
+        M.os.replace = orig
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_api_post_location_zone_400_past_the_zone_cap(cfg, tmp_path):
+    zones_path = Path(_zone_cfg(cfg, tmp_path))
+    zones_path.write_text(json.dumps({"next_id": 201, "zones": [
+        {"id": "z%d" % (i + 1), "label": "z%d" % i, "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1} for i in range(M._MAX_OPERATOR_ZONES)]}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 2, "label": "one too many"})
+        assert ei.value.code == 400
+        assert "too many zones" in json.loads(ei.value.read())["error"]
+        # The way back under the cap must still work.
+        status, body = _post_zone(port, {"id": "z1", "delete": True})
+        assert status == 200 and len(body["zones"]) == 199
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_keeps_a_level_off_the_driving_table(cfg_with_fec, tmp_path):
+    """The stored level is 4; the cellular profile driving right now has four
+    rungs (0..3). Editing the label must not rewrite that floor to 3, and must
+    not be refused outright either -- the zone would be uneditable."""
+    zones_path = tmp_path / "location_zones.json"
+    cfg_with_fec.map = {"location_zones_path": str(zones_path)}
+    cfg_with_fec.fec.wan_profiles = {"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+        ramp_up_ticks=1, ramp_down_hold_s=0, floor_ratio="8:0",
+        signal_floor_fec="12:1")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"profile": {"driver_wan": "wan1"}}}))
+    zones_path.write_text(json.dumps({"next_id": 2, "zones": [
+        {"id": "z1", "label": "long tunnel", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 4, "wans": None,
+         "suppress_learned": False}]}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 4, "label": "long tunnel, renamed"})
+        assert status == 200
+        assert body["zones"][0]["level"] == 4
+        assert body["zones"][0]["label"] == "long tunnel, renamed"
+
+        # It preserves, it never introduces: a DIFFERENT zone cannot be
+        # raised to a rung this table does not have.
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 41.1, "lon": -73.5, "radius_m": 300,
+                              "level": 4, "label": "new one"})
+        assert ei.value.code == 400
+        # Nor can an existing zone be pushed there from below.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 2, "label": "lowered"})
+        assert status == 200 and body["zones"][0]["level"] == 2
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"id": "z1", "lat": 41.1, "lon": -73.5,
+                              "radius_m": 300, "level": 4, "label": "raised"})
+        assert ei.value.code == 400
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_will_not_keep_a_level_a_racing_edit_removed(
+        cfg_with_fec, tmp_path, monkeypatch):
+    """The kept level is read FROM the zone file, so the look-up, the
+    validation and the write have to see one version of it.
+
+    Looked up outside the lock, a racing edit fits in between: the lower is
+    accepted (200), and the first save is then validated against a level the
+    zone no longer has and writes it back -- putting an off-table floor
+    returned by one operator straight back on a live vehicle, with both
+    requests answered 200 and nothing to say so."""
+    zones_path = tmp_path / "location_zones.json"
+    cfg_with_fec.map = {"location_zones_path": str(zones_path)}
+    cfg_with_fec.fec.wan_profiles = {"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=fec_control.DEFAULT_CELL_LOSS_TABLE,
+        ramp_up_ticks=1, ramp_down_hold_s=0, floor_ratio="8:0",
+        signal_floor_fec="12:1")}
+    Path(cfg_with_fec.published_state).write_text(json.dumps(
+        {"fec": {"profile": {"driver_wan": "wan1"}}}))
+    zones_path.write_text(json.dumps({"next_id": 2, "zones": [
+        {"id": "z1", "label": "long tunnel", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 4, "wans": None,
+         "suppress_learned": False}]}))
+
+    started, released = threading.Event(), threading.Event()
+    real = M.validate_zone_payload
+
+    def wedged(*a, **kw):
+        # Fires once, on the first save to reach validation: it stands exactly
+        # where the racing edit used to fit. Under the fix this runs with the
+        # lock held, the other POST cannot get in, and the wait times out.
+        if not started.is_set():
+            started.set()
+            released.wait(1.0)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(M, "validate_zone_payload", wedged)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg_with_fec, stop)
+    lowered = []
+    try:
+        port = httpd.server_address[1]
+
+        def lower():
+            started.wait(10)
+            try:
+                lowered.append(_post_zone(port, {
+                    "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+                    "level": 2, "label": "lowered"}))
+            except Exception as e:                   # noqa: BLE001
+                lowered.append(repr(e))
+            released.set()
+
+        racer = threading.Thread(target=lower)
+        racer.start()
+        # The rename carries the level the zone is stored at, which is off the
+        # four-rung table driving now: legitimate only while that IS its level.
+        status, _body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 4, "label": "long tunnel, renamed"})
+        racer.join(timeout=15)
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+    assert status == 200
+    assert lowered and lowered[0][0] == 200, lowered
+    stored = json.loads(zones_path.read_text())["zones"][0]
+    # The lower was accepted, so it is the last word: the rename was decided
+    # before it and cannot be written after it. A 4 here is a stale keep_level.
+    assert stored["level"] == 2, stored
+
+
+def _raw_post(port, path, length_header, body=b"{}", timeout=3):
+    """POST with a Content-Length we choose, which urllib will not allow."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.putrequest("POST", path, skip_accept_encoding=True)
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", length_header)
+        conn.endheaders()
+        conn.send(body)
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+    finally:
+        conn.close()
+
+
+def test_api_post_rejects_an_unusable_content_length(cfg, tmp_path):
+    """int() on a non-numeric header raised straight out of the handler, and a
+    NEGATIVE length passed the size cap and then blocked in rfile.read(-1)
+    until the peer closed -- one pinned thread per request. The timeout on
+    these calls is the assertion for the second half."""
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for path in ("/api/location-zone", "/api/station-label",
+                     "/api/runtime"):
+            # An EMPTY header is deliberately not here: `or "0"` has always
+            # read it as a bodyless POST, and that is a different question.
+            # (A whitespace-only one is stripped to empty before we see it.)
+            for bad in ("abc", "-1", "1.5", "0x10", "1 2", "+"):
+                assert _raw_post(port, path, bad) == 400, (path, bad)
+        # The server is still healthy afterwards.
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            assert r.status == 200
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_still_accepts_a_well_formed_length(cfg, tmp_path):
+    _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 2})
+        assert status == 200 and body["ok"] is True
+        # An oversized body is still 413, not 400.
+        assert _raw_post(port, "/api/location-zone", "99999") == 413
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_validate_zone_payload_only_deletes_on_a_real_true():
+    """`delete` is actuation, not a hint: a truthy string arriving from a
+    hand-rolled client must not remove a floor."""
+    for truthy in ("yes", 1, [1], "false"):
+        ok, _z, err = M.validate_zone_payload({"id": "z1", "delete": truthy},
+                                              {"wan1"}, 5)
+        assert not ok and err                    # falls through to full checks
+    ok, zone, _ = M.validate_zone_payload({"id": "z1", "delete": True},
+                                          {"wan1"}, 5)
+    assert ok and zone == {"id": "z1", "delete": True}
+    # A false delete is an ordinary update and still needs a whole zone.
+    ok, zone, _ = M.validate_zone_payload(
+        {"id": "z1", "delete": False, "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 2}, {"wan1"}, 5)
+    assert ok and zone["id"] == "z1" and "delete" not in zone
+
+
+def test_api_map_names_a_zone_file_the_daemon_is_not_reading(cfg, tmp_path):
+    """End to end: the daemon publishes the path it reads, /api/map compares
+    it against the path this process writes, and the page is told which file
+    to go and look at. Without cfg.location reaching the payload the operator
+    gets a 200, a drawn circle, and no floor."""
+    import time as _time
+    _zone_cfg(cfg, tmp_path)
+    cfg.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    Path(cfg.location.state_path).write_text(json.dumps({
+        "set_ts": _time.time(), "source": "location_fec", "wans": {},
+        "operator_zones_path": theirs}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            loc = json.loads(r.read())["location_fec"]
+        assert loc["zones_path_mismatch"] == theirs
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_map_reports_no_mismatch_when_the_daemon_agrees(cfg, tmp_path):
+    import time as _time
+    zones_path = _zone_cfg(cfg, tmp_path)
+    cfg.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    Path(cfg.location.state_path).write_text(json.dumps({
+        "set_ts": _time.time(), "source": "location_fec", "wans": {},
+        "operator_zones_path": zones_path}))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/map", timeout=2) as r:
+            loc = json.loads(r.read())["location_fec"]
+        assert loc["zones_path_mismatch"] is None
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+# -- round 7: the endpoint refuses while the daemon reads another file ---------
+
+
+def _mismatch_cfg(cfg, tmp_path):
+    """A zone file with one drawn zone in it, and a daemon record to publish.
+
+    The zone is there so update and delete have something real to address:
+    the refusal has to cover all three mutations, not just the create."""
+    zones_path = Path(_zone_cfg(cfg, tmp_path))
+    zones_path.write_text(json.dumps({"next_id": 2, "zones": [
+        {"id": "z1", "label": "dock", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 2, "wans": None,
+         "suppress_learned": False}]}))
+    cfg.location = M.LocationFecCfg(
+        state_path=str(tmp_path / "location_fec.json"), enabled=True,
+        stale_after_s=30.0)
+    return zones_path
+
+
+def _publish_record(cfg, **over):
+    import time as _time
+    rec = {"set_ts": _time.time(), "source": "location_fec", "wans": {}}
+    rec.update(over)
+    Path(cfg.location.state_path).write_text(json.dumps(rec))
+
+
+_ZONE_MUTATIONS = (
+    {"lat": 41.2, "lon": -73.6, "radius_m": 400, "level": 1,
+     "label": "new one"},
+    {"id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+     "label": "dock, raised"},
+    {"id": "z1", "delete": True},
+)
+
+
+def test_api_post_location_zone_refuses_while_the_daemon_reads_another_file(
+        cfg, tmp_path):
+    """The page is not the only client, and a lie to any client is still a
+    lie. With a FRESH record proving the daemon reads a different file, a
+    200 {"ok": true} would be the API confirming a change it knows cannot
+    move the FEC floor -- so create, update and delete are all refused, and
+    the body names the file the operator has to go and fix."""
+    zones_path = _mismatch_cfg(cfg, tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    _publish_record(cfg, operator_zones_path=theirs)
+    before = zones_path.read_text()
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for payload in _ZONE_MUTATIONS:
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                _post_zone(port, payload)
+            assert ei.value.code == 409
+            assert theirs in json.loads(ei.value.read())["error"]
+        assert zones_path.read_text() == before
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_writes_when_the_daemon_agrees(cfg, tmp_path):
+    """The refusal is narrow: one file, two settings that agree, everything
+    works exactly as before."""
+    zones_path = _mismatch_cfg(cfg, tmp_path)
+    _publish_record(cfg, operator_zones_path=str(zones_path))
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for payload in _ZONE_MUTATIONS:
+            status, body = _post_zone(port, payload)
+            assert status == 200 and body["ok"] is True
+        assert [z["id"] for z in json.loads(
+            zones_path.read_text())["zones"]] == ["z2"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+@pytest.mark.parametrize("unprovable", ["absent", "stale", "keyless",
+                                        "malformed"])
+def test_api_post_location_zone_writes_when_a_mismatch_is_unproven(
+        cfg, tmp_path, unprovable):
+    """FAIL-OPEN, the property that matters most here. A mismatch may only be
+    acted on when it is PROVEN: a daemon that is stopped, a record that has
+    gone stale, a daemon too old to publish the key, or a record that will not
+    parse are each evidence of nothing. Refusing on any of them would take
+    zone editing away from the operator exactly when the daemon is down --
+    strictly worse than the bug this refusal fixes."""
+    zones_path = _mismatch_cfg(cfg, tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    if unprovable == "absent":
+        pass                                   # the daemon never wrote one
+    elif unprovable == "stale":
+        _publish_record(cfg, operator_zones_path=theirs, set_ts=1000.0)
+    elif unprovable == "keyless":
+        _publish_record(cfg)                   # a daemon that predates the key
+    else:
+        Path(cfg.location.state_path).write_text("{not json")
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        for payload in _ZONE_MUTATIONS:
+            status, body = _post_zone(port, payload)
+            assert status == 200 and body["ok"] is True
+        assert [z["id"] for z in json.loads(
+            zones_path.read_text())["zones"]] == ["z2"]
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_keeps_the_wan_scope_it_is_not_sent(cfg, tmp_path):
+    """The scope of a live FEC floor may only be widened deliberately. An
+    update that never mentions `wans` keeps the stored list; only an explicit
+    null or [] means every WAN."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        status, body = _post_zone(port, {
+            "lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+            "label": "dock", "wans": ["wan1"]})
+        assert status == 200 and body["zones"][0]["wans"] == ["wan1"]
+
+        # A label change with no `wans` key at all: the scope survives.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 3, "label": "dock north"})
+        assert body["zones"][0]["label"] == "dock north"
+        assert body["zones"][0]["wans"] == ["wan1"]
+        assert (json.loads(Path(zones_path).read_text())["zones"][0]["wans"]
+                == ["wan1"])
+
+        # Widening is still one explicit save away.
+        status, body = _post_zone(port, {
+            "id": "z1", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+            "level": 3, "label": "dock north", "wans": []})
+        assert body["zones"][0]["wans"] is None
+    finally:
+        stop.set()
+        httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_a_number_too_large_for_a_float(
+        cfg, tmp_path):
+    """math.isfinite() raises OverflowError on a JSON integer past float
+    range, and do_POST catches only ZoneLimitError and OSError -- so this
+    came back a 500 with a traceback in the journal instead of the 400 every
+    other unusable coordinate gets. Nothing is written either way."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 10 ** 400, "lon": -73.5,
+                              "radius_m": 300, "level": 3})
+        assert ei.value.code == 400
+        assert not Path(zones_path).exists()
+        # And the endpoint is still serving afterwards.
+        status, body = _post_zone(port, {"lat": 41.1, "lon": -73.5,
+                                         "radius_m": 300, "level": 3})
+        assert status == 200 and [z["id"] for z in body["zones"]] == ["z1"]
+    finally:
+        stop.set()
+        httpd.shutdown()

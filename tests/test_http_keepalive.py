@@ -65,7 +65,7 @@ def sbfd_state_listener(tmp_path):
 @pytest.fixture
 def ui_server(tmp_path: Path):
     cfg = sbfd_ctl.Config(
-        wans={"wan1": sbfd_ctl.WanCfg("wan1", 1, "T-Mo")},
+        wans={"wan1": sbfd_ctl.WanCfg("wan1", 1, "Cellular")},
         relay=sbfd_ctl.RelayCfg("http://x"),
         engarde=sbfd_ctl.EngardeCfg("198.51.100.10", 59402),
         nft=sbfd_ctl.NftCfg(),

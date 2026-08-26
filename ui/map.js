@@ -38,6 +38,7 @@ setInterval(stepRadar, 700);
 
 // ---- live state -------------------------------------------------------------
 let follow = true;
+let zoneMode = false;
 let vehMarker = null, crumb = null, crumbPts = [];
 const stationLayer = L.layerGroup().addTo(map);
 const environLayer = L.layerGroup().addTo(map);
@@ -48,8 +49,15 @@ function levelColor(level) {
   return ["#2b2", "#9c2", "#eb0", "#e83", "#e33"][Math.max(0, Math.min(level || 0, 4))];
 }
 
+// The last location_fec block the server sent. The editor is built from it
+// (level list, WAN names, floor), and the layer is redrawn from it when zone
+// mode is toggled -- the circles' interactivity depends on that mode.
+let lastLoc = null;
+
 function drawLocation(loc) {
   locationLayer.clearLayers();
+  lastLoc = loc || null;
+  syncZonesPathWarning();
   if (!loc) return;
   // One bad value must cost the location layer alone. tick() draws this
   // in the same pass that moves the vehicle marker, so an exception
@@ -80,14 +88,31 @@ function drawLocation(loc) {
     });
     (loc.zones || []).forEach((z) => {
       try {
+        const drawn = z.source === "operator";
+        // Every zone the daemon is acting on is drawn; `editable` is a
+        // separate question. A config zone ships with the box, and an
+        // operator zone with no id cannot be addressed by the endpoint --
+        // both are shown, and both say why they cannot be changed here.
         const c = L.circle([z.lat, z.lon], {
-          radius: z.radius_m, color: "#fff", weight: 2, dashArray: "6 4",
-          fillColor: levelColor(z.level), fillOpacity: 0.2,
+          radius: z.radius_m, color: "#fff", weight: 2,
+          dashArray: z.editable ? null : "6 4",
+          fillColor: levelColor(z.level), fillOpacity: z.editable ? 0.3 : 0.2,
+          interactive: !!z.editable && zoneMode,
         }).addTo(locationLayer);
         const tip = document.createElement("span");
         tip.className = "stn-tip";
-        tip.textContent = `${z.label}: level ${z.level}` + (z.wans ? ` (${z.wans.join(", ")})` : "");
+        tip.textContent = `${z.label}: level ${z.level}`
+          + (z.wans ? ` (${z.wans.join(", ")})` : "")
+          + (z.editable ? ""
+             : drawn ? " - no id: edit the file, or delete and redraw"
+                     : " - from the config file");
         c.bindTooltip(tip, { permanent: true, direction: "center" });
+        if (z.editable && zoneMode) c.on("click", (e) => {
+          // Without this the map's own click handler also fires and opens a
+          // NEW zone on top of the one just asked for.
+          L.DomEvent.stopPropagation(e);
+          openEditor(z);
+        });
       } catch (e) { /* skip this zone, draw the rest */ }
     });
   } catch (e) {
@@ -155,6 +180,235 @@ function drawEnviron(env) {
   });
 }
 
+// ---- zone editor ------------------------------------------------------------
+// A zone has five fields and only means anything against the map underneath
+// it, so it is edited in a panel with a live preview circle rather than in a
+// chain of prompts. The server stays the truth: Save posts, and the next
+// poll redraws the layer -- nothing here mutates locationLayer optimistically.
+
+const el = (id) => document.getElementById(id);
+let editing = null;       // {lat, lon, id?} being edited, or null when closed
+let preview = null;       // the circle that follows the radius slider
+
+// This page writes the zone file sbfd-ctl is configured with; the daemon
+// reads the one ITS own config names, and nothing ties the two settings
+// together. Diverged, a save would draw its circle while no floor ever moves.
+// The server proves the divergence (null unless the daemon's own record says
+// otherwise) and the panel names the file the operator has to go and fix,
+// because a mutation that cannot work must not look like one that did.
+//
+// Belt and braces: the endpoint itself now refuses a proven mismatch with a
+// 409 naming the daemon's path, so a hand-rolled client is not lied to
+// either. This stays because it is the better message -- it disables the
+// buttons and explains the box BEFORE the operator types a zone, rather than
+// after -- and because it is the only half that can act on a mismatch which
+// appears between two polls, where the 409 is the backstop.
+//
+// BOTH mutations are blocked, not just Save. The map draws the zones in the
+// file this page writes, so on a mismatch a delete SUCCEEDS: the circle
+// disappears while the daemon carries on applying the floor from the file it
+// actually reads. "I deleted it and the parity is still there" is the worst
+// version of this failure, which makes Delete the more dangerous of the two,
+// not the lesser. Reading is untouched -- a zone can still be opened and
+// looked at.
+function syncZonesPathWarning() {
+  const theirs = lastLoc ? lastLoc.zones_path_mismatch : null;
+  const warn = el("z-path-warn");
+  // textContent: a path is server-supplied text, never markup.
+  warn.textContent = theirs
+    ? "the location daemon is reading " + theirs
+      + " - saving and deleting here will not take effect until the two"
+      + " paths agree"
+    : "";
+  el("z-save").disabled = !!theirs;
+  el("z-delete").disabled = !!theirs;
+}
+
+function zoneLevels() {
+  const levels = (lastLoc && lastLoc.levels) || [];
+  if (levels.length) return levels;
+  // No FEC section configured, so the server could not describe a table. The
+  // endpoint still validates against the default one; offer its indices
+  // rather than an empty list the operator cannot save from.
+  return [0, 1, 2, 3, 4].map((i) => ({ level: i, ratio: null,
+                                       overhead_pct: null }));
+}
+
+function buildLevels(chosen) {
+  const sel = el("z-level");
+  const floor = lastLoc ? lastLoc.floor_level : null;
+  sel.textContent = "";
+  zoneLevels().forEach((lv) => {
+    const o = document.createElement("option");
+    o.value = String(lv.level);
+    let text = `level ${lv.level}`;
+    if (lv.ratio) text += ` — ${lv.ratio}`;
+    if (lv.overhead_pct != null) text += ` (${lv.overhead_pct}% overhead)`;
+    if (floor != null && lv.level <= floor) {
+      // Still selectable: an operator may want the zone to outlive a floor
+      // change, and it costs nothing while the floor is where it is.
+      text += " — already covered by the floor";
+      o.className = "dim";
+    }
+    o.textContent = text;
+    sel.appendChild(o);
+  });
+  sel.value = String(chosen);
+  if (sel.value !== String(chosen)) {
+    // The zone is stored on a rung the table driving RIGHT NOW does not have
+    // -- level 4 was set while the five-rung base profile drove, and a
+    // four-rung cellular one drives today. Snapping to the nearest option
+    // would rewrite that floor to 3 the next time the operator saves so much
+    // as a label change, and they would never see it happen. Carry the stored
+    // value instead; the server accepts a level a zone already has.
+    const kept = document.createElement("option");
+    kept.value = String(chosen);
+    kept.textContent = `level ${chosen} — not on the current table (kept)`;
+    kept.className = "dim";
+    sel.appendChild(kept);
+    sel.value = String(chosen);
+  }
+}
+
+// True when the server published no WAN names at all, so there are no boxes
+// to check and `checkedWans()` would answer [] -- which the endpoint reads as
+// EVERY wan. Save omits the key entirely in that state and the server keeps
+// what is stored, rather than silently widening a zone scoped to one link.
+let wansUnavailable = false;
+
+function buildWans(chosen) {
+  const row = el("z-wans");
+  const wans = (lastLoc && lastLoc.wans) || {};
+  row.textContent = "";
+  wansUnavailable = Object.keys(wans).length === 0;
+  // "all WANs when none checked" describes checkboxes that are not there.
+  el("z-wans-hint").hidden = wansUnavailable;
+  if (wansUnavailable) {
+    // No table or no wan_labels in the snapshot yet. Show the stored scope as
+    // text so the operator can still see it, and say why it cannot be edited
+    // here -- an empty row would read as "no WANs", which is the opposite of
+    // what an empty list means.
+    const note = document.createElement("span");
+    note.textContent = (chosen && chosen.length ? chosen.join(", ")
+                                                : "all WANs")
+      + " - WAN list unavailable; a save leaves this unchanged";
+    note.className = "hint";
+    row.appendChild(note);
+    return;
+  }
+  Object.keys(wans).forEach((name) => {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = name;
+    box.checked = !!(chosen && chosen.indexOf(name) >= 0);
+    const text = document.createElement("span");
+    // Operator-supplied, from the config: text only, never markup.
+    text.textContent = " " + (wans[name] || name);
+    label.appendChild(box);
+    label.appendChild(text);
+    row.appendChild(label);
+  });
+}
+
+function checkedWans() {
+  const out = [];
+  el("z-wans").querySelectorAll("input:checked").forEach((b) => {
+    out.push(b.value);
+  });
+  return out;
+}
+
+// The number input is the authoritative radius; the slider is a quick way to
+// move it and only spans the radii worth dragging. A hand-written 5 km zone
+// therefore opens at 5000 and stays 5000 unless the operator actually moves
+// the slider -- the editor must never quietly shrink a zone it was only
+// opened to look at.
+function radiusValue() {
+  return Number(el("z-radius-m").value);
+}
+
+function syncFromSlider() {
+  el("z-radius-m").value = el("z-radius").value;
+  updatePreview();
+}
+
+function syncFromNumber() {
+  const r = radiusValue();
+  if (Number.isFinite(r)) {
+    el("z-radius").value = String(Math.min(2000, Math.max(50, r)));
+  }
+  updatePreview();
+}
+
+function updatePreview() {
+  if (!editing) return;
+  const radius = radiusValue();
+  // A half-typed or emptied number is not a circle. Leave the preview where
+  // it was; the server names the problem if they save it anyway.
+  if (!Number.isFinite(radius) || radius <= 0) return;
+  const color = levelColor(Number(el("z-level").value));
+  const at = [editing.lat, editing.lon];
+  if (!preview) {
+    preview = L.circle(at, { radius: radius, color: color, weight: 2,
+                             dashArray: "3 3", fillColor: color,
+                             fillOpacity: 0.25,
+                             interactive: false }).addTo(map);
+  } else {
+    preview.setLatLng(at);
+    preview.setRadius(radius);
+    preview.setStyle({ color: color, fillColor: color });
+  }
+}
+
+function openEditor(zone) {
+  editing = { lat: zone.lat, lon: zone.lon, id: zone.id };
+  el("z-label").value = zone.label || "";
+  const radius = Number(zone.radius_m) || 300;
+  el("z-radius-m").value = String(radius);
+  el("z-radius").value = String(Math.min(2000, Math.max(50, radius)));
+  buildLevels(zone.level != null ? zone.level : 2);
+  buildWans(zone.wans);
+  el("z-suppress").checked = !!zone.suppress_learned;
+  el("z-error").textContent = "";
+  syncZonesPathWarning();
+  el("z-delete").hidden = !zone.id;
+  el("zone-editor").hidden = false;
+  updatePreview();
+}
+
+function closeEditor() {
+  editing = null;
+  el("zone-editor").hidden = true;
+  if (preview) { map.removeLayer(preview); preview = null; }
+}
+
+async function postZone(body) {
+  let resp;
+  try {
+    resp = await fetch("/api/location-zone", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+  } catch (e) {
+    el("z-error").textContent = "save failed: " + e;
+    return;
+  }
+  // Parsed separately, because not every refusal is JSON: send_error answers
+  // an unusable Content-Length or an oversized body with HTML, and parsing
+  // that inside the try above showed the operator "save failed: SyntaxError"
+  // while hiding the status that would have explained it.
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  if (!resp.ok || !data || !data.ok) {
+    // Leave the panel open on a refusal: the operator has to see which field
+    // the server rejected, with what they typed still in front of them.
+    el("z-error").textContent = (data && data.error) || ("HTTP " + resp.status);
+    return;
+  }
+  closeEditor();
+  tick();
+}
+
 function banner(d) {
   const el = document.getElementById("banner");
   const bits = [];
@@ -200,9 +454,52 @@ document.getElementById("follow").onclick = function () {
 document.getElementById("radar").onclick = function () {
   radarOn = !radarOn; this.classList.toggle("on", radarOn); loadRadar();
 };
+document.getElementById("zones").onclick = function () {
+  zoneMode = !zoneMode;
+  this.classList.toggle("on", zoneMode);
+  if (!zoneMode) closeEditor();
+  // Redraw so the operator circles pick up (or drop) their click handlers.
+  drawLocation(lastLoc);
+};
 map.on("dragstart", () => {
   follow = false;
   document.getElementById("follow").classList.remove("on");
+});
+map.on("click", (e) => {
+  if (!zoneMode) return;
+  openEditor({ lat: e.latlng.lat, lon: e.latlng.lng, level: 2 });
+});
+
+el("z-radius").oninput = syncFromSlider;
+el("z-radius-m").oninput = syncFromNumber;
+el("z-level").onchange = updatePreview;
+el("z-cancel").onclick = closeEditor;
+el("z-save").onclick = () => {
+  if (!editing) return;
+  const body = {
+    lat: editing.lat, lon: editing.lon,
+    radius_m: radiusValue(),
+    level: Number(el("z-level").value),
+    label: el("z-label").value,
+    suppress_learned: el("z-suppress").checked,
+  };
+  // Absent, not empty: [] means every WAN to the endpoint, and with no boxes
+  // rendered that is not something the operator asked for.
+  if (!wansUnavailable) body.wans = checkedWans();
+  if (editing.id) body.id = editing.id;
+  postZone(body);
+};
+el("z-delete").onclick = () => {
+  if (!editing || !editing.id) return;
+  // One click removes a live FEC floor, and ids are never reused: this exact
+  // zone cannot be put back, only drawn again.
+  const name = el("z-label").value || editing.id;
+  if (!window.confirm('Delete zone "' + name + '"? Its FEC floor stops '
+                      + "applying and it cannot be restored.")) return;
+  postZone({ id: editing.id, delete: true });
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeEditor();
 });
 
 tick();

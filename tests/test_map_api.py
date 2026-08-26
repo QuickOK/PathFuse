@@ -2,8 +2,11 @@ import json as _json
 import logging
 import os
 import socket
+import threading
 from pathlib import Path
 
+import pytest
+import fec_control as FC
 import sbfd_ctl as M
 import tile_store as T
 
@@ -23,6 +26,34 @@ def test_resolve_map_cfg_overrides_merge():
     assert m["gpsd"] == {"host": "192.0.2.9", "port": 2947}
     assert m["tile_cache"]["max_mb"] == 64
     assert m["tile_cache"]["max_zoom"] == 17
+
+
+def test_resolve_map_cfg_coerces_an_unusable_location_zones_path(caplog):
+    """`Path(map_cfg["location_zones_path"])` reaches the POST handler at
+    /api/location-zone with whatever this function hands back. A non-string
+    (None from `"location_zones_path": null`, or an int), an empty string, or
+    a path with an embedded NUL all raise out of Path()/open() as a TypeError
+    or ValueError the handler does not catch -- an uncaught 500 on a value
+    that /api/map already tolerates (it just yields no operator zones).
+    Coerced here, every consumer -- the endpoint and /api/map -- agrees on
+    what's usable, mirroring location_fec.py's _zones_path for
+    operator_zones_path."""
+    default = "/var/lib/sbfd-ctl/location_zones.json"
+    for bad in (None, 7, "", "/var/lib/zo\0nes.json"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            m = M.resolve_map_cfg({"location_zones_path": bad})
+        assert m["location_zones_path"] == default
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "location_zones_path" in warnings[0].getMessage()
+
+
+def test_resolve_map_cfg_leaves_a_normal_location_zones_path_untouched(caplog):
+    with caplog.at_level(logging.WARNING):
+        m = M.resolve_map_cfg({"location_zones_path": "/mnt/zones.json"})
+    assert m["location_zones_path"] == "/mnt/zones.json"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_validate_label_happy_path():
@@ -150,6 +181,64 @@ def test_apply_station_label_set_and_delete(tmp_path):
     assert _json.loads(Path(lp).read_text()) == {"s2": "Yard"}
 
 
+def test_apply_station_label_survives_concurrent_writers(tmp_path):
+    """station_labels.json is a read-modify-write on a threaded UI server,
+    exactly like the zone file, and it was neither locked nor written through
+    the unique-tmp helper.
+
+    Two effects, and the quiet one is the dangerous one. Unlocked, the later
+    read wins and labels are simply lost. Worse, every writer shares one
+    `<name>.tmp` inode: B is still writing into it when A's replace moves it
+    to the live path, so B's remaining bytes land in the LIVE file -- and a
+    torn station_labels.json reads back as no labels at all, blanking every
+    named station on the map at once."""
+    lp = str(tmp_path / "station_labels.json")
+    writers, per_writer = 8, 50
+    failures, torn = [], []
+    done = threading.Event()
+
+    def writer(n):
+        for i in range(per_writer):
+            try:
+                M.apply_station_label(lp, "s%d-%d" % (n, i), "L%d-%d" % (n, i))
+            except Exception as e:                       # noqa: BLE001
+                failures.append(repr(e))
+
+    def reader():
+        # The live path must never be observed as anything but a complete
+        # file: that is what a temp file plus os.replace buys.
+        while not done.is_set():
+            try:
+                text = Path(lp).read_text()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                torn.append(repr(e))
+                continue
+            try:
+                _json.loads(text)
+            except ValueError as e:
+                torn.append("%s: %r" % (e, text[:80]))
+
+    watcher = threading.Thread(target=reader, daemon=True)
+    watcher.start()
+    threads = [threading.Thread(target=writer, args=(n,))
+               for n in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    done.set()
+    watcher.join(timeout=5)
+
+    assert failures == []
+    assert torn == []
+    labels = _json.loads(Path(lp).read_text())
+    assert len(labels) == writers * per_writer
+    assert labels["s0-0"] == "L0-0"
+    assert labels["s7-49"] == "L7-49"
+
+
 def test_map_location_layer_reads_tiles_and_zones(tmp_path):
     tile = T.encode(41.1, -73.5, 7)
     store = tmp_path / "store.json"
@@ -192,7 +281,10 @@ def test_assemble_map_payload_carries_location_fec(tmp_path):
                            "location_store_path": str(tmp_path / "store.json"),
                            "location_config_path": str(tmp_path / "lf.json")})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
-    assert out["location_fec"] == {"tiles": [], "zones": []}
+    # The level keys ride along even with no FEC config to describe; the page
+    # reads them unconditionally.
+    assert out["location_fec"]["tiles"] == []
+    assert out["location_fec"]["zones"] == []
 
 
 def test_map_location_layer_tolerates_a_malformed_residual(tmp_path):
@@ -296,7 +388,8 @@ def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
                            "location_config_path": str(tmp_path / "lf.json"),
                            "max_location_tiles": "lots"})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
-    assert out["location_fec"] == {"tiles": [], "zones": []}
+    assert out["location_fec"]["tiles"] == []
+    assert out["location_fec"]["zones"] == []
 
 
 def test_map_location_layer_drops_a_non_finite_residual(tmp_path):
@@ -444,3 +537,814 @@ def test_map_location_layer_survives_a_nul_in_the_store_path(tmp_path):
     out = M.map_location_layer(bad, str(tmp_path / "absent.json"), None,
                                max_tiles=10)
     assert out == {"tiles": [], "zones": []}
+
+
+# -- operator zone editing -----------------------------------------------------
+
+_WANS = {"wan1", "wan2"}
+
+
+def _zone_payload(**over):
+    p = {"lat": 41.1, "lon": -73.5, "radius_m": 300, "level": 3,
+         "label": "dock"}
+    p.update(over)
+    return p
+
+
+def test_map_defaults_name_the_operator_zone_file():
+    m = M.resolve_map_cfg(None)
+    assert m["location_zones_path"] == "/var/lib/sbfd-ctl/location_zones.json"
+
+
+def test_validate_zone_payload_accepts_a_new_zone():
+    ok, zone, err = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    assert ok and err is None
+    assert zone == {"label": "dock", "lat": 41.1, "lon": -73.5,
+                    "radius_m": 300.0, "level": 3, "wans": None,
+                    "suppress_learned": False}
+    assert "id" not in zone                    # no id means create
+
+
+def test_validate_zone_payload_keeps_an_id_for_an_update():
+    ok, zone, _ = M.validate_zone_payload(_zone_payload(id="z7"), _WANS, 5)
+    assert ok and zone["id"] == "z7"
+
+
+def test_validate_zone_payload_accepts_a_delete():
+    ok, zone, err = M.validate_zone_payload({"id": "z2", "delete": True},
+                                            _WANS, 5)
+    assert ok and err is None
+    assert zone == {"id": "z2", "delete": True}
+
+
+def test_validate_zone_payload_rejects_a_delete_without_a_usable_id():
+    for bad in (None, "", "zone1", "z", "../etc", 3, True):
+        ok, _z, err = M.validate_zone_payload({"id": bad, "delete": True},
+                                              _WANS, 5)
+        assert not ok and err
+
+
+def test_validate_zone_payload_rejects_a_bad_id_format_on_an_update():
+    ok, _z, err = M.validate_zone_payload(_zone_payload(id="s1"), _WANS, 5)
+    assert not ok and "id" in err
+
+
+def test_validate_zone_payload_rejects_a_non_object():
+    for bad in ([], "zone", 4, None):
+        ok, _z, err = M.validate_zone_payload(bad, _WANS, 5)
+        assert not ok and "object" in err
+
+
+def test_validate_zone_payload_rejects_coordinates_out_of_range():
+    for over in ({"lat": 91.0}, {"lat": -90.5}, {"lon": 180.5},
+                 {"lon": -181.0}):
+        ok, _z, err = M.validate_zone_payload(_zone_payload(**over), _WANS, 5)
+        assert not ok and err
+
+
+def test_validate_zone_payload_rejects_a_non_finite_coordinate():
+    """json.loads accepts the barewords NaN and Infinity, and this file has
+    been bitten twice by a non-finite number reaching something that only
+    range-checks. NaN fails every comparison, so the bounds test alone lets it
+    straight through."""
+    for text in ('{"lat": NaN, "lon": -73.5, "radius_m": 300, "level": 3}',
+                 '{"lat": 41.1, "lon": Infinity, "radius_m": 300, "level": 3}',
+                 '{"lat": 41.1, "lon": -73.5, "radius_m": NaN, "level": 3}'):
+        ok, _z, err = M.validate_zone_payload(_json.loads(text), _WANS, 5)
+        assert not ok and err
+
+
+def test_validate_zone_payload_rejects_a_radius_outside_its_bounds():
+    for radius in (0, -10, 50001, "300", None, True):
+        ok, _z, err = M.validate_zone_payload(
+            _zone_payload(radius_m=radius), _WANS, 5)
+        assert not ok and "radius" in err
+
+
+def test_validate_zone_payload_rejects_a_level_past_the_table():
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=5), _WANS, 5)
+    assert not ok and "level" in err
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=-1), _WANS, 5)
+    assert not ok and "level" in err
+    # The shorter cellular table means the same level is out of range there.
+    ok, _z, _err = M.validate_zone_payload(_zone_payload(level=3), _WANS, 5)
+    assert ok
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=3), _WANS, 3)
+    assert not ok and "level" in err
+
+
+def test_validate_zone_payload_rejects_a_boolean_level():
+    # bool is a subclass of int: int(True) is 1, so an unguarded check would
+    # turn `"level": true` into a real floor of level 1.
+    ok, _z, err = M.validate_zone_payload(_zone_payload(level=True), _WANS, 5)
+    assert not ok and "level" in err
+
+
+def test_validate_zone_payload_rejects_an_unknown_wan_by_name():
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(wans=["wan1", "wan9"]), _WANS, 5)
+    assert not ok and "wan9" in err
+    ok, _z, err = M.validate_zone_payload(_zone_payload(wans="wan1"), _WANS, 5)
+    assert not ok and "wans" in err
+
+
+def test_validate_zone_payload_treats_an_absent_wans_as_all_wans():
+    for payload in (_zone_payload(), _zone_payload(wans=None),
+                    _zone_payload(wans=[])):
+        ok, zone, _ = M.validate_zone_payload(payload, _WANS, 5)
+        assert ok and zone["wans"] is None
+
+
+def test_validate_zone_payload_rejects_a_non_bool_suppress_learned():
+    for bad in (1, "true", None, []):
+        ok, _z, err = M.validate_zone_payload(
+            _zone_payload(suppress_learned=bad), _WANS, 5)
+        assert not ok and "suppress_learned" in err
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(suppress_learned=True), _WANS, 5)
+    assert ok and zone["suppress_learned"] is True
+
+
+def test_validate_zone_payload_sanitises_the_label():
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(label="a\x07b" + "x" * 100), _WANS, 5)
+    assert ok and zone["label"].startswith("ab") and len(zone["label"]) == 48
+    # An empty (or all-control-character) label still has to name something:
+    # the resolver publishes it as the reason a floor was raised.
+    for empty in ("", "   ", "\x07\x00"):
+        ok, zone, _ = M.validate_zone_payload(
+            _zone_payload(label=empty), _WANS, 5)
+        assert ok and zone["label"] == "zone"
+    ok, _z, err = M.validate_zone_payload(_zone_payload(label=7), _WANS, 5)
+    assert not ok and "label" in err
+
+
+def test_validated_zone_survives_the_daemons_own_validator():
+    """The endpoint and location_fec must agree about what a zone is, or the
+    map could write a zone the daemon then silently drops."""
+    import location_fec as LF
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(wans=["wan1"], suppress_learned=True), _WANS, 5)
+    assert ok
+    assert LF.validate_zone(zone, 5) is not None
+
+
+def test_apply_location_zone_assigns_ids_in_sequence(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    ok, zone, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    zones = M.apply_location_zone(p, zone)
+    assert [z["id"] for z in zones] == ["z1"]
+    ok, zone, _ = M.validate_zone_payload(_zone_payload(label="yard"),
+                                          _WANS, 5)
+    zones = M.apply_location_zone(p, zone)
+    assert [z["id"] for z in zones] == ["z1", "z2"]
+    assert [z["label"] for z in zones] == ["dock", "yard"]
+    assert _json.loads(Path(p).read_text())["zones"] == zones
+
+
+def test_apply_location_zone_numbers_a_new_id_above_every_existing_one(tmp_path):
+    """max+1, not count+1: with z1 deleted, the next zone must not be handed
+    z2 while a live z2 is still in the file."""
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    M.apply_location_zone(p, {"id": "z1", "delete": True})
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="c"), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert [z["id"] for z in zones] == ["z2", "z3"]
+
+
+def test_apply_location_zone_updates_in_place_and_keeps_the_id(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    _ok, z, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", label="renamed", level=4), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert [z["id"] for z in zones] == ["z1", "z2"]          # order kept
+    assert zones[0]["label"] == "renamed" and zones[0]["level"] == 4
+
+
+def test_apply_location_zone_deletes_by_id(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    zones = M.apply_location_zone(p, {"id": "z1", "delete": True})
+    assert [z["id"] for z in zones] == ["z2"]
+
+
+def test_apply_location_zone_reports_an_unknown_id(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    M.apply_location_zone(p, z)
+    assert M.apply_location_zone(p, {"id": "z9", "delete": True}) is None
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(id="z9"), _WANS, 5)
+    assert M.apply_location_zone(p, z) is None
+    # A refused change must not have touched the file.
+    assert [z["id"] for z in
+            _json.loads(Path(p).read_text())["zones"]] == ["z1"]
+
+
+def test_apply_location_zone_leaves_valid_json_with_no_zones_left(tmp_path):
+    """The daemon re-reads this file on every change; deleting the last zone
+    must leave it parseable, not empty or absent."""
+    p = str(tmp_path / "location_zones.json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    M.apply_location_zone(p, z)
+    assert M.apply_location_zone(p, {"id": "z1", "delete": True}) == []
+    assert _json.loads(Path(p).read_text())["zones"] == []
+
+
+def test_apply_location_zone_fails_open_on_an_unreadable_file(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text("{not json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    zones = M.apply_location_zone(str(p), z)
+    assert [z["id"] for z in zones] == ["z1"]
+
+
+# -- what the page needs to offer a level --------------------------------------
+
+
+def _levels_cfg(tmp_path, **over):
+    m = M.resolve_map_cfg({
+        "stations_path": str(tmp_path / "s.json"),
+        "labels_path": str(tmp_path / "l.json"),
+        "environ_points_path": str(tmp_path / "e.json"),
+        "location_store_path": str(tmp_path / "store.json"),
+        "location_config_path": str(tmp_path / "lf.json"),
+        "location_zones_path": str(tmp_path / "location_zones.json")})
+    m.update(over)
+    return m
+
+
+def _fec_cfg(profiles=None):
+    return M.FecCfg(enabled=True, fifo="/dev/null",
+                    loss_table=FC.DEFAULT_LOSS_TABLE, ramp_up_ticks=1,
+                    ramp_down_hold_s=0, full_mode_backoff_fec="8:0",
+                    full_min_up_wans=2, floor_ratio="20:1",
+                    wan_profiles=profiles or {})
+
+
+def test_map_location_layer_tags_both_zone_sources(tmp_path):
+    """A config zone is not editable from the map and an operator zone is, so
+    the page has to be able to tell them apart without guessing."""
+    cfgz = tmp_path / "lf.json"
+    cfgz.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}]}))
+    opz = tmp_path / "location_zones.json"
+    opz.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "dock", "lat": 41.2, "lon": -73.6,
+         "radius_m": 150, "level": 3, "wans": ["wan1"],
+         "suppress_learned": True}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(cfgz), None,
+                               10, operator_zones_path=str(opz))
+    assert [z["source"] for z in out["zones"]] == ["config", "operator"]
+    assert "id" not in out["zones"][0]
+    assert out["zones"][1]["id"] == "z1"
+    assert out["zones"][1]["label"] == "dock"
+    assert out["zones"][1]["wans"] == ["wan1"]
+
+
+def test_map_location_layer_without_an_operator_file_is_config_only(tmp_path):
+    cfgz = tmp_path / "lf.json"
+    cfgz.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(cfgz), None,
+                               10, operator_zones_path=str(tmp_path / "no.json"))
+    assert [z["source"] for z in out["zones"]] == ["config"]
+
+
+def test_map_payload_levels_describe_the_driving_profiles_table(tmp_path):
+    m = _levels_cfg(tmp_path)
+    pub = tmp_path / "pub.json"
+    pub.write_text(_json.dumps({"fec": {"floor_ratio": "8:4",
+                                        "profile": {"driver_wan": "wan1"}},
+                                "wan_labels": {"wan1": "Cell",
+                                               "wan2": "Satellite"}}))
+    out = M.assemble_map_payload(m, str(pub), None, 1000.0,
+                                 fec_cfg=_fec_cfg())
+    loc = out["location_fec"]
+    assert [lv["level"] for lv in loc["levels"]] == [0, 1, 2, 3, 4]
+    assert [lv["ratio"] for lv in loc["levels"]] == ["8:0", "8:2", "8:4",
+                                                   "8:6", "8:8"]
+    assert [lv["overhead_pct"] for lv in loc["levels"]] == [0.0, 25.0, 50.0,
+                                                          75.0, 100.0]
+    # 8:4 is 50% overhead, which is the third rung of this table.
+    assert loc["floor_level"] == 2
+    assert loc["wans"] == {"wan1": "Cell", "wan2": "Satellite"}
+
+
+def test_map_payload_levels_follow_the_driver_onto_a_shorter_table(tmp_path):
+    m = _levels_cfg(tmp_path)
+    pub = tmp_path / "pub.json"
+    pub.write_text(_json.dumps({"fec": {"floor_ratio": "20:1",
+                                        "profile": {"driver_wan": "wan1"}}}))
+    fec = _fec_cfg({"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=FC.DEFAULT_CELL_LOSS_TABLE, ramp_up_ticks=1,
+        ramp_down_hold_s=0, floor_ratio="8:0", signal_floor_fec="12:1")})
+    loc = M.assemble_map_payload(m, str(pub), None, 1000.0,
+                                 fec_cfg=fec)["location_fec"]
+    assert [lv["ratio"] for lv in loc["levels"]] == ["8:0", "20:1", "12:1",
+                                                   "8:1"]
+    assert loc["floor_level"] == 1                 # 20:1 = 5%, the second rung
+    assert loc["wans"] == {}                       # no wan_labels published
+
+
+def test_map_payload_levels_fall_back_to_the_default_table_without_a_driver(tmp_path):
+    """A snapshot that names no driver is the state right after a restart;
+    the page still has to be able to offer a level."""
+    m = _levels_cfg(tmp_path)
+    pub = tmp_path / "pub.json"
+    pub.write_text(_json.dumps({"fec": {"floor_ratio": "20:1"}}))
+    fec = _fec_cfg({"wan1": M.WanProfileCfg(
+        name="wan1", loss_table=FC.DEFAULT_CELL_LOSS_TABLE, ramp_up_ticks=1,
+        ramp_down_hold_s=0, floor_ratio="8:0", signal_floor_fec="12:1")})
+    loc = M.assemble_map_payload(m, str(pub), None, 1000.0,
+                                 fec_cfg=fec)["location_fec"]
+    assert len(loc["levels"]) == len(FC.DEFAULT_LOSS_TABLE)
+    assert loc["floor_level"] == 0                 # 20:1 is below every rung
+
+
+def test_map_payload_without_a_fec_cfg_degrades_but_never_omits(tmp_path):
+    """The map page reads location_fec.levels unconditionally; the keys have
+    to be there even on a box with no FEC configured at all."""
+    m = _levels_cfg(tmp_path)
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    loc = out["location_fec"]
+    assert loc["levels"] == [] and loc["floor_level"] is None
+    assert loc["wans"] == {}
+    assert loc["tiles"] == [] and loc["zones"] == []
+    assert out["fix"] is None and out["stations"] == []
+
+
+# -- round 2: every live zone visible, ids never reused ------------------------
+
+
+def test_map_location_layer_shows_an_operator_zone_with_no_id(tmp_path):
+    """A zone with no id is still a zone the daemon acts on -- validate_zone
+    never asked for one. Hiding it would mean the map omits a circle that is
+    steering real parity; show it, and say it cannot be edited from here."""
+    opz = tmp_path / "location_zones.json"
+    opz.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "dock", "lat": 41.2, "lon": -73.6,
+         "radius_m": 150, "level": 3},
+        {"label": "hand written", "lat": 41.3, "lon": -73.7,
+         "radius_m": 200, "level": 1},
+        {"id": "not-a-zone-id", "label": "also hand written", "lat": 41.4,
+         "lon": -73.8, "radius_m": 250, "level": 2}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"),
+                               str(tmp_path / "absent-cfg.json"), None, 10,
+                               operator_zones_path=str(opz))
+    assert [z["label"] for z in out["zones"]] == [
+        "dock", "hand written", "also hand written"]
+    assert [z["source"] for z in out["zones"]] == ["operator"] * 3
+    assert [z["editable"] for z in out["zones"]] == [True, False, False]
+    assert out["zones"][0]["id"] == "z1"
+    assert "id" not in out["zones"][1]
+    assert "id" not in out["zones"][2]      # an unusable id is no id at all
+
+
+def test_map_location_layer_still_drops_a_zone_with_unusable_geometry(tmp_path):
+    """An id-less row is editable elsewhere, not unusable. A row with no
+    position is unusable, and stays dropped."""
+    opz = tmp_path / "location_zones.json"
+    opz.write_text(_json.dumps({"zones": [
+        {"label": "no position", "radius_m": 200, "level": 1},
+        {"label": "no radius", "lat": 41.3, "lon": -73.7, "level": 1},
+        {"label": "keeps its place", "lat": 41.3, "lon": -73.7,
+         "radius_m": 200, "level": 1}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"),
+                               str(tmp_path / "absent-cfg.json"), None, 10,
+                               operator_zones_path=str(opz))
+    assert [z["label"] for z in out["zones"]] == ["keeps its place"]
+
+
+def test_config_zones_are_never_editable(tmp_path):
+    cfgz = tmp_path / "lf.json"
+    cfgz.write_text(_json.dumps({"zones": [
+        {"label": "yard", "lat": 41.1, "lon": -73.5, "radius_m": 300,
+         "level": 2}]}))
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(cfgz), None,
+                               10)
+    assert out["zones"][0]["editable"] is False
+    assert out["zones"][0]["source"] == "config"
+
+
+def test_apply_location_zone_never_reuses_an_id_after_a_delete(tmp_path):
+    """A stale editor panel still holding z2 must never be able to save over a
+    DIFFERENT z2 handed out later. The counter is persisted for that reason."""
+    p = str(tmp_path / "location_zones.json")
+    for label in ("a", "b"):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label=label),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    M.apply_location_zone(p, {"id": "z2", "delete": True})   # the highest
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="c"), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert [z["id"] for z in zones] == ["z1", "z3"]
+    assert _json.loads(Path(p).read_text())["next_id"] == 4
+
+
+def test_apply_location_zone_keeps_the_counter_past_an_empty_file(tmp_path):
+    p = str(tmp_path / "location_zones.json")
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    M.apply_location_zone(p, z)
+    assert M.apply_location_zone(p, {"id": "z1", "delete": True}) == []
+    body = _json.loads(Path(p).read_text())
+    assert body["zones"] == [] and body["next_id"] == 2
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(), _WANS, 5)
+    assert [z["id"] for z in M.apply_location_zone(p, z)] == ["z2"]
+
+
+def test_apply_location_zone_allocates_without_a_stored_counter(tmp_path):
+    """Files written before the counter existed, and hand-edited ones, still
+    have to allocate a free id."""
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "a", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1},
+        {"id": "z2", "label": "b", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1}]}))
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="c"), _WANS, 5)
+    zones = M.apply_location_zone(str(p), z)
+    assert [z["id"] for z in zones] == ["z1", "z2", "z3"]
+
+
+def test_apply_location_zone_never_collides_with_a_stale_counter(tmp_path):
+    """A hand-edited counter below an id already in the file must not hand out
+    that id again: the watermark is the max of the two."""
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"next_id": 2, "zones": [
+        {"id": "z5", "label": "a", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 1}]}))
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="b"), _WANS, 5)
+    zones = M.apply_location_zone(str(p), z)
+    assert [z["id"] for z in zones] == ["z5", "z6"]
+
+
+def test_apply_location_zone_ignores_an_unusable_counter(tmp_path):
+    for n, bad in enumerate(("3", True, -1, 0, None, 2.5, [])):
+        p = tmp_path / ("counter-%d.json" % n)
+        p.write_text(_json.dumps({"next_id": bad, "zones": [
+            {"id": "z1", "label": "a", "lat": 41.1, "lon": -73.5,
+             "radius_m": 300, "level": 1}]}))
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label="b"),
+                                            _WANS, 5)
+        zones = M.apply_location_zone(str(p), z)
+        assert [z["id"] for z in zones] == ["z1", "z2"], bad
+
+
+# -- round 3: one bad zone must not cost the page the whole map ---------------
+
+
+def test_map_location_layer_drops_a_zone_with_a_non_finite_position(tmp_path):
+    """json.dumps writes NaN and Infinity as bare tokens and JSON.parse throws
+    on them, so ONE poisoned zone costs the page the entire payload -- the
+    same class already fixed for a tile's residual."""
+    zones = tmp_path / "location_zones.json"
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        zones.write_text(
+            '{"zones": [{"label": "poison", "lat": %s, "lon": -73.5,'
+            ' "radius_m": 300, "level": 2},'
+            ' {"label": "good", "lat": 41.1, "lon": -73.5,'
+            ' "radius_m": 300, "level": 2}]}' % bad)
+        out = M.map_location_layer(str(tmp_path / "absent.json"),
+                                   str(tmp_path / "absent-cfg.json"), None, 10,
+                                   operator_zones_path=str(zones))
+        assert [z["label"] for z in out["zones"]] == ["good"], bad
+        _json.dumps(out, allow_nan=False)     # what the browser must parse
+
+
+def test_map_location_layer_drops_a_zone_with_a_non_finite_radius(tmp_path):
+    zones = tmp_path / "lf.json"
+    zones.write_text(
+        '{"zones": [{"label": "poison", "lat": 41.1, "lon": -73.5,'
+        ' "radius_m": Infinity, "level": 2},'
+        ' {"label": "good", "lat": 41.1, "lon": -73.5,'
+        ' "radius_m": 300, "level": 2}]}')
+    out = M.map_location_layer(str(tmp_path / "absent.json"), str(zones),
+                               None, 10)
+    assert [z["label"] for z in out["zones"]] == ["good"]
+    _json.dumps(out, allow_nan=False)
+
+
+def test_map_location_layer_drops_a_zone_whose_numbers_overflow(tmp_path):
+    """float() and int() raise OverflowError -- not ValueError -- on an
+    integer literal too large for a float and on an infinite level, and
+    OverflowError was in neither except tuple.
+
+    The endpoint refuses both, so this is not reachable through the map; the
+    CONFIG zone file is hand-edited by design and feeds the same rows, and one
+    poisoned character there took out the whole /api/map response."""
+    big = "1" + "0" * 400
+    good = ('{"label": "good", "lat": 41.1, "lon": -73.5,'
+            ' "radius_m": 300, "level": 2}')
+    zones = tmp_path / "location-fec.json"
+    for key, bad in (("lat", big), ("lon", big), ("radius_m", big),
+                     ("level", "Infinity")):
+        fields = {"label": '"poison"', "lat": "41.1", "lon": "-73.5",
+                  "radius_m": "300", "level": "2"}
+        fields[key] = bad
+        poison = "{%s}" % ", ".join('"%s": %s' % kv for kv in fields.items())
+        zones.write_text('{"zones": [%s, %s]}' % (poison, good))
+        out = M.map_location_layer(str(tmp_path / "absent.json"), str(zones),
+                                   None, 10)
+        assert [z["label"] for z in out["zones"]] == ["good"], key
+        _json.dumps(out, allow_nan=False)     # what the browser must parse
+
+
+def test_map_payload_stays_parseable_with_a_poisoned_zone(tmp_path):
+    m = M.resolve_map_cfg({"stations_path": str(tmp_path / "s.json"),
+                           "labels_path": str(tmp_path / "l.json"),
+                           "environ_points_path": str(tmp_path / "e.json"),
+                           "location_store_path": str(tmp_path / "store.json"),
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "location_zones_path": str(tmp_path / "op.json")})
+    Path(m["location_zones_path"]).write_text(
+        '{"zones": [{"id": "z1", "label": "poison", "lat": NaN,'
+        ' "lon": -73.5, "radius_m": 300, "level": 2}]}')
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"]["zones"] == []
+    _json.dumps(out, allow_nan=False)
+
+
+# -- round 3: the file cannot grow without bound -------------------------------
+
+
+def test_apply_location_zone_refuses_a_create_past_the_cap(tmp_path):
+    """Every zone is walked once per look-ahead point in the 1 Hz loop and
+    rides in every 3 s map payload; the per-request byte cap bounds one POST,
+    nothing bounded the file."""
+    p = str(tmp_path / "location_zones.json")
+    for i in range(M._MAX_OPERATOR_ZONES):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label="z%d" % i),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    assert len(_json.loads(Path(p).read_text())["zones"]) == 200
+
+    _ok, z, _ = M.validate_zone_payload(_zone_payload(label="one too many"),
+                                        _WANS, 5)
+    with pytest.raises(M.ZoneLimitError) as ei:
+        M.apply_location_zone(p, z)
+    assert "200" in str(ei.value)
+    assert len(_json.loads(Path(p).read_text())["zones"]) == 200
+
+
+def test_apply_location_zone_still_edits_and_deletes_at_the_cap(tmp_path):
+    """The cap must never trap the operator: the way back under it is an
+    update or a delete, so those stay allowed."""
+    p = str(tmp_path / "location_zones.json")
+    for i in range(M._MAX_OPERATOR_ZONES):
+        _ok, z, _ = M.validate_zone_payload(_zone_payload(label="z%d" % i),
+                                            _WANS, 5)
+        M.apply_location_zone(p, z)
+    _ok, z, _ = M.validate_zone_payload(
+        _zone_payload(id="z7", label="renamed at the cap"), _WANS, 5)
+    zones = M.apply_location_zone(p, z)
+    assert len(zones) == 200
+    assert [x for x in zones if x["id"] == "z7"][0]["label"] \
+        == "renamed at the cap"
+    assert len(M.apply_location_zone(p, {"id": "z7", "delete": True})) == 199
+
+
+# -- round 3: a level the driving table has lost --------------------------------
+
+
+def test_validate_zone_payload_keeps_a_level_the_driving_table_has_lost():
+    """A zone stored at level 4 opened while a 4-rung cellular profile drives
+    must save back at 4. Refusing it would make the zone uneditable; snapping
+    it to 3 would quietly rewrite a floor the operator set."""
+    ok, zone, err = M.validate_zone_payload(
+        _zone_payload(id="z1", level=4), _WANS, 4, keep_level=4)
+    assert ok and err is None and zone["level"] == 4
+    # It only ever PRESERVES: a different level past the table is still out.
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(id="z1", level=4), _WANS, 4, keep_level=2)
+    assert not ok and "level" in err
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(id="z1", level=4), _WANS, 4)
+    assert not ok and "level" in err
+    # And a level below the table's top is unaffected either way.
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", level=2), _WANS, 4, keep_level=4)
+    assert ok and zone["level"] == 2
+
+
+def test_stored_zone_level_reads_only_a_usable_level(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": [
+        {"id": "z1", "label": "a", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": 4},
+        {"id": "z2", "label": "b", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": True},
+        {"id": "z3", "label": "c", "lat": 41.1, "lon": -73.5,
+         "radius_m": 300, "level": "4"}]}))
+    assert M.stored_zone_level(str(p), "z1") == 4
+    assert M.stored_zone_level(str(p), "z2") is None     # bool is not a level
+    assert M.stored_zone_level(str(p), "z3") is None
+    assert M.stored_zone_level(str(p), "z9") is None
+    assert M.stored_zone_level(str(tmp_path / "absent.json"), "z1") is None
+
+
+# -- round 5: the map and the daemon must be reading one file ------------------
+
+
+def _record(tmp_path, **over):
+    """What location_fec publishes, at a timestamp the reader calls fresh."""
+    rec = {"set_ts": 1000.0, "source": "location_fec", "wans": {}}
+    rec.update(over)
+    (tmp_path / "location_fec.json").write_text(_json.dumps(rec))
+    return M.LocationFecCfg(state_path=str(tmp_path / "location_fec.json"),
+                            enabled=True, stale_after_s=30.0)
+
+
+def test_no_zones_path_mismatch_when_both_sides_read_one_file(tmp_path):
+    m = _levels_cfg(tmp_path)
+    loc = _record(tmp_path, operator_zones_path=m["location_zones_path"])
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+    # Spelt differently, still the same file: a mismatch we cannot prove is
+    # not a mismatch, and a false one would disable Save on a working box.
+    loc = _record(tmp_path,
+                  operator_zones_path=str(tmp_path) + "/./location_zones.json")
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+
+
+def test_zones_path_mismatch_names_the_file_the_daemon_reads(tmp_path):
+    """The map saves to its own configured path and the daemon reads its own;
+    nothing ties the two settings together. Diverged, the save returns 200 and
+    no floor ever moves -- so the payload has to carry the daemon's path, the
+    one thing the operator has to go and fix."""
+    m = _levels_cfg(tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    loc = _record(tmp_path, operator_zones_path=theirs)
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) == theirs
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0,
+                                 location_cfg=loc)
+    assert out["location_fec"]["zones_path_mismatch"] == theirs
+
+
+def test_zones_path_mismatch_is_null_when_it_cannot_be_proved(tmp_path):
+    """Absent, stale, unparseable, or simply from a daemon too old to publish
+    the key: none of those are evidence of a mismatch, and claiming one would
+    disable Save on a box that is working."""
+    m = _levels_cfg(tmp_path)
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    absent = M.LocationFecCfg(state_path=str(tmp_path / "gone.json"),
+                              enabled=True, stale_after_s=30.0)
+    assert M.location_zones_path_mismatch(absent, m, 1000.0) is None
+    assert M.location_zones_path_mismatch(None, m, 1000.0) is None
+    stale = _record(tmp_path, set_ts=100.0, operator_zones_path=theirs)
+    assert M.location_zones_path_mismatch(stale, m, 1000.0) is None
+    old = _record(tmp_path)                       # no such key in the record
+    assert M.location_zones_path_mismatch(old, m, 1000.0) is None
+    for bad in (7, None, ""):
+        rec = _record(tmp_path, operator_zones_path=bad)
+        assert M.location_zones_path_mismatch(rec, m, 1000.0) is None
+    (tmp_path / "location_fec.json").write_text("{not json")
+    assert M.location_zones_path_mismatch(old, m, 1000.0) is None
+    # And the payload always carries the key, so the page never has to guess.
+    out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
+    assert out["location_fec"]["zones_path_mismatch"] is None
+
+
+# -- round 7: two spellings of one file are not a mismatch ---------------------
+
+
+def test_zones_path_mismatch_resolves_symlinks_and_relative_spellings(
+        tmp_path, monkeypatch):
+    """normpath resolves neither, so one file named two ways compared unequal.
+    Cosmetic while the endpoint still wrote; now that a proven mismatch is a
+    409, a false one is a refusal to save on a box that works."""
+    m = _levels_cfg(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    # Relative to the daemon's working directory, absolute here.
+    loc = _record(tmp_path, operator_zones_path="location_zones.json")
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+    # A symlinked parent: /var/lib -> /mnt/state/lib and the like.
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    m2 = _levels_cfg(tmp_path,
+                     location_zones_path=str(real / "location_zones.json"))
+    loc = _record(tmp_path,
+                  operator_zones_path=str(tmp_path / "link"
+                                          / "location_zones.json"))
+    assert M.location_zones_path_mismatch(loc, m2, 1000.0) is None
+    # Genuinely two files, and neither of them exists: realpath absolutises
+    # without raising, so the answer is still the lexical one.
+    theirs = str(tmp_path / "somewhere-else" / "zones.json")
+    loc = _record(tmp_path, operator_zones_path=theirs)
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) == theirs
+    # ...and it is the CONFIGURED spelling that comes back, not the resolved
+    # one: that is the string the operator has to go and fix.
+    loc = _record(tmp_path, operator_zones_path="./somewhere-else/zones.json")
+    assert (M.location_zones_path_mismatch(loc, m, 1000.0)
+            == "./somewhere-else/zones.json")
+
+
+def test_zones_path_mismatch_falls_open_when_realpath_raises(tmp_path,
+                                                             monkeypatch):
+    """Fail-open all the way down: if the filesystem work cannot be done we
+    report no mismatch rather than guessing, because the guess now locks the
+    operator out of the editor."""
+    m = _levels_cfg(tmp_path)
+    loc = _record(tmp_path,
+                  operator_zones_path=str(tmp_path / "elsewhere.json"))
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is not None
+
+    def boom(_p):
+        raise OSError("ELOOP")
+
+    monkeypatch.setattr(M.os.path, "realpath", boom)
+    assert M.location_zones_path_mismatch(loc, m, 1000.0) is None
+
+
+# -- round 5: a save must not widen a zone to every WAN ------------------------
+
+
+def test_validate_zone_payload_preserves_wans_the_payload_never_mentions():
+    """Absent is not empty. The page renders one checkbox per WAN the payload
+    names, and publishes none at all when it cannot resolve the WAN labels --
+    so a zone scoped to wan1, opened in that state, used to save back as
+    `wans: []`, which the endpoint reads as EVERY wan. A floor the operator
+    scoped to one link silently applied to all of them.
+
+    An omitted key now keeps what is stored; null and [] still mean all WANs,
+    because that is the only way the page can ask for all of them."""
+    p = _zone_payload(id="z1")
+    p.pop("wans", None)
+    ok, zone, _ = M.validate_zone_payload(p, _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] == ["wan1"]
+    # Explicit still wins in both directions.
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=[]), _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] is None
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=None), _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] is None
+    ok, zone, _ = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=["wan2"]), _WANS, 5, keep_wans=["wan1"])
+    assert ok and zone["wans"] == ["wan2"]
+    # Nothing stored (a create): an absent key is still all WANs.
+    p = _zone_payload()
+    p.pop("wans", None)
+    ok, zone, _ = M.validate_zone_payload(p, _WANS, 5)
+    assert ok and zone["wans"] is None
+
+
+def test_a_preserved_wan_list_is_not_re_validated_against_the_live_names():
+    """Like keep_level: preserving what is already stored can never introduce
+    a scope, only keep one. A WAN renamed out of the config would otherwise
+    make its zone uneditable -- or, worse, widen it on the next save."""
+    p = _zone_payload(id="z1")
+    p.pop("wans", None)
+    ok, zone, _ = M.validate_zone_payload(p, _WANS, 5, keep_wans=["wan9"])
+    assert ok and zone["wans"] == ["wan9"]
+    # But naming it explicitly is still refused.
+    ok, _z, err = M.validate_zone_payload(
+        _zone_payload(id="z1", wans=["wan9"]), _WANS, 5, keep_wans=["wan9"])
+    assert not ok and "wan9" in err
+
+
+def test_stored_zone_wans_reads_only_a_usable_list(tmp_path):
+    p = tmp_path / "location_zones.json"
+    p.write_text(_json.dumps({"zones": [
+        {"id": "z1", "wans": ["wan1"]},
+        {"id": "z2", "wans": None},
+        {"id": "z3", "wans": "wan1"},
+        {"id": "z4", "wans": ["wan1", 7]},
+        {"id": "z5"}]}))
+    assert M.stored_zone_wans(str(p), "z1") == ["wan1"]
+    assert M.stored_zone_wans(str(p), "z2") is None
+    assert M.stored_zone_wans(str(p), "z3") is None
+    assert M.stored_zone_wans(str(p), "z4") is None
+    assert M.stored_zone_wans(str(p), "z5") is None
+    assert M.stored_zone_wans(str(p), "z9") is None
+    assert M.stored_zone_wans(str(tmp_path / "absent.json"), "z1") is None
+
+
+def test_zone_number_refuses_an_integer_too_large_for_a_float():
+    """JSON integers are unbounded and math.isfinite() raises OverflowError on
+    one past float range. Round 4 closed that in _map_zone_rows and in the
+    daemon's validator but not here, so `"lat": 10**400` left the endpoint as
+    a 500 instead of the 400 every other bad coordinate gets."""
+    big = 10 ** 400
+    assert M._zone_number(big) is None
+    assert M._zone_number(-big) is None
+    assert M._zone_number(float("inf")) is None
+    assert M._zone_number(41.1) == 41.1
+    ok, _z, err = M.validate_zone_payload(_zone_payload(lat=big), _WANS, 5)
+    assert not ok and "lat" in err
+    for key in ("lon", "radius_m"):
+        ok, _z, err = M.validate_zone_payload(
+            _zone_payload(**{key: big}), _WANS, 5)
+        assert not ok and key in err

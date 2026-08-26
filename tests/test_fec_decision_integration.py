@@ -46,7 +46,7 @@ def test_effective_floor_precedence_profile_beats_config_not_operator(tmp_path):
     fec = _cfg_with_fec()
     fec.floor_ratio = "20:1"
     cfg = M.Config(
-        wans={"wan1": M.WanCfg("wan1", 1, "T-Mo"),
+        wans={"wan1": M.WanCfg("wan1", 1, "Cellular"),
               "wan2": M.WanCfg("wan2", 2, "Satellite")},
         relay=M.RelayCfg("http://x"),
         engarde=M.EngardeCfg("198.51.100.10", 59402),
