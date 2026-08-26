@@ -59,6 +59,31 @@ window the level is held for `exit_hold_s` before dropping.
 
 ## Manual zones
 
+A zone pins a minimum level to a place. There are two ways to make one, and
+the daemon treats them identically once they exist.
+
+### Draw it on the map
+
+Open the `:8081` map, press **Zones**, and click where the bad stretch is. The
+editor opens at that point: name it, drag the radius until the circle covers
+the place, choose a level, tick the WANs it applies to, and Save. Click a zone
+you drew to edit or delete it; Escape cancels. Leave every WAN unticked to
+cover all of them.
+
+Each level in the list names its ratio and what it costs — `level 3 — 8:6 (75%
+overhead)` — on the loss table of the link **currently driving FEC**, so the
+choice is made against the ladder that will actually be applied. Levels at or
+below the current floor say `already covered by the floor` and are dimmed;
+they remain selectable, because a zone chosen there still holds if the floor
+later drops.
+
+Drawn zones live in `/var/lib/sbfd-ctl/location_zones.json`. `sbfd-ctl` writes
+it and `location_fec` re-reads it whenever the file changes, so a zone takes
+effect within a poll — no signal, no restart. A missing file simply means no
+drawn zones; an unusable one is logged once and treated the same way.
+
+### Declare it in the config file
+
 ```json
 "zones": [
   {"label": "depot", "lat": 0.000, "lon": 0.000, "radius_m": 300, "level": 3},
@@ -67,16 +92,23 @@ window the level is held for `exit_hold_s` before dropping.
 ]
 ```
 
+Zones in `/etc/sbfd-ctl/location-fec.json` are for places that should ship
+with the box: they are deployed with the rest of the config and take effect on
+a reload. That is the whole difference. Config zones need a deploy and a
+reload; map-drawn zones need neither. The map shows config zones as dashed
+circles it will not let you edit, and drawn ones as solid circles it will.
+
+### What a zone does
+
 A zone matches when its centre is within `radius_m` of the position or any
 look-ahead point. `level` is a guaranteed minimum for the listed `wans`
-(default: all); the learned value can only push above it, and the two combine
-by `max`. `suppress_learned: true` ignores the learned value inside that zone,
-for a place the learner has simply got wrong — inside it only: the tiles whose
-centres fall in the circle are dropped from the look-ahead, and a confirmed bad
-tile on the approach still raises the floor. Read a station's label off the
-`:8081` map and paste its centroid to name a place you already recognise.
+(default: all); the learned value can only push above it, and every source
+combines by `max`. `suppress_learned: true` ignores the learned value inside
+that zone, for a place the learner has simply got wrong — inside it only: the
+tiles whose centres fall in the circle are dropped from the look-ahead, and a
+confirmed bad tile on the approach still raises the floor.
 
-Edited zones are re-read on `SIGHUP`: `systemctl reload location-fec`, or
+Config zones are re-read on `SIGHUP`: `systemctl reload location-fec`, or
 `kill -HUP <pid>` where the daemon is not run under systemd. A reload re-reads
 the **whole** config file — zones, the gpsd host/port, `wans`, the intervals,
 the loss table — and re-applies `exit_hold_s` and the `learning` parameters to
@@ -95,7 +127,11 @@ restart, and the reload says so.
 - *active* means the location floor is currently why the wire carries more
   parity than the loss-driven decision alone would send, whether or not it
   triggered the most recent write; a refused write is never counted.
-- The map draws learned tiles as loss-coloured squares and zones as circles.
+- The map draws learned tiles as loss-coloured squares and zones as
+  circles: dashed for a config zone, solid for one drawn on the map.
+- **Zones** on the map page opens the zone editor. With it off the map
+  behaves exactly as it did before, and config zones stay read-only in
+  either state.
 
 ## Fail-safe
 
@@ -107,6 +143,7 @@ restart, and the reload says so.
 | daemon alive but blind for `withdraw.max_stale_s` | already withdrawn (no fix ⇒ withdrawal is immediate); logs one warning per blind episode, not one per tick, so the blindness is visible in the journal without flooding it |
 | corrupt store | starts empty, one log line |
 | invalid zone | logged and skipped |
+| drawn-zone file missing or corrupt | no drawn zones, one log line; config zones and learning are unaffected |
 
 Known hole: in a tunnel the fix dies where the link does, so nothing is learned
 there. The approach tiles usually still learn; a manual zone covers the rest.
