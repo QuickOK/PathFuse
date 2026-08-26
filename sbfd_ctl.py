@@ -1031,8 +1031,9 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
                         ladder_inputs=None):
     """Shape the relay->client published direction dict from a fetch_relay_fec result.
 
-    `desired` / `last_acked` are the 6-tuple
-    (mode, fixed_ratio, floor_ratio, loss_level, profile_name, signal_floor).
+    `desired` / `last_acked` are the 7-tuple
+    (mode, fixed_ratio, floor_ratio, loss_level, profile_name, signal_floor,
+    location_level).
     We just compare them for equality to drive reconcile_pending — the relay
     echoes back what it actually applied."""
     fetch = fetch or {}
@@ -1071,6 +1072,11 @@ def relay_fec_direction(fetch, fetched_at, now, desired, last_acked, local_rx=No
         "floor_ratio": data.get("floor_ratio"),
         "ratio": data.get("ratio"),
         "level": data.get("level"),
+        # The level the relay is applying, clamped to its own table — not the
+        # one we asked for. None from a relay too old to report it. The two
+        # legs legitimately differ mid-push, and differ for good after a clamp,
+        # so this is the relay's own value, never ours echoed back.
+        "location_level": data.get("location_level"),
         # Absent from a relay older than the ladder field; the UI falls back to
         # a fixed-width pip row rather than showing an empty one.
         "ladder": ladder,
@@ -2118,15 +2124,16 @@ _post_relay_fec_last_warned = None
 
 def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
                    client_loss_pct=None, wan_profile=None,
-                   signal_floor=None) -> bool:
+                   signal_floor=None, location_level=None) -> bool:
     """Best-effort POST of desired (mode, fixed_ratio, floor_ratio) to relay /fec.
 
     client_loss_pct carries our locally measured relay->client loss — the
     direction the relay's TX leg repairs but cannot see (sbfd loss is
     RX-side). wan_profile/signal_floor carry the per-WAN policy selection to
-    the relay leg; older relays ignore unknown keys. Also sends the legacy
-    `enabled` boolean so an older relay binary still honors the off/on intent
-    during a rolling upgrade. Returns True iff 200.
+    the relay leg, and location_level the floor this PLACE is known to need,
+    so both legs lift together; older relays ignore unknown keys. Also sends
+    the legacy `enabled` boolean so an older relay binary still honors the
+    off/on intent during a rolling upgrade. Returns True iff 200.
 
     A non-200 HTTP response (e.g. 400 from an unknown wan_profile, which
     would otherwise 400 forever and invisibly on every reconcile tick) is
@@ -2149,6 +2156,11 @@ def post_relay_fec(url, mode, fixed_ratio, floor_ratio, timeout_s,
         payload["wan_profile"] = wan_profile
     if signal_floor is not None:
         payload["signal_floor"] = bool(signal_floor)
+    # Coerce nothing: int() on a bad value would raise from OUTSIDE the try
+    # below and take the controller tick with it. A level that is not a plain
+    # int (bool included — the relay 400s it) costs us the key, not the push.
+    if isinstance(location_level, int) and not isinstance(location_level, bool):
+        payload["location_level"] = location_level
     body = _json.dumps(payload).encode()
     try:
         status, _reason, resp_body = _relay_request(
@@ -3127,11 +3139,15 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             # a table level in relay_desired so posts fire on level changes,
             # not every EWMA wiggle.
             client_push_loss = worst_active_loss(loss, currently_active)
+            # The location level rides along as the last element: a change in
+            # the place we are standing in must re-post at once, not wait out
+            # the heartbeat, and shows as reconcile_pending until acked.
             relay_desired = (fec_mode_eff, fec_fixed_ratio_eff,
                              fec_floor_ratio_eff,
                              fec_control.loss_to_level(client_push_loss,
                                                        prof_table),
-                             prof_name, fec_signal_floor_applied)
+                             prof_name, fec_signal_floor_applied,
+                             fec_location_level)
             if _fec_ratio != fec_current_ratio:
                 fec_actuator_ok = fec_control.write_fifo(
                     cfg.fec.fifo, _fec_ratio, logging)
@@ -3220,7 +3236,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                                   cfg.relay.fetch_timeout_s,
                                   client_loss_pct=client_push_loss,
                                   wan_profile=prof_name,
-                                  signal_floor=fec_signal_floor_applied):
+                                  signal_floor=fec_signal_floor_applied,
+                                  location_level=fec_location_level):
                     fec_relay_last_acked = relay_desired
                 fec_relay_last_post_ts = loop_start
 

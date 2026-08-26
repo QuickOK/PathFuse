@@ -49,6 +49,7 @@ class FecState:
         self.profile_names = frozenset(profile_names) | {"default"}
         self._pushed_profile = None
         self._pushed_signal_floor = False
+        self._pushed_location_level = 0
         self._pushed_link_ts = 0.0
         self._snapshot = {
             "enabled": self._mode != fec_control.MODE_OFF,
@@ -66,6 +67,7 @@ class FecState:
             "profile": "default",
             "profile_source": "default",
             "signal_floor_active": False,
+            "location_level": 0,
         }
 
     def get_enabled(self):
@@ -141,23 +143,37 @@ class FecState:
                 return None
             return self._pushed_loss
 
-    def set_pushed_link(self, profile, signal_floor, ts):
-        """Per-WAN policy pushed by the client; one timestamp for the pair."""
+    def set_pushed_link(self, profile, signal_floor, ts, location_level=None):
+        """Per-WAN policy pushed by the client; one timestamp for the group."""
         with self._lock:
             if profile is not None:
                 self._pushed_profile = profile
             if signal_floor is not None:
                 self._pushed_signal_floor = bool(signal_floor)
+            if location_level is not None:
+                self._pushed_location_level = int(location_level)
             self._pushed_link_ts = ts
 
     def get_pushed_link(self, now, stale_after_s):
-        """(profile, signal_floor), or (None, False) when never pushed or
-        stale — stale MUST also drop the signal floor, not just the table."""
+        """(profile, signal_floor, location_level). Stale, or never pushed at
+        all, drops all three — a client that stopped talking vouches for
+        nothing.
+
+        Fresh with NO profile still carries the location level, and this is the
+        one place the two floors deliberately part company. The signal floor's
+        rung is looked up IN the profile's table (sf_fec), so without a profile
+        it names nothing and stays dropped. The location level is an index the
+        resolved table merely clamps — the default table when nothing was
+        pushed — so it means exactly the same thing with or without a profile,
+        and withholding it would make the floor silently inert for anyone
+        running without wan_profiles."""
         with self._lock:
-            if self._pushed_profile is None or \
-                    (now - self._pushed_link_ts) > stale_after_s:
-                return None, False
-            return self._pushed_profile, self._pushed_signal_floor
+            if (now - self._pushed_link_ts) > stale_after_s:
+                return None, False, 0
+            if self._pushed_profile is None:
+                return None, False, self._pushed_location_level
+            return (self._pushed_profile, self._pushed_signal_floor,
+                    self._pushed_location_level)
 
     def publish(self, **fields):
         with self._lock:
@@ -235,12 +251,16 @@ def start_fec_http(listen, state, stop_event=None):
             loss_in = payload.get("client_loss_pct")
             profile_in = payload.get("wan_profile")
             signal_in = payload.get("signal_floor")
+            location_in = payload.get("location_level")
             if (mode_in is None and enabled_in is None and loss_in is None
                     and fixed_in is None and floor_in is None
-                    and profile_in is None and signal_in is None):
+                    and profile_in is None and signal_in is None
+                    and location_in is None):
                 self._json(400, {"error": "mode, enabled, client_loss_pct, "
-                                          "fixed_ratio, floor_ratio, wan_profile "
-                                          "or signal_floor required"}); return
+                                          "fixed_ratio, floor_ratio, wan_profile, "
+                                          "signal_floor or location_level "
+                                          "required"})
+                return
             if mode_in is not None and mode_in not in fec_control.ALL_MODES:
                 self._json(400, {"error": f"mode must be one of "
                                           f"{sorted(fec_control.ALL_MODES)}"}); return
@@ -253,6 +273,15 @@ def start_fec_http(listen, state, stop_event=None):
                                           f"{sorted(state.profile_names)}"}); return
             if signal_in is not None and not isinstance(signal_in, bool):
                 self._json(400, {"error": "signal_floor must be true or false"}); return
+            # bool is an int subclass, so it must be excluded explicitly — a
+            # stray `true` would otherwise be stored as level 1 and quietly
+            # lift this leg a rung.
+            if location_in is not None and (
+                    isinstance(location_in, bool)
+                    or not isinstance(location_in, int) or location_in < 0):
+                self._json(400, {"error": "location_level must be a "
+                                          "non-negative integer"})
+                return
             # Resolve every field BEFORE mutating any of it. A payload that
             # carries a good ratio and a bad client_loss_pct must leave the
             # relay untouched, not half-applied behind a 400.
@@ -277,8 +306,18 @@ def start_fec_http(listen, state, stop_event=None):
                 mode=mode_in, enabled=enabled_in, **ratio_updates)
             if loss_in is not None:
                 state.set_pushed_loss(loss_in, time.time())
-            if profile_in is not None or signal_in is not None:
-                state.set_pushed_link(profile_in, signal_in, time.time())
+            if (profile_in is not None or signal_in is not None
+                    or location_in is not None):
+                # An absent level on a LINK-POLICY update means zero, not
+                # "unchanged": a client rolled back to a build that knows
+                # nothing of location_level keeps pushing profile/signal_floor,
+                # and that refreshes the timestamp — so preserving the last
+                # level here would pin a location floor that can never expire.
+                # A location-only push always has a level, so one expression
+                # covers both cases.
+                state.set_pushed_link(
+                    profile_in, signal_in, time.time(),
+                    location_level=(0 if location_in is None else location_in))
             self._json(200, {"ok": True, "mode": mode_now,
                              "fixed_ratio": fixed_now,
                              "floor_ratio": floor_now,
@@ -376,14 +415,18 @@ def resolve_relay_profile(cfg, name):
 
 def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
              pushed_loss=None, *, floor_ratio=None, pushed_profile=None,
-             pushed_signal_floor=False):
+             pushed_signal_floor=False, pushed_location_level=0):
     """One control tick. Returns (new_runtime, ratio_now_or_current).
     The adaptive engine always advances so the loss-tracked level stays fresh;
     apply_mode then maps it through the operator-chosen mode.
 
     pushed_loss is the fresh client-measured relay->client loss (the direction
     this leg repairs); when present it drives the level. Relay-local sbfd loss
-    (opposite direction) is only the fallback for clients that don't push."""
+    (opposite direction) is only the fallback for clients that don't push.
+
+    pushed_location_level is the floor the client's location daemon asks for
+    at the place the vehicle is standing in. Raise-only and clamped to this
+    profile's table, so an absent, stale or over-tall level is inert."""
     table, hyst, sf_fec = resolve_relay_profile(cfg, pushed_profile)
     # The caller (the control loop) passes the operator-settable floor from
     # FecState; cfg is only the boot default, as for mode and fixed_ratio.
@@ -408,6 +451,8 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
         # sample would silently lose its floor.
         level = fec_control.apply_signal_floor(
             rt.current_level, pushed_signal_floor, table, sf_fec)
+        level = fec_control.apply_location_floor(
+            level, pushed_location_level, table)
         forced = fec_control.apply_mode(
             mode, fec_control.level_to_ratio(level, table),
             fixed_ratio=fixed_ratio, floor_ratio=floor_ratio)
@@ -421,6 +466,8 @@ def run_once(cfg, rt, current_ratio, enabled=True, mode=None, fixed_ratio=None,
     rt, _changed = fec_control.step_level(target, rt, hyst, time.time())
     level = fec_control.apply_signal_floor(
         rt.current_level, pushed_signal_floor, table, sf_fec)
+    level = fec_control.apply_location_floor(
+        level, pushed_location_level, table)
     adaptive_ratio = fec_control.level_to_ratio(level, table)
     ratio = fec_control.apply_mode(mode, adaptive_ratio,
                                    fixed_ratio=fixed_ratio,
@@ -456,11 +503,12 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
     current_ratio = None
     since = None
     last_profile = "default"
+    last_location_level = 0
     pushed_stale_after = float(cfg.get("pushed_loss_stale_after_s", 90.0))
     while not stop_event.is_set():
         mode, fixed_ratio, floor_ratio = state.get_desired()
         pushed = state.get_pushed_loss(time.time(), pushed_stale_after)
-        pushed_profile, pushed_sf = state.get_pushed_link(
+        pushed_profile, pushed_sf, pushed_loc = state.get_pushed_link(
             time.time(), pushed_stale_after)
         profile_name = pushed_profile or "default"
         if profile_name != last_profile:
@@ -481,7 +529,8 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
                                      floor_ratio=floor_ratio,
                                      pushed_loss=pushed,
                                      pushed_profile=pushed_profile,
-                                     pushed_signal_floor=pushed_sf)
+                                     pushed_signal_floor=pushed_sf,
+                                     pushed_location_level=pushed_loc)
         if current_ratio != prev:
             since = time.time()
         driving = pushed
@@ -492,6 +541,16 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
         # resolves it internally and the table is dict lookups, so re-resolving
         # is cheaper than threading it back out through the return tuple.
         pub_table, _, _ = resolve_relay_profile(cfg, pushed_profile)
+        # What this leg APPLIES, not what was asked for: run_once clamps the
+        # pushed level to this same table, so echoing the raw request would
+        # claim a rung the leg is not holding whenever the client's table for
+        # the profile is taller than ours. Logged on the applied value for the
+        # same reason — and a profile switch that re-clamps it is a real change
+        # in what the leg holds, so it belongs in the log too.
+        applied_loc = fec_control.apply_location_floor(0, pushed_loc, pub_table)
+        if applied_loc != last_location_level:
+            logging.info("fec location level -> %d", applied_loc)
+            last_location_level = applied_loc
         ladder = fec_control.ladder_state(
             mode, current_ratio,
             # Coerce as run_once does: an unusable floor is applied as the
@@ -511,6 +570,7 @@ def run(cfg, stop_event=None, state=None, wire_tracker=None):
                       profile=profile_name,
                       profile_source=("pushed" if pushed_profile else "default"),
                       signal_floor_active=pushed_sf,
+                      location_level=applied_loc,
                       wire=(wire_tracker.snapshot(now) if wire_tracker else None),
                       rx=(wire_tracker.rx_snapshot(now) if wire_tracker else None))
         stop_event.wait(cfg["poll_interval_s"])

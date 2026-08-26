@@ -628,10 +628,10 @@ import fec_control as F
 def test_pushed_link_staleness():
     st = U.FecState(profile_names=frozenset({"default", "wan1"}))
     st.set_pushed_link("wan1", True, ts=100.0)
-    assert st.get_pushed_link(now=105.0, stale_after_s=90.0) == ("wan1", True)
-    assert st.get_pushed_link(now=300.0, stale_after_s=90.0) == (None, False)
+    assert st.get_pushed_link(now=105.0, stale_after_s=90.0) == ("wan1", True, 0)
+    assert st.get_pushed_link(now=300.0, stale_after_s=90.0) == (None, False, 0)
     st2 = U.FecState()
-    assert st2.get_pushed_link(now=0.0, stale_after_s=90.0) == (None, False)
+    assert st2.get_pushed_link(now=0.0, stale_after_s=90.0) == (None, False, 0)
 
 
 def test_resolve_relay_profile_default_and_named():
@@ -703,7 +703,7 @@ def test_post_unknown_wan_profile_rejected():
         except urllib.error.HTTPError as e:
             assert e.code == 400
         # rejection must leave the pushed state untouched
-        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == (None, False)
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == (None, False, 0)
         # and a VALID profile round-trips
         ok_body = json.dumps({"wan_profile": "wan1", "signal_floor": True}).encode()
         ok_req = urllib.request.Request(
@@ -711,7 +711,7 @@ def test_post_unknown_wan_profile_rejected():
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(ok_req, timeout=5) as resp:
             assert resp.status == 200
-        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == ("wan1", True)
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == ("wan1", True, 0)
     finally:
         httpd.shutdown()
 
@@ -721,7 +721,7 @@ def test_lone_signal_floor_accepted_but_inert_by_design():
     # part of the profile contract, not a standalone toggle — pushing it
     # without a wan_profile EVER pushed for this link is a no-op on the base
     # table anyway, so it 200s but get_pushed_link still reports (None,
-    # False). This pins that behavior against an accidental "fix" later.
+    # False, 0). This pins that behavior against an accidental "fix" later.
     st = U.FecState(profile_names=frozenset({"default", "wan1"}))
     httpd = U.start_fec_http("127.0.0.1:0", st)
     assert httpd is not None
@@ -733,6 +733,252 @@ def test_lone_signal_floor_accepted_but_inert_by_design():
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
-        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == (None, False)
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) == (None, False, 0)
+    finally:
+        httpd.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Location floor on the relay leg: the client pushes the level it resolved for
+# the place the vehicle is standing in, and the relay lifts ITS leg the same
+# raise-only way. It rides the pushed link, so it expires with the profile.
+# ---------------------------------------------------------------------------
+
+def test_pushed_link_carries_the_location_level_and_expires_with_it():
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    st.set_pushed_link("wan1", True, ts=100.0, location_level=3)
+    assert st.get_pushed_link(now=105.0, stale_after_s=90.0) == ("wan1", True, 3)
+    # Stale must drop the LEVEL too, not just the table: a client that stopped
+    # talking is no longer vouching for the place it last reported.
+    assert st.get_pushed_link(now=300.0, stale_after_s=90.0) == (None, False, 0)
+    st2 = U.FecState()
+    assert st2.get_pushed_link(now=0.0, stale_after_s=90.0) == (None, False, 0)
+
+
+def test_post_location_level_validation():
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+    host, port = httpd.server_address[:2]
+
+    def post(obj):
+        body = json.dumps(obj).encode()
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+
+    def post_expect_400(obj):
+        try:
+            post(obj)
+        except urllib.error.HTTPError as e:
+            return e.code
+        raise AssertionError(f"expected HTTP 400 for {obj!r}")
+
+    try:
+        assert post({"location_level": 2}) == 200
+        assert st._pushed_location_level == 2
+        # bool is an int subclass — it must not sneak through as level 1.
+        assert post_expect_400({"location_level": True}) == 400
+        assert post_expect_400({"location_level": -1}) == 400
+        assert post_expect_400({"location_level": "2"}) == 400
+        # A rejection leaves the accepted value standing, untouched.
+        assert st._pushed_location_level == 2
+        # 0 is the release, not junk: accepted, and inert downstream.
+        assert post({"location_level": 0}) == 200
+        assert st._pushed_location_level == 0
+        # Alongside a profile it round-trips through the pushed link.
+        assert post({"wan_profile": "wan1", "location_level": 2}) == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == ("wan1", False, 2)
+    finally:
+        httpd.shutdown()
+
+
+def _run_once_ratio(tmp_path, **kwargs):
+    """run_once against a real fifo with a reader; returns the ratio written."""
+    fifo = tmp_path / "loc.fifo"
+    os.mkfifo(str(fifo))
+    fd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        cfg = {"loss_table": F.DEFAULT_LOSS_TABLE, "ramp_up_ticks": 1,
+               "ramp_down_hold_s": 0.0, "fifo": str(fifo),
+               "sbfd_state": str(tmp_path / "none.json"),
+               "wan_profiles": {"wan1": {}}}
+        rt = F.FecRuntime(0, 0, 0.0)
+        _rt, ratio = U.run_once(cfg, rt, None, **kwargs)
+        return ratio
+    finally:
+        os.close(fd)
+
+
+def test_run_once_lifts_to_the_pushed_location_level(tmp_path):
+    # Zero loss maps to level 0; the pushed level is the only thing lifting it.
+    ratio = _run_once_ratio(tmp_path, pushed_loss=0.0, pushed_location_level=3)
+    assert ratio == F.level_to_ratio(3, F.DEFAULT_LOSS_TABLE)
+
+
+def test_run_once_lifts_to_the_location_level_without_a_loss_sample(tmp_path):
+    # sbfd_state does not exist -> no loss sample; the floor must still hold,
+    # exactly as the signal floor does on this branch.
+    ratio = _run_once_ratio(tmp_path, pushed_loss=None, pushed_location_level=3)
+    assert ratio == F.level_to_ratio(3, F.DEFAULT_LOSS_TABLE)
+
+
+def test_run_once_location_level_never_lowers(tmp_path):
+    # 12% loss -> level 4 on the base table; a pushed level 1 must not pull the
+    # leg back down to it.
+    ratio = _run_once_ratio(tmp_path, pushed_loss=12.0, pushed_location_level=1)
+    assert ratio == F.level_to_ratio(4, F.DEFAULT_LOSS_TABLE)
+
+
+def test_run_once_location_level_is_clamped_to_the_pushed_profile_table(tmp_path):
+    # The client learned the level against ITS table; the cellular table this
+    # push selects is a rung shorter, so level 4 must land on its top row
+    # (8:1) rather than index past it.
+    ratio = _run_once_ratio(tmp_path, pushed_loss=0.0, pushed_profile="wan1",
+                            pushed_location_level=4)
+    assert ratio == F.level_to_ratio(3, F.DEFAULT_CELL_LOSS_TABLE) == "8:1"
+
+
+def _published_after_push(tmp_path, push, settle_on):
+    """Run the relay control loop behind a live /fec server, POST `push`, and
+    return the snapshot it publishes once location_level settles. `settle_on`
+    is only the value the poll waits for — the assertion belongs to the caller.
+    The snapshot and GET /fec must agree, so a reader of either sees the same
+    thing."""
+    import threading as _t, time as _time
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(
+        {"sessions": {"a": {"session_id": 1, "state": "UP", "loss_pct": 0.0}}}))
+    fifo = tmp_path / "srv.fifo"
+    os.mkfifo(str(fifo))
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    cfg = {"fifo": str(fifo), "sbfd_state": str(state_path),
+           "poll_interval_s": 0.01, "loss_table": F.DEFAULT_LOSS_TABLE,
+           "ramp_up_ticks": 1, "ramp_down_hold_s": 0,
+           "wan_profiles": {"wan1": {}}}
+    st = U.FecState(mode=F.MODE_ADAPTIVE,
+                    profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+    stop = _t.Event()
+    th = _t.Thread(target=lambda: U.run(cfg, stop, st), daemon=True)
+
+    def await_level(want, deadline_s=5.0):
+        end = _time.monotonic() + deadline_s
+        seen = None
+        while _time.monotonic() < end:
+            seen = st.snapshot().get("location_level")
+            if seen == want:
+                return seen
+            _time.sleep(0.01)
+        return seen
+
+    try:
+        th.start()
+        assert await_level(0) == 0          # nothing pushed yet
+        host, port = httpd.server_address[:2]
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=json.dumps(push).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        settled = await_level(settle_on)
+        snap = st.snapshot()
+        assert snap["location_level"] == settled
+        with urllib.request.urlopen(f"http://{host}:{port}/fec", timeout=5) as r:
+            assert json.loads(r.read())["location_level"] == settled
+        return snap
+    finally:
+        stop.set()
+        th.join(timeout=2)
+        httpd.shutdown()
+        os.close(rfd)
+
+
+def test_run_publishes_the_pushed_location_level(tmp_path):
+    """GET /fec must show the level the relay leg is holding, so the operator
+    can see the two legs agree."""
+    snap = _published_after_push(
+        tmp_path, {"wan_profile": "wan1", "location_level": 2}, 2)
+    assert snap["location_level"] == 2
+
+
+def test_run_publishes_the_location_level_clamped_to_its_own_table(tmp_path):
+    """What is published is what the leg APPLIES, not what was asked for.
+
+    run_once clamps the pushed level to the table it resolves; if the two boxes
+    ever disagree about a profile's table, echoing the raw request would have
+    the client's card claim a rung the relay is not holding. The cellular table
+    is 4 rows, so a pushed level 4 is applied — and must be reported — as 3."""
+    snap = _published_after_push(
+        tmp_path, {"wan_profile": "wan1", "location_level": 4}, 3)
+    assert snap["location_level"] == 3
+
+
+def test_run_applies_a_location_level_pushed_without_a_profile(tmp_path):
+    """The level does not depend on a profile: it is clamped to whatever table
+    the relay resolves, which is the default table when nothing is pushed. A
+    client that sends only a level must still lift this leg — otherwise the
+    floor is silently inert on every deployment with no wan_profiles."""
+    snap = _published_after_push(tmp_path, {"location_level": 3}, 3)
+    assert snap["location_level"] == 3
+    # Zero loss, so level 3 on the default table is the floor's work alone.
+    assert snap["ratio"] == F.level_to_ratio(3, F.DEFAULT_LOSS_TABLE) == "8:6"
+    assert snap["profile"] == "default"
+
+
+def test_a_lone_location_level_survives_without_a_profile():
+    """The twin of test_lone_signal_floor_accepted_but_inert_by_design, and
+    deliberately the opposite ruling: the signal floor's rung is looked up IN
+    the profile's table, so it means nothing without one, while the location
+    level is an index the resolved table merely clamps."""
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+    try:
+        host, port = httpd.server_address[:2]
+        body = json.dumps({"location_level": 3}).encode()
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == (None, False, 3)
+        # Still expires with the link it rode in on.
+        assert st.get_pushed_link(now=time.time() + 500.0, stale_after_s=90.0) \
+            == (None, False, 0)
+    finally:
+        httpd.shutdown()
+
+
+def test_a_link_policy_update_without_a_level_clears_it():
+    """A client rolled back to a build that knows nothing of location_level
+    keeps pushing wan_profile/signal_floor, which refreshes the pushed link's
+    timestamp. Preserving the last level there would pin a location floor
+    forever — the floor must be dropped by the very same update instead."""
+    st = U.FecState(profile_names=frozenset({"default", "wan1"}))
+    httpd = U.start_fec_http("127.0.0.1:0", st)
+    assert httpd is not None
+
+    def post(obj):
+        req = urllib.request.Request(
+            f"http://{host}:{port}/fec", data=json.dumps(obj).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+
+    try:
+        host, port = httpd.server_address[:2]
+        assert post({"wan_profile": "wan1", "location_level": 3}) == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == ("wan1", False, 3)
+        # The legacy payload: profile and signal floor, no level.
+        assert post({"wan_profile": "default", "signal_floor": False}) == 200
+        assert st.get_pushed_link(now=time.time(), stale_after_s=90.0) \
+            == ("default", False, 0)
     finally:
         httpd.shutdown()
