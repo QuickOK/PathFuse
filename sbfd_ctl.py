@@ -2341,10 +2341,20 @@ def _zone_number(value):
     bool is a subclass of int, and json.loads accepts the barewords NaN and
     Infinity. NaN in particular fails EVERY comparison, so a range check alone
     passes it straight through — which is how this file has twice let a
-    non-finite number reach something that only bounds-checked it."""
+    non-finite number reach something that only bounds-checked it.
+
+    OverflowError because JSON integers are unbounded and math.isfinite()
+    raises on one past float range. do_POST catches ZoneLimitError and OSError
+    and nothing else, so `"lat": 10**400` used to leave the endpoint as a 500
+    with a traceback rather than the 400 every other unusable coordinate
+    gets."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) else None
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        return None
+    return float(value) if finite else None
 
 
 def validate_zone_payload(payload, wan_names, table_len,

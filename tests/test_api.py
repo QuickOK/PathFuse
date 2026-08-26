@@ -2102,3 +2102,28 @@ def test_api_post_location_zone_keeps_the_wan_scope_it_is_not_sent(cfg, tmp_path
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_api_post_location_zone_400_on_a_number_too_large_for_a_float(
+        cfg, tmp_path):
+    """math.isfinite() raises OverflowError on a JSON integer past float
+    range, and do_POST catches only ZoneLimitError and OSError -- so this
+    came back a 500 with a traceback in the journal instead of the 400 every
+    other unusable coordinate gets. Nothing is written either way."""
+    zones_path = _zone_cfg(cfg, tmp_path)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            _post_zone(port, {"lat": 10 ** 400, "lon": -73.5,
+                              "radius_m": 300, "level": 3})
+        assert ei.value.code == 400
+        assert not Path(zones_path).exists()
+        # And the endpoint is still serving afterwards.
+        status, body = _post_zone(port, {"lat": 41.1, "lon": -73.5,
+                                         "radius_m": 300, "level": 3})
+        assert status == 200 and [z["id"] for z in body["zones"]] == ["z1"]
+    finally:
+        stop.set()
+        httpd.shutdown()

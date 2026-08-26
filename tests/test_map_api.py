@@ -1250,3 +1250,21 @@ def test_stored_zone_wans_reads_only_a_usable_list(tmp_path):
     assert M.stored_zone_wans(str(p), "z5") is None
     assert M.stored_zone_wans(str(p), "z9") is None
     assert M.stored_zone_wans(str(tmp_path / "absent.json"), "z1") is None
+
+
+def test_zone_number_refuses_an_integer_too_large_for_a_float():
+    """JSON integers are unbounded and math.isfinite() raises OverflowError on
+    one past float range. Round 4 closed that in _map_zone_rows and in the
+    daemon's validator but not here, so `"lat": 10**400` left the endpoint as
+    a 500 instead of the 400 every other bad coordinate gets."""
+    big = 10 ** 400
+    assert M._zone_number(big) is None
+    assert M._zone_number(-big) is None
+    assert M._zone_number(float("inf")) is None
+    assert M._zone_number(41.1) == 41.1
+    ok, _z, err = M.validate_zone_payload(_zone_payload(lat=big), _WANS, 5)
+    assert not ok and "lat" in err
+    for key in ("lon", "radius_m"):
+        ok, _z, err = M.validate_zone_payload(
+            _zone_payload(**{key: big}), _WANS, 5)
+        assert not ok and key in err
