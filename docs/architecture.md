@@ -78,8 +78,10 @@ never forces master/backup). See [`environmental.md`](environmental.md).
 - **Modes:** `full` (redundancy — all UP links) · `master_backup` (one master, fail over).
 - **Master policies:** `static_primary` (pin the configured primary link) · `dynamic` (pick the best
   link by EWMA RTT/loss with hysteresis to avoid flapping) · `static_configured` (operator picks).
-- **Egress modes:** `relay_vpn` (out via an upstream VPN/overlay at the relay) · `relay_direct` (out
-  the relay's own WAN) · `local_direct` (out the local link, bypassing the relay).
+- **Egress modes:** `relay_vpn` (out via an upstream VPN/overlay at the relay) · `relay_backbone`
+  (out via a cloud-backbone exit behind the relay, which hands traffic off near each destination) ·
+  `relay_direct` (out the relay's own WAN) · `local_direct` (out the local link, bypassing the relay).
+  The relay enacts the mode with `deploy/relay/egress/relay-egress-watchdog`.
 
 ## Adaptive FEC
 

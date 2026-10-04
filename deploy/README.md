@@ -18,8 +18,9 @@ does not ship or manage them):
   docs (its `engarde.yml` and its service). This kit does **not** ship engarde unit files.
 - a **management overlay** (any VPN/mesh, e.g. a WireGuard mesh) giving the relay a stable
   address the client can reach for the `/state` (9275) and `/fec` (9276) control endpoints;
-- an **egress VPN/overlay at the relay** if you want `relay_vpn` egress mode (otherwise use
-  `relay_direct`).
+- an **egress VPN/overlay at the relay** if you want `relay_vpn` egress mode, and/or a
+  **cloud-backbone exit** for `relay_backbone` (otherwise use `relay_direct`). The relay-side
+  actuator for both is in `deploy/relay/egress/`.
 
 ## 1. Install the PathFuse code
 Copy the daemons to the install paths from `values.json` (`paths.*`):

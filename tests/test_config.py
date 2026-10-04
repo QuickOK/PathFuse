@@ -138,7 +138,7 @@ def test_load_config_dynamic_policy_defaults_when_absent(tmp_path: Path):
     assert cfg.policy.dynamic_loss_margin_pct == 1.0
 
 
-@pytest.mark.parametrize("mode", ["relay_vpn", "relay_direct", "local_direct"])
+@pytest.mark.parametrize("mode", ["relay_vpn", "relay_backbone", "relay_direct", "local_direct"])
 def test_load_config_egress_block_parses_all_valid_modes(tmp_path: Path, mode):
     cfg_raw = dict(SAMPLE)
     cfg_raw["egress"] = {"engarde_table": "engarde_v2", "wg_iface": "wg1", "default_mode": mode}

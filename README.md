@@ -76,7 +76,8 @@ the signal diagram all render whatever links you define.
 **Failover policies:** `static_primary` (pin the configured default link),
 `dynamic` (pick the best link by RTT/loss with hysteresis), `static_configured`
 (operator picks). **Egress modes:** `relay_vpn` (egress via an upstream VPN/overlay at
-the relay), `relay_direct` (out the relay's own WAN), `local_direct` (out the local link,
+the relay), `relay_backbone` (egress via a cloud-backbone exit behind the relay),
+`relay_direct` (out the relay's own WAN), `local_direct` (out the local link,
 bypassing the relay).
 
 ## Requirements

@@ -24,7 +24,9 @@ import notify
 
 VALID_MODES = {"full", "master_backup"}
 VALID_POLICIES = {"static_primary", "dynamic", "static_configured"}
-VALID_EGRESS_MODES = {"relay_vpn", "relay_direct", "local_direct"}
+VALID_EGRESS_MODES = {"relay_vpn", "relay_backbone", "relay_direct", "local_direct"}
+# Modes whose client traffic rides the tunnel to the relay; the relay picks the exit.
+RELAY_EGRESS_MODES = {"relay_vpn", "relay_backbone", "relay_direct"}
 
 
 @dataclass
@@ -1148,11 +1150,11 @@ def compute_engarde_table_action(egress_mode: str,
     Returns None | {"op": "replace", "via": str|None, "dev": str, "table": str}.
     Returns None when current state already matches desired (idempotent).
 
-    For relay_vpn/relay_direct: desired = `default dev <wg_iface>` (today's state).
+    For the relay modes (relay_vpn/relay_backbone/relay_direct): desired = `default dev <wg_iface>`.
     For local_direct: desired = `default via <master_gw> dev <master_iface>`.
     Refuses to act on local_direct when master_gw is None (would black-hole).
     """
-    if egress_mode in ("relay_vpn", "relay_direct"):
+    if egress_mode in RELAY_EGRESS_MODES:
         desired = {"via": None, "dev": cfg.wg_iface}
     elif egress_mode == "local_direct":
         if master_gw is None or master_iface is None:
@@ -3903,6 +3905,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             "master_policy": policy,
             "master_wan": master_wan,
             "egress_mode": egress_mode,
+            # The UI moves its "default" tag to this mode.
+            "egress_default_mode": cfg.egress.default_mode,
             # The UI renders its persist checkbox from this. Omit it and a
             # freshly loaded page shows the box unchecked, so the next Apply
             # posts persist=false and deletes the persisted overlay.

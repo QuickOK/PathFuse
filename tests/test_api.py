@@ -2241,3 +2241,8 @@ def test_api_post_location_zone_400_on_a_number_too_large_for_a_float(
     finally:
         stop.set()
         httpd.shutdown()
+
+
+def test_validate_runtime_payload_accepts_relay_backbone():
+    ok, err = M.validate_runtime_payload({"egress_mode": "relay_backbone"}, wan_names={"wan1", "wan2"})
+    assert ok and err is None

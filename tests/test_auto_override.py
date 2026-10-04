@@ -894,3 +894,20 @@ def test_load_auto_override_allows_small_clock_skew(tmp_path):
                     force_full=True)
     ao = M.load_auto_override(c, 1001.0)
     assert ao is not None and ao.force_full is True
+
+
+def test_published_snapshot_carries_egress_default_mode(tmp_path, monkeypatch):
+    import threading
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_direct"),
+    )
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_default_mode"] == "relay_direct"
+    assert snap["egress_mode"] == "relay_direct"
