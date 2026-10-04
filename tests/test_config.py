@@ -478,3 +478,34 @@ def test_location_fec_enabled_defaults_to_true_when_absent(tmp_path: Path):
     p = tmp_path / "c.json"
     p.write_text(json.dumps(raw))
     assert sbfd_ctl.load_config(str(p)).location.enabled is True
+
+
+def test_load_config_egress_observe_parsed(tmp_path: Path):
+    cfg_raw = dict(SAMPLE)
+    cfg_raw["egress"] = {"default_mode": "relay_direct", "observe": {
+        "url": "https://probe.example.net/trace", "interval_s": 60,
+        "exits": [{"mode": "relay_backbone", "field": "ip", "values": ["203.0.113.10"]}]}}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(cfg_raw))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.egress.observe.url == "https://probe.example.net/trace"
+    assert cfg.egress.observe.interval_s == 60.0
+    assert cfg.egress.observe.exits[0].mode == "relay_backbone"
+
+
+def test_load_config_egress_observe_off_without_url(tmp_path: Path):
+    cfg_raw = dict(SAMPLE)
+    cfg_raw["egress"] = {"observe": {"url": ""}}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(cfg_raw))
+    assert sbfd_ctl.load_config(str(p)).egress.observe is None
+
+
+def test_load_config_egress_observe_rejects_bad_exit_mode(tmp_path: Path):
+    cfg_raw = dict(SAMPLE)
+    cfg_raw["egress"] = {"observe": {"url": "https://x", "exits": [
+        {"mode": "banana", "field": "ip", "values": ["203.0.113.10"]}]}}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(cfg_raw))
+    with pytest.raises(ValueError, match="exits"):
+        sbfd_ctl.load_config(str(p))

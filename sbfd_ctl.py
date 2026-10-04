@@ -19,6 +19,7 @@ import fec_control
 import fec_history
 import fec_report
 import notify
+import egress_observer
 
 # -- Configuration -----------------------------------------------------------
 
@@ -62,6 +63,8 @@ class EgressCfg:
     engarde_table: str = "engarde"
     wg_iface: str = "wg0"
     default_mode: str = "relay_vpn"
+    # Actual-exit check (egress_observer.ObserveCfg), or None when it is off.
+    observe: object = None
 
 
 @dataclass
@@ -1379,6 +1382,7 @@ def load_config(path: str) -> Config:
             engarde_table=str(eraw.get("engarde_table", "engarde")),
             wg_iface=str(eraw.get("wg_iface", "wg0")),
             default_mode=str(eraw.get("default_mode", "relay_vpn")),
+            observe=egress_observer.parse_observe_cfg(eraw.get("observe"), VALID_EGRESS_MODES),
         )
 
         raw_fec = raw.get("fec")

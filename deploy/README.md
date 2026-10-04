@@ -39,6 +39,7 @@ sudo install -D -m0644 tile_store.py      /opt/sbfd-ctl/tile_store.py    # requi
 sudo install -D -m0644 station_tracker.py /opt/sbfd-ctl/station_tracker.py # required by sbfd-ctl's map, environ_ctl and location_fec
 sudo install -d /opt/sbfd-ctl/ui && sudo install -m0644 ui/* /opt/sbfd-ctl/ui/
 sudo install -D -m0644 notify.py             /opt/sbfd-ctl/notify.py             # required by sbfd-ctl and hotspot_watchdog
+sudo install -D -m0644 egress_observer.py    /opt/sbfd-ctl/egress_observer.py    # required by sbfd-ctl (actual-exit check)
 sudo install -D -m0644 netgear_api.py        /opt/sbfd-ctl/netgear_api.py        # required by hotspot_watchdog and cell_telemetry
 sudo install -D -m0755 hotspot_watchdog.py   /opt/sbfd-ctl/hotspot_watchdog.py   # optional: wan1 auto-reboot watchdog
 sudo install -D -m0755 cell_telemetry.py     /opt/sbfd-ctl/cell_telemetry.py     # optional: wan1 modem signal telemetry (feeds the FEC signal floor)
