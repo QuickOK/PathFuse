@@ -35,6 +35,7 @@ class Clock:
 def test_parse_observe_cfg_defaults_and_rules():
     c = E.parse_observe_cfg({"url": "https://probe.example.net/trace", "exits": [
         {"mode": "relay_backbone", "field": "ip", "values": ["203.0.113.10"]}]}, MODES)
+    assert c is not None
     assert c.url == "https://probe.example.net/trace" and c.iface == "wg0"
     assert (c.interval_s, c.timeout_s, c.mismatch_checks) == (120.0, 8.0, 2)
     assert c.exits == (E.ExitRule("relay_backbone", "ip", ("203.0.113.10",)),)
@@ -378,7 +379,8 @@ def test_thread_survives_a_fetch_that_raises():
     try:
         # a second check proves the first raise did not end the thread
         assert _wait_for(lambda: len(calls) >= 2 and o.snapshot()["status"] == "error")
-        assert o._thread.is_alive() and o.snapshot()["error"] == "fetch error: boom"
+        assert o._thread is not None and o._thread.is_alive()
+        assert o.snapshot()["error"] == "fetch error: boom"
     finally:
         exited = _stop_and_join(o, stop)
     assert exited
@@ -399,7 +401,7 @@ def test_start_is_a_no_op_while_the_thread_is_alive():
     stop2 = threading.Event()
     o.start(stop2)                                           # the first thread is gone: this one starts
     try:
-        assert o._thread is not first and o._thread.is_alive()
+        assert o._thread is not None and o._thread is not first and o._thread.is_alive()
     finally:
         exited = _stop_and_join(o, stop2)
     assert exited

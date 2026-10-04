@@ -488,6 +488,7 @@ def test_load_config_egress_observe_parsed(tmp_path: Path):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps(cfg_raw))
     cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.egress.observe is not None
     assert cfg.egress.observe.url == "https://probe.example.net/trace"
     assert cfg.egress.observe.interval_s == 60.0
     assert cfg.egress.observe.exits[0].mode == "relay_backbone"

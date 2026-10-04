@@ -1,0 +1,127 @@
+{
+  "cell_telemetry.py": {
+    "mypy": 7,
+    "pyright": 6
+  },
+  "environ_ctl.py": {
+    "mypy": 10,
+    "pyright": 11
+  },
+  "fec_control.py": {
+    "mypy": 1
+  },
+  "fec_history.py": {
+    "mypy": 1
+  },
+  "fec_report.py": {
+    "mypy": 2,
+    "pyright": 5
+  },
+  "hotspot_watchdog.py": {
+    "pyright": 1
+  },
+  "location_fec.py": {
+    "mypy": 3,
+    "pyright": 2
+  },
+  "netgear_api.py": {
+    "pyright": 1
+  },
+  "notify.py": {
+    "mypy": 14
+  },
+  "sbfd.py": {
+    "mypy": 11,
+    "pyright": 3
+  },
+  "sbfd_ctl.py": {
+    "mypy": 22,
+    "pyright": 17
+  },
+  "tests/test_api.py": {
+    "mypy": 15,
+    "pyright": 10
+  },
+  "tests/test_auto_override.py": {
+    "mypy": 25,
+    "pyright": 60
+  },
+  "tests/test_cell_telemetry.py": {
+    "pyright": 4
+  },
+  "tests/test_config.py": {
+    "mypy": 43,
+    "pyright": 32
+  },
+  "tests/test_engarde_table.py": {
+    "mypy": 1
+  },
+  "tests/test_environ.py": {
+    "mypy": 8,
+    "pyright": 8
+  },
+  "tests/test_fec_config.py": {
+    "mypy": 20,
+    "pyright": 18
+  },
+  "tests/test_fec_decision_integration.py": {
+    "pyright": 1
+  },
+  "tests/test_fec_directions.py": {
+    "mypy": 1
+  },
+  "tests/test_fec_report.py": {
+    "pyright": 28
+  },
+  "tests/test_hotspot_watchdog.py": {
+    "mypy": 6,
+    "pyright": 17
+  },
+  "tests/test_location_fec.py": {
+    "pyright": 5
+  },
+  "tests/test_maintenance_reboot.py": {
+    "mypy": 24,
+    "pyright": 3
+  },
+  "tests/test_map_api.py": {
+    "mypy": 2,
+    "pyright": 17
+  },
+  "tests/test_notify.py": {
+    "mypy": 1,
+    "pyright": 1
+  },
+  "tests/test_relay_egress_watchdog.py": {
+    "mypy": 1,
+    "pyright": 1
+  },
+  "tests/test_render.py": {
+    "mypy": 3,
+    "pyright": 3
+  },
+  "tests/test_sbfd_session.py": {
+    "pyright": 1
+  },
+  "tests/test_station_tracker.py": {
+    "pyright": 2
+  },
+  "tests/test_udpspeeder_fec.py": {
+    "pyright": 22
+  },
+  "tile_store.py": {
+    "mypy": 5,
+    "pyright": 8
+  },
+  "tools/simulate_dynamic.py": {
+    "mypy": 3,
+    "pyright": 3
+  },
+  "udpspeeder_fec.py": {
+    "pyright": 4
+  },
+  "ui-preview.py": {
+    "mypy": 2,
+    "pyright": 2
+  }
+}

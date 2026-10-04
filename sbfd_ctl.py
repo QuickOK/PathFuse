@@ -63,8 +63,8 @@ class EgressCfg:
     engarde_table: str = "engarde"
     wg_iface: str = "wg0"
     default_mode: str = "relay_vpn"
-    # Actual-exit check (egress_observer.ObserveCfg), or None when it is off.
-    observe: object = None
+    # Actual-exit check, or None when it is off.
+    observe: Optional[egress_observer.ObserveCfg] = None
 
 
 @dataclass

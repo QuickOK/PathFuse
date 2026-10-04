@@ -1,3 +1,5 @@
+from typing import Any, Optional
+
 import pytest
 import notify
 
@@ -216,7 +218,7 @@ def test_notifier_survives_failing_command(tmp_path):
 
 
 def obs(**kw):
-    base = dict(
+    base: dict[str, Any] = dict(
         wan_states={"wan1": "UP", "wan2": "UP"},
         wan_labels={"wan1": "Cellular", "wan2": "Satellite"},
         mode="master_backup",
@@ -888,7 +890,8 @@ def test_maintenance_still_wins_over_the_switch_hold():
 # -- egress fallback ----------------------------------------------------------
 
 
-def _eg(status, selected="relay_backbone", observed="relay_direct", ip="198.51.100.20"):
+def _eg(status: str, selected: str = "relay_backbone", observed: Optional[str] = "relay_direct",
+        ip: Optional[str] = "198.51.100.20") -> dict:
     return {"selected": selected, "observed": observed, "ip": ip, "status": status,
             "since": 1.0, "checked_at": 1.0, "error": None}
 

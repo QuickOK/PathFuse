@@ -168,7 +168,7 @@ def _validate_upstream(name, raw) -> dict:
 
 
 def _validate_exempt(raw) -> dict:
-    empty = {"via": None, "dev": None, "prefixes": []}
+    empty: dict = {"via": None, "dev": None, "prefixes": []}
     if raw is None:
         return empty
     if not isinstance(raw, dict):
@@ -542,7 +542,9 @@ def with_defaults(state: dict, cfg: dict) -> dict:
     if not isinstance(s.get("desired_mode_fetch_fail"), int) or isinstance(s.get("desired_mode_fetch_fail"), bool):
         s["desired_mode_fetch_fail"] = 0
 
-    old = state.get("upstreams") if isinstance(state.get("upstreams"), dict) else {}
+    old = state.get("upstreams")
+    if not isinstance(old, dict):
+        old = {}
     s["upstreams"] = {}
     for name in cfg["upstreams"]:
         h = new_health()

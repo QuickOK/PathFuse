@@ -109,7 +109,7 @@ OK_VPN, OK_BB, FAIL = (True, "vpn=on"), (True, "ip=203.0.113.10"), (False, "time
 
 
 def run_tick(c, state, now, ip, probes, mode="relay_backbone", fetch_err=None):
-    lines = []
+    lines: list[str] = []
 
     def fetch(url, timeout):
         return (None, None, fetch_err) if fetch_err else (mode, "wan2", None)
@@ -419,7 +419,7 @@ def test_at_most_one_preferred_route_across_mode_and_health_changes():
            ("relay_backbone", OK_VPN, FAIL), ("relay_vpn", OK_VPN, FAIL),
            ("relay_direct", OK_VPN, OK_BB), ("relay_backbone", FAIL, OK_BB),
            ("relay_backbone", OK_VPN, OK_BB), ("local_direct", OK_VPN, OK_BB)]
-    state = {}
+    state: dict = {}
     for i, (mode, pv, pb) in enumerate(seq):
         state, rc, _ = run_tick(c, state, 100.0 + i, ip, {"vpn": pv, "backbone": pb}, mode=mode)
         assert rc == 0

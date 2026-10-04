@@ -2264,6 +2264,7 @@ def test_client_egress_modes_match_the_relay_actuator():
     path = Path(__file__).resolve().parent.parent / "deploy/relay/egress/relay-egress-watchdog"
     loader = SourceFileLoader("relay_egress_watchdog", str(path))
     spec = importlib.util.spec_from_loader("relay_egress_watchdog", loader)
+    assert spec is not None
     relay = importlib.util.module_from_spec(spec)
     loader.exec_module(relay)
     assert relay.VALID_DESIRED_MODES == M.VALID_EGRESS_MODES

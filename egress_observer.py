@@ -26,7 +26,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
 _IP_MAX_CHARS = 64   # the `ip` text is stored as the page sent it, so it is capped
 
@@ -108,7 +108,7 @@ def parse_observe_cfg(raw, valid_modes) -> Optional[ObserveCfg]:
                       mismatch_checks=checks, exits=tuple(rules))
 
 
-def parse_trace(body: str) -> dict:
+def parse_trace(body: Optional[str]) -> dict:
     """`key=value` lines into a dict; other lines are ignored."""
     out = {}
     for line in (body or "").splitlines():
@@ -167,13 +167,13 @@ class ExitTracker:
         self.mismatch_checks = max(1, int(mismatch_checks))
         self._clock = clock
         self._count = 0
-        self.selected = None
-        self.observed = None
-        self.ip = None
-        self.error = None
+        self.selected: Optional[str] = None
+        self.observed: Optional[str] = None
+        self.ip: Optional[str] = None
+        self.error: Optional[str] = None
         self.status = "checking"
         self.since = clock()
-        self.checked_at = None
+        self.checked_at: Optional[float] = None
 
     def _set(self, status: str, now: float) -> None:
         if status != self.status:
@@ -217,6 +217,14 @@ class ExitTracker:
                 "checked_at": self.checked_at, "error": self.error}
 
 
+class StopSignal(Protocol):
+    """What the observer thread needs from its stop flag (a threading.Event has both)."""
+
+    def is_set(self) -> bool: ...
+
+    def wait(self, timeout: Optional[float] = None) -> bool: ...
+
+
 class EgressObserver:
     """Runs the check on a daemon thread every `interval_s`, and `settle_s` after
     the selected mode changes. The relay applies a new mode on its next 10 s tick,
@@ -232,7 +240,7 @@ class EgressObserver:
         self._lock = threading.Lock()
         self._kick = threading.Event()
         self._tracker = ExitTracker(cfg.mismatch_checks, clock=clock)
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
 
     def set_selected(self, mode: str) -> None:
         with self._lock:
@@ -268,7 +276,7 @@ class EgressObserver:
         with self._lock:
             return self._tracker.snapshot()
 
-    def _run(self, stop: threading.Event) -> None:
+    def _run(self, stop: StopSignal) -> None:
         while not stop.is_set():
             # A pending kick means the mode changed: let the relay apply it before
             # checking. A change that lands during the settle earns another full one.
