@@ -969,3 +969,81 @@ def test_published_snapshot_egress_observed_is_null_when_off(tmp_path, monkeypat
     M.run_controller(cfg, stop_event=stop)
     snap = json.loads(Path(cfg.published_state).read_text())
     assert snap["egress_observed"] is None
+
+
+def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path, monkeypatch):
+    # run_controller with notifications on. The tests above stop short of two wiring
+    # points: the observer runs on the controller's own stop event, and every tick's
+    # egress_observed reaches the detector, so a persistent fallback pages once and
+    # its end pages once.
+    import egress_observer
+    import notify
+    import threading
+    script = ["checking", "pending", "mismatch", "mismatch", "error", "match", "match"]
+    started, published, pages = [], [], []
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            self.selected = None
+            self.n = 0
+
+        def start(self, stop):
+            started.append(stop)
+
+        def set_selected(self, mode):
+            self.selected = mode
+
+        def snapshot(self):
+            status = script[min(self.n, len(script) - 1)]
+            self.n += 1
+            return {"selected": self.selected,
+                    "observed": "relay_backbone" if status == "match" else "relay_direct",
+                    "ip": "198.51.100.20", "status": status, "since": 1.0,
+                    "checked_at": 2.0, "error": None}
+
+    class StubNotifier:
+        def __init__(self, topic, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def notify(self, ev):
+            pages.append(ev)
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    monkeypatch.setattr(notify, "Notifier", StubNotifier)
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=egress_observer.ObserveCfg(
+            url="https://probe.example.net/trace")),
+        notifications=notify.NotifyCfg(topic="t"),
+    )
+    stop = threading.Event()
+    monkeypatch.setattr(stop, "wait", lambda timeout=None: stop.is_set())   # no sleeping between ticks
+    real_publish = M.publish_state
+    _stub_controller_io(monkeypatch, stop)
+
+    def publish_the_script(c, snap):
+        # _stub_controller_io stops after one tick; this runs one tick per scripted status.
+        real_publish(c, snap)
+        published.append(snap["egress_observed"]["status"])
+        if len(published) == len(script):
+            stop.set()
+
+    monkeypatch.setattr(M, "publish_state", publish_the_script)
+    M.run_controller(cfg, stop_event=stop)
+
+    assert len(started) == 1 and started[0] is stop         # the controller's own stop event
+    assert published == script                              # the whole script ran, one snapshot a tick
+    assert [e.kind for e in pages] == ["started", "egress", "egress"]
+    fallback, restored = pages[1], pages[2]
+    assert "fallback" in fallback.title.lower() and fallback.priority == "high"
+    assert "relay Backbone" in fallback.message and "198.51.100.20" in fallback.message
+    assert "restored" in restored.title.lower() and restored.priority == "default"

@@ -573,8 +573,10 @@ class EventDetector:
     def _egress_events(self, obs):
         """Page once when the observed exit has disagreed with the selected mode
         for the configured number of checks, and once when it agrees again. A
-        failed check is not a recovery. local_direct (skipped) ends an alert
-        silently, because the operator changed the mode."""
+        failed check is not a recovery. A change of the selected mode ends an
+        alert silently: the observer reports `checking` right after the change,
+        and `skipped` while local_direct is selected. A fallback on the new mode
+        then pages afresh, and a match under it is not announced as a restore."""
         e = obs.egress
         if not e:
             return []
@@ -590,6 +592,6 @@ class EventDetector:
             return [Event("egress", "🧭 Egress restored",
                           f"actual exit matches {egress_label(e.get('selected'))} again",
                           "default")]
-        if status == "skipped":
+        if status in ("skipped", "checking"):
             self._egress_alerted = False
         return []
