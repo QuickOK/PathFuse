@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""relay-egress-deadman: fail open when the relay egress actuator fails.
+
+systemd runs this (OnFailure=) when a relay-egress-watchdog tick crashes, times
+out or rejects its config. It deletes every preferred default (metric 100
+unless the config says otherwise) from the egress table, so the client's
+traffic falls through to the relay's own WAN default. It is independent of the
+main script on purpose: it must work while that script is broken.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def table_and_metric(config_path):
+    """(table, metric) from the config; on any read error the table comes from
+    $EGRESS_TABLE (None if unset) and the metric is 100."""
+    try:
+        with open(config_path) as f:
+            raw = json.load(f)
+        return str(raw["table"]), int(raw.get("preferred_metric", 100))
+    except Exception:
+        return os.environ.get("EGRESS_TABLE") or None, 100
+
+
+def main(argv=None, runner=subprocess.run) -> int:
+    ap = argparse.ArgumentParser(description="Delete every preferred egress default (fail open).")
+    ap.add_argument("--config", default="/etc/relay-egress-watchdog/config.json")
+    args = ap.parse_args(argv)
+    table, metric = table_and_metric(args.config)
+    if not table:
+        print("relay-egress-deadman: no table (config unreadable and EGRESS_TABLE unset)",
+              file=sys.stderr, flush=True)
+        return 1
+    removed = 0
+    for _ in range(16):
+        r = runner(["ip", "route", "del", "default", "metric", str(metric), "table", table],
+                   capture_output=True, text=True)
+        if r.returncode != 0:
+            break
+        removed += 1
+    print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
+          f"{table} (fail open)", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

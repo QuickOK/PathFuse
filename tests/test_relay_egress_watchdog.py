@@ -646,3 +646,58 @@ def test_effective_mode_within_grace_uses_desired():
 
 def test_effective_mode_past_grace_falls_back_to_default():
     assert M.effective_mode_for("relay_backbone", 61.0, 60.0, "relay_direct") == "relay_direct"
+
+
+# --- dead-man switch, units, example config -------------------------------------------
+
+D = _load("relay_egress_deadman", "relay-egress-deadman")
+
+
+def test_deadman_deletes_every_preferred_default(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls, left = [], [2]
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if left[0]:
+            left[0] -= 1
+            return R()
+        return R(rc=2, err="No such process")
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "egress"]] * 3
+
+
+def test_deadman_falls_back_to_env_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("EGRESS_TABLE", "egress2")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2)
+
+    assert D.main(["--config", str(tmp_path / "missing.json")], runner=run) == 0
+    assert calls[0][-1] == "egress2"
+
+
+def test_deadman_without_any_table_exits_1(tmp_path, monkeypatch):
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    assert D.main(["--config", str(tmp_path / "missing.json")], runner=lambda *a, **k: R()) == 1
+
+
+def test_example_config_validates():
+    raw = json.loads((_ROOT / "config/relay-egress.example.json").read_text())
+    c = M.validate_config(raw)
+    assert c["client"]["default_mode"] == "relay_direct"
+    assert set(c["mode_upstreams"]) == {"relay_vpn", "relay_backbone"}
+
+
+def test_units_wire_the_deadman_and_the_paths():
+    unit = (_DIR / "systemd/relay-egress-watchdog.service").read_text()
+    assert "OnFailure=relay-egress-deadman.service" in unit
+    assert "ExecStart=/usr/local/sbin/relay-egress-watchdog --config " in unit
+    timer = (_DIR / "systemd/relay-egress-watchdog.timer").read_text()
+    assert "OnUnitActiveSec=10" in timer
+    dead = (_DIR / "systemd/relay-egress-deadman.service").read_text()
+    assert "ExecStart=/usr/local/sbin/relay-egress-deadman --config " in dead

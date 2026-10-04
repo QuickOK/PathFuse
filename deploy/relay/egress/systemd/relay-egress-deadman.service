@@ -1,0 +1,7 @@
+[Unit]
+Description=Relay egress dead-man switch (fail open to the relay WAN)
+Documentation=file:///usr/local/sbin/relay-egress-deadman
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/relay-egress-deadman --config /etc/relay-egress-watchdog/config.json
