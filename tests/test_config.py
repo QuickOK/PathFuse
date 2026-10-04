@@ -509,3 +509,13 @@ def test_load_config_egress_observe_rejects_bad_exit_mode(tmp_path: Path):
     p.write_text(json.dumps(cfg_raw))
     with pytest.raises(ValueError, match="exits"):
         sbfd_ctl.load_config(str(p))
+
+
+def test_load_config_egress_observe_requires_an_exit_rule(tmp_path: Path):
+    # A url with no rule can never name an exit: every check would read as a mismatch.
+    cfg_raw = dict(SAMPLE)
+    cfg_raw["egress"] = {"observe": {"url": "https://probe.example.net/trace"}}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(cfg_raw))
+    with pytest.raises(ValueError, match="exits"):
+        sbfd_ctl.load_config(str(p))
