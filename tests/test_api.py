@@ -2246,3 +2246,24 @@ def test_api_post_location_zone_400_on_a_number_too_large_for_a_float(
 def test_validate_runtime_payload_accepts_relay_backbone():
     ok, err = M.validate_runtime_payload({"egress_mode": "relay_backbone"}, wan_names={"wan1", "wan2"})
     assert ok and err is None
+
+
+def test_relay_egress_modes_are_every_valid_mode_but_local_direct():
+    # compute_engarde_table_action steers RELAY_EGRESS_MODES into the tunnel and
+    # local_direct out a WAN gateway; any other mode gets no action at all. A mode
+    # added to VALID_EGRESS_MODES alone would pass validation and then do nothing.
+    assert M.RELAY_EGRESS_MODES == M.VALID_EGRESS_MODES - {"local_direct"}
+
+
+def test_client_egress_modes_match_the_relay_actuator():
+    # The relay rejects a mode it does not know as `invalid mode` on every poll and
+    # silently stays on its default, so both ends must name exactly the same modes.
+    # The actuator ships without a .py extension, so load it by path.
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    path = Path(__file__).resolve().parent.parent / "deploy/relay/egress/relay-egress-watchdog"
+    loader = SourceFileLoader("relay_egress_watchdog", str(path))
+    spec = importlib.util.spec_from_loader("relay_egress_watchdog", loader)
+    relay = importlib.util.module_from_spec(spec)
+    loader.exec_module(relay)
+    assert relay.VALID_DESIRED_MODES == M.VALID_EGRESS_MODES

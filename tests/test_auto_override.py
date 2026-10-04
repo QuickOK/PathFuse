@@ -897,6 +897,9 @@ def test_load_auto_override_allows_small_clock_skew(tmp_path):
 
 
 def test_published_snapshot_carries_egress_default_mode(tmp_path, monkeypatch):
+    # The UI moves its "default" tag to egress_default_mode, so it must be the
+    # CONFIGURED default and not the mode in effect. With no operator overlay the
+    # two are equal by construction, so seed one that differs from the config.
     import threading
     cfg = base_cfg(
         runtime_state=str(tmp_path / "runtime.json"),
@@ -905,9 +908,11 @@ def test_published_snapshot_carries_egress_default_mode(tmp_path, monkeypatch):
         sbfd_local_state=str(tmp_path / "sbfd.json"),
         egress=M.EgressCfg(default_mode="relay_direct"),
     )
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(
+        egress_mode="relay_backbone", set_by="ui", set_ts=1.0))
     stop = threading.Event()
     _stub_controller_io(monkeypatch, stop)
     M.run_controller(cfg, stop_event=stop)
     snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_mode"] == "relay_backbone"
     assert snap["egress_default_mode"] == "relay_direct"
-    assert snap["egress_mode"] == "relay_direct"
