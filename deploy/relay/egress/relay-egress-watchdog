@@ -162,13 +162,13 @@ def _validate_exempt(raw) -> dict:
     for p in prefixes:
         try:
             net = ipaddress.IPv4Network(p, strict=True)
-            if net.prefixlen == 0:
-                raise ConfigError(f"exempt.prefixes: {p!r}: prefix length 0 would route everything")
-            norm.append(str(net))
         except ipaddress.AddressValueError as e:
             raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
         except (ValueError, TypeError) as e:
             raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
+        if net.prefixlen == 0:
+            raise ConfigError(f"exempt.prefixes: {p!r}: prefix length 0 would route everything")
+        norm.append(str(net))
     if not norm:
         return empty
     return {"via": _ipv4("exempt.via", raw.get("via")),
@@ -498,12 +498,40 @@ def with_defaults(state: dict, cfg: dict) -> dict:
          "desired_mode_fetch_fail": 0, "effective_mode": None, "target": None,
          "route": None, "last_route_change": 0.0, "last_check": 0.0}
     s.update({k: v for k, v in state.items() if k != "upstreams"})
+
+    # Validate and reset bad scalar values from hand-edited state files
+    if s.get("desired_mode") is not None and not isinstance(s["desired_mode"], str):
+        s["desired_mode"] = None
+    elif isinstance(s.get("desired_mode"), str) and s["desired_mode"] not in VALID_DESIRED_MODES:
+        s["desired_mode"] = None
+
+    for key in ("desired_mode_fetched_at", "last_route_change", "last_check"):
+        if not isinstance(s.get(key), (int, float)) or isinstance(s.get(key), bool):
+            s[key] = 0.0
+
+    if not isinstance(s.get("desired_mode_fetch_fail"), int) or isinstance(s.get("desired_mode_fetch_fail"), bool):
+        s["desired_mode_fetch_fail"] = 0
+
     old = state.get("upstreams") if isinstance(state.get("upstreams"), dict) else {}
     s["upstreams"] = {}
     for name in cfg["upstreams"]:
         h = new_health()
         if isinstance(old.get(name), dict):
             h.update({k: v for k, v in old[name].items() if k in h})
+        # Validate per-upstream health fields
+        for key in h:
+            if key in ("healthy", "first_pass_seen"):
+                if not isinstance(h[key], bool):
+                    h[key] = new_health()[key]
+            elif key in ("consecutive_pass", "consecutive_fail"):
+                if not isinstance(h[key], int) or isinstance(h[key], bool):
+                    h[key] = new_health()[key]
+            elif key == "last_probe":
+                if not isinstance(h[key], str):
+                    h[key] = new_health()[key]
+            elif key == "last_change":
+                if not isinstance(h[key], (int, float)) or isinstance(h[key], bool):
+                    h[key] = new_health()[key]
         s["upstreams"][name] = h
     return s
 

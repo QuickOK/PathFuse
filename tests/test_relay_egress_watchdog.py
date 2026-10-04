@@ -184,6 +184,19 @@ def test_validate_config_rejects(mutate, match):
         M.validate_config(raw)
 
 
+def test_validate_config_rejects_zero_prefix_with_exact_message():
+    """Verify the /0 error message is single-prefixed, not double."""
+    raw = raw_cfg()
+    raw["exempt"]["prefixes"] = ["0.0.0.0/0"]
+    with pytest.raises(M.ConfigError) as exc_info:
+        M.validate_config(raw)
+    # Message should be single-prefixed, not double
+    msg = str(exc_info.value)
+    assert msg == "exempt.prefixes: '0.0.0.0/0': prefix length 0 would route everything"
+    # Should not contain double prefix like "exempt.prefixes: ... exempt.prefixes: ..."
+    assert msg.count("exempt.prefixes:") == 1
+
+
 def test_load_config_unreadable_is_config_error(tmp_path):
     with pytest.raises(M.ConfigError):
         M.load_config(tmp_path / "missing.json")
@@ -500,32 +513,74 @@ def test_fetch_rejects_non_string_mode():
 
 
 def test_fetch_handles_http_incomplete_read():
-    # Test that fetch handles http.client.HTTPException (IncompleteRead, BadStatusLine)
-    import http.client
-    def bad_fetch(url, timeout):
-        raise http.client.BadStatusLine("x")
-    c, ip = cfg(), FakeIp(BASE)
-    state, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
-                                fetch_err=None)
-    # Override the fetch to test real fetch error handling
-    def fetch(url, timeout):
-        raise http.client.BadStatusLine("bad response")
-    try:
-        new, rc = M.tick(c, {}, 100.0, ip=ip, probe=lambda up: (True, "ok"),
-                         fetch=fetch, log=lambda x: None)
-        # Fetch error should be caught and counted
-        assert new["desired_mode_fetch_fail"] > 0
-    except Exception as e:
-        pytest.fail(f"fetch error should be caught, not raised: {e}")
+    """Test that fetch_desired_mode handles IncompleteRead (Content-Length but closes early)."""
+    import socket
+    import threading
+
+    def server_incomplete():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        def handle():
+            conn, _ = sock.accept()
+            try:
+                conn.recv(1024)  # read request
+                # Send incomplete response: Content-Length says 100 but send only 10 bytes
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                conn.sendall(b"short")
+            finally:
+                conn.close()
+                sock.close()
+
+        threading.Thread(target=handle, daemon=True).start()
+        return port
+
+    port = server_incomplete()
+    mode, master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
+    assert mode is None and err is not None and "protocol" in err
+
+
+def test_fetch_handles_http_bad_status_line():
+    """Test that fetch_desired_mode handles BadStatusLine (garbage response)."""
+    import socket
+    import threading
+
+    def server_badline():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        def handle():
+            conn, _ = sock.accept()
+            try:
+                conn.recv(1024)  # read request
+                # Send garbage instead of HTTP
+                conn.sendall(b"GARBAGE\r\n")
+            finally:
+                conn.close()
+                sock.close()
+
+        threading.Thread(target=handle, daemon=True).start()
+        return port
+
+    port = server_badline()
+    mode, master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
+    assert mode is None and err is not None and "protocol" in err
 
 
 def test_tick_with_fetch_error_counts_failure():
     c, ip = cfg(), FakeIp(BASE)
-    state, _, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
-                           fetch_err="fetch error: connection reset")
-    state, _, _ = run_tick(c, state, 110.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
-                           fetch_err="fetch error: connection reset")
-    assert state["desired_mode_fetch_fail"] == 2 and state["effective_mode"] == "relay_direct"
+    state, rc, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                            fetch_err="fetch error: connection reset")
+    assert rc == 0 and state["desired_mode_fetch_fail"] == 1
+    state, rc, _ = run_tick(c, state, 110.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                            fetch_err="fetch error: connection reset")
+    assert rc == 0 and state["desired_mode_fetch_fail"] == 2 and state["effective_mode"] == "relay_direct"
 
 
 def test_choose_fetch_timeout_cold_start_uses_bootstrap():
@@ -596,25 +651,30 @@ def test_iproute_apply_timeout_returns_false():
         raise subprocess.TimeoutExpired("ip", 5)
     r._run = runner
     ok, err = r.apply(["route", "replace", "default"])
-    assert ok is False
+    assert ok is False and "ip" in err and "5" in err
 
 
 def test_probe_that_raises_records_failure():
+    """A probe callable that raises for one upstream is caught, recorded as unhealthy."""
     c, ip = cfg(), FakeIp(BASE)
-    def broken_probe(up):
-        raise RuntimeError("probe crashed")
-    state, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": (True, "ok"), "backbone": (True, "ok")},
-                                fetch_err=None)
-    # Override the run_tick to use broken probe
+
+    def mixed_probe(up):
+        if up["name"] == "vpn":
+            raise RuntimeError("vpn probe crashed")
+        return (True, "backbone ok")
+
     def fetch(url, timeout):
         return ("relay_backbone", "wan2", None)
-    try:
-        new, rc = M.tick(c, {}, 100.0, ip=ip, probe=broken_probe, fetch=fetch, log=lambda x: None)
-        # Probe errors should be caught and logged
-        assert new["upstreams"]["vpn"]["healthy"] is False
-    except Exception as e:
-        # Should not raise; probe errors caught in _probe_all
-        pass
+
+    new, rc = M.tick(c, {}, 100.0, ip=ip, probe=mixed_probe, fetch=fetch, log=lambda x: None)
+
+    # vpn failed: should be unhealthy with error in last_probe
+    assert new["upstreams"]["vpn"]["healthy"] is False
+    assert new["upstreams"]["vpn"]["last_probe"].startswith("probe error:")
+    # backbone succeeded: should be healthy
+    assert new["upstreams"]["backbone"]["healthy"] is True
+    # tick should still succeed
+    assert rc == 0
 
 
 def test_default_with_no_metric_not_preferred():
@@ -624,20 +684,139 @@ def test_default_with_no_metric_not_preferred():
     assert pref == []  # No actions; metric 0 default is not touched
 
 
-def test_save_state_handles_unwritable_path():
-    # Test that save_state catches OSError but doesn't raise
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        # Create a file, then try to write state under it (fails)
-        bad_file = f"{tmp}/file.txt"
-        Path(bad_file).write_text("x")
-        bad_state = f"{bad_file}/state.json"
-        state = {"desired_mode": "relay_direct"}
-        try:
-            M.save_state(bad_state, state)
-            pytest.fail("save_state should raise OSError")
-        except OSError:
-            pass  # Expected
+def test_exemptions_applied_before_preferred():
+    """tick() applies exemption routes before preferred route via FakeIp.calls."""
+    c, ip = cfg(), FakeIp(BASE)
+    state, rc, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+
+    # Find indices of exemption and preferred commands in ip.calls
+    exempt_calls = [i for i, call in enumerate(ip.calls) if "10.0.0.0/8" in call or "198.51.100.7" in call]
+    preferred_calls = [i for i, call in enumerate(ip.calls) if call[1:3] == ["route", "replace"] and call[2] == "default"]
+
+    # All exemptions should come before all preferred
+    if exempt_calls and preferred_calls:
+        assert max(exempt_calls) < min(preferred_calls), "exemptions must be applied before preferred"
+
+
+def test_preferred_failure_stops_further_commands():
+    """When a preferred route command fails, tick stops and sweeps immediately."""
+    c = cfg()
+    # Seed two metric-100 defaults
+    ip = FakeIp(BASE + [{"dst": "default", "gateway": "10.200.0.2", "dev": "veth-vpn", "metric": 100},
+                        {"dst": "default", "dev": "wg-exit", "metric": 100}])
+    # Fail on any "replace" command
+    ip.fail = {"replace"}
+
+    state, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+
+    # Should have rc=1 (preferred failed)
+    assert rc == 1
+    # All dels should have succeeded, but replace should fail
+    # After failure, sweep should have deleted the preferred defaults
+    replace_calls = [call for call in ip.calls if len(call) > 1 and call[1] == "replace"]
+    assert len(replace_calls) >= 1, "should have tried to replace"
+    # After failure and sweep, no preferred defaults should remain
+    assert ip.preferred() == []
+
+
+def test_with_defaults_tolerates_bad_state_file():
+    """with_defaults resets bad types from hand-edited state files."""
+    c = cfg()
+
+    # State with wrong types
+    bad_state = {
+        "desired_mode": 123,  # should be None or str
+        "desired_mode_fetched_at": "not a float",  # should be float
+        "desired_mode_fetch_fail": "not an int",  # should be int
+        "last_route_change": [],  # should be float
+        "last_check": True,  # bool is wrong type
+        "effective_mode": "relay_backbone",  # this is OK
+        "target": "vpn",  # this is OK
+        "route": "vpn",  # this is OK
+        "upstreams": {
+            "vpn": {
+                "healthy": "yes",  # should be bool
+                "consecutive_pass": "5",  # should be int
+                "last_probe": 123,  # should be str
+                "last_change": "now"  # should be float
+            },
+            "backbone": {}  # will get defaults
+        }
+    }
+
+    result = M.with_defaults(bad_state, c)
+
+    # Scalars should be reset
+    assert result["desired_mode"] is None
+    assert result["desired_mode_fetched_at"] == 0.0
+    assert result["desired_mode_fetch_fail"] == 0
+    assert result["last_route_change"] == 0.0
+    assert result["last_check"] == 0.0
+    # Good scalars preserved
+    assert result["effective_mode"] == "relay_backbone"
+    # Per-upstream: bad types reset, good ones checked
+    assert result["upstreams"]["vpn"]["healthy"] == M.new_health()["healthy"]
+    assert result["upstreams"]["vpn"]["consecutive_pass"] == M.new_health()["consecutive_pass"]
+    assert result["upstreams"]["vpn"]["last_probe"] == M.new_health()["last_probe"]
+    assert result["upstreams"]["vpn"]["last_change"] == M.new_health()["last_change"]
+
+
+def test_tick_with_bad_state_file():
+    """tick() with a bad state file from with_defaults doesn't crash."""
+    c, ip = cfg(), FakeIp(BASE)
+
+    # Bad state
+    bad_state = {
+        "desired_mode": [],
+        "desired_mode_fetched_at": "bad",
+        "upstreams": {
+            "vpn": {"healthy": "yes"},
+            "backbone": {"last_change": []}
+        }
+    }
+
+    state, rc, _ = run_tick(c, bad_state, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+
+    # Should complete successfully despite bad input
+    assert rc == 0
+    # Should have reset bad values
+    assert isinstance(state["desired_mode"], (str, type(None)))
+    assert isinstance(state["desired_mode_fetched_at"], (int, float))
+
+
+def test_main_with_unwritable_state_path(tmp_path, capsys, monkeypatch):
+    """main() handles unwritable state_path: logs ERROR but returns tick's rc."""
+    # Create config
+    cfg_path = tmp_path / "c.json"
+    cfg_path.write_text(json.dumps({
+        "table": "egress",
+        "client": {"control_url": ""},
+        "mode_upstreams": {},
+        "upstreams": {},
+        "exempt": {"via": "192.0.2.1", "dev": "eth0", "prefixes": []}
+    }))
+
+    # Make state_path unwritable: path under a file
+    file_path = tmp_path / "state_file.txt"
+    file_path.write_text("x")
+    bad_state = file_path / "state.json"
+
+    raw = json.loads(cfg_path.read_text())
+    raw["state_path"] = str(bad_state)
+    cfg_path.write_text(json.dumps(raw))
+
+    # Monkeypatch IP and probes to avoid real network calls
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    monkeypatch.setattr(M, "run_probe", lambda up: (True, "ok"))
+
+    # Call main with unwritable state_path
+    rc = M.main(["--config", str(cfg_path)])
+
+    # Should return tick's rc (0), not error
+    assert rc == 0
+    # Should log the error
+    stderr = capsys.readouterr().err
+    assert "ERROR: cannot save state" in stderr
 
 
 def test_effective_mode_within_grace_uses_desired():
