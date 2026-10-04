@@ -130,6 +130,11 @@ def _mcfg(tmp_path, **over):
         "stations_path": str(tmp_path / "stations.json"),
         "labels_path": str(tmp_path / "labels.json"),
         "environ_points_path": str(tmp_path / "points.json"),
+        # Left unset, these three default to the box's live location store,
+        # config and drawn-zone files, and the payload reads all of them.
+        "location_store_path": str(tmp_path / "store.json"),
+        "location_config_path": str(tmp_path / "lf.json"),
+        "location_zones_path": str(tmp_path / "zones.json"),
     })
     m.update(over)
     return m
@@ -279,7 +284,8 @@ def test_assemble_map_payload_carries_location_fec(tmp_path):
                            "labels_path": str(tmp_path / "l.json"),
                            "environ_points_path": str(tmp_path / "e.json"),
                            "location_store_path": str(tmp_path / "store.json"),
-                           "location_config_path": str(tmp_path / "lf.json")})
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "location_zones_path": str(tmp_path / "zones.json")})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     # The level keys ride along even with no FEC config to describe; the page
     # reads them unconditionally.
@@ -386,6 +392,7 @@ def test_assemble_map_payload_tolerates_a_bad_max_location_tiles(tmp_path):
                            "environ_points_path": str(tmp_path / "e.json"),
                            "location_store_path": str(tmp_path / "store.json"),
                            "location_config_path": str(tmp_path / "lf.json"),
+                           "location_zones_path": str(tmp_path / "zones.json"),
                            "max_location_tiles": "lots"})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     assert out["location_fec"]["tiles"] == []
@@ -420,7 +427,8 @@ def test_map_payload_stays_parseable_with_a_non_finite_loss_in_the_store(tmp_pat
                            "labels_path": str(tmp_path / "l.json"),
                            "environ_points_path": str(tmp_path / "e.json"),
                            "location_store_path": str(store),
-                           "location_config_path": str(tmp_path / "lf.json")})
+                           "location_config_path": str(tmp_path / "lf.json"),
+                           "location_zones_path": str(tmp_path / "zones.json")})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     _json.dumps(out, allow_nan=False)
     assert out["location_fec"]["tiles"] == []
@@ -438,6 +446,7 @@ def test_assemble_map_payload_clamps_a_negative_max_location_tiles(tmp_path):
                            "environ_points_path": str(tmp_path / "e.json"),
                            "location_store_path": str(store),
                            "location_config_path": str(tmp_path / "lf.json"),
+                           "location_zones_path": str(tmp_path / "zones.json"),
                            "max_location_tiles": -5})
     out = M.assemble_map_payload(m, str(tmp_path / "pub.json"), None, 1000.0)
     assert out["location_fec"]["tiles"] == []
