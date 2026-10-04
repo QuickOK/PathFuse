@@ -956,6 +956,50 @@ def test_published_snapshot_carries_egress_observed_and_feeds_the_observer(tmp_p
     assert snap["egress_observed"]["selected"] == "relay_direct"
 
 
+def test_controller_builds_the_observer_from_the_observe_block_and_feeds_it_the_effective_mode(
+        tmp_path, monkeypatch):
+    """The observer must be built from cfg.egress.observe and fed the EFFECTIVE egress
+    mode, the operator's overlay over the config default. The overlay here differs from
+    the default, or a feed of the default would pass too. Fed the default, the observer
+    would judge the exit against a mode the operator has already left, and page on it."""
+    import threading
+    import egress_observer
+    built, seen = [], []
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            built.append(cfg)
+
+        def start(self, stop):
+            pass
+
+        def set_selected(self, mode):
+            seen.append(mode)
+
+        def snapshot(self):
+            return {"selected": seen[-1] if seen else None, "observed": None, "ip": None,
+                    "status": "checking", "since": 1.0, "checked_at": None, "error": None}
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    observe = egress_observer.ObserveCfg(url="https://probe.example.net/trace")
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=observe),
+    )
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(egress_mode="relay_vpn", set_by="ui",
+                                                 set_ts=1.0))
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    assert len(built) == 1 and built[0] is observe
+    assert seen == ["relay_vpn"]
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_observed"]["selected"] == "relay_vpn"
+
+
 def test_published_snapshot_egress_observed_is_null_when_off(tmp_path, monkeypatch):
     import threading
     cfg = base_cfg(

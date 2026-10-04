@@ -103,8 +103,12 @@ def _ipv4(name: str, value) -> str:
 
 def _check_http_url(name: str, url: str) -> None:
     """ConfigError unless `url` is an http(s) URL that names a host. urlsplit raises
-    ValueError for a malformed netloc (an unclosed "["), as does its lazy .port;
-    urlopen raises the same at runtime, so reject such a URL at load instead."""
+    ValueError for a malformed netloc (an unclosed "["), and its lazy .port raises it
+    for a port that is not a number from 0 to 65535. urlopen raises the same
+    ValueError for the "[" but does not check the port: a non-numeric port fails each
+    poll with http.client.InvalidURL, and an out-of-range one is not caught at all
+    (on Linux, port 70000 polls port 4464, the port modulo 65536). So reject a bad
+    URL at load."""
     try:
         parts = urlsplit(url)
         host, _port = parts.hostname, parts.port
@@ -491,7 +495,7 @@ def load_state(path) -> dict:
     """The last tick's state, or {} when missing or unreadable (a fresh start)."""
     try:
         s = json.loads(Path(path).read_text())
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
         return {}
     return s if isinstance(s, dict) else {}
 

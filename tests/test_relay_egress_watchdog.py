@@ -208,6 +208,18 @@ def test_validate_config_accepts_control_urls(url):
     assert M.validate_config(raw)["client"]["control_url"] == url
 
 
+@pytest.mark.parametrize("url", [123, True, ["http://127.0.0.1:9/x"], [], {"u": 1}],
+                         ids=["int", "bool", "list", "empty-list", "dict"])
+def test_validate_config_rejects_a_control_url_that_is_not_a_string(url):
+    """Without the type check urlsplit raises AttributeError or TypeError on these, which
+    escapes load_config (main() crashes with exit 1, not a CONFIG ERROR exit 2), and an
+    empty list reads as "polling off"."""
+    raw = raw_cfg()
+    raw["client"]["control_url"] = url
+    with pytest.raises(M.ConfigError, match="control_url must be a string"):
+        M.validate_config(raw)
+
+
 def test_validate_config_rejects_zero_prefix_with_exact_message():
     """Verify the /0 error message is single-prefixed, not double."""
     raw = raw_cfg()
@@ -469,6 +481,31 @@ def test_load_state_tolerates_garbage(tmp_path):
     assert M.load_state(p) == {}
 
 
+DEEP = 100_000   # far past the JSON parser's nesting limit
+
+
+@pytest.mark.parametrize("text", ["[" * DEEP, "[" * DEEP + "]" * DEEP, '{"a":' * DEEP],
+                         ids=["unclosed-lists", "closed-lists", "objects"])
+def test_load_state_tolerates_a_deeply_nested_file(tmp_path, text):
+    """json.loads raises RecursionError here, which is not a ValueError."""
+    p = tmp_path / "s.json"
+    p.write_text(text)
+    assert M.load_state(p) == {}
+
+
+def test_main_runs_the_tick_over_a_deeply_nested_state_file(tmp_path, monkeypatch):
+    """The state file is only the tick's own memory, so a corrupt one means a fresh start.
+    Raised out of main(), it would fail every tick until someone deleted the file, each
+    failure firing the dead-man switch."""
+    state = tmp_path / "state.json"
+    state.write_text("[" * DEEP)
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "state_path": str(state)}))
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    assert M.main(["--config", str(p)]) == 0
+    assert isinstance(json.loads(state.read_text()), dict)   # replaced by a fresh state
+
+
 def test_main_returns_2_on_bad_config(tmp_path, capsys):
     p = tmp_path / "c.json"
     p.write_text("{}")
@@ -636,6 +673,20 @@ def test_tick_survives_the_real_fetch_on_an_unparseable_control_url():
     new, rc = M.tick(c, {}, 100.0, ip=ip, probe=lambda up: (True, "ok"), log=lines.append)
     assert rc == 0 and new["desired_mode_fetch_fail"] == 1
     assert any("fetch_err=fetch error: Invalid IPv6 URL" in line for line in lines)
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit], ids=["ctrl-c", "exit"])
+def test_tick_does_not_swallow_an_interrupt_from_the_fetch(exc):
+    """The fetch guard is for a poll glitch (an Exception). A BaseException that is not
+    one, such as ^C, must still stop the tick, not count as a failed fetch."""
+    c, ip = cfg(), FakeIp(BASE)
+
+    def fetch(url, timeout):
+        raise exc()
+
+    with pytest.raises(exc):
+        M.tick(c, {}, 100.0, ip=ip, probe=lambda up: (True, "ok"), fetch=fetch,
+               log=lambda line: None)
 
 
 def test_choose_fetch_timeout_cold_start_uses_bootstrap():
@@ -1003,6 +1054,25 @@ def test_deadman_honours_dry_run(tmp_path):
     assert D.main(["--config", str(p)], runner=run) == 0
 
 
+@pytest.mark.parametrize("value", ["yes", "true", 1], ids=["yes", "string-true", "one"])
+def test_deadman_fails_open_on_a_dry_run_that_is_not_a_real_true(tmp_path, value):
+    """The actuator rejects such a config (exit 2) rather than reading it as a dry run,
+    so the dead-man must not read it as one either: it deletes (fails open), not skips."""
+    with pytest.raises(M.ConfigError, match="dry_run"):
+        M.validate_config(raw_cfg(dry_run=value))
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "dry_run": value}))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2, err="RTNETLINK answers: No such process")
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "egress"]]
+
+
 def test_deadman_falls_back_to_env_table(tmp_path, monkeypatch):
     D = _load_deadman()
     monkeypatch.setenv("EGRESS_TABLE", "egress2")
@@ -1064,11 +1134,14 @@ def test_deadman_bool_metric_defaults_to_100(tmp_path):
     assert calls[0][5] == "100"
 
 
-def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys):
+@pytest.mark.parametrize("ok_before", [0, 2], ids=["first-call-hangs", "third-call-hangs"])
+def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys, ok_before):
+    """`ok_before` deletes work, then the next `ip route del` hangs. 0 is the likeliest
+    real case (a wedged `ip` hangs at once, nothing removed); 2 shows the count is kept."""
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress"}))
-    calls, left = [], [2]
+    calls, left = [], [ok_before]
 
     def run(argv, **kw):
         calls.append(argv)
@@ -1078,12 +1151,12 @@ def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys):
         raise subprocess.TimeoutExpired("ip", 5)
 
     assert D.main(["--config", str(p)], runner=run) == 1
-    # Two deletes worked, the third hung: the hung call is not retried.
-    assert len(calls) == 3
+    # The hung call is not retried.
+    assert len(calls) == ok_before + 1
     out, err = capsys.readouterr()
     # What was removed, then why it stopped. A bare "(fail open)" would hide the hang.
-    assert out == ("relay-egress-deadman: removed 2 preferred default(s) from table egress "
-                   "(fail open)\n"
+    assert out == (f"relay-egress-deadman: removed {ok_before} preferred default(s) from "
+                   "table egress (fail open)\n"
                    "relay-egress-deadman: ip route del timed out after 5 s\n")
     assert err == ""
 
@@ -1102,10 +1175,13 @@ def test_deadman_timeout_passes_timeout_kwarg(tmp_path):
     assert timeout_values[0] == 5
 
 
-def test_deadman_metric_zero_defaults_to_100_keeps_table(tmp_path):
+@pytest.mark.parametrize("metric", [0, -1, -100], ids=["zero", "minus-one", "minus-100"])
+def test_deadman_metric_below_1_defaults_to_100_keeps_table(tmp_path, metric):
+    """The actuator rejects a preferred_metric below 1, so none of its routes has such a
+    metric: the dead-man falls back to 100 and keeps the table it read."""
     D = _load_deadman()
     p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": "mytable", "preferred_metric": 0}))
+    p.write_text(json.dumps({"table": "mytable", "preferred_metric": metric}))
     calls = []
 
     def run(argv, **kw):
@@ -1113,7 +1189,6 @@ def test_deadman_metric_zero_defaults_to_100_keeps_table(tmp_path):
         return R(rc=2)
 
     assert D.main(["--config", str(p)], runner=run) == 0
-    # metric 0 should be rejected, defaults to 100, but table should be kept
     assert calls[0][5] == "100"
     assert calls[0][7] == "mytable"
 
@@ -1162,6 +1237,26 @@ def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
     assert err == NO_TABLE_MSG + "\n"
 
 
+@pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],
+                         ids=["truncated-json", "empty-file", "list", "null", "string"])
+def test_deadman_unusable_config_falls_back_to_env_table(tmp_path, monkeypatch, text):
+    """The dead-man exists for when the actuator's config is broken (the actuator exits 2
+    on an unreadable or malformed file), so a config that is there but not a JSON object
+    must still fail open through EGRESS_TABLE."""
+    D = _load_deadman()
+    monkeypatch.setenv("EGRESS_TABLE", "envtable")
+    p = tmp_path / "c.json"
+    p.write_text(text)
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2, err="RTNETLINK answers: No such process")
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "envtable"]]
+
+
 def test_deadman_fib_table_not_exist_same_as_no_such_process(tmp_path, capsys):
     D = _load_deadman()
     p = tmp_path / "c.json"
@@ -1189,6 +1284,31 @@ def test_deadman_stderr_not_no_such_process_exits_1_with_summary(tmp_path, capsy
     # Must print summary line before exiting
     assert "removed 0 preferred default" in out
     assert "Permission denied" in out
+
+
+def test_deadman_real_error_after_deletes_reports_the_true_count(tmp_path, capsys):
+    """Two deletes work, then one fails for a reason other than "nothing left": the
+    summary must say 2 were removed, not 0, before it says why it stopped."""
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls, left = [], [2]
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if left[0]:
+            left[0] -= 1
+            return R()
+        return R(rc=2, err="RTNETLINK answers: Operation not permitted\n")
+
+    assert D.main(["--config", str(p)], runner=run) == 1
+    assert len(calls) == 3
+    out, err = capsys.readouterr()
+    assert out == ("relay-egress-deadman: removed 2 preferred default(s) from table egress "
+                   "(fail open)\n"
+                   "relay-egress-deadman: ip route del failed: "
+                   "RTNETLINK answers: Operation not permitted\n")
+    assert err == ""
 
 
 def test_example_config_validates():
