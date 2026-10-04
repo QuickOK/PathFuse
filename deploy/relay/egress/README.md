@@ -13,8 +13,8 @@ subnet> lookup <table>` sends it there). In that table:
 
 | Route | Owner | Purpose |
 |---|---|---|
-| `default … metric 100` (at most one) | this actuator | the *preferred* exit: the upstream the mode selects, only while its probe passes |
 | exemption prefixes `via <wan gw>` | this actuator | destinations that always use the relay's own WAN |
+| `default … metric 100` (at most one) | this actuator | the *preferred* exit: the upstream the mode selects, only while its probe passes |
 | `default via <wan gw> metric 200` | your setup | fail-open path when no preferred route exists |
 
 An **upstream** is a named egress path: an upstream VPN behind a veth, a
@@ -27,13 +27,14 @@ Each 10 s tick:
 1. probes every upstream in parallel; each has its own hysteresis (unhealthy
    after `fail_threshold` straight failures, healthy after `pass_threshold`
    passes, the first pass ever counts at once);
-2. polls the client for the desired mode. Within `grace_s` of the last good
+2. re-adds any missing exemption route (applied first, so exempt prefixes never
+   briefly exit via an upstream);
+3. polls the client for the desired mode. Within `grace_s` of the last good
    poll that mode holds; after that `default_mode` applies. Unknown names are
    rejected and counted in `desired_mode_fetch_fail`;
-3. installs the mode's upstream as the single preferred default with an atomic
+4. installs the mode's upstream as the single preferred default with an atomic
    `ip route replace`, or deletes every preferred default when the mode uses no
-   upstream or its upstream is unhealthy (fail open);
-4. re-adds any missing exemption route.
+   upstream or its upstream is unhealthy (fail open).
 
 `dry_run: true` logs `DRY-RUN would run: …` and changes nothing. Use it to
 shadow-run beside an existing actuator before taking over.
@@ -56,6 +57,14 @@ names. Watch for `fetch_fail=` climbing in the journal.
 
 `/etc/relay-egress-watchdog/config.json`; see `config/relay-egress.example.json`.
 The actuator re-reads it every tick, so an edit takes effect within 10 s.
+
+**Key fields:**
+- `table`: the PBR table name (no default; required).
+- `preferred_metric`: the metric for the preferred route (default 100). Must be a positive integer.
+- `dry_run`: if `true`, logs `DRY-RUN would run: …` without changing routes (default `false`).
+- `client.control_url`: the client's desired-mode endpoint (e.g., `http://100.64.0.2:8081/api/desired_egress`). If set to `""` (empty string), polling is disabled and `default_mode` always applies (no HTTP call).
+- `exempt.prefixes`: list of CIDR prefixes that always exit via the relay's own WAN. Include your site's private address ranges (e.g., the upstream VPN's subnet, the backbone exit's source space).
+
 Removing a prefix from `exempt.prefixes` does not delete its route: run
 `ip route del <prefix> table <table>` yourself.
 
@@ -69,11 +78,21 @@ sudo install -D -m0644 config/relay-egress.example.json /etc/relay-egress-watchd
 sudo systemctl daemon-reload && sudo systemctl enable --now relay-egress-watchdog.timer
 ```
 
-The dead-man switch runs when a tick crashes, times out or rejects its config.
-It deletes every preferred default (fail open). Give it the table name through a
-drop-in too (`Environment=EGRESS_TABLE=<table>`), so it still works when the
-config cannot be read. Order the service after whatever creates the table and
-the upstream interfaces (a drop-in with `After=`).
+**The dead-man switch** runs when a tick crashes, times out, or rejects its config (exit 1 on config failure or table read failure; exit 2 on config error). It deletes every preferred default (fail open). Suppress the dead-man during a shadow run by setting `dry_run: true` in the config—the dead-man then skips execution and exits 0, leaving the live actuator's routes untouched. If the config cannot be read during shadow run, the dead-man has no way to see the dry_run flag; keep the config readable, or do not wire the OnFailure hook until the shadow run is complete.
+
+**Relay drop-in examples** (create at `/etc/systemd/system/relay-egress-watchdog.{service,timer}.d/relay-egress-local.conf`):
+
+Tell the dead-man the table name when the config is unreadable:
+```ini
+[Service]
+Environment=EGRESS_TABLE=egress
+```
+
+Order the service after whatever creates the table and upstream interfaces:
+```ini
+[Unit]
+After=network-online.target some-veth-setup.service
+```
 
 > **Regression watch:** `journalctl -u relay-egress-watchdog` shows one summary line per tick,
 > plus `ROUTE:` and `HEALTH:` lines on every change. Covered by

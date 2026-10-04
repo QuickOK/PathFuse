@@ -6,6 +6,10 @@ out or rejects its config. It deletes every preferred default (metric 100
 unless the config says otherwise) from the egress table, so the client's
 traffic falls through to the relay's own WAN default. It is independent of the
 main script on purpose: it must work while that script is broken.
+
+If the config has "dry_run": true, this script skips execution (does not run
+any ip commands) and exits 0. This prevents the dead-man from undoing a
+shadow run's dry-run state.
 """
 import argparse
 import json
@@ -15,32 +19,78 @@ import sys
 
 
 def table_and_metric(config_path):
-    """(table, metric) from the config; on any read error the table comes from
-    $EGRESS_TABLE (None if unset) and the metric is 100."""
+    """(table, metric, dry_run) from the config; on any read error the table comes from
+    $EGRESS_TABLE (None if unset), metric defaults to 100, and dry_run is False.
+
+    Parses table and metric independently:
+    - unusable metric (non-int, bool, < 1) falls back to 100 without discarding a good table
+    - missing/null/empty/non-str table falls back to $EGRESS_TABLE, else None
+    """
+    dry_run = False
+    table = os.environ.get("EGRESS_TABLE") or None
+    metric = 100
+
     try:
         with open(config_path) as f:
             raw = json.load(f)
-        return str(raw["table"]), int(raw.get("preferred_metric", 100))
+
+        # Parse table: must be non-empty string
+        t = raw.get("table")
+        if isinstance(t, str) and t:
+            table = t
+
+        # Parse metric: must be int >= 1 (not bool)
+        m = raw.get("preferred_metric", 100)
+        if isinstance(m, int) and not isinstance(m, bool) and m >= 1:
+            metric = m
+
+        # Parse dry_run: must be bool
+        d = raw.get("dry_run", False)
+        if isinstance(d, bool):
+            dry_run = d
+
     except Exception:
-        return os.environ.get("EGRESS_TABLE") or None, 100
+        pass  # fall back to defaults
+
+    return table, metric, dry_run
 
 
 def main(argv=None, runner=subprocess.run) -> int:
     ap = argparse.ArgumentParser(description="Delete every preferred egress default (fail open).")
     ap.add_argument("--config", default="/etc/relay-egress-watchdog/config.json")
     args = ap.parse_args(argv)
-    table, metric = table_and_metric(args.config)
+    table, metric, dry_run = table_and_metric(args.config)
+
+    # If the config says dry_run, skip execution (safe for shadow runs)
+    if dry_run:
+        print("relay-egress-deadman: skipping (dry_run in config)", flush=True)
+        return 0
+
     if not table:
-        print("relay-egress-deadman: no table (config unreadable and EGRESS_TABLE unset)",
-              file=sys.stderr, flush=True)
+        msg = "relay-egress-deadman: no table (config has no usable table and EGRESS_TABLE is unset/empty)"
+        print(msg, file=sys.stderr, flush=True)
         return 1
+
     removed = 0
     for _ in range(16):
-        r = runner(["ip", "route", "del", "default", "metric", str(metric), "table", table],
-                   capture_output=True, text=True)
-        if r.returncode != 0:
+        try:
+            r = runner(["ip", "route", "del", "default", "metric", str(metric), "table", table],
+                       capture_output=True, text=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            # Timeout counts as a failure; stop trying
             break
+
+        if r.returncode != 0:
+            # Stop looping if we get a return code
+            stderr = r.stderr if hasattr(r, 'stderr') else ""
+            # If stderr doesn't mention "No such process", it's a real error
+            if stderr and "No such process" not in stderr:
+                print(f"relay-egress-deadman: ip route del failed: {stderr.strip()}", flush=True)
+                return 1
+            break
+
         removed += 1
+
     print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
           f"{table} (fail open)", flush=True)
     return 0

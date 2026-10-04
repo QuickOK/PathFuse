@@ -1,7 +1,7 @@
 {
   "table": "egress",
   "preferred_metric": 100,
-  "dry_run": false,
+  "dry_run": true,
   "state_path": "/run/relay-egress-watchdog/state.json",
   "client": {
     "control_url": "http://100.64.0.2:8081/api/desired_egress",
@@ -14,8 +14,7 @@
   "exempt": {
     "via": "192.0.2.1",
     "dev": "eth0",
-    "prefixes": ["10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12",
-                 "192.168.0.0/16", "198.51.100.7/32"]
+    "prefixes": ["10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "198.51.100.7/32"]
   },
   "upstreams": {
     "vpn": {

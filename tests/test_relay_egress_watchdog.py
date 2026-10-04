@@ -650,10 +650,13 @@ def test_effective_mode_past_grace_falls_back_to_default():
 
 # --- dead-man switch, units, example config -------------------------------------------
 
-D = _load("relay_egress_deadman", "relay-egress-deadman")
+def _load_deadman():
+    """Load the dead-man module lazily so a broken script doesn't break test collection."""
+    return _load("relay_egress_deadman", "relay-egress-deadman")
 
 
 def test_deadman_deletes_every_preferred_default(tmp_path):
+    D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress"}))
     calls, left = [], [2]
@@ -669,7 +672,20 @@ def test_deadman_deletes_every_preferred_default(tmp_path):
     assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "egress"]] * 3
 
 
+def test_deadman_honours_dry_run(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "dry_run": True}))
+
+    # Runner should never be called
+    def run(argv, **kw):
+        raise AssertionError("runner called during dry_run")
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+
+
 def test_deadman_falls_back_to_env_table(tmp_path, monkeypatch):
+    D = _load_deadman()
     monkeypatch.setenv("EGRESS_TABLE", "egress2")
     calls = []
 
@@ -682,8 +698,79 @@ def test_deadman_falls_back_to_env_table(tmp_path, monkeypatch):
 
 
 def test_deadman_without_any_table_exits_1(tmp_path, monkeypatch):
+    D = _load_deadman()
     monkeypatch.delenv("EGRESS_TABLE", raising=False)
     assert D.main(["--config", str(tmp_path / "missing.json")], runner=lambda *a, **k: R()) == 1
+
+
+def test_deadman_uses_config_metric(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "preferred_metric": 50}))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2)
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls[0][5] == "50"  # metric argument
+
+
+def test_deadman_bad_metric_defaults_to_100(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "preferred_metric": "bad"}))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2)
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls[0][5] == "100"  # metric defaults to 100
+
+
+def test_deadman_bool_metric_defaults_to_100(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "preferred_metric": True}))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2)
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls[0][5] == "100"
+
+
+def test_deadman_timeout_stops_loop(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired("ip", 5)
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    # Only one attempt before timeout stops it
+    assert len(calls) == 1
+
+
+def test_deadman_stderr_not_no_such_process_exits_1(tmp_path, capsys):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+
+    def run(argv, **kw):
+        return R(rc=1, err="RTNETLINK answers: Permission denied")
+
+    assert D.main(["--config", str(p)], runner=run) == 1
+    out, err = capsys.readouterr()
+    assert "Permission denied" in out
 
 
 def test_example_config_validates():
@@ -691,13 +778,18 @@ def test_example_config_validates():
     c = M.validate_config(raw)
     assert c["client"]["default_mode"] == "relay_direct"
     assert set(c["mode_upstreams"]) == {"relay_vpn", "relay_backbone"}
+    assert c["dry_run"] is True
 
 
 def test_units_wire_the_deadman_and_the_paths():
     unit = (_DIR / "systemd/relay-egress-watchdog.service").read_text()
     assert "OnFailure=relay-egress-deadman.service" in unit
     assert "ExecStart=/usr/local/sbin/relay-egress-watchdog --config " in unit
+    assert "Type=oneshot" in unit
+    assert "TimeoutStartSec=25" in unit
+    assert "RuntimeDirectoryPreserve=yes" in unit
     timer = (_DIR / "systemd/relay-egress-watchdog.timer").read_text()
     assert "OnUnitActiveSec=10" in timer
     dead = (_DIR / "systemd/relay-egress-deadman.service").read_text()
     assert "ExecStart=/usr/local/sbin/relay-egress-deadman --config " in dead
+    assert "Type=oneshot" in dead
