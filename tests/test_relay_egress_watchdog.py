@@ -5,10 +5,13 @@ by path. These tests pin the client<->relay egress vocabulary (drift there
 silently pins the relay to its default mode) and the route invariant: at most
 one preferred default, and only toward a healthy upstream the mode selects.
 """
+import contextlib
 import http.client
 import importlib.util
+import io
 import json
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.machinery import SourceFileLoader
@@ -1025,15 +1028,58 @@ def _load_deadman():
     return _load("relay_egress_deadman", "relay-egress-deadman")
 
 
-def _deadman_lines(err):
-    """The dead-man's own lines in captured stderr, each with its newline.
+class _ThreadStderr(io.StringIO):
+    """A sys.stderr that keeps what the test's own thread writes, and passes any other
+    thread's writes on to the stream it replaced.
 
-    capsys captures the process-wide sys.stderr, so whatever another thread writes
-    meanwhile (a request handler left over from an earlier test, say) lands there
-    too. Every dead-man message starts with its name, and comparing those lines
-    whole still pins each message exactly, prefix and newline included."""
-    return [line for line in err.splitlines(keepends=True)
-            if line.startswith("relay-egress-deadman")]
+    capsys captures the process-wide sys.stderr, so a thread left over from an earlier
+    test (a request handler, say) can print into a dead-man test mid-run. Filtering the
+    captured lines by the dead-man's prefix would survive that, but it would also let
+    an unprefixed line from the dead-man itself go unnoticed. The dead-man runs on the
+    test's thread, so keeping only that thread's writes lets each test compare the
+    dead-man's whole stderr exactly."""
+
+    def __init__(self, passthrough):
+        super().__init__()
+        self._passthrough = passthrough
+        self._owner = threading.get_ident()
+
+    def write(self, s):
+        if threading.get_ident() != self._owner:
+            return self._passthrough.write(s)
+        return super().write(s)
+
+    def flush(self):
+        if threading.get_ident() != self._owner:
+            self._passthrough.flush()
+
+
+@contextlib.contextmanager
+def _deadman_stderr():
+    """Swap in a _ThreadStderr for the body of the `with`; yields it."""
+    saved = sys.stderr
+    sys.stderr = own = _ThreadStderr(saved)
+    try:
+        yield own
+    finally:
+        sys.stderr = saved
+
+
+def test_deadman_stderr_keeps_only_the_test_threads_writes(capsys):
+    """Why the dead-man's exact stderr assertions cannot be broken by another thread."""
+    def stray():
+        print("stray line from another thread", file=sys.stderr, flush=True)
+
+    with _deadman_stderr() as err:
+        t = threading.Thread(target=stray)
+        t.start()
+        t.join()
+        print("relay-egress-deadman: mine", file=sys.stderr, flush=True)
+
+    assert err.getvalue() == "relay-egress-deadman: mine\n"
+    # The other thread's line went on to capsys. `in`, not `==`: capsys also holds
+    # whatever any other thread wrote meanwhile, the very noise this helper keeps out.
+    assert "stray line from another thread\n" in capsys.readouterr().err
 
 
 def test_deadman_deletes_every_preferred_default(tmp_path):
@@ -1161,15 +1207,16 @@ def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys, ok_bef
             return R()
         raise subprocess.TimeoutExpired("ip", 5)
 
-    assert D.main(["--config", str(p)], runner=run) == 1
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == 1
     # The hung call is not retried.
     assert len(calls) == ok_before + 1
-    out, err = capsys.readouterr()
+    out = capsys.readouterr().out
     # What was removed, then why it stopped. A bare "(fail open)" would hide the hang.
     assert out == (f"relay-egress-deadman: removed {ok_before} preferred default(s) from "
                    "table egress (fail open)\n"
                    "relay-egress-deadman: ip route del timed out after 5 s\n")
-    assert _deadman_lines(err) == [], err
+    assert err.getvalue() == ""
 
 
 def test_deadman_timeout_passes_timeout_kwarg(tmp_path):
@@ -1242,10 +1289,10 @@ def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
     def run(argv, **kw):
         raise AssertionError(f"no usable table, so no ip command: {argv}")
 
-    assert D.main(["--config", str(p)], runner=run) == 1
-    out, err = capsys.readouterr()
-    assert out == ""
-    assert _deadman_lines(err) == [NO_TABLE_MSG + "\n"], err
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == 1
+    assert capsys.readouterr().out == ""
+    assert err.getvalue() == NO_TABLE_MSG + "\n"
 
 
 @pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],
@@ -1312,14 +1359,15 @@ def test_deadman_real_error_after_deletes_reports_the_true_count(tmp_path, capsy
             return R()
         return R(rc=2, err="RTNETLINK answers: Operation not permitted\n")
 
-    assert D.main(["--config", str(p)], runner=run) == 1
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == 1
     assert len(calls) == 3
-    out, err = capsys.readouterr()
+    out = capsys.readouterr().out
     assert out == ("relay-egress-deadman: removed 2 preferred default(s) from table egress "
                    "(fail open)\n"
                    "relay-egress-deadman: ip route del failed: "
                    "RTNETLINK answers: Operation not permitted\n")
-    assert _deadman_lines(err) == [], err
+    assert err.getvalue() == ""
 
 
 def test_example_config_validates():
