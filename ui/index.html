@@ -107,12 +107,15 @@
             <span id="egress-warn" class="egress-warn" hidden>master DOWN</span>
             <span id="engarde-pbr-warn" class="egress-warn" hidden>engarde PBR missing</span>
           </div>
-          <label class="ctl-radio"><input type="radio" name="egress_mode" value="relay_vpn"><span>relay-VPN <em>default</em>
-            <span class="tip" title="client → engarde tunnel → relay netns → an upstream egress VPN TUN. Default; works around CGNAT and most ISP quirks.">i</span></span></label>
+          <label class="ctl-radio"><input type="radio" name="egress_mode" value="relay_vpn"><span>relay-VPN <em id="egress-default-tag">default</em>
+            <span class="tip" title="client → engarde tunnel → relay netns → an upstream egress VPN TUN. Works around CGNAT and most ISP quirks.">i</span></span></label>
+          <label class="ctl-radio"><input type="radio" name="egress_mode" value="relay_backbone"><span>relay Backbone
+            <span class="tip" title="client → engarde tunnel → relay → a cloud-backbone exit. Traffic rides the provider's backbone and leaves near each destination.">i</span></span></label>
           <label class="ctl-radio"><input type="radio" name="egress_mode" value="relay_direct"><span>relay Direct
             <span class="tip" title="client → engarde tunnel → relay WAN (no relay-VPN). Use when relay-VPN is broken or blocking destinations.">i</span></span></label>
           <label class="ctl-radio"><input type="radio" name="egress_mode" value="local_direct"><span>Local Direct
             <span class="tip" title="client → master WAN directly (no engarde tunnel, no relay). Local IP varies; use when relay path is broken.">i</span></span></label>
+          <div id="egress-actual" class="egress-actual" hidden></div>
         </div>
 
         <div class="ctl-block" id="environment-block">

@@ -2,6 +2,9 @@
 
 const $  = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
+const EGRESS_LABELS = {relay_vpn: "relay-VPN", relay_backbone: "relay Backbone",
+                       relay_direct: "relay Direct", local_direct: "Local Direct"};
+const egressLabel = (m) => EGRESS_LABELS[m] || m || "unknown";
 
 /* ---------- layout toggle (ops | wall) ---------- */
 (function initLayoutToggle(){
@@ -370,6 +373,8 @@ function render(s){
   renderEnvironmental(s);
   renderLocationFec(s);
   renderMaintenance(s);
+  renderEgressDefault(s);
+  renderEgressActual(s);
 
   /* Local-Direct + master-DOWN red badge */
   const warn = $("#egress-warn");
@@ -505,10 +510,11 @@ function renderSignalDiagram(s, wans, active, masterWan){
   // Egress-mode overlay: relabels the engarde node + panel subtitle and dims
   // the BFD edges when the client-device flow is bypassing the tunnel entirely.
   const egressMode = s.egress_mode || "relay_vpn";
-  const exit = egressMode === "relay_vpn"        ? { tag: "→ egress relay-VPN",  sub: "client → engarde → egress relay-VPN" }
-             : egressMode === "relay_direct"  ? { tag: "→ relay WAN",  sub: "client → engarde → relay WAN" }
-             : egressMode === "local_direct"? { tag: "BYPASSED",   sub: "client → local WAN (engarde bypassed)" }
-             :                                { tag: "?",          sub: `unknown egress: ${egressMode}` };
+  const exit = egressMode === "relay_vpn"      ? { tag: "→ egress relay-VPN", sub: "client → engarde → egress relay-VPN" }
+             : egressMode === "relay_backbone" ? { tag: "→ relay Backbone",   sub: "client → engarde → relay → backbone exit" }
+             : egressMode === "relay_direct"   ? { tag: "→ relay WAN",        sub: "client → engarde → relay WAN" }
+             : egressMode === "local_direct"   ? { tag: "BYPASSED",           sub: "client → local WAN (engarde bypassed)" }
+             :                                   { tag: "?",                  sub: `unknown egress: ${egressMode}` };
   const flowSub = document.getElementById("signal-flow-sub");
   if (flowSub) flowSub.textContent = exit.sub;
   const eSub = document.getElementById("engarde-sub");
@@ -1543,6 +1549,47 @@ function renderLocationFec(s){
     r.disabled = !loc.configured;
     if (!loc.configured) r.checked = false;
   });
+}
+
+/* Move the single "default" tag onto the configured default egress mode. */
+function renderEgressDefault(s){
+  const tag = $("#egress-default-tag");
+  const input = s.egress_default_mode &&
+    document.querySelector(`input[name="egress_mode"][value="${s.egress_default_mode}"]`);
+  const span = input && input.nextElementSibling;
+  if (!tag || !span || tag.parentElement === span) return;
+  span.insertBefore(tag, span.querySelector(".tip"));
+}
+
+/* The actual-exit check: what the relay path really uses right now. */
+function renderEgressActual(s){
+  const el = $("#egress-actual");
+  if (!el) return;
+  const o = s.egress_observed;
+  if (!o){ el.hidden = true; return; }
+  el.hidden = false;
+  const at = o.since
+    ? new Date(o.since * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})
+    : "";
+  const ip = o.ip ? ` · ${o.ip}` : "";
+  let text, warn = false;
+  switch (o.status){
+    case "match":
+      text = `actual: ${egressLabel(o.observed)}${ip}`; break;
+    case "pending":
+      text = `actual: ${egressLabel(o.observed)}${ip} ≠ selected ${egressLabel(o.selected)} (rechecking)`; break;
+    case "mismatch":
+      text = `actual: ${egressLabel(o.observed)}${ip} ≠ selected ${egressLabel(o.selected)}` + (at ? ` since ${at}` : "");
+      warn = true; break;
+    case "skipped":
+      text = "actual: n/a (local direct)"; break;
+    case "error":
+      text = "actual: unknown (trace failed)"; warn = true; break;
+    default:
+      text = "actual: checking…";
+  }
+  el.textContent = text;
+  el.classList.toggle("warn", warn);
 }
 
 /* ---------- maintenance reboot ---------- */
