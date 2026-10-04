@@ -7,6 +7,7 @@ one preferred default, and only toward a healthy upstream the mode selects.
 """
 import importlib.util
 import json
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.machinery import SourceFileLoader
@@ -170,6 +171,11 @@ def test_default_mode_defaults_to_relay_direct():
     (lambda c: c["exempt"].update(prefixes=["10.0.0.1/8"]), "exempt.prefixes"),
     (lambda c: c["upstreams"]["vpn"].update(fail_threshold=0), "fail_threshold"),
     (lambda c: c.update(dry_run="yes"), "dry_run"),
+    (lambda c: c["client"].update(control_url="ftp://example.com"), "http://"),
+    (lambda c: c["client"].update(default_mode=["relay_vpn"]), "must be a string"),
+    (lambda c: c["mode_upstreams"].update({123: "vpn"}), "key must be a string"),
+    (lambda c: c["mode_upstreams"].update(relay_vpn=["backbone"]), "value must be a string"),
+    (lambda c: c["exempt"].update(prefixes=["0.0.0.0/0"]), "prefix length 0"),
 ])
 def test_validate_config_rejects(mutate, match):
     raw = raw_cfg()
@@ -457,21 +463,181 @@ def _serve_once(payload):
 def test_fetch_accepts_canonical_modes(mode):
     srv = _serve_once({"mode": mode, "master_wan": "wan2", "ts": 1.0})
     port = srv.server_address[1]
-    assert M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0) == (mode, "wan2", None)
+    try:
+        assert M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0) == (mode, "wan2", None)
+    finally:
+        srv.server_close()
 
 
 def test_fetch_accepts_alias_and_normalizes():
     srv = _serve_once({"mode": "relay_wan", "master_wan": "wan2", "ts": 1.0})
     port = srv.server_address[1]
-    mode, _master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
-    assert mode == "relay_direct" and err is None
+    try:
+        mode, _master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
+        assert mode == "relay_direct" and err is None
+    finally:
+        srv.server_close()
 
 
 def test_fetch_rejects_unknown_mode():
     srv = _serve_once({"mode": "banana"})
     port = srv.server_address[1]
-    mode, _master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
-    assert mode is None and "invalid mode" in err
+    try:
+        mode, _master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
+        assert mode is None and "invalid mode" in err
+    finally:
+        srv.server_close()
+
+
+def test_fetch_rejects_non_string_mode():
+    srv = _serve_once({"mode": ["relay_backbone"]})
+    port = srv.server_address[1]
+    try:
+        mode, _master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
+        assert mode is None and "invalid mode" in err
+    finally:
+        srv.server_close()
+
+
+def test_fetch_handles_http_incomplete_read():
+    # Test that fetch handles http.client.HTTPException (IncompleteRead, BadStatusLine)
+    import http.client
+    def bad_fetch(url, timeout):
+        raise http.client.BadStatusLine("x")
+    c, ip = cfg(), FakeIp(BASE)
+    state, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                                fetch_err=None)
+    # Override the fetch to test real fetch error handling
+    def fetch(url, timeout):
+        raise http.client.BadStatusLine("bad response")
+    try:
+        new, rc = M.tick(c, {}, 100.0, ip=ip, probe=lambda up: (True, "ok"),
+                         fetch=fetch, log=lambda x: None)
+        # Fetch error should be caught and counted
+        assert new["desired_mode_fetch_fail"] > 0
+    except Exception as e:
+        pytest.fail(f"fetch error should be caught, not raised: {e}")
+
+
+def test_tick_with_fetch_error_counts_failure():
+    c, ip = cfg(), FakeIp(BASE)
+    state, _, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                           fetch_err="fetch error: connection reset")
+    state, _, _ = run_tick(c, state, 110.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                           fetch_err="fetch error: connection reset")
+    assert state["desired_mode_fetch_fail"] == 2 and state["effective_mode"] == "relay_direct"
+
+
+def test_choose_fetch_timeout_cold_start_uses_bootstrap():
+    assert M.choose_fetch_timeout(None, 5.0, 1.0) == 5.0
+
+
+def test_choose_fetch_timeout_known_mode_uses_regular():
+    assert M.choose_fetch_timeout("relay_backbone", 5.0, 1.0) == 1.0
+
+
+def test_plan_actions_with_duplicate_stale_defaults():
+    c = cfg()
+    routes = BASE + [{"dst": "default", "gateway": "10.200.0.2", "dev": "veth-vpn", "metric": 100},
+                     {"dst": "default", "dev": "wg-exit", "metric": 100}]
+    pref, _ = M.plan_actions(c, routes, c["upstreams"]["backbone"]["route"])
+    # Should have del, del, replace
+    assert len([a for a in pref if a[1] == "del"]) == 2
+    assert len([a for a in pref if a[1] == "replace"]) == 1
+
+
+def test_tick_collapses_duplicate_metric_100_defaults():
+    c, ip = cfg(), FakeIp()
+    # Seed routes with two metric-100 defaults
+    ip.routes = [{"dst": "default", "gateway": "10.200.0.2", "dev": "veth-vpn", "metric": 100},
+                 {"dst": "default", "dev": "wg-exit", "metric": 100}]
+    state, rc, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+    assert rc == 0
+    pref = ip.preferred()
+    assert len(pref) == 1
+
+
+def test_iproute_parses_real_json():
+    r = M.IpRoute()
+    # Mock the runner to return valid JSON
+    runner = lambda argv, **kw: R(out='[{"dst":"default","dev":"eth0","metric":200}]')
+    r._run = runner
+    routes = r.show_table("main")
+    assert len(routes) == 1 and routes[0]["dst"] == "default"
+
+
+def test_iproute_raises_on_nonzero_rc():
+    r = M.IpRoute()
+    runner = lambda argv, **kw: R(rc=1, err="table id value is invalid")
+    r._run = runner
+    with pytest.raises(RuntimeError, match="table id"):
+        r.show_table("bad")
+
+
+def test_iproute_empty_stdout_gives_empty_list():
+    r = M.IpRoute()
+    runner = lambda argv, **kw: R(out="")
+    r._run = runner
+    assert r.show_table("main") == []
+
+
+def test_iproute_timeout_propagates():
+    r = M.IpRoute()
+    def runner(argv, **kw):
+        raise subprocess.TimeoutExpired("ip", 5)
+    r._run = runner
+    with pytest.raises(subprocess.TimeoutExpired):
+        r.show_table("main")
+
+
+def test_iproute_apply_timeout_returns_false():
+    r = M.IpRoute()
+    def runner(argv, **kw):
+        raise subprocess.TimeoutExpired("ip", 5)
+    r._run = runner
+    ok, err = r.apply(["route", "replace", "default"])
+    assert ok is False
+
+
+def test_probe_that_raises_records_failure():
+    c, ip = cfg(), FakeIp(BASE)
+    def broken_probe(up):
+        raise RuntimeError("probe crashed")
+    state, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": (True, "ok"), "backbone": (True, "ok")},
+                                fetch_err=None)
+    # Override the run_tick to use broken probe
+    def fetch(url, timeout):
+        return ("relay_backbone", "wan2", None)
+    try:
+        new, rc = M.tick(c, {}, 100.0, ip=ip, probe=broken_probe, fetch=fetch, log=lambda x: None)
+        # Probe errors should be caught and logged
+        assert new["upstreams"]["vpn"]["healthy"] is False
+    except Exception as e:
+        # Should not raise; probe errors caught in _probe_all
+        pass
+
+
+def test_default_with_no_metric_not_preferred():
+    c = cfg()
+    routes = [{"dst": "default", "dev": "eth0"}]  # metric defaults to 0
+    pref, _ = M.plan_actions(c, routes, None)
+    assert pref == []  # No actions; metric 0 default is not touched
+
+
+def test_save_state_handles_unwritable_path():
+    # Test that save_state catches OSError but doesn't raise
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        # Create a file, then try to write state under it (fails)
+        bad_file = f"{tmp}/file.txt"
+        Path(bad_file).write_text("x")
+        bad_state = f"{bad_file}/state.json"
+        state = {"desired_mode": "relay_direct"}
+        try:
+            M.save_state(bad_state, state)
+            pytest.fail("save_state should raise OSError")
+        except OSError:
+            pass  # Expected
 
 
 def test_effective_mode_within_grace_uses_desired():

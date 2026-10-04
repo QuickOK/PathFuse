@@ -62,6 +62,8 @@ class ConfigError(ValueError):
 
 def normalize_mode(mode):
     """Map an alternate egress name onto the canonical client vocabulary."""
+    if not isinstance(mode, str):
+        return mode  # non-string passes through unchanged for VALID check to reject
     return MODE_ALIASES.get(mode, mode)
 
 
@@ -159,7 +161,12 @@ def _validate_exempt(raw) -> dict:
     norm = []
     for p in prefixes:
         try:
-            norm.append(str(ipaddress.IPv4Network(p, strict=True)))
+            net = ipaddress.IPv4Network(p, strict=True)
+            if net.prefixlen == 0:
+                raise ConfigError(f"exempt.prefixes: {p!r}: prefix length 0 would route everything")
+            norm.append(str(net))
+        except ipaddress.AddressValueError as e:
+            raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
         except (ValueError, TypeError) as e:
             raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
     if not norm:
@@ -192,7 +199,11 @@ def validate_config(raw) -> dict:
     url = craw.get("control_url", "")
     if not isinstance(url, str):
         raise ConfigError("client.control_url must be a string")
+    if url and not url.startswith(("http://", "https://")):
+        raise ConfigError("client.control_url must be empty or start with http:// or https://")
     default_mode = craw.get("default_mode", "relay_direct")
+    if not isinstance(default_mode, str):
+        raise ConfigError(f"client.default_mode must be a string, got {default_mode!r}")
     if default_mode not in VALID_DESIRED_MODES:
         raise ConfigError(f"client.default_mode must be one of "
                           f"{sorted(VALID_DESIRED_MODES)}, got {default_mode!r}")
@@ -214,10 +225,14 @@ def validate_config(raw) -> dict:
     if not isinstance(mraw, dict):
         raise ConfigError("mode_upstreams must be an object")
     for mode, up in mraw.items():
+        if not isinstance(mode, str):
+            raise ConfigError(f"mode_upstreams key must be a string, got {mode!r}")
         if mode not in VALID_DESIRED_MODES:
             raise ConfigError(f"mode_upstreams: unknown mode {mode!r}")
         if mode in NO_UPSTREAM_MODES:
             raise ConfigError(f"mode_upstreams: {mode} never uses an upstream")
+        if not isinstance(up, str):
+            raise ConfigError(f"mode_upstreams value must be a string, got {up!r}")
         if up not in upstreams:
             raise ConfigError(f"mode_upstreams: {mode} -> {up!r} is not a configured upstream")
 
@@ -242,6 +257,7 @@ def fetch_desired_mode(url: str, timeout_s: float) -> tuple:
     Success: (mode, master_wan, None), mode normalized into VALID_DESIRED_MODES.
     Failure: (None, None, "<reason>"); the caller keeps last-known or the default.
     """
+    import http.client
     import socket
     import urllib.error
     import urllib.request
@@ -250,6 +266,8 @@ def fetch_desired_mode(url: str, timeout_s: float) -> tuple:
             body = r.read()
     except urllib.error.HTTPError as e:
         return (None, None, f"http {e.code}")
+    except http.client.HTTPException as e:
+        return (None, None, f"http protocol: {type(e).__name__}")
     except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
         timed_out = isinstance(e, (socket.timeout, TimeoutError))
         return (None, None, "timeout" if timed_out else f"transport: {e}")
@@ -259,7 +277,10 @@ def fetch_desired_mode(url: str, timeout_s: float) -> tuple:
         return (None, None, f"parse: {e}")
     if not isinstance(payload, dict):
         return (None, None, "parse: not an object")
-    mode = normalize_mode(payload.get("mode"))
+    mode_raw = payload.get("mode")
+    if not isinstance(mode_raw, str):
+        return (None, None, f"invalid mode: {mode_raw!r}")
+    mode = normalize_mode(mode_raw)
     if mode not in VALID_DESIRED_MODES:
         return (None, None, f"invalid mode: {mode!r}")
     return (mode, payload.get("master_wan"), None)
@@ -542,7 +563,10 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
     if c["control_url"]:
         timeout = choose_fetch_timeout(s.get("desired_mode"), c["bootstrap_timeout_s"],
                                        c["fetch_timeout_s"])
-        mode, _master, fetch_err = fetch(c["control_url"], timeout)
+        try:
+            mode, _master, fetch_err = fetch(c["control_url"], timeout)
+        except Exception as e:
+            mode, _master, fetch_err = None, None, f"fetch error: {e}"
         s = apply_post_fetch_state_update(s, mode, c["default_mode"], now)
     desired = s.get("desired_mode") or c["default_mode"]
     age = (now - s["desired_mode_fetched_at"]) if s.get("desired_mode_fetched_at") else 0.0
@@ -562,7 +586,16 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
         routes, installed, rc = None, None, 1
     if routes is not None:
         preferred, exempt = plan_actions(cfg, routes, route)
-        for argv in preferred + exempt:
+        # Apply exemptions first so they never briefly route through an upstream
+        for argv in exempt:
+            if dry:
+                log(f"DRY-RUN would run: ip {' '.join(argv)}")
+                continue
+            ok, err = ip.apply(argv)
+            if not ok:
+                log(f"ERROR: ip {' '.join(argv)}: {err}")
+        # Apply preferred routes; any failure causes immediate sweep
+        for argv in preferred:
             if dry:
                 log(f"DRY-RUN would run: ip {' '.join(argv)}")
                 continue
@@ -570,11 +603,11 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
             if ok:
                 continue
             log(f"ERROR: ip {' '.join(argv)}: {err}")
-            if argv in preferred:
-                rc = 1
-        if rc and not dry:
-            _withdraw_all(ip, delete)   # a half-done switch must not linger
+            rc = 1
+            if not dry:
+                _withdraw_all(ip, delete)   # a half-done switch must not linger
             installed = None
+            break  # stop applying after first failure
 
     if installed != s.get("route"):
         log(f"{tag}ROUTE: {s.get('route') or 'none'} -> {installed or 'none'} (mode={effective})")
@@ -602,7 +635,10 @@ def main(argv=None) -> int:
         return 2
     state, rc = tick(cfg, load_state(cfg["state_path"]), time.time(), ip=IpRoute(),
                      log=lambda line: print(line, flush=True))
-    save_state(cfg["state_path"], state)
+    try:
+        save_state(cfg["state_path"], state)
+    except OSError as e:
+        print(f"ERROR: cannot save state to {cfg['state_path']}: {e}", file=sys.stderr, flush=True)
     return rc
 
 
