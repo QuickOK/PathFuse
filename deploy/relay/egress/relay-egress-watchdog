@@ -33,6 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlsplit
 
 # Canonical client egress vocabulary, exactly as sbfd-ctl publishes it at
 # /api/desired_egress. This MUST match VALID_EGRESS_MODES in sbfd_ctl.py.
@@ -100,6 +101,19 @@ def _ipv4(name: str, value) -> str:
         raise ConfigError(f"{name} must be an IPv4 address, got {value!r}") from None
 
 
+def _check_http_url(name: str, url: str) -> None:
+    """ConfigError unless `url` is an http(s) URL that names a host. urlsplit raises
+    ValueError for a malformed netloc (an unclosed "["), as does its lazy .port;
+    urlopen raises the same at runtime, so reject such a URL at load instead."""
+    try:
+        parts = urlsplit(url)
+        host, _port = parts.hostname, parts.port
+    except ValueError as e:
+        raise ConfigError(f"{name} is not a valid URL: {e}") from None
+    if not url.startswith(("http://", "https://")) or not host:
+        raise ConfigError(f"{name} must be an http:// or https:// URL with a host, got {url!r}")
+
+
 def _validate_upstream(name, raw) -> dict:
     if not isinstance(name, str) or not _UPSTREAM_NAME.fullmatch(name):
         raise ConfigError(f"upstream name {name!r} must match [a-z0-9_-]{{1,32}}")
@@ -162,9 +176,7 @@ def _validate_exempt(raw) -> dict:
     for p in prefixes:
         try:
             net = ipaddress.IPv4Network(p, strict=True)
-        except ipaddress.AddressValueError as e:
-            raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError) as e:  # AddressValueError is a ValueError
             raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
         if net.prefixlen == 0:
             raise ConfigError(f"exempt.prefixes: {p!r}: prefix length 0 would route everything")
@@ -199,8 +211,8 @@ def validate_config(raw) -> dict:
     url = craw.get("control_url", "")
     if not isinstance(url, str):
         raise ConfigError("client.control_url must be a string")
-    if url and not url.startswith(("http://", "https://")):
-        raise ConfigError("client.control_url must be empty or start with http:// or https://")
+    if url:  # "" turns the poll off
+        _check_http_url("client.control_url", url)
     default_mode = craw.get("default_mode", "relay_direct")
     if not isinstance(default_mode, str):
         raise ConfigError(f"client.default_mode must be a string, got {default_mode!r}")
@@ -492,22 +504,36 @@ def save_state(path, state: dict) -> None:
     tmp.replace(p)
 
 
+_MAX_TS = 1e11  # about the year 5138: a later "timestamp" in a state file is corrupt
+
+
+def _is_ts(v) -> bool:
+    """A usable timestamp: a number (not a bool) from 0 to _MAX_TS. A range test rather
+    than math.isfinite, so NaN, +-inf and an int too big for a float fail it instead
+    of raising."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= _MAX_TS
+
+
 def with_defaults(state: dict, cfg: dict) -> dict:
-    """`state` with every key a tick needs; upstreams no longer configured are dropped."""
-    s = {"desired_mode": None, "desired_mode_fetched_at": 0.0,
-         "desired_mode_fetch_fail": 0, "effective_mode": None, "target": None,
-         "route": None, "last_route_change": 0.0, "last_check": 0.0}
+    """`state` with every key a tick needs and every value usable; upstreams no longer
+    configured are dropped. The file can be hand-edited, so a wrong-typed or absurd
+    value is reset to its default rather than trusted: it must never crash a tick
+    (which fires the dead-man switch) or pin a stale mode."""
+    s: dict = {"desired_mode": None, "desired_mode_fetched_at": 0.0,
+               "desired_mode_fetch_fail": 0, "effective_mode": None, "target": None,
+               "route": None, "last_route_change": 0.0, "last_check": 0.0}
     s.update({k: v for k, v in state.items() if k != "upstreams"})
 
-    # Validate and reset bad scalar values from hand-edited state files
-    if s.get("desired_mode") is not None and not isinstance(s["desired_mode"], str):
+    mode = s["desired_mode"]
+    if not (isinstance(mode, str) and mode in VALID_DESIRED_MODES):
         s["desired_mode"] = None
-    elif isinstance(s.get("desired_mode"), str) and s["desired_mode"] not in VALID_DESIRED_MODES:
-        s["desired_mode"] = None
-
     for key in ("desired_mode_fetched_at", "last_route_change", "last_check"):
-        if not isinstance(s.get(key), (int, float)) or isinstance(s.get(key), bool):
+        if not _is_ts(s[key]):
             s[key] = 0.0
+    if s["desired_mode"] is not None and s["desired_mode_fetched_at"] <= 0:
+        # tick() reads a fetch time of 0 as "no age", so a mode kept without one would
+        # never age out while the fetches fail. Drop it: the default stands in.
+        s["desired_mode"] = None
 
     if not isinstance(s.get("desired_mode_fetch_fail"), int) or isinstance(s.get("desired_mode_fetch_fail"), bool):
         s["desired_mode_fetch_fail"] = 0
@@ -530,7 +556,7 @@ def with_defaults(state: dict, cfg: dict) -> dict:
                 if not isinstance(h[key], str):
                     h[key] = new_health()[key]
             elif key == "last_change":
-                if not isinstance(h[key], (int, float)) or isinstance(h[key], bool):
+                if not _is_ts(h[key]):
                     h[key] = new_health()[key]
         s["upstreams"][name] = h
     return s

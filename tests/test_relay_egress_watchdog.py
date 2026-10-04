@@ -5,6 +5,7 @@ by path. These tests pin the client<->relay egress vocabulary (drift there
 silently pins the relay to its default mode) and the route invariant: at most
 one preferred default, and only toward a healthy upstream the mode selects.
 """
+import http.client
 import importlib.util
 import json
 import subprocess
@@ -172,16 +173,39 @@ def test_default_mode_defaults_to_relay_direct():
     (lambda c: c["upstreams"]["vpn"].update(fail_threshold=0), "fail_threshold"),
     (lambda c: c.update(dry_run="yes"), "dry_run"),
     (lambda c: c["client"].update(control_url="ftp://example.com"), "http://"),
+    pytest.param(lambda c: c["client"].update(control_url=" http://127.0.0.1:9/x"), "http://",
+                 id="url-leading-space"),
+    pytest.param(lambda c: c["client"].update(control_url="http://[::1/x"), "not a valid URL",
+                 id="url-unclosed-bracket"),
+    pytest.param(lambda c: c["client"].update(control_url="http://127.0.0.1:99999/x"),
+                 "not a valid URL", id="url-port-out-of-range"),
+    pytest.param(lambda c: c["client"].update(control_url="http://127.0.0.1:abc/x"),
+                 "not a valid URL", id="url-port-not-a-number"),
+    pytest.param(lambda c: c["client"].update(control_url="http://"), "with a host",
+                 id="url-no-host"),
+    pytest.param(lambda c: c["client"].update(control_url="https:///x"), "with a host",
+                 id="url-no-host-with-path"),
     (lambda c: c["client"].update(default_mode=["relay_vpn"]), "must be a string"),
     (lambda c: c["mode_upstreams"].update({123: "vpn"}), "key must be a string"),
     (lambda c: c["mode_upstreams"].update(relay_vpn=["backbone"]), "value must be a string"),
     (lambda c: c["exempt"].update(prefixes=["0.0.0.0/0"]), "prefix length 0"),
+    pytest.param(lambda c: c["exempt"].update(prefixes=["not-a-prefix"]), "exempt.prefixes",
+                 id="exempt-unparsable"),
 ])
 def test_validate_config_rejects(mutate, match):
     raw = raw_cfg()
     mutate(raw)
     with pytest.raises(M.ConfigError, match=match):
         M.validate_config(raw)
+
+
+@pytest.mark.parametrize("url", ["", "https://relay.example.net/api/desired_egress",
+                                 "http://[::1]:8081/x"])
+def test_validate_config_accepts_control_urls(url):
+    """An empty URL turns polling off; any other needs an http(s) scheme and a host."""
+    raw = raw_cfg()
+    raw["client"]["control_url"] = url
+    assert M.validate_config(raw)["client"]["control_url"] == url
 
 
 def test_validate_config_rejects_zero_prefix_with_exact_message():
@@ -583,6 +607,37 @@ def test_tick_with_fetch_error_counts_failure():
     assert rc == 0 and state["desired_mode_fetch_fail"] == 2 and state["effective_mode"] == "relay_direct"
 
 
+@pytest.mark.parametrize("exc", [
+    pytest.param(ValueError("Invalid IPv6 URL"), id="value-error"),
+    pytest.param(http.client.BadStatusLine("x"), id="bad-status-line"),
+    pytest.param(RuntimeError("boom"), id="runtime-error"),
+])
+def test_tick_survives_a_fetch_that_raises(exc):
+    """A poll glitch is a counted fetch error, never a failed tick: a failed tick
+    fires the dead-man switch, which withdraws a healthy preferred route."""
+    c, ip = cfg(), FakeIp(BASE)
+    lines: list[str] = []
+
+    def fetch(url, timeout):
+        raise exc
+
+    new, rc = M.tick(c, {}, 100.0, ip=ip, probe=lambda up: (True, "ok"), fetch=fetch,
+                     log=lines.append)
+    assert rc == 0 and new["desired_mode_fetch_fail"] == 1
+    assert any("fetch_err=fetch error:" in line for line in lines)
+
+
+def test_tick_survives_the_real_fetch_on_an_unparseable_control_url():
+    """urlopen raises ValueError (not URLError) for this URL. validate_config now
+    rejects it, so it is forced in here: the tick's own guard must hold anyway."""
+    c, ip = cfg(), FakeIp(BASE)
+    lines: list[str] = []
+    c["client"]["control_url"] = "http://[::1/x"
+    new, rc = M.tick(c, {}, 100.0, ip=ip, probe=lambda up: (True, "ok"), log=lines.append)
+    assert rc == 0 and new["desired_mode_fetch_fail"] == 1
+    assert any("fetch_err=fetch error: Invalid IPv6 URL" in line for line in lines)
+
+
 def test_choose_fetch_timeout_cold_start_uses_bootstrap():
     assert M.choose_fetch_timeout(None, 5.0, 1.0) == 5.0
 
@@ -684,38 +739,34 @@ def test_default_with_no_metric_not_preferred():
     assert pref == []  # No actions; metric 0 default is not touched
 
 
-def test_exemptions_applied_before_preferred():
-    """tick() applies exemption routes before preferred route via FakeIp.calls."""
+def test_exemptions_are_installed_before_the_preferred_default():
+    """Otherwise the exempt prefixes would briefly leave through the upstream."""
     c, ip = cfg(), FakeIp(BASE)
-    state, rc, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
-
-    # Find indices of exemption and preferred commands in ip.calls
-    exempt_calls = [i for i, call in enumerate(ip.calls) if "10.0.0.0/8" in call or "198.51.100.7" in call]
-    preferred_calls = [i for i, call in enumerate(ip.calls) if call[1:3] == ["route", "replace"] and call[2] == "default"]
-
-    # All exemptions should come before all preferred
-    if exempt_calls and preferred_calls:
-        assert max(exempt_calls) < min(preferred_calls), "exemptions must be applied before preferred"
+    run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+    # ip.calls holds argv tails ["route", op, dst, ...]: dst is the third word
+    assert [call[2] for call in ip.calls] == ["10.0.0.0/8", "198.51.100.7/32", "default"]
 
 
-def test_preferred_failure_stops_further_commands():
-    """When a preferred route command fails, tick stops and sweeps immediately."""
+def test_after_the_first_preferred_failure_no_more_preferred_commands():
+    """The plan here is [del, del, replace]. When the first del fails the tick must
+    sweep and stop: the replace after it would install a route the tick reports
+    as withdrawn."""
+    class FirstDelFails(FakeIp):
+        failed = False
+
+        def apply(self, argv):
+            if argv[1] == "del" and not self.failed:
+                self.failed = True
+                self.calls.append(list(argv))
+                return False, "RTNETLINK answers: simulated failure"
+            return super().apply(argv)
+
     c = cfg()
-    # Seed two metric-100 defaults
-    ip = FakeIp(BASE + [{"dst": "default", "gateway": "10.200.0.2", "dev": "veth-vpn", "metric": 100},
-                        {"dst": "default", "dev": "wg-exit", "metric": 100}])
-    # Fail on any "replace" command
-    ip.fail = {"replace"}
-
-    state, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
-
-    # Should have rc=1 (preferred failed)
-    assert rc == 1
-    # All dels should have succeeded, but replace should fail
-    # After failure, sweep should have deleted the preferred defaults
-    replace_calls = [call for call in ip.calls if len(call) > 1 and call[1] == "replace"]
-    assert len(replace_calls) >= 1, "should have tried to replace"
-    # After failure and sweep, no preferred defaults should remain
+    ip = FirstDelFails(BASE + [{"dst": "default", "gateway": "10.200.0.2", "dev": "veth-vpn", "metric": 100},
+                               {"dst": "default", "dev": "wg-exit", "metric": 100}])
+    new, rc, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+    assert rc == 1 and new["route"] is None
+    assert not any(call[1] == "replace" and call[2] == "default" for call in ip.calls)
     assert ip.preferred() == []
 
 
@@ -761,27 +812,100 @@ def test_with_defaults_tolerates_bad_state_file():
     assert result["upstreams"]["vpn"]["last_change"] == M.new_health()["last_change"]
 
 
-def test_tick_with_bad_state_file():
-    """tick() with a bad state file from with_defaults doesn't crash."""
+# A timestamp the state file must not be trusted with: wrong type, negative, NaN,
+# infinite, past 1e11 (year 5138), or an int too big for a float (it made the age
+# arithmetic raise OverflowError).
+BAD_TIMES = [pytest.param("bad", id="str"), pytest.param(True, id="bool"),
+             pytest.param(None, id="none"), pytest.param(-1.0, id="negative"),
+             pytest.param(float("nan"), id="nan"), pytest.param(float("inf"), id="inf"),
+             pytest.param(float("-inf"), id="-inf"), pytest.param(1e11 + 1, id="past-the-limit"),
+             pytest.param(10 ** 400, id="huge-int")]
+
+
+@pytest.mark.parametrize("state", [
+    pytest.param({"desired_mode": ["relay_vpn"], "desired_mode_fetched_at": "bad",
+                  "desired_mode_fetch_fail": "x",
+                  "upstreams": {"vpn": {"consecutive_pass": "5", "healthy": "yes"}}},
+                 id="wrong-types"),
+    pytest.param({"desired_mode": ["relay_vpn"], "desired_mode_fetched_at": 95.0}, id="list-mode"),
+    pytest.param({"desired_mode": "banana", "desired_mode_fetched_at": 95.0}, id="unknown-mode"),
+    pytest.param({"desired_mode_fetch_fail": True}, id="bool-fail-count"),
+])
+def test_tick_on_hand_edited_state_with_a_failing_fetch(state):
+    """The fetch fails, so nothing overwrites a bad field: with_defaults has to make it
+    safe, or this tick crashes or pins a mode nobody asked for."""
     c, ip = cfg(), FakeIp(BASE)
+    new, rc, _ = run_tick(c, state, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                          fetch_err="timeout")
+    assert rc == 0 and new["desired_mode_fetch_fail"] == 1
+    assert new["effective_mode"] == "relay_direct" and ip.preferred() == []
 
-    # Bad state
-    bad_state = {
-        "desired_mode": [],
-        "desired_mode_fetched_at": "bad",
-        "upstreams": {
-            "vpn": {"healthy": "yes"},
-            "backbone": {"last_change": []}
-        }
-    }
 
-    state, rc, _ = run_tick(c, bad_state, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+@pytest.mark.parametrize("fetched_at", BAD_TIMES)
+def test_tick_never_pins_a_mode_whose_fetch_time_is_corrupt(fetched_at):
+    c, ip = cfg(), FakeIp(BASE)
+    state = {"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at}
+    new, rc, _ = run_tick(c, state, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                          fetch_err="timeout")
+    assert rc == 0 and new["effective_mode"] == "relay_direct" and ip.preferred() == []
 
-    # Should complete successfully despite bad input
-    assert rc == 0
-    # Should have reset bad values
-    assert isinstance(state["desired_mode"], (str, type(None)))
-    assert isinstance(state["desired_mode_fetched_at"], (int, float))
+
+def test_tick_keeps_the_last_known_mode_within_grace_when_the_fetch_fails():
+    c, ip = cfg(), FakeIp(BASE)
+    probes = {"vpn": OK_VPN, "backbone": OK_BB}
+    state, _, _ = run_tick(c, {}, 100.0, ip, probes, mode="relay_vpn")
+    state, rc, _ = run_tick(c, state, 130.0, ip, probes, fetch_err="timeout")
+    assert rc == 0 and state["effective_mode"] == "relay_vpn"
+    assert [r["dev"] for r in ip.preferred()] == ["veth-vpn"]
+
+
+@pytest.mark.parametrize("mode", ["banana", "", ["relay_vpn"], {"mode": "relay_vpn"}, 123],
+                         ids=["unknown", "empty", "list", "dict", "int"])
+def test_with_defaults_resets_a_mode_that_is_not_a_known_name(mode):
+    """The fetch time is valid, so only the mode check can drop it."""
+    s = M.with_defaults({"desired_mode": mode, "desired_mode_fetched_at": 95.0}, cfg())
+    assert s["desired_mode"] is None
+
+
+@pytest.mark.parametrize("fails", [True, "x", 1.5, None], ids=["bool", "str", "float", "none"])
+def test_with_defaults_resets_a_fail_count_that_is_not_an_int(fails):
+    s = M.with_defaults({"desired_mode_fetch_fail": fails}, cfg())
+    assert s["desired_mode_fetch_fail"] == 0 and type(s["desired_mode_fetch_fail"]) is int
+
+
+@pytest.mark.parametrize("fetched_at", BAD_TIMES)
+def test_with_defaults_drops_the_mode_along_with_an_unusable_fetch_time(fetched_at):
+    """tick() reads a fetch time of 0 as no age, so a mode kept here would never age out."""
+    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at}, cfg())
+    assert s["desired_mode"] is None and s["desired_mode_fetched_at"] == 0.0
+
+
+@pytest.mark.parametrize("extra", [{}, {"desired_mode_fetched_at": 0}, {"desired_mode_fetched_at": 0.0}],
+                         ids=["missing", "int-zero", "float-zero"])
+def test_with_defaults_drops_a_mode_that_has_no_fetch_time(extra):
+    assert M.with_defaults({"desired_mode": "relay_vpn", **extra}, cfg())["desired_mode"] is None
+
+
+@pytest.mark.parametrize("fetched_at", [1.7e9, 1700000000, 1e11], ids=["float", "int", "the-limit"])
+def test_with_defaults_keeps_a_mode_with_a_usable_fetch_time(fetched_at):
+    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at}, cfg())
+    assert s["desired_mode"] == "relay_vpn" and s["desired_mode_fetched_at"] == fetched_at
+
+
+@pytest.mark.parametrize("bad", BAD_TIMES)
+def test_with_defaults_resets_every_unusable_timestamp(bad):
+    s = M.with_defaults({"desired_mode_fetched_at": bad, "last_route_change": bad,
+                         "last_check": bad, "upstreams": {"vpn": {"last_change": bad}}}, cfg())
+    assert (s["desired_mode_fetched_at"], s["last_route_change"], s["last_check"],
+            s["upstreams"]["vpn"]["last_change"]) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_with_defaults_keeps_usable_timestamps():
+    s = M.with_defaults({"desired_mode_fetched_at": 1.7e9, "last_route_change": 1700000001,
+                         "last_check": 1.7e9 + 2, "upstreams": {"vpn": {"last_change": 1.7e9 + 5}}},
+                        cfg())
+    assert (s["desired_mode_fetched_at"], s["last_route_change"], s["last_check"],
+            s["upstreams"]["vpn"]["last_change"]) == (1.7e9, 1700000001, 1.7e9 + 2, 1.7e9 + 5)
 
 
 def test_main_with_unwritable_state_path(tmp_path, capsys, monkeypatch):
@@ -817,6 +941,22 @@ def test_main_with_unwritable_state_path(tmp_path, capsys, monkeypatch):
     # Should log the error
     stderr = capsys.readouterr().err
     assert "ERROR: cannot save state" in stderr
+
+
+def test_main_unwritable_state_keeps_a_failing_ticks_rc(tmp_path, capsys, monkeypatch):
+    """A failed state save must not turn a failing tick into success: the exit code is
+    what fires the dead-man switch."""
+    class Broken(FakeIp):
+        def show_table(self, table):
+            raise RuntimeError("no table")
+
+    p = tmp_path / "c.json"
+    blocker = tmp_path / "f"
+    blocker.write_text("x")
+    p.write_text(json.dumps({"table": "egress", "state_path": str(blocker / "s.json")}))
+    monkeypatch.setattr(M, "IpRoute", lambda: Broken(BASE))
+    assert M.main(["--config", str(p)]) == 1
+    assert "ERROR: cannot save state" in capsys.readouterr().err
 
 
 def test_effective_mode_within_grace_uses_desired():
