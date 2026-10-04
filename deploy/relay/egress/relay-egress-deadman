@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 
-def table_and_metric(config_path):
+def read_config(config_path):
     """(table, metric, dry_run) from the config; on any read error the table comes from
     $EGRESS_TABLE (None if unset), metric defaults to 100, and dry_run is False.
 
@@ -59,7 +59,7 @@ def main(argv=None, runner=subprocess.run) -> int:
     ap = argparse.ArgumentParser(description="Delete every preferred egress default (fail open).")
     ap.add_argument("--config", default="/etc/relay-egress-watchdog/config.json")
     args = ap.parse_args(argv)
-    table, metric, dry_run = table_and_metric(args.config)
+    table, metric, dry_run = read_config(args.config)
 
     # If the config says dry_run, skip execution (safe for shadow runs)
     if dry_run:
@@ -77,14 +77,19 @@ def main(argv=None, runner=subprocess.run) -> int:
             r = runner(["ip", "route", "del", "default", "metric", str(metric), "table", table],
                        capture_output=True, text=True, timeout=5)
         except subprocess.TimeoutExpired:
-            # Timeout counts as a failure; stop trying
-            break
+            # Timeout counts as a hung ip; print summary and exit 1
+            print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
+                  f"{table} (fail open)", flush=True)
+            return 1
 
         if r.returncode != 0:
             # Stop looping if we get a return code
             stderr = r.stderr if hasattr(r, 'stderr') else ""
-            # If stderr doesn't mention "No such process", it's a real error
-            if stderr and "No such process" not in stderr:
+            # "No such process" and "FIB table does not exist" both mean nothing to delete
+            if stderr and "No such process" not in stderr and "FIB table does not exist" not in stderr:
+                # Real error; print summary and exit 1
+                print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
+                      f"{table} (fail open)", flush=True)
                 print(f"relay-egress-deadman: ip route del failed: {stderr.strip()}", flush=True)
                 return 1
             break

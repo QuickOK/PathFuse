@@ -924,7 +924,7 @@ def test_deadman_bool_metric_defaults_to_100(tmp_path):
     assert calls[0][5] == "100"
 
 
-def test_deadman_timeout_stops_loop(tmp_path):
+def test_deadman_timeout_stops_loop_and_exits_1(tmp_path, capsys):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress"}))
@@ -934,12 +934,86 @@ def test_deadman_timeout_stops_loop(tmp_path):
         calls.append(argv)
         raise subprocess.TimeoutExpired("ip", 5)
 
-    assert D.main(["--config", str(p)], runner=run) == 0
+    assert D.main(["--config", str(p)], runner=run) == 1
     # Only one attempt before timeout stops it
     assert len(calls) == 1
+    out, err = capsys.readouterr()
+    # Should print summary before exiting 1
+    assert "removed 0 preferred default" in out
 
 
-def test_deadman_stderr_not_no_such_process_exits_1(tmp_path, capsys):
+def test_deadman_timeout_passes_timeout_kwarg(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    timeout_values = []
+
+    def run(argv, **kw):
+        timeout_values.append(kw.get("timeout"))
+        return R(rc=2)
+
+    D.main(["--config", str(p)], runner=run)
+    assert timeout_values[0] == 5
+
+
+def test_deadman_metric_zero_defaults_to_100_keeps_table(tmp_path):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "mytable", "preferred_metric": 0}))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2)
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    # metric 0 should be rejected, defaults to 100, but table should be kept
+    assert calls[0][5] == "100"
+    assert calls[0][7] == "mytable"
+
+
+def test_deadman_bad_table_falls_back_to_env(tmp_path, monkeypatch):
+    D = _load_deadman()
+    monkeypatch.setenv("EGRESS_TABLE", "envtable")
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": None}))  # Bad table
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2)
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    # Should use env table
+    assert calls[0][7] == "envtable"
+
+
+def test_deadman_bad_table_unset_env_exits_1_with_message(tmp_path, monkeypatch, capsys):
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": 123}))  # Bad table
+
+    assert D.main(["--config", str(p)], runner=lambda *a, **k: R()) == 1
+    out, err = capsys.readouterr()
+    assert "config has no usable table and EGRESS_TABLE is unset/empty" in err
+
+
+def test_deadman_fib_table_not_exist_same_as_no_such_process(tmp_path, capsys):
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+
+    def run(argv, **kw):
+        return R(rc=1, err="RTNETLINK answers: No such address\nFIB table does not exist")
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    out, err = capsys.readouterr()
+    # Should treat "FIB table does not exist" same as "No such process"
+    assert "removed 0 preferred default" in out
+
+
+def test_deadman_stderr_not_no_such_process_exits_1_with_summary(tmp_path, capsys):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress"}))
@@ -949,6 +1023,8 @@ def test_deadman_stderr_not_no_such_process_exits_1(tmp_path, capsys):
 
     assert D.main(["--config", str(p)], runner=run) == 1
     out, err = capsys.readouterr()
+    # Must print summary line before exiting
+    assert "removed 0 preferred default" in out
     assert "Permission denied" in out
 
 
