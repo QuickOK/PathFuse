@@ -916,3 +916,56 @@ def test_published_snapshot_carries_egress_default_mode(tmp_path, monkeypatch):
     snap = json.loads(Path(cfg.published_state).read_text())
     assert snap["egress_mode"] == "relay_backbone"
     assert snap["egress_default_mode"] == "relay_direct"
+
+
+def test_published_snapshot_carries_egress_observed_and_feeds_the_observer(tmp_path, monkeypatch):
+    import threading
+    import egress_observer
+    seen = []
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            self.cfg = cfg
+
+        def start(self, stop):
+            pass
+
+        def set_selected(self, mode):
+            seen.append(mode)
+
+        def snapshot(self):
+            return {"selected": seen[-1] if seen else None, "observed": "relay_direct",
+                    "ip": "198.51.100.20", "status": "match", "since": 1.0,
+                    "checked_at": 2.0, "error": None}
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_direct", observe=egress_observer.ObserveCfg(
+            url="https://probe.example.net/trace")),
+    )
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert seen == ["relay_direct"]
+    assert snap["egress_observed"]["status"] == "match"
+    assert snap["egress_observed"]["selected"] == "relay_direct"
+
+
+def test_published_snapshot_egress_observed_is_null_when_off(tmp_path, monkeypatch):
+    import threading
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+    )
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_observed"] is None

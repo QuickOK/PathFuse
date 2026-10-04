@@ -3511,12 +3511,19 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     if stop_event is None:
         stop_event = threading.Event()
 
+    egress_obs = None
+    if cfg.egress.observe is not None:
+        egress_obs = egress_observer.EgressObserver(cfg.egress.observe)
+        egress_obs.start(stop_event)
+
     while not stop_event.is_set():
         loop_start = time.time()
         relay_polled = False
         switch_event = None
         ov = load_runtime_overlay(cfg)
         mode, policy, master_wan, egress_mode = effective_policy(cfg, ov)
+        if egress_obs is not None:
+            egress_obs.set_selected(egress_mode)
         env_auto = load_auto_override(cfg, loop_start)
         cell_sample = load_cell_sample(cfg, loop_start)
         location_floors = load_location_floor(cfg, loop_start)
@@ -3911,6 +3918,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             "egress_mode": egress_mode,
             # The UI moves its "default" tag to this mode.
             "egress_default_mode": cfg.egress.default_mode,
+            # The actual-exit check (egress_observer); None when it is off.
+            "egress_observed": egress_obs.snapshot() if egress_obs is not None else None,
             # The UI renders its persist checkbox from this. Omit it and a
             # freshly loaded page shows the box unchecked, so the next Apply
             # posts persist=false and deletes the persisted overlay.
@@ -4085,7 +4094,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                     relay_ok=last_remote.ok,
                     switch=switch_event,
                     maintenance=maint_window,
-                    handoff_active=handoff_was_active)):
+                    handoff_active=handoff_was_active,
+                    egress=snapshot["egress_observed"])):
                 notifier.notify(_ev)
         if fec_hist is not None and cfg.fec:
             fec_hist.append_from_directions(

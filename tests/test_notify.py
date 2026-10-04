@@ -882,3 +882,46 @@ def test_maintenance_still_wins_over_the_switch_hold():
                          switch=(["wan1", "wan2"], ["wan1"], "wan2 down"))) == []
     clk.advance(300)
     assert d.observe(obs(maintenance=win)) == []
+
+
+# -- egress fallback ----------------------------------------------------------
+
+
+def _eg(status, selected="relay_backbone", observed="relay_direct", ip="198.51.100.20"):
+    return {"selected": selected, "observed": observed, "ip": ip, "status": status,
+            "since": 1.0, "checked_at": 1.0, "error": None}
+
+
+def test_egress_label_known_and_unknown():
+    assert notify.egress_label("relay_backbone") == "relay Backbone"
+    assert notify.egress_label("relay_direct") == "relay Direct"
+    assert notify.egress_label("banana") == "banana"
+    assert notify.egress_label(None) == "unknown"
+
+
+def test_egress_mismatch_pages_once_then_restores():
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=_eg("checking"))) == []          # seed
+    assert d.observe(obs(egress=_eg("pending"))) == []
+    evs = d.observe(obs(egress=_eg("mismatch")))
+    assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
+    assert "relay Backbone" in evs[0].message and "relay Direct" in evs[0].message
+    assert "198.51.100.20" in evs[0].message
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # no repeat
+    assert d.observe(obs(egress=_eg("error"))) == []             # an error is not a recovery
+    evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert len(evs) == 1 and "restored" in evs[0].title.lower()
+
+
+def test_egress_skipped_clears_the_alert_silently():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    d.observe(obs(egress=_eg("mismatch")))
+    assert d.observe(obs(egress=_eg("skipped", selected="local_direct"))) == []
+    assert d.observe(obs(egress=_eg("match", selected="relay_direct", observed="relay_direct"))) == []
+
+
+def test_egress_none_is_ignored():
+    d = notify.EventDetector()
+    d.observe(obs())
+    assert d.observe(obs()) == []
