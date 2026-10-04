@@ -1,16 +1,8 @@
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 import sbfd_ctl as M
-
-
-def start_server(handler_factory):
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_factory)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    return httpd
 
 
 SBFD_PAYLOAD = {
@@ -23,7 +15,7 @@ SBFD_PAYLOAD = {
 
 
 @pytest.fixture
-def ok_server():
+def ok_server(http_servers):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a, **k): pass
         def do_GET(self):
@@ -35,20 +27,16 @@ def ok_server():
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-    httpd = start_server(H)
-    yield httpd
-    httpd.shutdown()
+    return http_servers.start(H)
 
 
 @pytest.fixture
-def err_server():
+def err_server(http_servers):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a, **k): pass
         def do_GET(self):
             self.send_error(503, "down")
-    httpd = start_server(H)
-    yield httpd
-    httpd.shutdown()
+    return http_servers.start(H)
 
 
 def test_fetch_remote_happy_path(ok_server):
@@ -78,23 +66,22 @@ def test_fetch_remote_connection_refused():
     assert "refused" in snap.error.lower() or "connection" in snap.error.lower()
 
 
-def test_fetch_remote_timeout():
+def test_fetch_remote_timeout(http_servers):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a, **k): pass
         def do_GET(self):
-            import time as _t
-            _t.sleep(2.0)
+            # Hang on the test's stop event, not in a sleep, so the thread ends with
+            # the test instead of answering the long-gone client during a later one.
+            if http_servers.stopping.wait(2.0):
+                return
             self.send_response(200); self.end_headers()
-    httpd = start_server(H)
-    try:
-        port = httpd.server_address[1]
-        snap = M.fetch_remote_sbfd_state(f"http://127.0.0.1:{port}/state",
-                                         timeout_s=0.3,
-                                         session_id_to_wan={1:"wan1", 2:"wan2"})
-        assert snap.ok is False
-        assert "timed out" in snap.error.lower() or "timeout" in snap.error.lower()
-    finally:
-        httpd.shutdown()
+    httpd = http_servers.start(H)
+    port = httpd.server_address[1]
+    snap = M.fetch_remote_sbfd_state(f"http://127.0.0.1:{port}/state",
+                                     timeout_s=0.3,
+                                     session_id_to_wan={1:"wan1", 2:"wan2"})
+    assert snap.ok is False
+    assert "timed out" in snap.error.lower() or "timeout" in snap.error.lower()
 
 
 def test_merge_effective_down_dominates():

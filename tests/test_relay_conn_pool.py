@@ -12,7 +12,6 @@ against real servers rather than a mocked transport.
 """
 import http.client
 import json
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -45,7 +44,7 @@ class CountingServer(ThreadingHTTPServer):
         return super().get_request()
 
 
-def make_handler(close_every_response=False, hang_s=0.0):
+def make_handler(stopping, close_every_response=False, hang_s=0.0):
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 10
@@ -54,8 +53,11 @@ def make_handler(close_every_response=False, hang_s=0.0):
             pass
 
         def _respond(self, obj):
-            if hang_s:
-                time.sleep(hang_s)
+            # Hang on the test's stop event, not in a sleep: when the test ends, so
+            # does the wait, and the thread exits instead of answering a client
+            # that gave up -- a failure the server would print into a later test.
+            if hang_s and stopping.wait(hang_s):
+                return
             body = json.dumps(obj).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -96,22 +98,13 @@ def clean_pool():
 
 
 @pytest.fixture
-def server():
-    def _start(**kw):
-        httpd = CountingServer(("127.0.0.1", 0), make_handler(**kw))
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        return httpd, httpd.server_address[1]
-    started = []
-
+def server(http_servers):
     def start(**kw):
-        httpd, port = _start(**kw)
-        started.append(httpd)
-        return httpd, port
+        httpd = http_servers.start(make_handler(http_servers.stopping, **kw),
+                                   CountingServer)
+        return httpd, httpd.server_address[1]
 
-    yield start
-    for httpd in started:
-        httpd.shutdown()
-        httpd.server_close()
+    return start
 
 
 # -- reuse -------------------------------------------------------------------
@@ -176,7 +169,7 @@ def test_fetch_succeeds_when_the_relay_declines_keepalive(server):
     assert httpd.conn_count == 3
 
 
-def test_polling_an_http10_relay_still_works_and_pools_nothing():
+def test_polling_an_http10_relay_still_works_and_pools_nothing(http_servers):
     """The rolling-upgrade path: client updated, relay not yet.
 
     An un-upgraded relay answers HTTP/1.0, so there is no keep-alive to reuse.
@@ -196,17 +189,12 @@ def test_polling_an_http10_relay_still_works_and_pools_nothing():
             self.end_headers()
             self.wfile.write(body)
 
-    httpd = CountingServer(("127.0.0.1", 0), Old)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
-        url = f"http://127.0.0.1:{httpd.server_address[1]}/state"
-        for _ in range(3):
-            assert M.fetch_remote_sbfd_state(url, 2.0, SIDS).ok is True
-        assert httpd.conn_count == 3, "HTTP/1.0 cannot be reused; expect one each"
-        assert not M._relay_conns, "must not pool a connection the peer closed"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+    httpd = http_servers.start(Old, CountingServer)
+    url = f"http://127.0.0.1:{httpd.server_address[1]}/state"
+    for _ in range(3):
+        assert M.fetch_remote_sbfd_state(url, 2.0, SIDS).ok is True
+    assert httpd.conn_count == 3, "HTTP/1.0 cannot be reused; expect one each"
+    assert not M._relay_conns, "must not pool a connection the peer closed"
 
 
 def test_a_down_relay_is_not_retried_into_a_doubled_timeout(server):

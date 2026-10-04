@@ -1025,6 +1025,17 @@ def _load_deadman():
     return _load("relay_egress_deadman", "relay-egress-deadman")
 
 
+def _deadman_lines(err):
+    """The dead-man's own lines in captured stderr, each with its newline.
+
+    capsys captures the process-wide sys.stderr, so whatever another thread writes
+    meanwhile (a request handler left over from an earlier test, say) lands there
+    too. Every dead-man message starts with its name, and comparing those lines
+    whole still pins each message exactly, prefix and newline included."""
+    return [line for line in err.splitlines(keepends=True)
+            if line.startswith("relay-egress-deadman")]
+
+
 def test_deadman_deletes_every_preferred_default(tmp_path):
     D = _load_deadman()
     p = tmp_path / "c.json"
@@ -1158,7 +1169,7 @@ def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys, ok_bef
     assert out == (f"relay-egress-deadman: removed {ok_before} preferred default(s) from "
                    "table egress (fail open)\n"
                    "relay-egress-deadman: ip route del timed out after 5 s\n")
-    assert err == ""
+    assert _deadman_lines(err) == [], err
 
 
 def test_deadman_timeout_passes_timeout_kwarg(tmp_path):
@@ -1234,7 +1245,7 @@ def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
     assert D.main(["--config", str(p)], runner=run) == 1
     out, err = capsys.readouterr()
     assert out == ""
-    assert err == NO_TABLE_MSG + "\n"
+    assert _deadman_lines(err) == [NO_TABLE_MSG + "\n"], err
 
 
 @pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],
@@ -1308,7 +1319,7 @@ def test_deadman_real_error_after_deletes_reports_the_true_count(tmp_path, capsy
                    "(fail open)\n"
                    "relay-egress-deadman: ip route del failed: "
                    "RTNETLINK answers: Operation not permitted\n")
-    assert err == ""
+    assert _deadman_lines(err) == [], err
 
 
 def test_example_config_validates():
