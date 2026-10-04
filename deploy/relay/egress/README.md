@@ -78,7 +78,7 @@ sudo install -D -m0644 config/relay-egress.example.json /etc/relay-egress-watchd
 sudo systemctl daemon-reload && sudo systemctl enable --now relay-egress-watchdog.timer
 ```
 
-**The dead-man switch** runs when a tick crashes, times out, exits 1 (table read failure or preferred-route command failure), or exits 2 (config error). It deletes every preferred default (fail open). Exemption-route errors and unhealthy upstreams do NOT trigger the dead-man; the tick fails open itself and exits 0. Suppress the dead-man during a shadow run by setting `dry_run: true` in the config—the dead-man then skips execution and exits 0, leaving the live actuator's routes untouched. If the config cannot be read during shadow run, the dead-man has no way to see the dry_run flag; keep the config readable, or do not wire the OnFailure hook until the shadow run is complete.
+**The dead-man switch** runs when a tick crashes, times out, exits 1 (table read failure or preferred-route command failure), or exits 2 (config error). It deletes every preferred default (fail open). Two cases do NOT trigger it, because the tick exits 0 in both: an unhealthy upstream (the tick itself fails open and deletes the preferred default) and an exemption-route error (only logged; the preferred route stays as it is). Suppress the dead-man during a shadow run by setting `dry_run: true` in the config—the dead-man then skips execution and exits 0, leaving the live actuator's routes untouched. If the config cannot be read during shadow run, the dead-man has no way to see the dry_run flag; keep the config readable, or do not wire the OnFailure hook until the shadow run is complete.
 
 **Relay drop-in examples:**
 
@@ -92,6 +92,11 @@ Order the watchdog after whatever creates the table and upstream interfaces (cre
 ```ini
 [Unit]
 After=network-online.target some-veth-setup.service
+```
+
+After creating both drop-ins, make systemd read them:
+```bash
+sudo systemctl daemon-reload
 ```
 
 > **Regression watch:** `journalctl -u relay-egress-watchdog` shows one summary line per tick,

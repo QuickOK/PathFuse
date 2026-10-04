@@ -1064,22 +1064,28 @@ def test_deadman_bool_metric_defaults_to_100(tmp_path):
     assert calls[0][5] == "100"
 
 
-def test_deadman_timeout_stops_loop_and_exits_1(tmp_path, capsys):
+def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress"}))
-    calls = []
+    calls, left = [], [2]
 
     def run(argv, **kw):
         calls.append(argv)
+        if left[0]:
+            left[0] -= 1
+            return R()
         raise subprocess.TimeoutExpired("ip", 5)
 
     assert D.main(["--config", str(p)], runner=run) == 1
-    # Only one attempt before timeout stops it
-    assert len(calls) == 1
+    # Two deletes worked, the third hung: the hung call is not retried.
+    assert len(calls) == 3
     out, err = capsys.readouterr()
-    # Should print summary before exiting 1
-    assert "removed 0 preferred default" in out
+    # What was removed, then why it stopped. A bare "(fail open)" would hide the hang.
+    assert out == ("relay-egress-deadman: removed 2 preferred default(s) from table egress "
+                   "(fail open)\n"
+                   "relay-egress-deadman: ip route del timed out after 5 s\n")
+    assert err == ""
 
 
 def test_deadman_timeout_passes_timeout_kwarg(tmp_path):
@@ -1112,31 +1118,48 @@ def test_deadman_metric_zero_defaults_to_100_keeps_table(tmp_path):
     assert calls[0][7] == "mytable"
 
 
-def test_deadman_bad_table_falls_back_to_env(tmp_path, monkeypatch):
+# A config that reads fine but names no usable table: null, "", a number, a list.
+BAD_TABLES = [pytest.param(None, id="null"), pytest.param("", id="empty-string"),
+              pytest.param(5, id="number"), pytest.param(["x"], id="list")]
+NO_TABLE_MSG = ("relay-egress-deadman: no table "
+                "(config has no usable table and EGRESS_TABLE is unset/empty)")
+
+
+@pytest.mark.parametrize("bad", BAD_TABLES)
+def test_deadman_bad_table_falls_back_to_env(tmp_path, monkeypatch, bad):
     D = _load_deadman()
     monkeypatch.setenv("EGRESS_TABLE", "envtable")
     p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": None}))  # Bad table
+    p.write_text(json.dumps({"table": bad}))
     calls = []
 
     def run(argv, **kw):
         calls.append(argv)
-        return R(rc=2)
+        return R(rc=2, err="RTNETLINK answers: No such process")
 
     assert D.main(["--config", str(p)], runner=run) == 0
-    # Should use env table
-    assert calls[0][7] == "envtable"
+    assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "envtable"]]
 
 
-def test_deadman_bad_table_unset_env_exits_1_with_message(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("env", [None, ""], ids=["env-unset", "env-empty"])
+@pytest.mark.parametrize("bad", BAD_TABLES)
+def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
+        tmp_path, monkeypatch, capsys, bad, env):
     D = _load_deadman()
-    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    if env is None:
+        monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    else:
+        monkeypatch.setenv("EGRESS_TABLE", env)
     p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": 123}))  # Bad table
+    p.write_text(json.dumps({"table": bad}))
 
-    assert D.main(["--config", str(p)], runner=lambda *a, **k: R()) == 1
+    def run(argv, **kw):
+        raise AssertionError(f"no usable table, so no ip command: {argv}")
+
+    assert D.main(["--config", str(p)], runner=run) == 1
     out, err = capsys.readouterr()
-    assert "config has no usable table and EGRESS_TABLE is unset/empty" in err
+    assert out == ""
+    assert err == NO_TABLE_MSG + "\n"
 
 
 def test_deadman_fib_table_not_exist_same_as_no_such_process(tmp_path, capsys):

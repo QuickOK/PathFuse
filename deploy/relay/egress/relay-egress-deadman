@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """relay-egress-deadman: fail open when the relay egress actuator fails.
 
-systemd runs this (OnFailure=) when a relay-egress-watchdog tick crashes, times
-out or rejects its config. It deletes every preferred default (metric 100
-unless the config says otherwise) from the egress table, so the client's
-traffic falls through to the relay's own WAN default. It is independent of the
-main script on purpose: it must work while that script is broken.
+systemd runs this (OnFailure=) when a relay-egress-watchdog tick fails:
+- the actuator exits 1 (it could not read the egress table, or a preferred-route
+  command failed),
+- the actuator exits 2 (it rejected its config),
+- the actuator crashes, or
+- the tick times out.
+It deletes every preferred default (metric 100 unless the config says otherwise)
+from the egress table, so the client's traffic falls through to the relay's own
+WAN default. It is independent of the main script on purpose: it must work while
+that script is broken.
 
 If the config has "dry_run": true, this script skips execution (does not run
 any ip commands) and exits 0. This prevents the dead-man from undoing a
@@ -16,6 +21,8 @@ import json
 import os
 import subprocess
 import sys
+
+IP_TIMEOUT_S = 5   # one `ip route del` may take this long before it counts as hung
 
 
 def read_config(config_path):
@@ -75,11 +82,13 @@ def main(argv=None, runner=subprocess.run) -> int:
     for _ in range(16):
         try:
             r = runner(["ip", "route", "del", "default", "metric", str(metric), "table", table],
-                       capture_output=True, text=True, timeout=5)
+                       capture_output=True, text=True, timeout=IP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            # Timeout counts as a hung ip; print summary and exit 1
+            # A hung ip is not success: report what was removed, say why we stopped, exit 1
             print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
                   f"{table} (fail open)", flush=True)
+            print(f"relay-egress-deadman: ip route del timed out after {IP_TIMEOUT_S} s",
+                  flush=True)
             return 1
 
         if r.returncode != 0:
