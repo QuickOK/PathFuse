@@ -1495,6 +1495,9 @@ def load_config(path: str) -> Config:
                 wan_down_hold_s=float(raw_notif.get("wan_down_hold_s", 10.0)),
                 switch_hold_s=float(raw_notif.get("switch_hold_s", 60.0)),
                 fec_alerts=bool(raw_notif.get("fec_alerts", False)),
+                # Absent: the default path. JSON null: None, which keeps no record.
+                egress_alert_path=raw_notif.get("egress_alert_path",
+                                                notify.DEFAULT_EGRESS_ALERT_PATH),
             )
 
         cfg = Config(
@@ -1600,6 +1603,11 @@ def load_config(path: str) -> Config:
             raise ValueError(
                 f"notifications.switch_hold_s must be >= 0, "
                 f"got {cfg.notifications.switch_hold_s}")
+        alert_path = cfg.notifications.egress_alert_path
+        if alert_path is not None and (not isinstance(alert_path, str) or not alert_path):
+            raise ValueError(
+                f"notifications.egress_alert_path must be a non-empty string or null, "
+                f"got {alert_path!r}")
 
     return cfg
 
@@ -3506,7 +3514,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             relay_fail_threshold=max(1, round(10.0 / remote_interval)),
             wan_down_hold_s=cfg.notifications.wan_down_hold_s,
             switch_hold_s=cfg.notifications.switch_hold_s,
-            fec_alerts=cfg.notifications.fec_alerts)
+            fec_alerts=cfg.notifications.fec_alerts,
+            egress_alert_path=cfg.notifications.egress_alert_path)
 
     if stop_event is None:
         stop_event = threading.Event()

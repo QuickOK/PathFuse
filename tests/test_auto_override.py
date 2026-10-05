@@ -1016,15 +1016,17 @@ def test_published_snapshot_egress_observed_is_null_when_off(tmp_path, monkeypat
 
 
 def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path, monkeypatch):
-    # run_controller with notifications on. The tests above stop short of two wiring
-    # points: the observer runs on the controller's own stop event, and every tick's
+    # run_controller with notifications on. The tests above stop short of three wiring
+    # points: the observer runs on the controller's own stop event; every tick's
     # egress_observed reaches the detector, so a persistent fallback pages once and
-    # its end pages once.
+    # its end pages once; and the detector keeps the fallback's record at the
+    # configured egress_alert_path while it stands.
     import egress_observer
     import notify
     import threading
     script = ["checking", "pending", "mismatch", "mismatch", "error", "match", "match"]
-    started, published, pages = [], [], []
+    started, published, pages, recorded = [], [], [], []
+    record = tmp_path / "egress_alert.json"
 
     class FakeObserver:
         def __init__(self, cfg, **kw):
@@ -1067,7 +1069,7 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
         sbfd_local_state=str(tmp_path / "sbfd.json"),
         egress=M.EgressCfg(default_mode="relay_backbone", observe=egress_observer.ObserveCfg(
             url="https://probe.example.net/trace")),
-        notifications=notify.NotifyCfg(topic="t"),
+        notifications=notify.NotifyCfg(topic="t", egress_alert_path=str(record)),
     )
     stop = threading.Event()
     monkeypatch.setattr(stop, "wait", lambda timeout=None: stop.is_set())   # no sleeping between ticks
@@ -1078,6 +1080,7 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
         # _stub_controller_io stops after one tick; this runs one tick per scripted status.
         real_publish(c, snap)
         published.append(snap["egress_observed"]["status"])
+        recorded.append(record.exists())     # the detector has seen this tick by now
         if len(published) == len(script):
             stop.set()
 
@@ -1086,6 +1089,7 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
 
     assert len(started) == 1 and started[0] is stop         # the controller's own stop event
     assert published == script                              # the whole script ran, one snapshot a tick
+    assert recorded == [False, False, True, True, True, False, False]
     assert [e.kind for e in pages] == ["started", "egress", "egress"]
     fallback, restored = pages[1], pages[2]
     assert "fallback" in fallback.title.lower() and fallback.priority == "high"

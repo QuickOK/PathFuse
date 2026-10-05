@@ -188,6 +188,38 @@ def test_load_config_notifications_minimal(tmp_path: Path):
     assert cfg.notifications.fec_alerts is False
 
 
+@pytest.mark.parametrize("notif, want", [
+    pytest.param({"topic": "pathfuse"}, "/var/lib/sbfd-ctl/egress_alert.json", id="absent"),
+    pytest.param({"topic": "pathfuse", "egress_alert_path": "/srv/sbfd-ctl/egress_alert.json"},
+                 "/srv/sbfd-ctl/egress_alert.json", id="a-path"),
+    # null keeps no record, so a restart pages a standing fallback again
+    pytest.param({"topic": "pathfuse", "egress_alert_path": None}, None, id="null"),
+])
+def test_load_config_notifications_egress_alert_path(tmp_path: Path, notif, want):
+    raw = dict(SAMPLE)
+    raw["notifications"] = notif
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.notifications is not None
+    assert cfg.notifications.egress_alert_path == want
+
+
+@pytest.mark.parametrize("value", [
+    pytest.param("", id="empty"),
+    pytest.param(5, id="a-number"),
+    pytest.param(True, id="a-bool"),
+    pytest.param(["/srv/egress_alert.json"], id="a-list"),
+])
+def test_load_config_notifications_bad_egress_alert_path_raises(tmp_path: Path, value):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse", "egress_alert_path": value}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="egress_alert_path"):
+        sbfd_ctl.load_config(str(p))
+
+
 def test_load_config_notifications_full(tmp_path: Path):
     raw = dict(SAMPLE)
     raw["notifications"] = {"topic": "pathfuse", "min_interval_s": 60,

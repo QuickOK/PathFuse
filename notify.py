@@ -11,6 +11,7 @@ appends to an in-memory deque and returns; all subprocess work happens on the
 worker thread. Delivery reliability (spool + redeliver when the uplink is
 down) is spool-notify's job, not ours.
 """
+import json
 import logging
 import math
 import os
@@ -22,6 +23,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 DEFAULT_COMMAND = "/usr/local/sbin/spool-notify"
+# sbfd-ctl's StateDirectory: it survives a service restart and a reboot alike.
+DEFAULT_EGRESS_ALERT_PATH = "/var/lib/sbfd-ctl/egress_alert.json"
 
 # What the UI calls each egress mode; used in egress fallback messages.
 EGRESS_LABELS = {
@@ -50,6 +53,9 @@ class NotifyCfg:
     # down events; switches never got it.
     switch_hold_s: float = 60.0
     fec_alerts: bool = False
+    # Where an announced egress fallback is recorded, so a restart in the middle of
+    # one does not page it again (see EventDetector). None keeps no record.
+    egress_alert_path: Optional[str] = DEFAULT_EGRESS_ALERT_PATH
 
 
 @dataclass
@@ -254,11 +260,21 @@ class EventDetector:
     A WAN must be continuously not-UP for wan_down_hold_s before it alerts;
     the same hold gates the all-WANs-down alert. Anything shorter is a blip
     and stays invisible — including the recovery, since alerting "✅ up" for
-    an outage that was never announced would be noise on its own."""
+    an outage that was never announced would be noise on its own.
+
+    An egress fallback can outlive the process that announced it, and the seed
+    cannot see one: the actual-exit check starts over at `checking`. So with
+    egress_alert_path set, each fallback announced is recorded there, and the
+    record is removed when the alert ends. A restart reads it at the seed: a
+    fallback paged before the restart is not paged again and its restore still
+    is, while one that began during the restart pages as usual. With
+    egress_alert_path None the detector does no file I/O at all, and a restart
+    in the middle of a fallback pages it again."""
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
                  switch_hold_s: float = 60.0,
+                 egress_alert_path: Optional[str] = None,
                  clock=time.monotonic, wall_clock=time.time):
         self.relay_fail_threshold = max(1, int(relay_fail_threshold))
         self.wan_down_hold_s = max(0.0, float(wan_down_hold_s))
@@ -292,7 +308,10 @@ class EventDetector:
         self._fec_at_max = False
         self._relay_fails = 0
         self._relay_alerted = False
-        self._egress_alerted = False
+        # The selected mode whose fallback has been announced; None when no
+        # egress alert stands. Mirrored at egress_alert_path when that is set.
+        self._egress_alert_mode: Optional[str] = None
+        self._egress_alert_path = egress_alert_path
 
     def observe(self, obs: Observation) -> list:
         evs = []
@@ -343,10 +362,29 @@ class EventDetector:
             self._all_down_alerted = True
         if obs.relay_polled and not obs.relay_ok:
             self._relay_fails = 1
-        # An exit already confirmed wrong counts as announced too; a later match
-        # still sends the restore. A `pending` is not yet a fallback, so it stays armed.
-        if obs.egress and obs.egress.get("status") == "mismatch":
-            self._egress_alerted = True
+        # An egress fallback standing at a restart is invisible here: a fresh
+        # observer reports `checking` until its first check. The record the run
+        # before this one left tells a fallback it announced from one that began
+        # during the restart.
+        #   - A record for the selected mode: its fallback was paged and never
+        #     restored. The alert stands, so a confirmed mismatch stays silent and
+        #     a match sends the restore.
+        #   - A record for another mode: the selected mode changed while the
+        #     controller was down, which ends an alert silently. Drop it.
+        #   - No usable record: nothing stands, so a fallback pages as usual.
+        # An exit already confirmed wrong at startup counts as announced too, and
+        # is recorded like any other. A `pending` is not yet a fallback, so it
+        # stays armed. With the check off there is no egress, and nothing is read.
+        if obs.egress:
+            selected = obs.egress.get("selected")
+            recorded = self._read_egress_alert()
+            if recorded is not None:
+                if recorded == selected:
+                    self._egress_alert_mode = recorded
+                else:
+                    self._remove_egress_alert()
+            if obs.egress.get("status") == "mismatch" and self._egress_alert_mode is None:
+                self._raise_egress_alert(selected)
         self._seeded = True
 
     # -- per-category edges ----------------------------------------------
@@ -577,26 +615,108 @@ class EventDetector:
     def _egress_events(self, obs):
         """Page once when the observed exit has disagreed with the selected mode
         for the configured number of checks, and once when it agrees again. A
-        failed check is not a recovery. A change of the selected mode ends an
-        alert silently: the observer reports `checking` right after the change,
-        and `skipped` while local_direct is selected. A fallback on the new mode
+        failed check is not a recovery.
+
+        An alert belongs to the selected mode it was raised for. It ends silently
+        when an observation names another mode, or reports `skipped` (the check
+        does not run while local_direct is selected). A fallback on the new mode
         then pages afresh, and a match under it is not announced as a restore.
-        A mismatch already present at startup counts as announced (see _seed)."""
+        `checking` alone ends nothing: the observer reports it at its own start
+        and after a mode change, and the mode comparison already covers a change.
+        That leaves its start, after a restart, where an alert the record carried
+        over (see _seed) must stand until the first check confirms or clears it."""
         e = obs.egress
         if not e:
             return []
-        status = e.get("status")
-        if status == "mismatch" and not self._egress_alerted:
-            self._egress_alerted = True
+        status, selected = e.get("status"), e.get("selected")
+        if self._egress_alert_mode is not None and (
+                selected != self._egress_alert_mode or status == "skipped"):
+            self._end_egress_alert()
+        if status == "mismatch" and self._egress_alert_mode is None:
+            self._raise_egress_alert(selected)
             ip = f" ({e['ip']})" if e.get("ip") else ""
             return [Event("egress", "🧭 Egress fallback",
-                          f"selected {egress_label(e.get('selected'))}, "
+                          f"selected {egress_label(selected)}, "
                           f"actual {egress_label(e.get('observed'))}{ip}", "high")]
-        if status == "match" and self._egress_alerted:
-            self._egress_alerted = False
+        if status == "match" and self._egress_alert_mode is not None:
+            self._end_egress_alert()
             return [Event("egress", "🧭 Egress restored",
-                          f"actual exit matches {egress_label(e.get('selected'))} again",
+                          f"actual exit matches {egress_label(selected)} again",
                           "default")]
-        if status in ("skipped", "checking"):
-            self._egress_alerted = False
         return []
+
+    # -- the egress alert record ------------------------------------------------
+    #
+    # The record only spares the operator a repeated page. A failure to read,
+    # write or remove it is logged and the tick carries on: it must never cost a
+    # page or stop the control loop.
+
+    def _raise_egress_alert(self, mode) -> None:
+        self._egress_alert_mode = mode
+        path = self._egress_alert_path
+        if path is None:
+            return
+        body = json.dumps({"selected": mode, "announced_at": self._wall_clock()})
+        # A temp file beside the record, renamed over it, so a reader never meets
+        # half a record. The temp name is this writer's own.
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(body)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            logging.warning("egress alert: cannot record the fallback in %s, so a "
+                            "restart will page it again: %s", path, e)
+
+    def _end_egress_alert(self) -> None:
+        self._egress_alert_mode = None
+        self._remove_egress_alert()
+
+    def _remove_egress_alert(self) -> None:
+        path = self._egress_alert_path
+        if path is None:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logging.warning("egress alert: cannot remove the record %s, so a restart "
+                            "may take its fallback for still standing: %s", path, e)
+
+    def _read_egress_alert(self) -> Optional[str]:
+        """The selected mode the record names, or None when there is no usable
+        record. Only a missing file passes without a warning. A file that cannot
+        be read is left where it is."""
+        path = self._egress_alert_path
+        if path is None:
+            return None
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            logging.warning("egress alert: cannot read the record %s, so it counts "
+                            "as absent: %s", path, e)
+            return None
+        try:
+            rec = json.loads(raw)
+        except (ValueError, RecursionError) as e:   # not UTF-8, not JSON, or too deep
+            logging.warning("egress alert: the record %s is not JSON, so it counts "
+                            "as absent: %s", path, e)
+            return None
+        selected = rec.get("selected") if isinstance(rec, dict) else None
+        if not isinstance(selected, str) or not selected:
+            logging.warning("egress alert: the record %s names no selected mode, so "
+                            "it counts as absent", path)
+            return None
+        return selected

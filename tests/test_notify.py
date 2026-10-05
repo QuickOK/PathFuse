@@ -1,3 +1,9 @@
+import builtins
+import errno
+import io
+import logging
+import threading
+from pathlib import Path
 from typing import Any, Optional
 
 import pytest
@@ -932,11 +938,11 @@ def _eg_checking(selected):
     return _eg("checking", selected=selected, observed=None, ip=None)
 
 
-def test_egress_checking_clears_the_alert_silently():
+def test_egress_a_mode_change_clears_the_alert_silently():
     d = notify.EventDetector()
     d.observe(obs(egress=_eg("checking")))
     assert len(d.observe(obs(egress=_eg("mismatch")))) == 1      # relay Backbone fell back
-    assert d.observe(obs(egress=_eg_checking("relay_direct"))) == []
+    assert d.observe(obs(egress=_eg_checking("relay_direct"))) == []   # the mode changed
     # The alert was about relay Backbone, so relay Direct holding is no recovery.
     assert d.observe(obs(egress=_eg("match", selected="relay_direct", observed="relay_direct"))) == []
 
@@ -955,11 +961,12 @@ def test_egress_a_fallback_on_the_new_mode_pages_afresh():
 @pytest.mark.parametrize("ending", [
     pytest.param(_eg("match", observed="relay_backbone"), id="match"),
     pytest.param(_eg("skipped", selected="local_direct"), id="skipped"),
-    pytest.param(_eg_checking("relay_backbone"), id="checking"),
+    pytest.param(_eg_checking("relay_vpn"), id="mode-change"),
 ])
 def test_egress_a_new_mismatch_pages_again_after_the_alert_ends(ending):
     # Each ending is fed on its own, so a branch that forgets to re-arm the page
-    # cannot be rescued by another one.
+    # cannot be rescued by another one. After the mode change, the mismatch below is
+    # relay Backbone's again: selected once more, it starts with nothing announced.
     d = notify.EventDetector()
     d.observe(obs(egress=_eg("checking")))
     assert len(d.observe(obs(egress=_eg("mismatch")))) == 1
@@ -998,3 +1005,251 @@ def test_egress_none_is_ignored():
     d = notify.EventDetector()
     d.observe(obs())
     assert d.observe(obs()) == []
+
+
+# -- an egress alert across a restart -----------------------------------------------
+#
+# With egress_alert_path set, the detector records each fallback it announces and
+# removes the record when the alert ends. A restart is a second detector on the same
+# path, fed what a fresh observer reports: `checking` until its first check (its settle
+# alone outlasts many ticks), then its verdicts.
+
+FALLBACK, RESTORED = "🧭 Egress fallback", "🧭 Egress restored"
+ANNOUNCED_AT = 1_780_000_000.0   # a wall-clock epoch
+
+
+def _titles(evs):
+    return [e.title for e in evs]
+
+
+def _write_record(path, selected):
+    path.write_text(json.dumps({"selected": selected, "announced_at": ANNOUNCED_AT}))
+
+
+def _warnings(caplog):
+    # The detector runs on the test's own thread; a thread another test left running
+    # must not change the count.
+    me = threading.get_ident()
+    return [r for r in caplog.records if r.levelno == logging.WARNING and r.thread == me]
+
+
+def test_egress_a_fallback_announced_before_a_restart_is_not_paged_again(tmp_path):
+    path = tmp_path / "egress_alert.json"
+    before = notify.EventDetector(egress_alert_path=str(path))
+    assert before.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert before.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(before.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert path.exists()
+    after = notify.EventDetector(egress_alert_path=str(path))   # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # its seed
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # still settling
+    assert after.observe(obs(egress=_eg("pending"))) == []
+    assert after.observe(obs(egress=_eg("mismatch"))) == []     # paged before the restart
+    assert after.observe(obs(egress=_eg("mismatch"))) == []
+    evs = after.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert _titles(evs) == [RESTORED]
+    assert not path.exists()
+    assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
+
+
+def test_egress_a_fallback_that_began_while_down_pages_after_the_restart(tmp_path, caplog):
+    path = tmp_path / "egress_alert.json"     # no record: nothing was announced
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert after.observe(obs(egress=_eg("mismatch"))) == []
+    assert _warnings(caplog) == []            # no record is the normal case, not a fault
+
+
+@pytest.mark.parametrize("seed", [
+    pytest.param(_eg_checking("relay_backbone"), id="checking"),
+    pytest.param(_eg("match", observed="relay_backbone"), id="match"),
+])
+def test_egress_a_fallback_that_recovered_while_down_pages_the_restore(tmp_path, seed):
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")     # paged before the restart, never restored
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=seed)) == []
+    evs = after.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert _titles(evs) == [RESTORED]
+    assert not path.exists()
+    assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
+
+
+def test_egress_a_record_for_another_mode_is_dropped_at_the_restart(tmp_path):
+    # The selected mode changed while the controller was down. A change ends an alert
+    # silently while it runs, and does so across a restart too.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    assert not path.exists()
+    assert after.observe(obs(egress=_eg("match", selected="relay_vpn", observed="relay_vpn"))) == []
+    assert _titles(after.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
+
+
+@pytest.mark.parametrize("prior", [None, "relay_backbone"], ids=["no-record", "record-for-another-mode"])
+def test_egress_a_fallback_found_at_startup_is_recorded_like_any_other(tmp_path, prior):
+    path = tmp_path / "egress_alert.json"
+    if prior is not None:
+        _write_record(path, prior)
+    first = notify.EventDetector(egress_alert_path=str(path))
+    assert first.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))) == []   # counted as announced
+    assert json.loads(path.read_text())["selected"] == "relay_vpn"
+    again = notify.EventDetector(egress_alert_path=str(path))   # so a restart keeps it announced
+    assert again.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    assert again.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))) == []
+    evs = again.observe(obs(egress=_eg("match", selected="relay_vpn", observed="relay_vpn")))
+    assert _titles(evs) == [RESTORED]
+
+
+def test_egress_a_mode_change_ends_the_alert_and_its_record(tmp_path):
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    assert not path.exists()
+    # The alert was about relay Backbone, so relay-VPN holding is no recovery,
+    assert d.observe(obs(egress=_eg("match", selected="relay_vpn", observed="relay_vpn"))) == []
+    # and a fallback on relay-VPN is news.
+    assert _titles(d.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
+    assert json.loads(path.read_text())["selected"] == "relay_vpn"
+
+
+@pytest.mark.parametrize("selected", ["local_direct", "relay_backbone"])
+def test_egress_skipped_ends_the_alert_and_its_record(tmp_path, selected):
+    # The observer skips its check while local_direct is selected. `skipped` ends an
+    # alert even under the alert's own mode, so the rule does not lean on a mode change.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.observe(obs(egress=_eg("skipped", selected=selected, observed=None, ip=None))) == []
+    assert not path.exists()
+    assert d.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []   # no restore
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param(b'{"selected": "relay_backbone"', id="garbled"),
+    pytest.param(b'{"selected": "relay_\xffbackbone"}', id="not-utf-8"),
+    pytest.param(b'["relay_backbone"]', id="a-list"),
+    pytest.param(b'"relay_backbone"', id="a-string"),
+    pytest.param(b'{"announced_at": 1780000000.0}', id="no-selected"),
+    pytest.param(b'{"selected": 5}', id="selected-not-a-string"),
+    pytest.param(b'{"selected": ""}', id="selected-empty"),
+])
+def test_egress_a_bad_record_counts_as_no_record(tmp_path, caplog, body):
+    path = tmp_path / "egress_alert.json"
+    path.write_bytes(body)
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert len(_warnings(caplog)) == 1        # said once, at the seed
+    assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+
+
+def test_egress_an_unreadable_record_is_left_in_place(tmp_path, caplog, monkeypatch):
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_vpn")          # another mode's: if it could be read, it would go
+    real_open = builtins.open
+
+    def refuse_the_record(file, *a, **kw):
+        if os.fspath(file) == str(path):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_open(file, *a, **kw)
+
+    monkeypatch.setattr(builtins, "open", refuse_the_record)
+    monkeypatch.setattr(io, "open", refuse_the_record)
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert len(_warnings(caplog)) == 1
+    assert path.exists()
+
+
+@pytest.mark.parametrize("layout", ["parent-is-a-file", "path-is-a-directory"])
+def test_egress_alert_io_failures_are_logged_and_never_raise(tmp_path, caplog, layout):
+    if layout == "parent-is-a-file":
+        (tmp_path / "state").write_text("not a directory")
+        path = tmp_path / "state" / "egress_alert.json"   # reads, writes and removes all fail
+    else:
+        path = tmp_path / "egress_alert.json"
+        path.mkdir()                                       # reads, replaces and removes fail
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert len(_warnings(caplog)) == 1                     # the read
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert len(_warnings(caplog)) == 2                     # the write
+    assert _titles(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert len(_warnings(caplog)) == 3                     # the remove
+    left = {"parent-is-a-file": ["state"], "path-is-a-directory": ["egress_alert.json"]}[layout]
+    assert sorted(p.name for p in tmp_path.iterdir()) == left   # no temp file left behind
+
+
+def test_egress_alert_path_none_does_no_file_io(monkeypatch):
+    # Every file operation the detector could reach fails on this thread, and is noted.
+    me, attempted = threading.get_ident(), []
+
+    def refusing(name, real):
+        def call(*a, **kw):
+            if threading.get_ident() != me:
+                return real(*a, **kw)
+            attempted.append(name)
+            raise PermissionError(errno.EACCES, f"{name}: no file I/O expected")
+        return call
+
+    monkeypatch.setattr(builtins, "open", refusing("open", builtins.open))
+    monkeypatch.setattr(io, "open", refusing("io.open", io.open))
+    for name in ("open", "replace", "rename", "remove", "unlink", "makedirs", "mkdir"):
+        monkeypatch.setattr(os, name, refusing(f"os.{name}", getattr(os, name)))
+    d = notify.EventDetector()
+    pages = []
+    for e in (_eg("mismatch"),                                   # the seed: counted as announced
+              _eg("match", observed="relay_backbone"),           # restored
+              _eg("mismatch"),                                   # a fallback
+              _eg_checking("relay_vpn"),                         # a mode change ends it
+              _eg("mismatch", selected="relay_vpn"),             # a fallback
+              _eg("skipped", selected="local_direct", observed=None, ip=None)):
+        pages += _titles(d.observe(obs(egress=e)))
+    assert pages == [RESTORED, FALLBACK, FALLBACK]
+    assert attempted == []
+
+
+def test_egress_alert_record_is_written_whole_in_a_directory_made_for_it(tmp_path, monkeypatch):
+    path = tmp_path / "state" / "egress_alert.json"   # the directory does not exist yet
+    real_replace, replaced = os.replace, []
+
+    def replace(src, dst, **kw):
+        if os.fspath(dst) == str(path):
+            replaced.append((os.fspath(src), Path(src).read_text(), path.exists()))
+        return real_replace(src, dst, **kw)
+
+    monkeypatch.setattr(os, "replace", replace)
+    d = notify.EventDetector(egress_alert_path=str(path), clock=FakeClock(1000.0),
+                             wall_clock=FakeClock(ANNOUNCED_AT))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    want = {"selected": "relay_backbone", "announced_at": ANNOUNCED_AT}
+    # A reader never sees part of it: the record is written whole to a temp file beside
+    # the path, and only then renamed over it.
+    assert len(replaced) == 1
+    src, body, visible_before = replaced[0]
+    assert os.path.dirname(src) == str(path.parent) and src != str(path)
+    assert json.loads(body) == want and not visible_before
+    assert json.loads(path.read_text()) == want
+    assert [p.name for p in path.parent.iterdir()] == ["egress_alert.json"]
+
+
+def test_egress_alert_record_is_read_at_a_seed_with_the_check_on_and_only_then(tmp_path, caplog):
+    path = tmp_path / "egress_alert.json"
+    path.mkdir()                              # any read of it fails, and says so
+    off = notify.EventDetector(egress_alert_path=str(path))
+    assert _warnings(caplog) == []            # constructing reads nothing,
+    assert off.observe(obs()) == []           # nor does a seed with the check off
+    assert off.observe(obs()) == []
+    assert _warnings(caplog) == []
+    on = notify.EventDetector(egress_alert_path=str(path))
+    assert on.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert len(_warnings(caplog)) == 1        # whereas a seed with it on reads the record
