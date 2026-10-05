@@ -895,6 +895,19 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 .egress-warn[hidden] { display: none; }
 .ctl-block[hidden]   { display: none; }
 
+/* Actual-exit line under the egress radios (egress_observed). */
+.egress-actual {
+  margin-top: .35em;
+  font-size: .85em;
+  opacity: .85;
+}
+.egress-actual.warn {
+  color: var(--down);
+  opacity: 1;
+  font-weight: 600;
+}
+.egress-actual[hidden] { display: none; }
+
 /* Signal-flow diagram dims its edges when egress_mode === "local_direct" —
    client-device traffic is bypassing engarde entirely so the tunnel paths
    shouldn't visually claim ownership of the egress flow. BFD probes still

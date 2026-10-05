@@ -1,0 +1,14 @@
+[Unit]
+Description=Relay egress actuator (one tick)
+Documentation=file:///usr/local/sbin/relay-egress-watchdog
+After=network-online.target
+Wants=network-online.target
+OnFailure=relay-egress-deadman.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/relay-egress-watchdog --config /etc/relay-egress-watchdog/config.json
+TimeoutStartSec=25
+RuntimeDirectory=relay-egress-watchdog
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes

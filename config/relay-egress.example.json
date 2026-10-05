@@ -1,0 +1,37 @@
+{
+  "table": "egress",
+  "preferred_metric": 100,
+  "dry_run": true,
+  "state_path": "/run/relay-egress-watchdog/state.json",
+  "client": {
+    "control_url": "http://100.64.0.2:8081/api/desired_egress",
+    "fetch_timeout_s": 1,
+    "bootstrap_timeout_s": 5,
+    "grace_s": 60,
+    "default_mode": "relay_direct"
+  },
+  "mode_upstreams": {"relay_vpn": "vpn", "relay_backbone": "backbone"},
+  "exempt": {
+    "via": "192.0.2.1",
+    "dev": "eth0",
+    "prefixes": ["10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "198.51.100.7/32"]
+  },
+  "upstreams": {
+    "vpn": {
+      "route": {"via": "10.200.0.2", "dev": "veth-vpn"},
+      "link": "veth-vpn",
+      "probe": {"url": "https://probe.example.net/trace", "netns": "vpn",
+                "expect": "^vpn=on$", "timeout_s": 5},
+      "fail_threshold": 3,
+      "pass_threshold": 2
+    },
+    "backbone": {
+      "route": {"dev": "wg-exit"},
+      "link": "wg-exit",
+      "probe": {"url": "https://probe.example.net/trace", "source": "10.99.1.2",
+                "expect": "^ip=203\\.0\\.113\\.10$", "timeout_s": 5},
+      "fail_threshold": 3,
+      "pass_threshold": 2
+    }
+  }
+}

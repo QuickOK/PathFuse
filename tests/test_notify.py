@@ -1,3 +1,6 @@
+from typing import Any, Optional
+
+import pytest
 import notify
 
 
@@ -215,7 +218,7 @@ def test_notifier_survives_failing_command(tmp_path):
 
 
 def obs(**kw):
-    base = dict(
+    base: dict[str, Any] = dict(
         wan_states={"wan1": "UP", "wan2": "UP"},
         wan_labels={"wan1": "Cellular", "wan2": "Satellite"},
         mode="master_backup",
@@ -882,3 +885,90 @@ def test_maintenance_still_wins_over_the_switch_hold():
                          switch=(["wan1", "wan2"], ["wan1"], "wan2 down"))) == []
     clk.advance(300)
     assert d.observe(obs(maintenance=win)) == []
+
+
+# -- egress fallback ----------------------------------------------------------
+
+
+def _eg(status: str, selected: str = "relay_backbone", observed: Optional[str] = "relay_direct",
+        ip: Optional[str] = "198.51.100.20") -> dict:
+    return {"selected": selected, "observed": observed, "ip": ip, "status": status,
+            "since": 1.0, "checked_at": 1.0, "error": None}
+
+
+def test_egress_label_known_and_unknown():
+    assert notify.egress_label("relay_backbone") == "relay Backbone"
+    assert notify.egress_label("relay_direct") == "relay Direct"
+    assert notify.egress_label("banana") == "banana"
+    assert notify.egress_label(None) == "unknown"
+
+
+def test_egress_mismatch_pages_once_then_restores():
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=_eg("checking"))) == []          # seed
+    assert d.observe(obs(egress=_eg("pending"))) == []
+    evs = d.observe(obs(egress=_eg("mismatch")))
+    assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
+    assert "relay Backbone" in evs[0].message and "relay Direct" in evs[0].message
+    assert "198.51.100.20" in evs[0].message
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # no repeat
+    assert d.observe(obs(egress=_eg("error"))) == []             # an error is not a recovery
+    evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert len(evs) == 1 and "restored" in evs[0].title.lower()
+    assert evs[0].priority == "default"                          # a recovery is not an alarm
+
+
+def test_egress_skipped_clears_the_alert_silently():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    d.observe(obs(egress=_eg("mismatch")))
+    assert d.observe(obs(egress=_eg("skipped", selected="local_direct"))) == []
+    assert d.observe(obs(egress=_eg("match", selected="relay_direct", observed="relay_direct"))) == []
+
+
+def _eg_checking(selected):
+    # What the observer publishes right after the selected mode changes: the
+    # evaluation restarts and nothing is known about the exit yet.
+    return _eg("checking", selected=selected, observed=None, ip=None)
+
+
+def test_egress_checking_clears_the_alert_silently():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert len(d.observe(obs(egress=_eg("mismatch")))) == 1      # relay Backbone fell back
+    assert d.observe(obs(egress=_eg_checking("relay_direct"))) == []
+    # The alert was about relay Backbone, so relay Direct holding is no recovery.
+    assert d.observe(obs(egress=_eg("match", selected="relay_direct", observed="relay_direct"))) == []
+
+
+def test_egress_a_fallback_on_the_new_mode_pages_afresh():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert len(d.observe(obs(egress=_eg("mismatch")))) == 1      # relay Backbone fell back
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    assert d.observe(obs(egress=_eg("pending", selected="relay_vpn"))) == []
+    evs = d.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))
+    assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
+    assert "selected relay-VPN" in evs[0].message and "actual relay Direct" in evs[0].message
+
+
+@pytest.mark.parametrize("ending", [
+    pytest.param(_eg("match", observed="relay_backbone"), id="match"),
+    pytest.param(_eg("skipped", selected="local_direct"), id="skipped"),
+    pytest.param(_eg_checking("relay_backbone"), id="checking"),
+])
+def test_egress_a_new_mismatch_pages_again_after_the_alert_ends(ending):
+    # Each ending is fed on its own, so a branch that forgets to re-arm the page
+    # cannot be rescued by another one.
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert len(d.observe(obs(egress=_eg("mismatch")))) == 1
+    d.observe(obs(egress=ending))
+    evs = d.observe(obs(egress=_eg("mismatch")))
+    assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
+
+
+def test_egress_none_is_ignored():
+    d = notify.EventDetector()
+    d.observe(obs())
+    assert d.observe(obs()) == []

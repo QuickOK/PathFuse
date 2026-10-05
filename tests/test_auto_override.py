@@ -894,3 +894,200 @@ def test_load_auto_override_allows_small_clock_skew(tmp_path):
                     force_full=True)
     ao = M.load_auto_override(c, 1001.0)
     assert ao is not None and ao.force_full is True
+
+
+def test_published_snapshot_carries_egress_default_mode(tmp_path, monkeypatch):
+    # The UI moves its "default" tag to egress_default_mode, so it must be the
+    # CONFIGURED default and not the mode in effect. With no operator overlay the
+    # two are equal by construction, so seed one that differs from the config.
+    import threading
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_direct"),
+    )
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(
+        egress_mode="relay_backbone", set_by="ui", set_ts=1.0))
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_mode"] == "relay_backbone"
+    assert snap["egress_default_mode"] == "relay_direct"
+
+
+def test_published_snapshot_carries_egress_observed_and_feeds_the_observer(tmp_path, monkeypatch):
+    import threading
+    import egress_observer
+    seen = []
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            self.cfg = cfg
+
+        def start(self, stop):
+            pass
+
+        def set_selected(self, mode):
+            seen.append(mode)
+
+        def snapshot(self):
+            return {"selected": seen[-1] if seen else None, "observed": "relay_direct",
+                    "ip": "198.51.100.20", "status": "match", "since": 1.0,
+                    "checked_at": 2.0, "error": None}
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_direct", observe=egress_observer.ObserveCfg(
+            url="https://probe.example.net/trace")),
+    )
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert seen == ["relay_direct"]
+    assert snap["egress_observed"]["status"] == "match"
+    assert snap["egress_observed"]["selected"] == "relay_direct"
+
+
+def test_controller_builds_the_observer_from_the_observe_block_and_feeds_it_the_effective_mode(
+        tmp_path, monkeypatch):
+    """The observer must be built from cfg.egress.observe and fed the EFFECTIVE egress
+    mode, the operator's overlay over the config default. The overlay here differs from
+    the default, or a feed of the default would pass too. Fed the default, the observer
+    would judge the exit against a mode the operator has already left, and page on it."""
+    import threading
+    import egress_observer
+    built, seen = [], []
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            built.append(cfg)
+
+        def start(self, stop):
+            pass
+
+        def set_selected(self, mode):
+            seen.append(mode)
+
+        def snapshot(self):
+            return {"selected": seen[-1] if seen else None, "observed": None, "ip": None,
+                    "status": "checking", "since": 1.0, "checked_at": None, "error": None}
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    observe = egress_observer.ObserveCfg(url="https://probe.example.net/trace")
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=observe),
+    )
+    M.save_runtime_overlay(cfg, M.RuntimeOverlay(egress_mode="relay_vpn", set_by="ui",
+                                                 set_ts=1.0))
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    assert len(built) == 1 and built[0] is observe
+    assert seen == ["relay_vpn"]
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_observed"]["selected"] == "relay_vpn"
+
+
+def test_published_snapshot_egress_observed_is_null_when_off(tmp_path, monkeypatch):
+    import threading
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+    )
+    stop = threading.Event()
+    _stub_controller_io(monkeypatch, stop)
+    M.run_controller(cfg, stop_event=stop)
+    snap = json.loads(Path(cfg.published_state).read_text())
+    assert snap["egress_observed"] is None
+
+
+def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path, monkeypatch):
+    # run_controller with notifications on. The tests above stop short of two wiring
+    # points: the observer runs on the controller's own stop event, and every tick's
+    # egress_observed reaches the detector, so a persistent fallback pages once and
+    # its end pages once.
+    import egress_observer
+    import notify
+    import threading
+    script = ["checking", "pending", "mismatch", "mismatch", "error", "match", "match"]
+    started, published, pages = [], [], []
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            self.selected = None
+            self.n = 0
+
+        def start(self, stop):
+            started.append(stop)
+
+        def set_selected(self, mode):
+            self.selected = mode
+
+        def snapshot(self):
+            status = script[min(self.n, len(script) - 1)]
+            self.n += 1
+            return {"selected": self.selected,
+                    "observed": "relay_backbone" if status == "match" else "relay_direct",
+                    "ip": "198.51.100.20", "status": status, "since": 1.0,
+                    "checked_at": 2.0, "error": None}
+
+    class StubNotifier:
+        def __init__(self, topic, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def notify(self, ev):
+            pages.append(ev)
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    monkeypatch.setattr(notify, "Notifier", StubNotifier)
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=egress_observer.ObserveCfg(
+            url="https://probe.example.net/trace")),
+        notifications=notify.NotifyCfg(topic="t"),
+    )
+    stop = threading.Event()
+    monkeypatch.setattr(stop, "wait", lambda timeout=None: stop.is_set())   # no sleeping between ticks
+    real_publish = M.publish_state
+    _stub_controller_io(monkeypatch, stop)
+
+    def publish_the_script(c, snap):
+        # _stub_controller_io stops after one tick; this runs one tick per scripted status.
+        real_publish(c, snap)
+        published.append(snap["egress_observed"]["status"])
+        if len(published) == len(script):
+            stop.set()
+
+    monkeypatch.setattr(M, "publish_state", publish_the_script)
+    M.run_controller(cfg, stop_event=stop)
+
+    assert len(started) == 1 and started[0] is stop         # the controller's own stop event
+    assert published == script                              # the whole script ran, one snapshot a tick
+    assert [e.kind for e in pages] == ["started", "egress", "egress"]
+    fallback, restored = pages[1], pages[2]
+    assert "fallback" in fallback.title.lower() and fallback.priority == "high"
+    assert "relay Backbone" in fallback.message and "198.51.100.20" in fallback.message
+    assert "restored" in restored.title.lower() and restored.priority == "default"

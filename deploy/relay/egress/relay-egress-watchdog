@@ -1,117 +1,340 @@
 #!/usr/bin/env python3
-"""relay-egress-watchdog: reference relay-side egress actuator.
+"""relay-egress-watchdog: relay-side egress actuator.
 
-Vendor-neutral reference implementation of the component that *enacts* a client's
-desired egress mode on the relay. The client (sbfd-ctl) only *publishes* the
-desired mode at `:8081/api/desired_egress`; this watchdog decides where the
+Enacts the client's desired egress mode on the relay. The client (sbfd-ctl) only
+publishes the mode at `:8081/api/desired_egress`; this watchdog decides where the
 client's decrypted traffic actually exits.
 
-Fired as a Type=oneshot by a 10s timer. Each tick it:
-  1. Probes the upstream-VPN egress for health.
-  2. Polls the client's control URL for the desired egress mode.
-  3. Adds/withdraws the metric-100 *upstream-VPN* default in the egress PBR
-     table so the client subnet exits via either the upstream VPN (`relay_vpn`)
-     or the relay's own WAN (`relay_direct` / `local_direct`, which leave a
-     lower-priority WAN default in place to fall through to).
+One routing table carries the client subnet's egress. This process owns two
+things in it:
 
-Reads config from an EnvironmentFile; hardcodes no real infrastructure
-addresses (defaults are RFC-5737/6598 reserved examples).
+  * the single *preferred* default route (metric `preferred_metric`), pointed at
+    the upstream the current mode selects, present only while that upstream's
+    health probe passes and every exemption route is in place; and
+  * the exemption routes: more-specific prefixes that always leave through the
+    relay's own WAN, whatever the upstream.
 
-See deploy/relay/egress/README.md for the egress-mode vocabulary contract — the
-single most important thing to keep in sync with the client.
+A lower-priority WAN default, installed by something else, stays in the table.
+With no preferred route, traffic falls through to it (fail open).
+
+Fired as a Type=oneshot by a 10 s timer. Each tick probes every upstream, polls
+the client for the desired mode, then reconciles the table. README.md beside this
+file documents the mode vocabulary and the config format.
 """
 from __future__ import annotations
 
+import argparse
+import ipaddress
 import json
-import os
+import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Callable, NamedTuple, Optional
+from urllib.parse import urlsplit
 
+# Canonical client egress vocabulary, exactly as sbfd-ctl publishes it at
+# /api/desired_egress. This MUST match VALID_EGRESS_MODES in sbfd_ctl.py.
+VALID_DESIRED_MODES = {"relay_vpn", "relay_backbone", "relay_direct", "local_direct"}
 
-# Canonical client egress vocabulary, exactly as published by sbfd-ctl's
-# /api/desired_egress. This MUST match the client; see MODE_ALIASES below.
-VALID_DESIRED_MODES = {"relay_vpn", "relay_direct", "local_direct"}
+# Modes that never use an upstream: their traffic leaves through the relay's own
+# WAN default (relay_direct) or never reaches the relay (local_direct).
+NO_UPSTREAM_MODES = {"relay_direct", "local_direct"}
 
-# Only these modes keep the upstream-VPN default route in place. Any other valid
-# mode withdraws it, so traffic falls through to the relay's own WAN default.
-UPSTREAM_MODES = {"relay_vpn"}
-
-# Translate alternate/legacy egress names onto the canonical vocabulary. An
-# actuator whose internal names drift from what the client publishes will reject
-# every poll as "invalid mode", fall back to the default, and silently never
-# honor the requested mode. Keeping this mapping correct is what prevents that.
-# Unknown/None passes through unchanged so the VALID check still rejects it.
+# Alternate/legacy names onto the canonical vocabulary. Unknown names pass
+# through unchanged so the VALID check still rejects them.
 MODE_ALIASES = {
     "upstream_vpn": "relay_vpn",
     "relay_wan": "relay_direct",
     "local": "local_direct",
 }
 
+DEFAULT_CONFIG = "/etc/relay-egress-watchdog/config.json"
+
+# Caps on the waits one tick can make, in seconds. The unit gives a tick
+# TimeoutStartSec=25 and, past it, systemd kills the tick and the dead-man withdraws
+# the preferred route. The probes (curl --max-time timeout_s) run in parallel and the
+# client poll follows them, so a slow tick lasts about probe + poll: 20 s with both at
+# their caps, or 25 s on a cold start (no last-known mode yet), when the poll may wait
+# the bootstrap timeout instead.
+MAX_PROBE_TIMEOUT_S = 10
+MAX_FETCH_TIMEOUT_S = 10
+MAX_BOOTSTRAP_TIMEOUT_S = 15
+
+_IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+_UPSTREAM_NAME = re.compile(r"[a-z0-9_-]{1,32}")
+_NETNS = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+class ConfigError(ValueError):
+    """The config file is missing, unreadable or invalid."""
+
 
 def normalize_mode(mode):
     """Map an alternate egress name onto the canonical client vocabulary."""
+    if not isinstance(mode, str):
+        return mode  # non-string passes through unchanged for VALID check to reject
     return MODE_ALIASES.get(mode, mode)
 
 
-def probe_upstream(url: str, timeout_s: float) -> tuple[bool, str]:
-    """Health-probe the upstream-VPN egress. ok=True on a 2xx response."""
-    import urllib.request, urllib.error, socket
+# --- config ------------------------------------------------------------------------
+
+def _positive(name: str, value, maximum: Optional[float] = None) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{name} must be a number, got {value!r}")
     try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as r:
-            code = r.getcode()
-            return (200 <= code < 300, str(code))
-    except urllib.error.HTTPError as e:
-        return (False, f"http {e.code}")
-    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
-        return (False, "timeout" if isinstance(e, (socket.timeout, TimeoutError)) else f"transport: {e}")
+        f = float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be a number, got {value!r}") from None
+    if not 0 < f < float("inf"):
+        raise ConfigError(f"{name} must be finite and > 0, got {value!r}")
+    if maximum is not None and f > maximum:
+        raise ConfigError(f"{name} must be at most {maximum:g} s so a tick ends within the "
+                          f"unit's TimeoutStartSec, got {value!r}")
+    return f
 
 
-def fetch_desired_mode(url: str, timeout_s: float) -> tuple[str | None, str | None, str | None]:
+def _count(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"{name} must be an integer >= 1, got {value!r}")
+    return value
+
+
+def _ifname(name: str, value) -> str:
+    if not isinstance(value, str) or not _IFNAME.fullmatch(value):
+        raise ConfigError(f"{name} must be an interface name, got {value!r}")
+    return value
+
+
+def _ipv4(name: str, value) -> str:
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except (ipaddress.AddressValueError, ValueError, TypeError):
+        raise ConfigError(f"{name} must be an IPv4 address, got {value!r}") from None
+
+
+def _check_http_url(name: str, url: str) -> None:
+    """ConfigError unless `url` is an http(s) URL that names a host. urlsplit raises
+    ValueError for a malformed netloc (an unclosed "["), and its lazy .port raises it
+    for a port that is not a number from 0 to 65535. urlopen raises the same
+    ValueError for the "[" but does not check the port: a non-numeric port fails each
+    poll with http.client.InvalidURL, and an out-of-range one is not caught at all
+    (on Linux, port 70000 polls port 4464, the port modulo 65536). So reject a bad
+    URL at load."""
+    try:
+        parts = urlsplit(url)
+        host, _port = parts.hostname, parts.port
+    except ValueError as e:
+        raise ConfigError(f"{name} is not a valid URL: {e}") from None
+    if not url.startswith(("http://", "https://")) or not host:
+        raise ConfigError(f"{name} must be an http:// or https:// URL with a host, got {url!r}")
+
+
+def _validate_upstream(name, raw) -> dict:
+    if not isinstance(name, str) or not _UPSTREAM_NAME.fullmatch(name):
+        raise ConfigError(f"upstream name {name!r} must match [a-z0-9_-]{{1,32}}")
+    if not isinstance(raw, dict):
+        raise ConfigError(f"upstreams.{name} must be an object")
+    route = raw.get("route")
+    if not isinstance(route, dict):
+        raise ConfigError(f"upstreams.{name}.route must be an object")
+    dev = _ifname(f"upstreams.{name}.route.dev", route.get("dev"))
+    via = route.get("via")
+    if via is not None:
+        via = _ipv4(f"upstreams.{name}.route.via", via)
+    link = raw.get("link")
+    if link is not None:
+        link = _ifname(f"upstreams.{name}.link", link)
+    probe = raw.get("probe")
+    if not isinstance(probe, dict):
+        raise ConfigError(f"upstreams.{name}.probe must be an object")
+    url = probe.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise ConfigError(f"upstreams.{name}.probe.url must be an http(s) URL")
+    netns, source = probe.get("netns"), probe.get("source")
+    if netns is not None and source is not None:
+        raise ConfigError(f"upstreams.{name}.probe: set netns or source, not both")
+    if netns is not None and (not isinstance(netns, str) or not _NETNS.fullmatch(netns)):
+        raise ConfigError(f"upstreams.{name}.probe.netns must be a namespace name")
+    if source is not None:
+        source = _ipv4(f"upstreams.{name}.probe.source", source)
+    expect = probe.get("expect")
+    if not isinstance(expect, str) or not expect:
+        raise ConfigError(f"upstreams.{name}.probe.expect must be a non-empty regex")
+    try:
+        re.compile(expect)
+    except re.error as e:
+        raise ConfigError(f"upstreams.{name}.probe.expect: {e}") from None
+    return {
+        "name": name,
+        "route": {"dev": dev, "via": via},
+        "link": link,
+        "probe": {"url": url, "netns": netns, "source": source, "expect": expect,
+                  "timeout_s": _positive(f"upstreams.{name}.probe.timeout_s",
+                                         probe.get("timeout_s", 5), MAX_PROBE_TIMEOUT_S)},
+        "fail_threshold": _count(f"upstreams.{name}.fail_threshold",
+                                 raw.get("fail_threshold", 3)),
+        "pass_threshold": _count(f"upstreams.{name}.pass_threshold",
+                                 raw.get("pass_threshold", 2)),
+    }
+
+
+def _validate_exempt(raw) -> dict:
+    empty: dict = {"via": None, "dev": None, "prefixes": []}
+    if raw is None:
+        return empty
+    if not isinstance(raw, dict):
+        raise ConfigError("exempt must be an object")
+    prefixes = raw.get("prefixes", [])
+    if not isinstance(prefixes, list):
+        raise ConfigError("exempt.prefixes must be a list")
+    norm = []
+    for p in prefixes:
+        try:
+            net = ipaddress.IPv4Network(p, strict=True)
+        except (ValueError, TypeError) as e:  # AddressValueError is a ValueError
+            raise ConfigError(f"exempt.prefixes: {p!r}: {e}") from None
+        if net.prefixlen == 0:
+            raise ConfigError(f"exempt.prefixes: {p!r}: prefix length 0 would route everything")
+        norm.append(str(net))
+    if not norm:
+        return empty
+    return {"via": _ipv4("exempt.via", raw.get("via")),
+            "dev": _ifname("exempt.dev", raw.get("dev")),
+            "prefixes": norm}
+
+
+def validate_config(raw) -> dict:
+    """Validate a parsed config; return it normalized, with defaults filled in."""
+    if not isinstance(raw, dict):
+        raise ConfigError("config must be a JSON object")
+    table = raw.get("table")
+    if not isinstance(table, str) or not table:
+        raise ConfigError("table must be a non-empty string")
+    metric = raw.get("preferred_metric", 100)
+    if isinstance(metric, bool) or not isinstance(metric, int) or metric < 1:
+        raise ConfigError(f"preferred_metric must be an integer >= 1, got {metric!r}")
+    dry_run = raw.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        raise ConfigError("dry_run must be true or false")
+    state_path = raw.get("state_path", "/run/relay-egress-watchdog/state.json")
+    if not isinstance(state_path, str) or not state_path:
+        raise ConfigError("state_path must be a non-empty string")
+
+    craw = raw.get("client") or {}
+    if not isinstance(craw, dict):
+        raise ConfigError("client must be an object")
+    url = craw.get("control_url", "")
+    if not isinstance(url, str):
+        raise ConfigError("client.control_url must be a string")
+    if url:  # "" turns the poll off
+        _check_http_url("client.control_url", url)
+    default_mode = craw.get("default_mode", "relay_direct")
+    if not isinstance(default_mode, str):
+        raise ConfigError(f"client.default_mode must be a string, got {default_mode!r}")
+    if default_mode not in VALID_DESIRED_MODES:
+        raise ConfigError(f"client.default_mode must be one of "
+                          f"{sorted(VALID_DESIRED_MODES)}, got {default_mode!r}")
+    client = {
+        "control_url": url,
+        "fetch_timeout_s": _positive("client.fetch_timeout_s", craw.get("fetch_timeout_s", 1),
+                                     MAX_FETCH_TIMEOUT_S),
+        "bootstrap_timeout_s": _positive("client.bootstrap_timeout_s",
+                                         craw.get("bootstrap_timeout_s", 5),
+                                         MAX_BOOTSTRAP_TIMEOUT_S),
+        "grace_s": _positive("client.grace_s", craw.get("grace_s", 60)),
+        "default_mode": default_mode,
+    }
+
+    uraw = raw.get("upstreams") or {}
+    if not isinstance(uraw, dict):
+        raise ConfigError("upstreams must be an object")
+    upstreams = {name: _validate_upstream(name, u) for name, u in uraw.items()}
+
+    mraw = raw.get("mode_upstreams") or {}
+    if not isinstance(mraw, dict):
+        raise ConfigError("mode_upstreams must be an object")
+    for mode, up in mraw.items():
+        if not isinstance(mode, str):
+            raise ConfigError(f"mode_upstreams key must be a string, got {mode!r}")
+        if mode not in VALID_DESIRED_MODES:
+            raise ConfigError(f"mode_upstreams: unknown mode {mode!r}")
+        if mode in NO_UPSTREAM_MODES:
+            raise ConfigError(f"mode_upstreams: {mode} never uses an upstream")
+        if not isinstance(up, str):
+            raise ConfigError(f"mode_upstreams value must be a string, got {up!r}")
+        if up not in upstreams:
+            raise ConfigError(f"mode_upstreams: {mode} -> {up!r} is not a configured upstream")
+
+    return {"table": table, "preferred_metric": metric, "dry_run": dry_run,
+            "state_path": state_path, "client": client, "upstreams": upstreams,
+            "mode_upstreams": dict(mraw), "exempt": _validate_exempt(raw.get("exempt"))}
+
+
+def load_config(path) -> dict:
+    try:
+        raw = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"cannot read {path}: {e}") from None
+    return validate_config(raw)
+
+
+# --- desired mode (client poll) ---------------------------------------------------------
+
+def fetch_desired_mode(url: str, timeout_s: float) -> tuple:
     """GET the client's /api/desired_egress and return (mode, master_wan, err).
 
-    Success: (mode, master_wan, None) — mode is normalized to VALID_DESIRED_MODES.
-    Failure: (None, None, "<reason>") — caller decides last-known vs. default.
+    Success: (mode, master_wan, None), mode normalized into VALID_DESIRED_MODES.
+    Failure: (None, None, "<reason>"); the caller keeps last-known or the default.
     """
-    import urllib.request, urllib.error, json as _j, socket
+    import http.client
+    import socket
+    import urllib.error
+    import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as r:
             body = r.read()
     except urllib.error.HTTPError as e:
         return (None, None, f"http {e.code}")
+    except http.client.HTTPException as e:
+        return (None, None, f"http protocol: {type(e).__name__}")
     except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
-        return (None, None, "timeout" if isinstance(e, (socket.timeout, TimeoutError)) else f"transport: {e}")
+        timed_out = isinstance(e, (socket.timeout, TimeoutError))
+        return (None, None, "timeout" if timed_out else f"transport: {e}")
     try:
-        payload = _j.loads(body.decode())
+        payload = json.loads(body.decode())
     except (ValueError, UnicodeDecodeError) as e:
         return (None, None, f"parse: {e}")
-    mode = normalize_mode(payload.get("mode"))
+    if not isinstance(payload, dict):
+        return (None, None, "parse: not an object")
+    mode_raw = payload.get("mode")
+    if not isinstance(mode_raw, str):
+        return (None, None, f"invalid mode: {mode_raw!r}")
+    mode = normalize_mode(mode_raw)
     if mode not in VALID_DESIRED_MODES:
         return (None, None, f"invalid mode: {mode!r}")
     return (mode, payload.get("master_wan"), None)
 
 
 def choose_fetch_timeout(last_known: Optional[str], bootstrap_s: float, regular_s: float) -> float:
-    """Cold-start (no last-known) gets the longer bootstrap timeout; else the snappy regular one."""
+    """Cold start (no last-known mode) gets the longer bootstrap timeout."""
     return bootstrap_s if last_known is None else regular_s
 
 
 def effective_mode_for(desired_mode: str, age_s: float, grace_s: float, default_mode: str) -> str:
-    """Resolve which mode to use this tick: desired if within grace, else default."""
+    """Desired mode while the last good fetch is within grace, else the default."""
     return desired_mode if age_s <= grace_s else default_mode
 
 
 def apply_post_fetch_state_update(state: dict, fetched_mode: Optional[str],
                                   default_mode: str, now: float) -> dict:
-    """Pure state update applied after attempting fetch_desired_mode().
+    """Pure state update after a fetch attempt.
 
-    - On success: store mode, refresh fetched_at, reset fail counter.
-    - On failure with last-known present: keep last-known, increment counter, do NOT
-      refresh fetched_at (so the grace window keeps ticking).
-    - On failure with NO last-known (cold-start): synthesize default_mode immediately
-      and refresh fetched_at — avoids assuming None for a whole grace window.
+    Success stores the mode, refreshes fetched_at and resets the failure count.
+    Failure with a last-known mode keeps it and lets the grace window run out.
+    Failure on a cold start synthesizes the default at once.
     """
     s = dict(state)
     if fetched_mode is not None:
@@ -126,27 +349,189 @@ def apply_post_fetch_state_update(state: dict, fetched_mode: Optional[str],
     return s
 
 
-_DEFAULT_STATE = {
-    "consecutive_pass": 0,
-    "consecutive_fail": 0,
-    "healthy": False,
-    "first_pass_seen": False,
-    "last_check": 0.0,
-    "last_change": 0.0,
-    "last_probe_value": "",
-    "desired_mode": None,
-    "desired_mode_fetched_at": 0.0,
-    "desired_mode_fetch_fail": 0,
-}
+# --- upstream health ----------------------------------------------------------------------
+
+def new_health() -> dict:
+    return {"healthy": False, "first_pass_seen": False, "consecutive_pass": 0,
+            "consecutive_fail": 0, "last_probe": "", "last_change": 0.0}
 
 
-def load_state(path: Path) -> dict:
-    if not Path(path).exists():
-        return dict(_DEFAULT_STATE)
-    return json.loads(Path(path).read_text())
+def advance_health(h: dict, ok: bool, detail: str, now: float,
+                   fail_threshold: int, pass_threshold: int) -> dict:
+    """Feed one probe result through the hysteresis. Pure."""
+    s = dict(h)
+    s["last_probe"] = detail
+    if ok:
+        s["consecutive_pass"] += 1
+        s["consecutive_fail"] = 0
+        if not s["healthy"] and (not s["first_pass_seen"]
+                                 or s["consecutive_pass"] >= pass_threshold):
+            s["healthy"] = True          # first pass ever (fast boot), or a recovery
+            s["last_change"] = now
+        s["first_pass_seen"] = True
+    else:
+        s["consecutive_fail"] += 1
+        s["consecutive_pass"] = 0
+        if s["healthy"] and s["consecutive_fail"] >= fail_threshold:
+            s["healthy"] = False
+            s["last_change"] = now
+    return s
 
 
-def save_state(path: Path, state: dict) -> None:
+# --- probes ------------------------------------------------------------------------------
+
+def probe_argv(probe: dict) -> list:
+    argv = ["curl", "--silent", "--show-error", "--max-time", f"{probe['timeout_s']:g}"]
+    if probe.get("source"):
+        argv += ["--interface", probe["source"]]
+    argv.append(probe["url"])
+    if probe.get("netns"):
+        argv = ["ip", "netns", "exec", probe["netns"]] + argv
+    return argv
+
+
+def probe_matches(body: str, expect: str) -> Optional[str]:
+    m = re.search(expect, body, re.MULTILINE)
+    return m.group(0) if m else None
+
+
+def link_up(iface: str, runner=subprocess.run) -> Optional[bool]:
+    """True when `iface` is admin-UP; False when it is missing (`ip` fails on it, as
+    after `wg-quick down` deletes a tunnel) or not UP; None when `ip` cannot tell
+    (it hangs, cannot run, or prints something unreadable)."""
+    try:
+        r = runner(["ip", "-j", "link", "show", "dev", iface],
+                   capture_output=True, text=True, timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return False
+    try:
+        flags = json.loads(r.stdout)[0].get("flags", [])
+    except (ValueError, IndexError, AttributeError, TypeError):
+        return None
+    return "UP" in flags
+
+
+class ProbeResult(NamedTuple):
+    """One upstream's probe. `hard` marks a failure that skips the hysteresis: the
+    upstream's link is missing or down, so it cannot carry traffic at all."""
+    ok: bool
+    detail: str
+    hard: bool = False
+
+
+def run_probe(upstream: dict, runner=subprocess.run) -> ProbeResult:
+    """The link check, then the HTTP probe."""
+    link = upstream.get("link")
+    if link:
+        state = link_up(link, runner)
+        if state is None:
+            return ProbeResult(False, f"cannot check link {link}")
+        if not state:
+            return ProbeResult(False, f"link {link} down", hard=True)
+    p = upstream["probe"]
+    try:
+        r = runner(probe_argv(p), capture_output=True, text=True, timeout=p["timeout_s"] + 3)
+    except subprocess.TimeoutExpired:
+        return ProbeResult(False, "timeout")
+    except OSError as e:
+        return ProbeResult(False, f"cannot run probe: {e}")
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().replace("\n", " ")[:80]
+        return ProbeResult(False, f"curl rc={r.returncode}: {err}")
+    hit = probe_matches(r.stdout or "", p["expect"])
+    if hit is None:
+        return ProbeResult(False, "unexpected body")
+    return ProbeResult(True, hit)
+
+
+# --- route selection and reconcile ----------------------------------------------------------
+
+def select_route(cfg: dict, effective_mode: str, health: dict) -> tuple:
+    """(target upstream or None, route or None). The route is None when the mode
+    uses no upstream or its upstream is unhealthy: that is the fail-open case."""
+    target = cfg["mode_upstreams"].get(effective_mode)
+    if target is None:
+        return None, None
+    if not health.get(target, {}).get("healthy"):
+        return target, None
+    return target, cfg["upstreams"][target]["route"]
+
+
+def _norm_dst(dst: str) -> str:
+    return dst if "/" in dst else f"{dst}/32"
+
+
+def preferred_defaults(routes: list, metric: int) -> list:
+    return [r for r in routes if r.get("dst") == "default" and r.get("metric", 0) == metric]
+
+
+def plan_actions(cfg: dict, routes: list, route: Optional[dict]) -> tuple:
+    """(preferred_actions, exempt_actions): `ip` argv tails, without the leading
+    "ip", that move the table from `routes` (as `ip -j route show table T` lists
+    it) to the desired state. Pure."""
+    table, metric = cfg["table"], str(cfg["preferred_metric"])
+    delete = ["route", "del", "default", "metric", metric, "table", table]
+    current = preferred_defaults(routes, cfg["preferred_metric"])
+    preferred = []
+    if route is None:
+        preferred = [list(delete) for _ in current]
+    else:
+        want = (route.get("via"), route["dev"])
+        have = [(r.get("gateway"), r.get("dev")) for r in current]
+        if have != [want]:
+            if len(current) > 1:
+                preferred = [list(delete) for _ in current]
+            argv = ["route", "replace", "default"]
+            if route.get("via"):
+                argv += ["via", route["via"]]
+            preferred.append(argv + ["dev", route["dev"], "metric", metric, "table", table])
+    exempt = []
+    ex = cfg["exempt"]
+    if ex["prefixes"]:
+        present = {_norm_dst(r["dst"]): (r.get("gateway"), r.get("dev"))
+                   for r in routes if r.get("dst") and r.get("dst") != "default"}
+        for p in ex["prefixes"]:
+            if present.get(p) != (ex["via"], ex["dev"]):
+                exempt.append(["route", "replace", p, "via", ex["via"],
+                               "dev", ex["dev"], "table", table])
+    return preferred, exempt
+
+
+class IpRoute:
+    """The only code that reads or changes kernel routes; tests swap in a fake."""
+
+    def __init__(self, runner=subprocess.run):
+        self._run = runner
+
+    def show_table(self, table: str) -> list:
+        r = self._run(["ip", "-j", "route", "show", "table", table],
+                      capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or "").strip() or f"rc={r.returncode}")
+        return json.loads(r.stdout) if (r.stdout or "").strip() else []
+
+    def apply(self, argv: list) -> tuple:
+        try:
+            r = self._run(["ip"] + list(argv), capture_output=True, text=True, timeout=5)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, str(e)
+        return r.returncode == 0, (r.stderr or "").strip()
+
+
+# --- state -----------------------------------------------------------------------------------
+
+def load_state(path) -> dict:
+    """The last tick's state, or {} when missing or unreadable (a fresh start)."""
+    try:
+        s = json.loads(Path(path).read_text())
+    except (OSError, ValueError, RecursionError):   # RecursionError: nested too deep
+        return {}
+    return s if isinstance(s, dict) else {}
+
+
+def save_state(path, state: dict) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -154,135 +539,217 @@ def save_state(path: Path, state: dict) -> None:
     tmp.replace(p)
 
 
-def advance(state: dict, *, ok: bool, probe_value: str, now: float,
-            fail_threshold: int, pass_threshold: int,
-            add_route, remove_route,
-            desired_mode: str = "relay_vpn",
-            desired_age_s: float = 0.0,
-            grace_s: float = 60.0,
-            default_mode: str = "relay_vpn") -> dict:
-    """Advance the state machine by one tick.
+_MAX_TS = 1e11  # about the year 5138: a later "timestamp" in a state file is corrupt
 
-    The upstream-VPN route is present only when BOTH upstream-healthy AND the
-    effective mode is an upstream mode. effective_mode = desired within grace_s,
-    else default_mode.
-    """
-    s = dict(state)
-    s["last_check"] = now
-    s["last_probe_value"] = probe_value
 
-    effective_mode = effective_mode_for(desired_mode, desired_age_s, grace_s, default_mode)
-    want_upstream = effective_mode in UPSTREAM_MODES
+def _is_ts(v) -> bool:
+    """A usable timestamp: a number (not a bool) from 0 to _MAX_TS. A range test rather
+    than math.isfinite, so NaN, +-inf and an int too big for a float fail it instead
+    of raising."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= _MAX_TS
 
-    if ok:
-        s["consecutive_pass"] = s["consecutive_pass"] + 1
-        s["consecutive_fail"] = 0
 
-        should_add = False
-        if not s["healthy"]:
-            if not s["first_pass_seen"]:
-                should_add = True            # first successful probe — fast boot
-            elif s["consecutive_pass"] >= pass_threshold:
-                should_add = True            # recovery after a failure window
+def with_defaults(state: dict, cfg: dict) -> dict:
+    """`state` with every key a tick needs and every value usable; upstreams no longer
+    configured are dropped. The file can be hand-edited, so a wrong-typed or absurd
+    value is reset to its default rather than trusted: it must never crash a tick
+    (which fires the dead-man switch) or pin a stale mode."""
+    s: dict = {"desired_mode": None, "desired_mode_fetched_at": 0.0,
+               "desired_mode_fetch_fail": 0, "effective_mode": None, "target": None,
+               "route": None, "last_route_change": 0.0, "last_check": 0.0}
+    s.update({k: v for k, v in state.items() if k != "upstreams"})
 
-        if should_add and want_upstream:
-            add_route()
-            s["healthy"] = True
-            s["last_change"] = now
+    mode = s["desired_mode"]
+    if not (isinstance(mode, str) and mode in VALID_DESIRED_MODES):
+        s["desired_mode"] = None
+    for key in ("desired_mode_fetched_at", "last_route_change", "last_check"):
+        if not _is_ts(s[key]):
+            s[key] = 0.0
+    if s["desired_mode"] is not None and s["desired_mode_fetched_at"] <= 0:
+        # tick() reads a fetch time of 0 as "no age", so a mode kept without one would
+        # never age out while the fetches fail. Drop it: the default stands in.
+        s["desired_mode"] = None
 
-        s["first_pass_seen"] = True
-    else:
-        s["consecutive_fail"] = s["consecutive_fail"] + 1
-        s["consecutive_pass"] = 0
+    if not isinstance(s.get("desired_mode_fetch_fail"), int) or isinstance(s.get("desired_mode_fetch_fail"), bool):
+        s["desired_mode_fetch_fail"] = 0
 
-        if s["healthy"] and s["consecutive_fail"] >= fail_threshold:
-            remove_route()
-            s["healthy"] = False
-            s["last_change"] = now
-
-    # Mode-driven removal: route present but the effective mode isn't an upstream mode.
-    if s["healthy"] and not want_upstream:
-        remove_route()
-        s["healthy"] = False
-        s["last_change"] = now
-
+    old = state.get("upstreams")
+    if not isinstance(old, dict):
+        old = {}
+    s["upstreams"] = {}
+    for name in cfg["upstreams"]:
+        h = new_health()
+        if isinstance(old.get(name), dict):
+            h.update({k: v for k, v in old[name].items() if k in h})
+        # Validate per-upstream health fields
+        for key in h:
+            if key in ("healthy", "first_pass_seen"):
+                if not isinstance(h[key], bool):
+                    h[key] = new_health()[key]
+            elif key in ("consecutive_pass", "consecutive_fail"):
+                if not isinstance(h[key], int) or isinstance(h[key], bool):
+                    h[key] = new_health()[key]
+            elif key == "last_probe":
+                if not isinstance(h[key], str):
+                    h[key] = new_health()[key]
+            elif key == "last_change":
+                if not _is_ts(h[key]):
+                    h[key] = new_health()[key]
+        s["upstreams"][name] = h
     return s
 
 
-def add_route(table: str, via_ip: str, dev: str) -> None:
-    """Install the metric-100 upstream-VPN default. Idempotent via `ip route replace`."""
-    subprocess.run(
-        ["ip", "route", "replace", "default", "via", via_ip, "dev", dev,
-         "metric", "100", "table", table],
-        check=False, capture_output=True,
-    )
+# --- one tick -----------------------------------------------------------------------------------
+
+def _probe_all(cfg: dict, probe: Callable) -> dict:
+    """{upstream name: ProbeResult}, probing all of them in parallel. `probe` returns
+    the ProbeResult fields: (ok, detail), or (ok, detail, hard)."""
+    names = list(cfg["upstreams"])
+    if not names:
+        return {}
+    out = {}
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        futures = {n: pool.submit(probe, cfg["upstreams"][n]) for n in names}
+        for n, f in futures.items():
+            try:
+                out[n] = ProbeResult(*f.result())
+            except Exception as e:  # a broken probe must not kill the tick
+                out[n] = ProbeResult(False, f"probe error: {e}")
+    return out
 
 
-def remove_route(table: str, via_ip: str, dev: str) -> None:
-    """Remove the metric-100 upstream-VPN default. Idempotent (ignore 'not found')."""
-    subprocess.run(
-        ["ip", "route", "del", "default", "via", via_ip, "dev", dev,
-         "metric", "100", "table", table],
-        check=False, capture_output=True,
-    )
+def _withdraw_all(ip, delete: list, limit: int = 8) -> None:
+    for _ in range(limit):
+        ok, _err = ip.apply(delete)
+        if not ok:
+            return
 
 
-def main() -> int:
-    table       = os.environ.get("EGRESS_TABLE", "egress")
-    up_gw       = os.environ.get("EGRESS_UPSTREAM_GW", "192.0.2.2")
-    up_dev      = os.environ.get("EGRESS_UPSTREAM_DEV", "vpn0")
-    probe_url   = os.environ.get("EGRESS_PROBE_URL", "http://198.51.100.1/healthz")
-    probe_t     = float(os.environ.get("EGRESS_PROBE_TIMEOUT_S", "5"))
-    fail_t      = int(os.environ.get("EGRESS_FAIL_THRESHOLD", "3"))
-    pass_t      = int(os.environ.get("EGRESS_PASS_THRESHOLD", "2"))
-    state_p     = Path(os.environ.get("EGRESS_STATE_PATH", "/run/relay-egress-watchdog/state.json"))
-    control_url = os.environ.get("EGRESS_CLIENT_CONTROL_URL", "")
-    grace_s     = float(os.environ.get("EGRESS_DESIRED_MODE_GRACE_S", "60"))
-    default_m   = os.environ.get("EGRESS_DESIRED_MODE_DEFAULT", "relay_vpn")
-    fetch_t     = float(os.environ.get("EGRESS_FETCH_TIMEOUT_S", "1"))
-    boot_t      = float(os.environ.get("EGRESS_BOOTSTRAP_TIMEOUT_S", "5"))
+def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
+         fetch: Optional[Callable] = None, log: Callable = print) -> tuple:
+    """Run one tick. Returns (new_state, exit_code).
 
-    ok, value = probe_upstream(probe_url, probe_t)
+    The exit code is 1 only when the table could not be read or a preferred-route
+    command failed. The tick has then already tried to fail open, and systemd's
+    OnFailure runs the dead-man switch as a second line.
 
-    state = load_state(state_p)
-    for k, v in _DEFAULT_STATE.items():
-        state.setdefault(k, v)
+    The exemption routes gate the preferred route: while one of them cannot be put
+    in place, its prefix would follow a preferred default into the upstream, so the
+    tick withdraws every preferred default instead (fail open) and logs an ERROR.
+    It still exits 0: it has failed open itself, and a failed tick would only fire
+    the dead-man switch every 10 s. The next tick retries the exemption.
+    """
+    fetch = fetch or fetch_desired_mode
+    s = with_defaults(state, cfg)
+    s["last_check"] = now
+    s["table"] = cfg["table"]   # for the dead-man, should the config become unreadable
+    dry = cfg["dry_run"]
+    tag = "DRY-RUN " if dry else ""
 
-    now = time.time()
-    fetch_err = None
-    if control_url:
-        eff_timeout = choose_fetch_timeout(state.get("desired_mode"), boot_t, fetch_t)
-        fetched_mode, _master, fetch_err = fetch_desired_mode(control_url, eff_timeout)
-        state = apply_post_fetch_state_update(state, fetched_mode, default_m, now)
-    else:
-        fetch_err = "disabled"
+    for name, (ok, detail, hard) in _probe_all(cfg, probe).items():
+        up = cfg["upstreams"][name]
+        before = s["upstreams"][name]["healthy"]
+        # A hard failure (the link is missing or down) skips the hysteresis: the
+        # upstream cannot carry traffic, so it is unhealthy on this very tick, and its
+        # preferred route goes now instead of failing to re-install for a few ticks.
+        s["upstreams"][name] = advance_health(s["upstreams"][name], ok, detail, now,
+                                              1 if hard else up["fail_threshold"],
+                                              up["pass_threshold"])
+        after = s["upstreams"][name]["healthy"]
+        if before != after:
+            log(f"HEALTH: {name} {'healthy' if before else 'unhealthy'} -> "
+                f"{'healthy' if after else 'unhealthy'} ({detail})")
 
-    desired_age_s = (now - state.get("desired_mode_fetched_at", 0.0)) if state.get("desired_mode_fetched_at") else 0.0
-    desired_for_advance = state.get("desired_mode") or default_m
+    c = cfg["client"]
+    fetch_err = "disabled"
+    if c["control_url"]:
+        timeout = choose_fetch_timeout(s.get("desired_mode"), c["bootstrap_timeout_s"],
+                                       c["fetch_timeout_s"])
+        try:
+            mode, _master, fetch_err = fetch(c["control_url"], timeout)
+        except Exception as e:
+            mode, _master, fetch_err = None, None, f"fetch error: {e}"
+        s = apply_post_fetch_state_update(s, mode, c["default_mode"], now)
+    desired = s.get("desired_mode") or c["default_mode"]
+    age = (now - s["desired_mode_fetched_at"]) if s.get("desired_mode_fetched_at") else 0.0
+    effective = effective_mode_for(desired, age, c["grace_s"], c["default_mode"])
+    target, route = select_route(cfg, effective, s["upstreams"])
 
-    new = advance(
-        state, ok=ok, probe_value=value, now=now,
-        fail_threshold=fail_t, pass_threshold=pass_t,
-        add_route=lambda: add_route(table, up_gw, up_dev),
-        remove_route=lambda: remove_route(table, up_gw, up_dev),
-        desired_mode=desired_for_advance,
-        desired_age_s=desired_age_s,
-        grace_s=grace_s,
-        default_mode=default_m,
-    )
-    save_state(state_p, new)
+    rc = 0
+    installed = target if route is not None else None
+    delete = ["route", "del", "default", "metric", str(cfg["preferred_metric"]),
+              "table", cfg["table"]]
+    try:
+        routes = ip.show_table(cfg["table"])
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired, OSError) as e:
+        log(f"ERROR: cannot read table {cfg['table']}: {e}")
+        if not dry:
+            _withdraw_all(ip, delete)
+        routes, installed, rc = None, None, 1
+    if routes is not None:
+        preferred, exempt = plan_actions(cfg, routes, route)
+        # Exemptions first, so they never briefly route through an upstream; and none
+        # may be missing while a preferred default stands (see the docstring).
+        missing = []
+        for argv in exempt:
+            if dry:
+                log(f"DRY-RUN would run: ip {' '.join(argv)}")
+                continue
+            ok, err = ip.apply(argv)
+            if not ok:
+                log(f"ERROR: ip {' '.join(argv)}: {err}")
+                missing.append(argv[2])
+        if missing:
+            log(f"ERROR: exemption {', '.join(missing)} not in place: no preferred route "
+                f"this tick (fail open)")
+            preferred, _ = plan_actions(cfg, routes, None)   # delete every preferred default
+            installed = None
+        # Apply preferred routes; any failure causes immediate sweep
+        for argv in preferred:
+            if dry:
+                log(f"DRY-RUN would run: ip {' '.join(argv)}")
+                continue
+            ok, err = ip.apply(argv)
+            if ok:
+                continue
+            log(f"ERROR: ip {' '.join(argv)}: {err}")
+            rc = 1
+            if not dry:
+                _withdraw_all(ip, delete)   # a half-done switch must not linger
+            installed = None
+            break  # stop applying after first failure
 
-    # Reconcile route to match state every tick.
-    effective_mode = effective_mode_for(desired_for_advance, desired_age_s, grace_s, default_m)
-    if new["healthy"] and effective_mode in UPSTREAM_MODES:
-        add_route(table, up_gw, up_dev)
-    else:
-        remove_route(table, up_gw, up_dev)
+    if installed != s.get("route"):
+        log(f"{tag}ROUTE: {s.get('route') or 'none'} -> {installed or 'none'} (mode={effective})")
+        s["route"] = installed
+        s["last_route_change"] = now
+    s["effective_mode"] = effective
+    s["target"] = target
 
-    print(f"probe={'ok' if ok else 'fail'} value={value} healthy={new['healthy']} "
-          f"mode={desired_for_advance} eff={effective_mode} fetch_err={fetch_err or '-'} "
-          f"pass={new['consecutive_pass']} fail={new['consecutive_fail']}", flush=True)
-    return 0
+    health = " ".join(f"{n}={'healthy' if h['healthy'] else 'unhealthy'}({h['last_probe']})"
+                      for n, h in s["upstreams"].items())
+    log(f"{tag}mode={desired} eff={effective} target={target or '-'} "
+        f"route={installed or 'none'} {health} fetch_err={fetch_err or '-'} "
+        f"fetch_fail={s['desired_mode_fetch_fail']}")
+    return s, rc
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Relay egress actuator: run one tick.")
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    args = ap.parse_args(argv)
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as e:
+        print(f"CONFIG ERROR: {e}", file=sys.stderr, flush=True)
+        return 2
+    state, rc = tick(cfg, load_state(cfg["state_path"]), time.time(), ip=IpRoute(),
+                     log=lambda line: print(line, flush=True))
+    try:
+        save_state(cfg["state_path"], state)
+    except OSError as e:
+        print(f"ERROR: cannot save state to {cfg['state_path']}: {e}", file=sys.stderr, flush=True)
+    return rc
 
 
 if __name__ == "__main__":

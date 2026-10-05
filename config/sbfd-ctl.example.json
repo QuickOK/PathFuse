@@ -29,7 +29,37 @@
   "egress": {
     "engarde_table": "engarde",
     "wg_iface": "wg0",
-    "default_mode": "relay_vpn"
+    "default_mode": "relay_vpn",
+    "observe": {
+      "url": "",
+      "iface": "wg0",
+      "interval_s": 120,
+      "timeout_s": 8,
+      "mismatch_checks": 2,
+      "exits": [
+        {
+          "mode": "relay_vpn",
+          "field": "vpn",
+          "values": [
+            "on"
+          ]
+        },
+        {
+          "mode": "relay_backbone",
+          "field": "ip",
+          "values": [
+            "203.0.113.10"
+          ]
+        },
+        {
+          "mode": "relay_direct",
+          "field": "ip",
+          "values": [
+            "198.51.100.20"
+          ]
+        }
+      ]
+    }
   },
   "policy": {
     "default_mode": "full",

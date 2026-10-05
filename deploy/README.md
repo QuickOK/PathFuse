@@ -18,8 +18,9 @@ does not ship or manage them):
   docs (its `engarde.yml` and its service). This kit does **not** ship engarde unit files.
 - a **management overlay** (any VPN/mesh, e.g. a WireGuard mesh) giving the relay a stable
   address the client can reach for the `/state` (9275) and `/fec` (9276) control endpoints;
-- an **egress VPN/overlay at the relay** if you want `relay_vpn` egress mode (otherwise use
-  `relay_direct`).
+- an **egress VPN/overlay at the relay** if you want `relay_vpn` egress mode, and/or a
+  **cloud-backbone exit** for `relay_backbone` (otherwise use `relay_direct`). The relay-side
+  actuator for both is in `deploy/relay/egress/`.
 
 ## 1. Install the PathFuse code
 Copy the daemons to the install paths from `values.json` (`paths.*`):
@@ -38,6 +39,7 @@ sudo install -D -m0644 tile_store.py      /opt/sbfd-ctl/tile_store.py    # requi
 sudo install -D -m0644 station_tracker.py /opt/sbfd-ctl/station_tracker.py # required by sbfd-ctl's map, environ_ctl and location_fec
 sudo install -d /opt/sbfd-ctl/ui && sudo install -m0644 ui/* /opt/sbfd-ctl/ui/
 sudo install -D -m0644 notify.py             /opt/sbfd-ctl/notify.py             # required by sbfd-ctl and hotspot_watchdog
+sudo install -D -m0644 egress_observer.py    /opt/sbfd-ctl/egress_observer.py    # required by sbfd-ctl (actual-exit check)
 sudo install -D -m0644 netgear_api.py        /opt/sbfd-ctl/netgear_api.py        # required by hotspot_watchdog and cell_telemetry
 sudo install -D -m0755 hotspot_watchdog.py   /opt/sbfd-ctl/hotspot_watchdog.py   # optional: wan1 auto-reboot watchdog
 sudo install -D -m0755 cell_telemetry.py     /opt/sbfd-ctl/cell_telemetry.py     # optional: wan1 modem signal telemetry (feeds the FEC signal floor)

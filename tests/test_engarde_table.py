@@ -162,3 +162,10 @@ def test_read_engarde_table_default_returns_none_on_invalid_json(monkeypatch):
     monkeypatch.setattr(M.subprocess, "run", lambda cmd, **kw: _R())
     out = M.read_engarde_table_default("engarde")
     assert out is None
+
+
+def test_relay_backbone_returns_dev_wg0():
+    out = M.compute_engarde_table_action(
+        egress_mode="relay_backbone", master_iface="wan2", master_gw="192.0.2.1",
+        current={"via": "192.0.2.1", "dev": "wan2"}, cfg=_cfg())
+    assert out == {"op": "replace", "via": None, "dev": "wg0", "table": "engarde"}

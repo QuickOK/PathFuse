@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the relay egress actuator every 10 s
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=10
+AccuracySec=1
+
+[Install]
+WantedBy=timers.target

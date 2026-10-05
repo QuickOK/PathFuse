@@ -23,6 +23,18 @@ from typing import Optional
 
 DEFAULT_COMMAND = "/usr/local/sbin/spool-notify"
 
+# What the UI calls each egress mode; used in egress fallback messages.
+EGRESS_LABELS = {
+    "relay_vpn": "relay-VPN",
+    "relay_backbone": "relay Backbone",
+    "relay_direct": "relay Direct",
+    "local_direct": "Local Direct",
+}
+
+
+def egress_label(mode) -> str:
+    return EGRESS_LABELS.get(mode, mode or "unknown")
+
 
 @dataclass
 class NotifyCfg:
@@ -229,6 +241,9 @@ class Observation:
     # or the published duplication block) so routine fringe ping-pong doesn't
     # misattribute a window-caused switch to "operator/policy" and page on it.
     handoff_active: bool = False
+    # The actual-exit check's snapshot (egress_observer.ExitTracker.snapshot()),
+    # or None when the check is off. Drives the egress fallback page.
+    egress: Optional[dict] = None
 
 
 class EventDetector:
@@ -277,6 +292,7 @@ class EventDetector:
         self._fec_at_max = False
         self._relay_fails = 0
         self._relay_alerted = False
+        self._egress_alerted = False
 
     def observe(self, obs: Observation) -> list:
         evs = []
@@ -288,6 +304,7 @@ class EventDetector:
             if self.fec_alerts:
                 evs.extend(self._fec_events(obs))
             evs.extend(self._relay_events(obs))
+            evs.extend(self._egress_events(obs))
         else:
             self._seed(obs)
         self._wan_states = dict(obs.wan_states)
@@ -551,4 +568,30 @@ class EventDetector:
             return [Event("relay", "🔌 Relay unreachable",
                           f"{self._relay_fails} consecutive failed polls",
                           "high")]
+        return []
+
+    def _egress_events(self, obs):
+        """Page once when the observed exit has disagreed with the selected mode
+        for the configured number of checks, and once when it agrees again. A
+        failed check is not a recovery. A change of the selected mode ends an
+        alert silently: the observer reports `checking` right after the change,
+        and `skipped` while local_direct is selected. A fallback on the new mode
+        then pages afresh, and a match under it is not announced as a restore."""
+        e = obs.egress
+        if not e:
+            return []
+        status = e.get("status")
+        if status == "mismatch" and not self._egress_alerted:
+            self._egress_alerted = True
+            ip = f" ({e['ip']})" if e.get("ip") else ""
+            return [Event("egress", "🧭 Egress fallback",
+                          f"selected {egress_label(e.get('selected'))}, "
+                          f"actual {egress_label(e.get('observed'))}{ip}", "high")]
+        if status == "match" and self._egress_alerted:
+            self._egress_alerted = False
+            return [Event("egress", "🧭 Egress restored",
+                          f"actual exit matches {egress_label(e.get('selected'))} again",
+                          "default")]
+        if status in ("skipped", "checking"):
+            self._egress_alerted = False
         return []

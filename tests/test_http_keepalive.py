@@ -51,19 +51,17 @@ def probe_reuse(port, path, method="GET", body=None):
 # -- fixtures ----------------------------------------------------------------
 
 @pytest.fixture
-def sbfd_state_listener(tmp_path):
+def sbfd_state_listener(tmp_path, http_servers):
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"timestamp": 1.0, "sessions": {}}))
     cfg = sbfd.DaemonConfig(state_file=str(state_file), state_listen="127.0.0.1:0")
     httpd = sbfd.start_state_listener(cfg)
     assert httpd is not None
-    yield httpd
-    httpd.shutdown()
-    httpd.server_close()
+    return http_servers.adopt(httpd)
 
 
 @pytest.fixture
-def ui_server(tmp_path: Path):
+def ui_server(tmp_path: Path, http_servers):
     cfg = sbfd_ctl.Config(
         wans={"wan1": sbfd_ctl.WanCfg("wan1", 1, "Cellular")},
         relay=sbfd_ctl.RelayCfg("http://x"),
@@ -78,21 +76,16 @@ def ui_server(tmp_path: Path):
     )
     Path(cfg.published_state).write_text(json.dumps({"ts": 1.0, "mode": "full"}))
     stop = threading.Event()
-    httpd = sbfd_ctl.start_ui_server(cfg, stop)
-    yield httpd
+    yield http_servers.adopt(sbfd_ctl.start_ui_server(cfg, stop))
     stop.set()
-    httpd.shutdown()
-    httpd.server_close()
 
 
 @pytest.fixture
-def fec_server():
+def fec_server(http_servers):
     state = udpspeeder_fec.FecState(mode=fec_control.MODE_ADAPTIVE)
     httpd = udpspeeder_fec.start_fec_http("127.0.0.1:0", state)
     assert httpd is not None
-    yield httpd
-    httpd.shutdown()
-    httpd.server_close()
+    return http_servers.adopt(httpd)
 
 
 # -- connection reuse --------------------------------------------------------

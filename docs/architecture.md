@@ -78,8 +78,14 @@ never forces master/backup). See [`environmental.md`](environmental.md).
 - **Modes:** `full` (redundancy — all UP links) · `master_backup` (one master, fail over).
 - **Master policies:** `static_primary` (pin the configured primary link) · `dynamic` (pick the best
   link by EWMA RTT/loss with hysteresis to avoid flapping) · `static_configured` (operator picks).
-- **Egress modes:** `relay_vpn` (out via an upstream VPN/overlay at the relay) · `relay_direct` (out
-  the relay's own WAN) · `local_direct` (out the local link, bypassing the relay).
+- **Egress modes:** `relay_vpn` (out via an upstream VPN/overlay at the relay) · `relay_backbone`
+  (out via a cloud-backbone exit behind the relay, which hands traffic off near each destination) ·
+  `relay_direct` (out the relay's own WAN) · `local_direct` (out the local link, bypassing the relay).
+  The relay enacts the mode with `deploy/relay/egress/relay-egress-watchdog`.
+- **Actual-exit check:** with `egress.observe` configured, `sbfd-ctl` fetches a `key=value` trace page
+  through `wg0` every `interval_s`, classifies the exit with `exits` rules, and publishes
+  `egress_observed`. The UI shows it next to the egress buttons, and ntfy pages when the observed exit
+  disagrees with the selected mode for `mismatch_checks` checks in a row.
 
 ## Adaptive FEC
 
