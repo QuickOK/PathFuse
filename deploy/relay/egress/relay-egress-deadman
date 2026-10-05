@@ -31,7 +31,8 @@ live one, the preferred default belongs to the live one; should an edit leave th
 dry-run actuator's config unusable, the record still tells the dead-man to keep off.
 
 A delete that fails for any reason but "nothing left to delete" stops the dead-man
-with exit 1, as does an `ip` that hangs or cannot run.
+with exit 1, as does an `ip` that hangs or cannot run. So does a delete that still
+succeeds after MAX_DELETES (16) have: preferred defaults may remain.
 """
 import argparse
 import json
@@ -40,6 +41,7 @@ import subprocess
 import sys
 
 IP_TIMEOUT_S = 5   # one `ip route del` may take this long before it counts as hung
+MAX_DELETES = 16   # then one more attempt must find nothing left (see delete_preferred)
 DEADMAN_RECORD = "/run/relay-egress-watchdog/deadman.json"   # the actuator's DEADMAN_RECORD
 DEFAULT_METRIC = 100
 # What `ip route del` says when there is nothing to delete: no such route (any more),
@@ -97,10 +99,14 @@ def resolve(config_path, record_path, env_table):
 
 def delete_preferred(table, metric, runner):
     """Delete preferred defaults until none is left. Returns (removed, error): error is
-    None once `ip` reports nothing left to delete, else why the dead-man stopped."""
+    None once `ip` reports nothing left to delete, else why the dead-man stopped.
+
+    After MAX_DELETES deletes it makes one more attempt, which must find nothing left.
+    Should that one delete a default too, more may remain: that is an error as well,
+    never a clean fail open."""
     argv = ["ip", "route", "del", "default", "metric", str(metric), "table", table]
     removed = 0
-    for _ in range(16):
+    for _ in range(MAX_DELETES + 1):   # the last attempt confirms that none is left
         try:
             r = runner(argv, capture_output=True, text=True, timeout=IP_TIMEOUT_S)
         except subprocess.TimeoutExpired:
@@ -116,7 +122,8 @@ def delete_preferred(table, metric, runner):
         # Anything else, an empty stderr or a signal (rc < 0) included, may leave a
         # preferred default standing.
         return removed, f"ip route del failed (rc={r.returncode}): {err or '(no stderr)'}"
-    return removed, None
+    return removed, (f"gave up after {removed} deletes that all succeeded: preferred "
+                     "defaults may remain")
 
 
 def main(argv=None, runner=subprocess.run) -> int:

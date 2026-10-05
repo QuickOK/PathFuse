@@ -10,7 +10,8 @@ things in it:
 
   * the single *preferred* default route (metric `preferred_metric`), pointed at
     the upstream the current mode selects, present only while that upstream's
-    health probe passes and every exemption route is in place; and
+    health probe passes, every exemption route is in place and the tick has
+    written its dead-man record; and
   * the exemption routes: more-specific prefixes that always leave through the
     relay's own WAN, whatever the upstream.
 
@@ -56,24 +57,32 @@ DEFAULT_CONFIG = "/etc/relay-egress-watchdog/config.json"
 
 # The dead-man record. Every tick writes here the table, preferred metric and dry_run
 # it runs with, as soon as its config has validated, for relay-egress-deadman to read
-# should the config become unreadable. A fixed path (in the unit's RuntimeDirectory),
-# so the dead-man needs nothing from the config to find it; relay-egress-deadman names
-# the same path.
+# should the config become unreadable. A live preferred route stands only after the
+# tick that keeps it has written a current record: a live tick that cannot write it
+# withdraws every preferred default (see tick()), so no live route is left to a stale
+# record, such as a shadow run's "dry_run": true, which makes the dead-man skip.
+# A fixed path (in the unit's RuntimeDirectory), so the dead-man needs nothing from
+# the config to find it; relay-egress-deadman names the same path.
 DEADMAN_RECORD = "/run/relay-egress-watchdog/deadman.json"
 
 # Caps on the waits one tick can make, in seconds. The unit gives a tick
-# TimeoutStartSec=25; past it, systemd kills the tick and the dead-man withdraws the
+# TimeoutStartSec=35; past it, systemd kills the tick and the dead-man withdraws the
 # preferred route. The upstreams are probed in parallel, each with a link check (`ip`,
 # LINK_TIMEOUT_S) and then curl (--max-time timeout_s, killed PROBE_BACKSTOP_S later
 # should it overrun). The client poll follows them and waits the fetch timeout, or the
-# longer bootstrap timeout on a cold start (no last-known mode yet). The slowest tick:
-#   link check 2 + probe (8 + 3 backstop) + bootstrap 8 = 21 s < 25,
-# leaving 4 s for the `ip route` work.
+# longer bootstrap timeout on a cold start (no last-known mode yet). Then each `ip`
+# command of the route work may wait IP_TIMEOUT_S: the table read, and each route
+# change. The slowest tick that changes one route:
+#   link check 2 + probe (8 + 3 backstop) + bootstrap 8 + table read 5
+#   + one route change 5 = 31 s < 35, leaving 4 s.
 MAX_PROBE_TIMEOUT_S = 8
 MAX_FETCH_TIMEOUT_S = 5
 MAX_BOOTSTRAP_TIMEOUT_S = 8
 LINK_TIMEOUT_S = 2
 PROBE_BACKSTOP_S = 3
+# Not shorter: the relay VM has had multi-second I/O stalls, and an `ip` that times out
+# in the route phase fails the tick.
+IP_TIMEOUT_S = 5
 
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 _UPSTREAM_NAME = re.compile(r"[a-z0-9_-]{1,32}")
@@ -531,14 +540,15 @@ class IpRoute:
 
     def show_table(self, table: str) -> list:
         r = self._run(["ip", "-j", "route", "show", "table", table],
-                      capture_output=True, text=True, timeout=5)
+                      capture_output=True, text=True, timeout=IP_TIMEOUT_S)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or "").strip() or f"rc={r.returncode}")
         return json.loads(r.stdout) if (r.stdout or "").strip() else []
 
     def apply(self, argv: list) -> tuple:
         try:
-            r = self._run(["ip"] + list(argv), capture_output=True, text=True, timeout=5)
+            r = self._run(["ip"] + list(argv), capture_output=True, text=True,
+                          timeout=IP_TIMEOUT_S)
         except (subprocess.TimeoutExpired, OSError) as e:
             return False, str(e)
         return r.returncode == 0, (r.stderr or "").strip()
@@ -673,7 +683,8 @@ def _withdraw_all(ip, delete: list, limit: int = 8) -> None:
 
 
 def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
-         fetch: Optional[Callable] = None, log: Callable = print) -> tuple:
+         fetch: Optional[Callable] = None, log: Callable = print,
+         record_ok: bool = True) -> tuple:
     """Run one tick. Returns (new_state, exit_code).
 
     The exit code is 1 only when the table could not be read or a preferred-route
@@ -685,6 +696,14 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
     tick withdraws every preferred default instead (fail open) and logs an ERROR.
     It still exits 0: it has failed open itself, and a failed tick would only fire
     the dead-man switch every 10 s. The next tick retries the exemption.
+
+    The dead-man record gates it too: a live preferred route stands only after the
+    tick that keeps it has written a current record. `record_ok` False says main()
+    could not write DEADMAN_RECORD, which may then be stale; should the config break
+    next, the dead-man would act on it, and one a shadow run left ("dry_run": true)
+    makes it skip. So a live tick withdraws every preferred default, just as for a
+    missing exemption: the exemptions still go in, it logs an ERROR, and it exits 0.
+    A dry run changes no route either way, and runs as with the record written.
     """
     fetch = fetch or fetch_desired_mode
     s = with_defaults(state, cfg, now)
@@ -734,8 +753,9 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
         routes, installed, rc = None, None, 1
     if routes is not None:
         preferred, exempt = plan_actions(cfg, routes, route)
-        # Exemptions first, so they never briefly route through an upstream; and none
-        # may be missing while a preferred default stands (see the docstring).
+        # Exemptions first, so they never briefly route through an upstream. A preferred
+        # default may stand only while none is missing and, on a live tick, the dead-man
+        # record is current (see the docstring).
         missing = []
         for argv in exempt:
             if dry:
@@ -748,6 +768,11 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
         if missing:
             log(f"ERROR: exemption {', '.join(missing)} not in place: no preferred route "
                 f"this tick (fail open)")
+        no_record = not record_ok and not dry
+        if no_record:
+            log(f"ERROR: dead-man record {DEADMAN_RECORD} not written: no preferred route "
+                f"this tick (fail open)")
+        if missing or no_record:
             preferred, _ = plan_actions(cfg, routes, None)   # delete every preferred default
             installed = None
         # Apply preferred routes; any failure causes immediate sweep
@@ -791,15 +816,19 @@ def main(argv=None) -> int:
         return 2
     now = time.time()
     # Before any route work, so the record stands even if this tick then fails. A write
-    # that fails leaves the last record in place (or none): worth an ERROR, not a failed
-    # tick, which would fire the dead-man every 10 s.
+    # that fails leaves the last record in place (or none), which may be stale, and a
+    # live preferred route stands only after the tick that keeps it has written a
+    # current record: so the tick, told record_ok=False, withdraws it. That costs an
+    # ERROR, not a failed tick, which would fire the dead-man every 10 s.
+    record_ok = True
     try:
         write_deadman_record(DEADMAN_RECORD, cfg, now)
     except OSError as e:
         print(f"ERROR: cannot write the dead-man record {DEADMAN_RECORD}: {e}",
               file=sys.stderr, flush=True)
+        record_ok = False
     state, rc = tick(cfg, load_state(cfg["state_path"]), now, ip=IpRoute(),
-                     log=lambda line: print(line, flush=True))
+                     log=lambda line: print(line, flush=True), record_ok=record_ok)
     try:
         save_state(cfg["state_path"], state)
     except OSError as e:

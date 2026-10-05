@@ -127,14 +127,15 @@ BASE = [{"dst": "default", "gateway": GW, "dev": "eth0", "metric": 200}]
 OK_VPN, OK_BB, FAIL = (True, "vpn=on"), (True, "ip=203.0.113.10"), (False, "timeout")
 
 
-def run_tick(c, state, now, ip, probes, mode="relay_backbone", fetch_err=None):
+def run_tick(c, state, now, ip, probes, mode="relay_backbone", fetch_err=None, **kw):
+    """One tick with canned probes and poll; `kw` goes on to tick() (record_ok, say)."""
     lines: list[str] = []
 
     def fetch(url, timeout):
         return (None, None, fetch_err) if fetch_err else (mode, "wan2", None)
 
     new, rc = M.tick(c, state, now, ip=ip, probe=lambda up: probes[up["name"]],
-                     fetch=fetch, log=lines.append)
+                     fetch=fetch, log=lines.append, **kw)
     return new, rc, lines
 
 
@@ -228,7 +229,7 @@ def test_default_mode_defaults_to_relay_direct():
     (lambda c: c["exempt"].update(prefixes=["0.0.0.0/0"]), "prefix length 0"),
     pytest.param(lambda c: c["exempt"].update(prefixes=["not-a-prefix"]), "exempt.prefixes",
                  id="exempt-unparsable"),
-    # A tick must end within the unit's TimeoutStartSec=25 (see MAX_PROBE_TIMEOUT_S).
+    # A tick must end within the unit's TimeoutStartSec=35 (see MAX_PROBE_TIMEOUT_S).
     pytest.param(lambda c: c["upstreams"]["vpn"]["probe"].update(timeout_s=8.5),
                  r"^upstreams\.vpn\.probe\.timeout_s must be at most 8 s",
                  id="probe-timeout-over-8"),
@@ -254,18 +255,62 @@ def test_validate_config_accepts_timeouts_at_their_caps():
             c["client"]["bootstrap_timeout_s"]) == (8.0, 5.0, 8.0)
 
 
-def test_the_slowest_tick_ends_within_the_units_timeout_with_headroom():
-    """systemd kills a tick still running at TimeoutStartSec, and the dead-man then
-    withdraws even a healthy route. The slowest tick the caps allow: the link check,
-    then curl at its cap plus the backstop that kills a curl overrunning it (the
-    upstreams are probed in parallel), then the cold-start poll at the bootstrap cap.
-    4 s must be left over for the `ip route` work."""
+def _unit_timeout_s():
+    """The TimeoutStartSec the watchdog's unit gives one tick."""
     unit = (_DIR / "systemd/relay-egress-watchdog.service").read_text()
     m = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
     assert m is not None
-    slowest = (M.LINK_TIMEOUT_S + M.MAX_PROBE_TIMEOUT_S + M.PROBE_BACKSTOP_S
-               + max(M.MAX_BOOTSTRAP_TIMEOUT_S, M.MAX_FETCH_TIMEOUT_S))
-    assert slowest <= int(m.group(1)) - 4
+    return int(m.group(1))
+
+
+# The link check, then curl at its cap plus the backstop that kills a curl overrunning
+# it (the upstreams are probed in parallel), then the cold-start poll at the bootstrap
+# cap: the slowest a tick can be before its route work starts.
+SLOWEST_PROBE_AND_POLL = (M.LINK_TIMEOUT_S + M.MAX_PROBE_TIMEOUT_S + M.PROBE_BACKSTOP_S
+                          + max(M.MAX_BOOTSTRAP_TIMEOUT_S, M.MAX_FETCH_TIMEOUT_S))
+
+
+def test_the_slowest_tick_ends_within_the_units_timeout_with_headroom():
+    """systemd kills a tick still running at TimeoutStartSec, and the dead-man then
+    withdraws even a healthy route. The slowest tick the caps allow: the probes and
+    the poll, then the table read and one route change, each `ip` waiting
+    IP_TIMEOUT_S. 4 s must be left over."""
+    assert M.IP_TIMEOUT_S == 5   # not shortened: the relay VM has had multi-second I/O stalls
+    slowest = SLOWEST_PROBE_AND_POLL + 2 * M.IP_TIMEOUT_S
+    assert slowest == 31         # the sum the comment above the caps and the README give
+    assert slowest <= _unit_timeout_s() - 4
+
+
+def _ip_waits(use):
+    """The timeouts an IpRoute passes to its runner while `use(ip_route)` runs."""
+    waits = []
+
+    def run(argv, **kw):
+        waits.append(kw["timeout"])
+        return R(out="[]")
+
+    use(M.IpRoute(run))
+    return waits
+
+
+def test_the_slowest_tick_leaves_room_for_the_route_table_read():
+    """Greptile PR #23, finding 2. The caps allow 21 s of link check, curl, backstop and
+    cold-start poll; the route phase then starts with `ip -j route show`, which may wait
+    its own timeout before the tick can do anything. Killed at TimeoutStartSec, the tick
+    fires the dead-man, which withdraws even a healthy route. The read must wait the
+    IP_TIMEOUT_S that the slowest tick counts."""
+    waits = _ip_waits(lambda ip: ip.show_table("egress"))
+    assert waits == [M.IP_TIMEOUT_S]
+    assert SLOWEST_PROBE_AND_POLL + waits[0] < _unit_timeout_s()
+
+
+def test_the_slowest_tick_leaves_room_for_a_route_change():
+    """The same for a route change after the table read: it must wait the IP_TIMEOUT_S
+    that the slowest tick counts, and still end before TimeoutStartSec."""
+    waits = _ip_waits(lambda ip: ip.apply(["route", "replace", "default", "dev", "wg-exit",
+                                           "metric", "100", "table", "egress"]))
+    assert waits == [M.IP_TIMEOUT_S]
+    assert SLOWEST_PROBE_AND_POLL + M.IP_TIMEOUT_S + waits[0] < _unit_timeout_s()
 
 
 def test_the_probe_waits_are_the_ones_the_slowest_tick_counts():
@@ -505,6 +550,20 @@ def test_link_up_reads_output_nested_too_deep_as_cannot_tell():
     link_up's handler: without it, link_up raises instead of answering None."""
     def run(argv, **kw):
         return R(out="[" * DEEP)
+
+    assert M.link_up("wg-exit", run) is None
+
+
+@pytest.mark.parametrize("out", ["null", "5", '"UP"', "[null]", '["UP"]', '[["UP"]]'],
+                         ids=["null", "number", "string", "list-of-null", "list-of-string",
+                              "list-of-list"])
+def test_link_up_reads_json_of_the_wrong_shape_as_cannot_tell(out):
+    """Output that cannot be read gives None, valid JSON of the wrong shape included.
+    Indexing such a value for [0]["flags"] raises a TypeError, which is neither a
+    ValueError nor a LookupError, so this pins the TypeError in link_up's handler:
+    without it, link_up raises instead of answering None."""
+    def run(argv, **kw):
+        return R(out=out)
 
     assert M.link_up("wg-exit", run) is None
 
@@ -821,6 +880,70 @@ def test_an_exemption_failure_whose_withdraw_also_fails_exits_1():
                for line in lines)
 
 
+def _record_error():
+    """The ERROR a live tick logs when main() could not write the dead-man record."""
+    return (f"ERROR: dead-man record {M.DEADMAN_RECORD} not written: no preferred route "
+            "this tick (fail open)")
+
+
+# The preferred defaults standing before the tick: none, the backbone's (the tick would
+# keep it), the vpn's (the tick would switch it), or both.
+SEEDED = [pytest.param((), id="bare"), pytest.param(("backbone",), id="would-keep"),
+          pytest.param(("vpn",), id="would-switch"),
+          pytest.param(("backbone", "vpn"), id="two-defaults")]
+
+
+@pytest.mark.parametrize("seeded", SEEDED)
+def test_a_live_tick_that_could_not_write_its_record_installs_no_preferred_route(seeded):
+    """Greptile PR #23, finding 1, at the tick. main() could not write the dead-man
+    record (record_ok=False). The backbone is healthy and the mode selects it, but a
+    live preferred route stands only after the tick that keeps it has written a
+    current record: should the config then break, the dead-man reads the stale record,
+    and one a shadow run left ("dry_run": true) makes it skip. So the tick withdraws
+    every preferred default, as for a missing exemption, still puts the exemptions in
+    place, and exits 0."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, name) for name in seeded])
+    state = _healthy_state("backbone", route=seeded[0] if seeded else None)
+    new, rc, lines = run_tick(c, state, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                              record_ok=False)
+    assert rc == 0 and new["route"] is None and new["target"] == "backbone"
+    assert _replaces_default(ip) == [] and ip.preferred() == []
+    assert {"dst": "10.0.0.0/8", "gateway": GW, "dev": "eth0"} in ip.routes
+    assert {"dst": "198.51.100.7", "gateway": GW, "dev": "eth0"} in ip.routes
+    assert [line for line in lines if line.startswith("ERROR")] == [_record_error()]
+
+
+def test_a_live_tick_without_its_record_whose_withdraw_fails_exits_1():
+    """A preferred default may then still stand, so the dead-man must get its turn, as
+    when the withdraw for a missing exemption fails."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone")], fail={"del"})
+    new, rc, lines = run_tick(c, _healthy_state("backbone", route="backbone"), 100.0, ip,
+                              {"vpn": OK_VPN, "backbone": OK_BB}, record_ok=False)
+    assert rc == 1 and new["route"] is None
+    assert _record_error() in lines
+    assert any(line.startswith("ERROR: ip route del default metric 100 table egress: ")
+               for line in lines)
+
+
+@pytest.mark.parametrize("seeded", SEEDED)
+def test_a_dry_run_tick_that_could_not_write_its_record_runs_as_with_one(seeded):
+    """In a dry run, a record that could not be written costs only main()'s ERROR line:
+    the tick runs no `ip` command, and logs and returns exactly what it would with the
+    record written."""
+    c = cfg(dry_run=True)
+    runs = []
+    for record_ok in (True, False):
+        ip = FakeIp(BASE + [_preferred_route(c, name) for name in seeded])
+        state = _healthy_state("backbone", route=seeded[0] if seeded else None)
+        runs.append(run_tick(c, state, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB},
+                             record_ok=record_ok))
+        assert ip.calls == []
+    assert runs[0][0]["route"] == "backbone"   # the dry run would keep or install it
+    assert runs[1] == runs[0]
+
+
 def test_unreadable_table_fails_open():
     class Broken(FakeIp):
         def show_table(self, table):
@@ -920,6 +1043,16 @@ class _NoTable(FakeIp):
         raise RuntimeError("table id value is invalid")
 
 
+def _main_ticks_on(monkeypatch, ip):
+    """main()'s ticks run on `ip`, every probe passing and the client asking for
+    relay_backbone: a live tick that writes its record installs or keeps the
+    backbone's preferred route."""
+    monkeypatch.setattr(M, "IpRoute", lambda: ip)
+    real_tick = M.tick
+    monkeypatch.setattr(M, "tick", lambda c, s, now, **kw: real_tick(
+        c, s, now, **dict(kw, probe=lambda up: OK_BB, fetch=_backbone)))
+
+
 @pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry-run"])
 def test_main_writes_the_deadman_record_before_any_route_work(tmp_path, monkeypatch,
                                                               deadman_record, dry_run):
@@ -969,11 +1102,13 @@ def test_main_leaves_the_record_behind_a_failing_tick(tmp_path, monkeypatch, dea
 @pytest.mark.parametrize("readable", [True, False], ids=["tick-ok", "tick-fails"])
 def test_any_failure_to_write_the_record_never_changes_the_ticks_exit(
         tmp_path, monkeypatch, capsys, deadman_record, failure, readable):
-    """Whatever stops the record write costs an ERROR line, never the tick: a failed
-    tick would fire the dead-man every 10 s and withdraw a healthy route. The causes
-    raise different OSErrors (a file where the record's directory goes, a full /run
-    tmpfs, a permission or read-only slip, a directory where the temporary file goes),
-    so a handler narrowed to some of them fails here."""
+    """Whatever stops the record write costs an ERROR line, never the tick's exit: a
+    failed tick would fire the dead-man every 10 s. The causes raise different OSErrors
+    (a file where the record's directory goes, a full /run tmpfs, a permission or
+    read-only slip, a directory where the temporary file goes), so a handler narrowed
+    to some of them fails here. Each also costs this live tick its preferred route: the
+    healthy backbone's route, which a tick that writes its record keeps, is gone (see
+    test_a_live_tick_that_could_not_write_its_record_installs_no_preferred_route)."""
     record = deadman_record
     if failure == "parent-is-a-file":
         blocker = tmp_path / "blocker"
@@ -994,12 +1129,18 @@ def test_any_failure_to_write_the_record_never_changes_the_ticks_exit(
             return real(path, obj)   # the state file still saves
 
         monkeypatch.setattr(M, "_write_json", write)
-    p = _main_config(tmp_path)
-    monkeypatch.setattr(M, "IpRoute", lambda: (FakeIp if readable else _NoTable)(BASE))
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw_cfg(state_path=str(tmp_path / "state.json"))))
+    ip = (FakeIp if readable else _NoTable)(BASE + [_preferred_route(cfg(), "backbone")])
+    _main_ticks_on(monkeypatch, ip)
     assert M.main(["--config", str(p)]) == (0 if readable else 1)
-    assert f"ERROR: cannot write the dead-man record {record}: " in capsys.readouterr().err
+    out, err = capsys.readouterr()
+    assert f"ERROR: cannot write the dead-man record {record}: " in err
+    if readable:
+        assert _record_error() in out.splitlines()
     assert json.loads((tmp_path / "state.json").read_text())["last_check"] > 0   # the tick ran
     assert not record.exists()
+    assert ip.preferred() == []
 
 
 def test_the_record_is_replaced_whole(tmp_path, monkeypatch, deadman_record):
@@ -2114,13 +2255,62 @@ def test_deadman_fails_open_when_going_live_with_a_config_the_actuator_rejects(
     monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
     assert M.main(["--config", str(p)]) == 0                    # the shadow tick
     assert json.loads(deadman_record.read_text())["dry_run"] is True
-    p.write_text(json.dumps({"table": "egress", "client": {"fetch_timeout_s": 10}, **live}))
+    p.write_text(json.dumps({"table": "egress", "client": {"fetch_timeout_s": 10},
+                             "state_path": str(tmp_path / "state.json"), **live}))
     assert M.main(["--config", str(p)]) == 2                    # rejected: no new record
     assert "fetch_timeout_s must be at most 5 s" in capsys.readouterr().err
     assert json.loads(deadman_record.read_text())["dry_run"] is True
     calls: list = []
     assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
     assert calls == [DEL_EGRESS]
+
+
+def _deadman_on(ip):
+    """A dead-man runner that applies each `ip route del` to the FakeIp `ip`."""
+    def run(argv, **kw):
+        assert argv[0] == "ip", argv
+        ok, err = ip.apply(argv[1:])
+        return R() if ok else R(rc=2, err=err)
+    return run
+
+
+def test_a_live_tick_that_cannot_write_its_record_leaves_the_deadman_able_to_fail_open(
+        tmp_path, monkeypatch, capsys, deadman_record):
+    """Greptile PR #23, finding 1. A shadow tick records "dry_run": true. Going live, the
+    record write fails (a full /run, say). An edit then breaks the config: the tick
+    exits 2, and the dead-man runs, finds the stale dry-run record and skips. So the
+    live tick must not have installed its preferred route, though the backbone is
+    healthy: a live preferred route stands only after the tick that keeps it has
+    written a current record. It exits 0 all the same, and no preferred default is
+    left once the dead-man has run."""
+    D = _load_deadman()
+    monkeypatch.setenv("EGRESS_TABLE", "egress")   # the drop-in README says to add once live
+    ip = FakeIp(BASE)
+    _main_ticks_on(monkeypatch, ip)
+    raw = raw_cfg(state_path=str(tmp_path / "state.json"))
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(dict(raw, dry_run=True)))
+    assert M.main(["--config", str(p)]) == 0                    # the shadow tick
+    assert json.loads(deadman_record.read_text())["dry_run"] is True
+    assert ip.preferred() == []
+
+    real_write = M._write_json
+
+    def write(path, obj):
+        if str(path) == M.DEADMAN_RECORD:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(path, obj)
+
+    monkeypatch.setattr(M, "_write_json", write)
+    p.write_text(json.dumps(dict(raw, dry_run=False)))
+    assert M.main(["--config", str(p)]) == 0                    # going live, no record
+    assert _record_error() in capsys.readouterr().out.splitlines()
+    assert ip.preferred() == []
+    p.write_text('{"table": "egress", "dry_run": fal')          # a broken edit
+    assert M.main(["--config", str(p)]) == 2
+    capsys.readouterr()
+    D.main(["--config", str(p)], runner=_deadman_on(ip))
+    assert ip.preferred() == [], capsys.readouterr().out
 
 
 @pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],
@@ -2257,6 +2447,68 @@ def test_deadman_real_error_after_deletes_reports_the_true_count(tmp_path, capsy
     assert err.getvalue() == ""
 
 
+def test_deadman_whose_deletes_never_run_out_exits_1(tmp_path, capsys):
+    """CodeRabbit PR #23. delete_preferred stops after MAX_DELETES (16) deletes and one
+    more attempt. If that one succeeds too, `ip` never said that nothing is left, so a
+    preferred default may still stand: a failure (exit 1) that says why, not a
+    "(fail open)" exit 0."""
+    D = _load_deadman()
+    assert D.MAX_DELETES == 16
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls: list = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R()   # every delete succeeds: duplicates keep coming
+
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == 1
+    assert calls == [DEL_EGRESS] * 17   # still bounded
+    assert capsys.readouterr().out == (
+        "relay-egress-deadman: gave up after 17 deletes that all succeeded: preferred "
+        "defaults may remain\n"
+        "relay-egress-deadman: removed 17 preferred default(s) from table egress "
+        "(fail open)\n")
+    assert err.getvalue() == ""
+
+
+@pytest.mark.parametrize("last, rc, why", [
+    pytest.param(R(rc=2, err="RTNETLINK answers: No such process"), 0, None, id="nothing-left"),
+    pytest.param(R(rc=2, err="RTNETLINK answers: Operation not permitted"), 1,
+                 "ip route del failed (rc=2): RTNETLINK answers: Operation not permitted",
+                 id="fails"),
+    pytest.param(subprocess.TimeoutExpired("ip", 5), 1, "ip route del timed out after 5 s",
+                 id="hangs"),
+])
+def test_deadman_with_exactly_16_preferred_defaults_tries_once_more(tmp_path, capsys, last,
+                                                                    rc, why):
+    """All 16 deletes succeed, and the 17th attempt tells whether any default is left.
+    "Nothing left" is a clean fail open (exit 0); any other answer is handled as on any
+    other delete."""
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls: list = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if len(calls) <= 16:
+            return R()
+        if isinstance(last, Exception):
+            raise last
+        return last
+
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == rc
+    assert calls == [DEL_EGRESS] * 17
+    assert capsys.readouterr().out == (
+        (f"relay-egress-deadman: {why}\n" if why else "")
+        + "relay-egress-deadman: removed 16 preferred default(s) from table egress "
+        "(fail open)\n")
+    assert err.getvalue() == ""
+
+
 def test_example_config_validates():
     raw = json.loads((_ROOT / "config/relay-egress.example.json").read_text())
     c = M.validate_config(raw)
@@ -2270,7 +2522,7 @@ def test_units_wire_the_deadman_and_the_paths():
     assert "OnFailure=relay-egress-deadman.service" in unit
     assert "ExecStart=/usr/local/sbin/relay-egress-watchdog --config " in unit
     assert "Type=oneshot" in unit
-    assert "TimeoutStartSec=25" in unit
+    assert "TimeoutStartSec=35" in unit
     assert "RuntimeDirectoryPreserve=yes" in unit
     timer = (_DIR / "systemd/relay-egress-watchdog.timer").read_text()
     assert "OnUnitActiveSec=10" in timer
@@ -2292,5 +2544,32 @@ def test_the_readme_gives_each_timeouts_cap(field, default, cap):
     assert f"`{field}` (default {default}, at most {getattr(M, cap)}" in README.read_text()
 
 
+def test_the_readme_gives_the_units_timeout_and_the_slowest_ticks_sum():
+    """The README's sum must name the unit's TimeoutStartSec and add up the caps and
+    the `ip` wait as the code has them."""
+    text = README.read_text()
+    timeout = _unit_timeout_s()
+    assert f"`TimeoutStartSec={timeout}`" in text
+    slowest = SLOWEST_PROBE_AND_POLL + 2 * M.IP_TIMEOUT_S
+    assert (f"{M.LINK_TIMEOUT_S} + ({M.MAX_PROBE_TIMEOUT_S} + {M.PROBE_BACKSTOP_S}) + "
+            f"{M.MAX_BOOTSTRAP_TIMEOUT_S} + {M.IP_TIMEOUT_S} + {M.IP_TIMEOUT_S} = {slowest} s, "
+            f"leaving {timeout - slowest} s") in text
+
+
 def test_the_readme_names_the_deadman_record():
     assert "`/run/relay-egress-watchdog/deadman.json`" in README.read_text()
+
+
+def test_the_readme_gives_the_deadmans_order_and_why_a_shadow_run_is_safe():
+    """The README documents the dead-man's resolution order (config, then the record,
+    then $EGRESS_TABLE); the rule that keeps a live route from outliving a stale record;
+    and that a shadow run is safe even if its config breaks, because every dry-run tick
+    records "dry_run": true."""
+    section = README.read_text().split("\n## The dead-man switch\n", 1)[1]
+    steps = re.findall(r"^(\d)\. \*\*(.+?)\*\*", section, re.MULTILINE)
+    assert steps[:3] == [("1", "The config"), ("2", "The record"), ("3", "`$EGRESS_TABLE`")]
+    assert ("a live preferred route stands only after the tick that keeps it has written "
+            "a current record") in section.lower()
+    shadow = section.split("\n### Shadow runs\n", 1)[1].split("\n#", 1)[0]
+    assert "a shadow run is safe even if its config breaks" in shadow.lower()
+    assert 'every dry-run tick records `"dry_run": true`' in shadow
