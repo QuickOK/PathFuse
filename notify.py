@@ -11,6 +11,7 @@ appends to an in-memory deque and returns; all subprocess work happens on the
 worker thread. Delivery reliability (spool + redeliver when the uplink is
 down) is spool-notify's job, not ours.
 """
+import functools
 import json
 import logging
 import math
@@ -19,8 +20,8 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 DEFAULT_COMMAND = "/usr/local/sbin/spool-notify"
 # sbfd-ctl's StateDirectory: it survives a service restart and a reboot alike.
@@ -53,8 +54,9 @@ class NotifyCfg:
     # down events; switches never got it.
     switch_hold_s: float = 60.0
     fec_alerts: bool = False
-    # Where an announced egress fallback is recorded, so a restart in the middle of
-    # one does not page it again (see EventDetector). None keeps no record.
+    # Where the egress fallback the operator was paged about is recorded, so a
+    # restart in the middle of it does not page it again (see EventDetector). The
+    # record follows the last egress page spool-notify accepted. None keeps no record.
     egress_alert_path: Optional[str] = DEFAULT_EGRESS_ALERT_PATH
 
 
@@ -64,6 +66,10 @@ class Event:
     title: str         # ntfy Title (emoji leads; spool-notify prefixes hostname)
     message: str       # body
     priority: str      # ntfy named priority: min|low|default|high|max
+    # Run by the Notifier's worker once spool-notify has accepted this page (exit 0),
+    # and never for a page that did not get that far. It is not part of the page:
+    # equality and repr leave it out.
+    on_sent: Optional[Callable[[], None]] = field(default=None, compare=False, repr=False)
 
 
 class RateLimiter:
@@ -122,6 +128,9 @@ class RateLimiter:
                       f"{int(self.min_interval_s)}s)",
                 message=last.message,
                 priority=last.priority,
+                # The last held event is the latest state of its kind, so the
+                # summary's send is its handoff. The earlier ones' never runs.
+                on_sent=last.on_sent,
             )
         # Window restarts from the actual flush time, not the theoretical
         # deadline: a late flush extends the quiet period rather than
@@ -138,7 +147,13 @@ class Notifier:
     runs `spool-notify <title> <priority> <message>` with NOTIFY_TOPIC set.
     A nonzero exit is logged and the message dropped — spool-notify itself
     spools on delivery failure, so nonzero means something *local* is wrong,
-    and notifications must never affect failover behavior."""
+    and notifications must never affect failover behavior.
+
+    Once spool-notify has accepted a page (exit 0), the worker runs the page's
+    on_sent, if it has one. A page that fails, or never reaches spool-notify
+    (dropped from a full buffer, or still buffered when the process ends; stop()
+    waits only so long), never runs it. An on_sent that raises is logged, and the
+    worker carries on with the next page."""
 
     BUFFER_MAX = 50
     SUBPROCESS_TIMEOUT_S = 30.0
@@ -194,7 +209,7 @@ class Notifier:
                 # window: summarize and send them before exiting.
                 try:
                     for summary in self._limiter.flush_all():
-                        self._send(summary)
+                        self._deliver(summary)
                 except Exception:
                     logging.exception("notify worker error during shutdown")
                 return
@@ -202,26 +217,40 @@ class Notifier:
                 for ev in batch:
                     sendable = self._limiter.admit(ev)
                     if sendable is not None:
-                        self._send(sendable)
+                        self._deliver(sendable)
                 for summary in self._limiter.flush_due():
-                    self._send(summary)
+                    self._deliver(summary)
             except Exception:
                 logging.exception("notify worker error (continuing)")
 
-    def _send(self, ev: Event):
+    def _deliver(self, ev: Event) -> None:
+        """Send `ev`, then run its on_sent if spool-notify accepted it."""
+        if not self._send(ev) or ev.on_sent is None:
+            return
+        try:
+            ev.on_sent()
+        except Exception:
+            # A callback must never stop the worker, nor the pages after this one.
+            logging.exception("notify: on_sent for %s failed", ev.kind)
+
+    def _send(self, ev: Event) -> bool:
+        """Run spool-notify for `ev`. True only when it exits 0."""
         env = dict(os.environ, NOTIFY_TOPIC=self._topic)
         try:
             res = subprocess.run(
                 [self._command, ev.title, ev.priority, ev.message],
                 env=env, capture_output=True,
                 timeout=self.SUBPROCESS_TIMEOUT_S)
-            if res.returncode != 0:
-                logging.warning(
-                    "spool-notify exited %d for %s: %s", res.returncode, ev.kind,
-                    res.stderr.decode(errors="replace").strip())
         except (OSError, subprocess.TimeoutExpired) as e:
             logging.warning("spool-notify invocation failed for %s: %s",
                             ev.kind, e)
+            return False
+        if res.returncode != 0:
+            logging.warning(
+                "spool-notify exited %d for %s: %s", res.returncode, ev.kind,
+                res.stderr.decode(errors="replace").strip())
+            return False
+        return True
 
 
 @dataclass
@@ -252,6 +281,28 @@ class Observation:
     egress: Optional[dict] = None
 
 
+def _fsync_parent(path: str) -> None:
+    """fsync the directory that holds `path`, so a rename into it or a removal from
+    it survives a power loss."""
+    fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def remove_egress_alert_record(path: str) -> bool:
+    """Remove the egress alert record at `path` (see EventDetector) durably: the
+    removal is synced into its directory, or a power loss could bring an ended
+    alert back. False when there was no record; any other failure raises OSError."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    _fsync_parent(path)
+    return True
+
+
 class EventDetector:
     """Turns per-tick observations into edge-triggered Events. The first
     observation seeds comparison state silently, so a controller restart
@@ -264,12 +315,21 @@ class EventDetector:
 
     An egress fallback can outlive the process that announced it, and the seed
     cannot see one: the actual-exit check starts over at `checking`. So with
-    egress_alert_path set, each fallback announced is recorded there, and the
-    record is removed when the alert ends. A restart reads it at the seed: a
-    fallback paged before the restart is not paged again and its restore still
-    is, while one that began during the restart pages as usual. With
-    egress_alert_path None the detector does no file I/O at all, and a restart
-    in the middle of a fallback pages it again."""
+    egress_alert_path set, the record there follows the last egress page
+    spool-notify accepted. A fallback page's on_sent writes it and a restore
+    page's removes it, both run by the Notifier once spool-notify has the page.
+    A page that never got that far (refused, or still buffered when the process
+    ended) leaves the record as it was, so a restart pages that fallback again,
+    or sends that restore again. An on_sent that runs after the alert has moved
+    on does nothing: the newer page settles the record. An alert that ends
+    without a page (a mode change, `skipped`) removes the record at once. The
+    alert itself changes at once in every case, so what a run pages does not
+    wait for the Notifier.
+
+    A restart reads the record at the seed: a fallback paged before the restart
+    is not paged again and its restore still is, while one that began during the
+    restart pages as usual. With egress_alert_path None the detector does no
+    file I/O at all, and a restart in the middle of a fallback pages it again."""
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
@@ -309,8 +369,13 @@ class EventDetector:
         self._relay_fails = 0
         self._relay_alerted = False
         # The selected mode whose fallback has been announced; None when no
-        # egress alert stands. Mirrored at egress_alert_path when that is set.
+        # egress alert stands. _egress_gen counts its transitions, so a page's
+        # on_sent can tell whether the alert has moved on since the page was made.
+        # _egress_lock covers every transition and every on_sent: the transitions
+        # run on the controller's thread, the on_sents on the Notifier's.
         self._egress_alert_mode: Optional[str] = None
+        self._egress_gen = 0
+        self._egress_lock = threading.Lock()
         self._egress_alert_path = egress_alert_path
 
     def observe(self, obs: Observation) -> list:
@@ -363,28 +428,29 @@ class EventDetector:
         if obs.relay_polled and not obs.relay_ok:
             self._relay_fails = 1
         # An egress fallback standing at a restart is invisible here: a fresh
-        # observer reports `checking` until its first check. The record the run
-        # before this one left tells a fallback it announced from one that began
-        # during the restart.
-        #   - A record for the selected mode: its fallback was paged and never
-        #     restored. The alert stands, so a confirmed mismatch stays silent and
-        #     a match sends the restore.
+        # observer reports `checking` until its first check. The record follows the
+        # last egress page spool-notify accepted, so it tells a fallback the
+        # operator was paged about from one that began during the restart.
+        #   - A record for the selected mode: its fallback page went out and no
+        #     restore page has. The alert stands, so a confirmed mismatch stays
+        #     silent and a match sends the restore. The record stays as written.
         #   - A record for another mode: the selected mode changed while the
         #     controller was down, which ends an alert silently. Drop it.
         #   - No usable record: nothing stands, so a fallback pages as usual.
-        # An exit already confirmed wrong at startup counts as announced too, and
-        # is recorded like any other. A `pending` is not yet a fallback, so it
-        # stays armed. With the check off there is no egress, and nothing is read.
+        # An exit already confirmed wrong at startup counts as announced too. No
+        # page goes out for it, so it is recorded at once. A `pending` is not yet a
+        # fallback, so it stays armed. With the check off there is no egress, and
+        # nothing is read.
         if obs.egress:
             selected = obs.egress.get("selected")
             recorded = self._read_egress_alert()
             if recorded is not None:
                 if recorded == selected:
-                    self._egress_alert_mode = recorded
+                    self._adopt_egress_alert(recorded)
                 else:
-                    self._remove_egress_alert()
+                    self._end_egress_alert()
             if obs.egress.get("status") == "mismatch" and self._egress_alert_mode is None:
-                self._raise_egress_alert(selected)
+                self._count_egress_alert_as_announced(selected)
         self._seeded = True
 
     # -- per-category edges ----------------------------------------------
@@ -624,7 +690,10 @@ class EventDetector:
         `checking` alone ends nothing: the observer reports it at its own start
         and after a mode change, and the mode comparison already covers a change.
         That leaves its start, after a restart, where an alert the record carried
-        over (see _seed) must stand until the first check confirms or clears it."""
+        over (see _seed) must stand until the first check confirms or clears it.
+
+        Each page carries the on_sent that settles the record once spool-notify
+        accepts it (see the class docstring); a silent end settles it at once."""
         e = obs.egress
         if not e:
             return []
@@ -633,38 +702,98 @@ class EventDetector:
                 selected != self._egress_alert_mode or status == "skipped"):
             self._end_egress_alert()
         if status == "mismatch" and self._egress_alert_mode is None:
-            self._raise_egress_alert(selected)
+            on_sent = self._raise_egress_alert(selected)
             ip = f" ({e['ip']})" if e.get("ip") else ""
             return [Event("egress", "🧭 Egress fallback",
                           f"selected {egress_label(selected)}, "
-                          f"actual {egress_label(e.get('observed'))}{ip}", "high")]
+                          f"actual {egress_label(e.get('observed'))}{ip}", "high",
+                          on_sent=on_sent)]
         if status == "match" and self._egress_alert_mode is not None:
-            self._end_egress_alert()
             return [Event("egress", "🧭 Egress restored",
                           f"actual exit matches {egress_label(selected)} again",
-                          "default")]
+                          "default", on_sent=self._restore_egress_alert())]
         return []
 
     # -- the egress alert record ------------------------------------------------
     #
+    # The record follows the last egress page spool-notify accepted. Every
+    # transition below moves the alert at once and bumps _egress_gen; a page's
+    # on_sent touches the record only if no transition has happened since its
+    # page was made, because a newer page then settles it. Transitions and
+    # on_sents all hold _egress_lock, so an on_sent never lands between a
+    # transition's change and its file I/O, or the other way round.
+    #
     # The record only spares the operator a repeated page. A failure to read,
-    # write or remove it is logged and the tick carries on: it must never cost a
-    # page or stop the control loop.
+    # write, sync or remove it is logged and the tick carries on: it must never
+    # cost a page or stop the control loop.
 
-    def _raise_egress_alert(self, mode) -> None:
-        self._egress_alert_mode = mode
+    def _raise_egress_alert(self, mode) -> Callable[[], None]:
+        """The fallback page: the alert stands for `mode` now. Returns the page's
+        on_sent, which writes the record."""
+        with self._egress_lock:
+            self._egress_gen += 1
+            self._egress_alert_mode = mode
+            return functools.partial(self._fallback_page_sent, self._egress_gen, mode)
+
+    def _fallback_page_sent(self, gen: int, mode) -> None:
+        with self._egress_lock:
+            if self._egress_gen == gen and self._egress_alert_mode == mode:
+                self._write_egress_alert(mode)
+
+    def _restore_egress_alert(self) -> Callable[[], None]:
+        """The restore page: the alert ends now. Returns the page's on_sent, which
+        removes the record. Until then a restart must still send a restore."""
+        with self._egress_lock:
+            self._egress_gen += 1
+            self._egress_alert_mode = None
+            return functools.partial(self._restore_page_sent, self._egress_gen)
+
+    def _restore_page_sent(self, gen: int) -> None:
+        with self._egress_lock:
+            if self._egress_gen == gen and self._egress_alert_mode is None:
+                self._remove_egress_alert()
+
+    def _end_egress_alert(self) -> None:
+        """A silent end (a mode change, `skipped`, or a record for another mode at
+        the seed). No page goes out, so nothing would confirm a deferred removal:
+        the record goes now."""
+        with self._egress_lock:
+            self._egress_gen += 1
+            self._egress_alert_mode = None
+            self._remove_egress_alert()
+
+    def _adopt_egress_alert(self, mode) -> None:
+        """A record for the selected mode at the seed: its alert stands again, and
+        the record stays as written."""
+        with self._egress_lock:
+            self._egress_gen += 1
+            self._egress_alert_mode = mode
+
+    def _count_egress_alert_as_announced(self, mode) -> None:
+        """A fallback already confirmed at the seed, with no record for it, counts
+        as announced. No page goes out for it, so it is recorded now."""
+        with self._egress_lock:
+            self._egress_gen += 1
+            self._egress_alert_mode = mode
+            self._write_egress_alert(mode)
+
+    def _write_egress_alert(self, mode) -> None:
         path = self._egress_alert_path
         if path is None:
             return
         body = json.dumps({"selected": mode, "announced_at": self._wall_clock()})
         # A temp file beside the record, renamed over it, so a reader never meets
-        # half a record. The temp name is this writer's own.
+        # half a record. Its data is synced before the rename and the rename after
+        # it, so a power loss leaves the old record or the new one. The temp name is
+        # this writer's own.
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
                     f.write(body)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(tmp, path)
             except BaseException:
                 try:
@@ -672,25 +801,20 @@ class EventDetector:
                 except OSError:
                     pass
                 raise
+            _fsync_parent(path)
         except OSError as e:
-            logging.warning("egress alert: cannot record the fallback in %s, so a "
-                            "restart will page it again: %s", path, e)
-
-    def _end_egress_alert(self) -> None:
-        self._egress_alert_mode = None
-        self._remove_egress_alert()
+            logging.warning("egress alert: cannot record the fallback in %s durably, so a "
+                            "restart may page it again: %s", path, e)
 
     def _remove_egress_alert(self) -> None:
         path = self._egress_alert_path
         if path is None:
             return
         try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+            remove_egress_alert_record(path)
         except OSError as e:
-            logging.warning("egress alert: cannot remove the record %s, so a restart "
-                            "may take its fallback for still standing: %s", path, e)
+            logging.warning("egress alert: cannot remove the record %s durably, so a "
+                            "restart may take its fallback for still standing: %s", path, e)
 
     def _read_egress_alert(self) -> Optional[str]:
         """The selected mode the record names, or None when there is no usable

@@ -1,8 +1,15 @@
 import copy
 import json
+import threading
 from pathlib import Path
 import pytest
+import egress_observer
+import notify
 import sbfd_ctl as M
+
+# The real ones, for runs that swap them out more than once in a test.
+_REAL_NOTIFIER = notify.Notifier
+_REAL_PUBLISH = M.publish_state
 
 
 BASE_WITH_ENV = {
@@ -1020,7 +1027,8 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
     # points: the observer runs on the controller's own stop event; every tick's
     # egress_observed reaches the detector, so a persistent fallback pages once and
     # its end pages once; and the detector keeps the fallback's record at the
-    # configured egress_alert_path while it stands.
+    # configured egress_alert_path while it stands. The stub takes each page as
+    # spool-notify would, so the page's on_sent runs as it is handed over.
     import egress_observer
     import notify
     import threading
@@ -1059,6 +1067,8 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
 
         def notify(self, ev):
             pages.append(ev)
+            if ev.on_sent is not None:
+                ev.on_sent()
 
     monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
     monkeypatch.setattr(notify, "Notifier", StubNotifier)
@@ -1095,3 +1105,141 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
     assert "fallback" in fallback.title.lower() and fallback.priority == "high"
     assert "relay Backbone" in fallback.message and "198.51.100.20" in fallback.message
     assert "restored" in restored.title.lower() and restored.priority == "default"
+
+
+# -- the egress alert record across controller runs -------------------------------------
+#
+# Each run is one run_controller lifetime, one tick per scripted egress status. The
+# record follows the pages spool-notify took (notify.EventDetector).
+
+_FALLBACK, _RESTORED = "🧭 Egress fallback", "🧭 Egress restored"
+
+
+def _spool_notify(tmp_path, name, rc):
+    """A spool-notify stand-in: logs the title it is handed, then exits rc."""
+    log = tmp_path / f"{name}.log"
+    script = tmp_path / name
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> "{log}"\nexit {rc}\n',
+                      encoding="utf-8")
+    script.chmod(0o755)
+    return str(script), log
+
+
+def _handed(log):
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+def _egress_pages(titles):
+    return [t for t in titles if "Egress" in t]
+
+
+def _keeping(record, command=notify.DEFAULT_COMMAND):
+    """Notifications that keep the egress alert record at `record`, every page sent at once."""
+    return notify.NotifyCfg(topic="t", min_interval_s=0, command=command,
+                            egress_alert_path=str(record))
+
+
+def _run_egress_controller(tmp_path, monkeypatch, statuses, notifications, *,
+                           observe=True, pages=None):
+    """One run_controller lifetime, one tick per scripted egress status, with the
+    actual-exit check on unless `observe` is False. `notifications` is the run's
+    NotifyCfg, or None for notifications off. With `pages`, a stub Notifier takes each
+    page as spool-notify would: it appends the title and runs the page's on_sent.
+    Without, the real Notifier runs notifications.command. Returns the ticks run."""
+    ticks = []
+    taken = [] if pages is None else pages
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            self.selected = None
+            self.i = 0
+
+        def start(self, stop):
+            pass
+
+        def set_selected(self, mode):
+            self.selected = mode
+
+        def snapshot(self):
+            status = statuses[min(self.i, len(statuses) - 1)]
+            self.i += 1
+            return {"selected": self.selected,
+                    "observed": "relay_backbone" if status == "match" else "relay_direct",
+                    "ip": "198.51.100.20", "status": status, "since": 1.0,
+                    "checked_at": 2.0, "error": None}
+
+    class AcceptingNotifier:
+        def __init__(self, topic, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def notify(self, ev):
+            taken.append(ev.title)
+            if ev.on_sent is not None:
+                ev.on_sent()
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    monkeypatch.setattr(notify, "Notifier", _REAL_NOTIFIER if pages is None else AcceptingNotifier)
+    cfg = base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=(
+            egress_observer.ObserveCfg(url="https://probe.example.net/trace")
+            if observe else None)),
+        notifications=notifications,
+    )
+    stop = threading.Event()
+    monkeypatch.setattr(stop, "wait", lambda timeout=None: stop.is_set())   # no sleeping between ticks
+    _stub_controller_io(monkeypatch, stop)
+
+    def one_tick_per_status(c, snap):
+        _REAL_PUBLISH(c, snap)
+        ticks.append(snap["egress_observed"])
+        if len(ticks) == len(statuses):
+            stop.set()
+
+    monkeypatch.setattr(M, "publish_state", one_tick_per_status)
+    M.run_controller(cfg, stop_event=stop)
+    return len(ticks)
+
+
+def test_a_fallback_page_spool_notify_refused_is_paged_after_a_restart(tmp_path, monkeypatch):
+    # Greptile P1 on PR #24: the record said a fallback was announced as soon as the
+    # detector raised it, before spool-notify had the page. Here spool-notify refuses the
+    # page (a local fault: the Notifier logs it and drops it), and the restart that
+    # follows, with the fallback still standing, must page it. The operator never heard
+    # of it.
+    record = tmp_path / "egress_alert.json"
+    refusing, refused = _spool_notify(tmp_path, "refusing-spool-notify", 1)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(record, refusing))
+    assert _egress_pages(_handed(refused)) == [_FALLBACK]   # handed over, and refused
+    assert not record.exists()
+    working, sent = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch,
+                           ["checking", "checking", "pending", "mismatch", "mismatch"],
+                           _keeping(record, working))
+    assert _egress_pages(_handed(sent)) == [_FALLBACK]
+
+
+def test_a_controller_restart_takes_over_a_fallback_spool_notify_took(tmp_path, monkeypatch):
+    # The other half, through the real Notifier: spool-notify took the fallback page, so
+    # its record is written, and the restart in the middle of the fallback takes it over.
+    # It pages the restore, not the fallback again.
+    record = tmp_path / "egress_alert.json"
+    working, sent = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(record, working))
+    assert json.loads(record.read_text())["selected"] == "relay_backbone"
+    _run_egress_controller(tmp_path, monkeypatch,
+                           ["checking", "checking", "pending", "mismatch", "mismatch", "match"],
+                           _keeping(record, working))
+    assert _egress_pages(_handed(sent)) == [_FALLBACK, _RESTORED]
+    assert not record.exists()
