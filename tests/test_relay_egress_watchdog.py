@@ -1581,6 +1581,27 @@ def test_deadman_takes_the_table_from_the_state_file_when_the_config_names_none(
     assert calls == [DEL_EGRESS]
 
 
+@pytest.mark.parametrize("env", [None, ""], ids=["env-unset", "env-empty"])
+def test_deadman_takes_the_state_table_when_egress_table_is_unset_or_empty(
+        tmp_path, monkeypatch, env):
+    """Only a NON-EMPTY $EGRESS_TABLE outranks the state file. A drop-in that sets
+    `Environment=EGRESS_TABLE=` (empty) must not cut the dead-man off from the table
+    the actuator saved."""
+    D = _load_deadman()
+    if env is None:
+        monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    else:
+        monkeypatch.setenv("EGRESS_TABLE", env)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"table": "egress"}))
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
+    p = tmp_path / "c.json"
+    p.write_text('{"table": "egress", "state_pa')   # a broken edit: unparseable
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
+
+
 def test_deadman_reads_the_state_path_from_a_readable_config(tmp_path, monkeypatch):
     """A config that names no usable table may still say where the state file is."""
     D = _load_deadman()
