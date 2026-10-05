@@ -525,6 +525,36 @@ def test_a_failing_probe_on_an_up_link_still_waits_for_fail_threshold():
     assert rc == 0 and state["route"] is None and ip.preferred() == []
 
 
+@pytest.mark.parametrize("failure", ["curl-hangs", "probe-cannot-start", "probe-crashes"])
+def test_other_ordinary_probe_failures_keep_the_hysteresis(failure):
+    """Only a missing or downed link skips the hysteresis. A curl that outlives its
+    limit, a probe that cannot start, or a probe that crashes is an ordinary failure:
+    the route survives fail_threshold - 1 of them in a row."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone")])
+    state = _healthy_state("backbone", route="backbone")
+
+    def run(argv, **kw):
+        if argv[:3] == ["ip", "-j", "link"]:
+            return R(out=json.dumps([{"ifname": argv[-1], "flags": ["UP", "LOWER_UP"]}]))
+        if failure == "curl-hangs":
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        raise OSError(11, "Resource temporarily unavailable")
+
+    def probe(up):
+        if failure == "probe-crashes":
+            raise RuntimeError("probe crashed")
+        return M.run_probe(up, run)
+
+    for t in range(2):
+        state, rc = M.tick(c, state, 100.0 + t, ip=ip, probe=probe, fetch=_backbone,
+                           log=lambda line: None)
+        assert rc == 0 and state["route"] == "backbone" and len(ip.preferred()) == 1
+    state, rc = M.tick(c, state, 102.0, ip=ip, probe=probe, fetch=_backbone,
+                       log=lambda line: None)
+    assert rc == 0 and state["route"] is None and ip.preferred() == []
+
+
 def test_tick_falls_back_to_relay_direct_past_grace():
     c, ip = cfg(), FakeIp(BASE)
     state, _, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB}, mode="relay_vpn")
