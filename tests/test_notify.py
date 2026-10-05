@@ -1052,6 +1052,26 @@ def test_egress_a_fallback_announced_before_a_restart_is_not_paged_again(tmp_pat
     assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
 
 
+def test_egress_a_fallback_standing_across_two_restarts_is_paged_once(tmp_path):
+    # A deploy restart and then a reboot, both during one fallback. The restart that
+    # takes the alert over must leave its record for the next one, or that one pages
+    # the fallback again.
+    path = tmp_path / "egress_alert.json"
+    pages = []
+    d = notify.EventDetector(egress_alert_path=str(path))
+    for e in (_eg_checking("relay_backbone"), _eg("pending"), _eg("mismatch")):
+        pages += _titles(d.observe(obs(egress=e)))
+    for restart in ("the deploy", "the reboot"):
+        d = notify.EventDetector(egress_alert_path=str(path))
+        for e in (_eg_checking("relay_backbone"), _eg_checking("relay_backbone"),
+                  _eg("pending"), _eg("mismatch"), _eg("mismatch")):
+            pages += _titles(d.observe(obs(egress=e)))
+        assert path.exists(), f"the fallback still stands after {restart}, so must its record"
+    pages += _titles(d.observe(obs(egress=_eg("match", observed="relay_backbone"))))
+    assert pages == [FALLBACK, RESTORED]
+    assert not path.exists()
+
+
 def test_egress_a_fallback_that_began_while_down_pages_after_the_restart(tmp_path, caplog):
     path = tmp_path / "egress_alert.json"     # no record: nothing was announced
     after = notify.EventDetector(egress_alert_path=str(path))
@@ -1131,6 +1151,25 @@ def test_egress_skipped_ends_the_alert_and_its_record(tmp_path, selected):
     assert not path.exists()
     assert d.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []   # no restore
     assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+
+
+@pytest.mark.parametrize("ending, want", [
+    pytest.param(_eg("match", observed="relay_backbone"), [RESTORED], id="restore"),
+    pytest.param(_eg_checking("relay_vpn"), [], id="mode-change"),
+])
+def test_egress_an_alert_whose_record_is_already_gone_ends_without_a_warning(
+        tmp_path, caplog, ending, want):
+    # A record already missing when its alert ends is fine: deleted by hand, or never
+    # written because the write failed. The alert ends as usual and nothing is logged.
+    # A warning here would say a restart may take the fallback for still standing,
+    # which is false.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    path.unlink()
+    assert _titles(d.observe(obs(egress=ending))) == want
+    assert _warnings(caplog) == []
 
 
 @pytest.mark.parametrize("body", [
@@ -1215,6 +1254,14 @@ def test_egress_alert_path_none_does_no_file_io(monkeypatch):
         pages += _titles(d.observe(obs(egress=e)))
     assert pages == [RESTORED, FALLBACK, FALLBACK]
     assert attempted == []
+
+
+def test_notify_cfg_keeps_its_record_in_the_state_directory_by_default():
+    # The detector alone keeps no record by default; the controller's config does, in
+    # sbfd-ctl's StateDirectory. load_config passes the path explicitly, so its tests
+    # cannot see this default.
+    assert notify.DEFAULT_EGRESS_ALERT_PATH == "/var/lib/sbfd-ctl/egress_alert.json"
+    assert notify.NotifyCfg(topic="t").egress_alert_path == notify.DEFAULT_EGRESS_ALERT_PATH
 
 
 def test_egress_alert_record_is_written_whole_in_a_directory_made_for_it(tmp_path, monkeypatch):

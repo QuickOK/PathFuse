@@ -2,6 +2,7 @@ import json
 import pytest
 from pathlib import Path
 
+import notify
 import sbfd_ctl
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -218,6 +219,13 @@ def test_load_config_notifications_bad_egress_alert_path_raises(tmp_path: Path, 
     p.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="egress_alert_path"):
         sbfd_ctl.load_config(str(p))
+
+
+def test_shipped_example_config_names_the_default_egress_alert_path():
+    # The example documents the key with its default. load_config fills in an absent
+    # key, so loading the example cannot tell whether it is there.
+    raw = json.loads((ROOT / "config" / "sbfd-ctl.example.json").read_text())
+    assert raw["notifications"].get("egress_alert_path") == notify.DEFAULT_EGRESS_ALERT_PATH
 
 
 def test_load_config_notifications_full(tmp_path: Path):
