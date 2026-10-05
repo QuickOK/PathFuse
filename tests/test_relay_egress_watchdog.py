@@ -6,6 +6,7 @@ silently pins the relay to its default mode) and the route invariant: at most
 one preferred default, and only toward a healthy upstream the mode selects.
 """
 import contextlib
+import errno
 import http.client
 import importlib.util
 import io
@@ -498,6 +499,16 @@ def test_link_up_tells_a_missing_or_downed_link_from_an_ip_that_cannot_tell(answ
     assert M.link_up("wg-exit", run) is want
 
 
+def test_link_up_reads_output_nested_too_deep_as_cannot_tell():
+    """Unparseable output gives None. On output nested too deep, json.loads raises a
+    RecursionError, which is not a ValueError, so this pins the RecursionError in
+    link_up's handler: without it, link_up raises instead of answering None."""
+    def run(argv, **kw):
+        return R(out="[" * DEEP)
+
+    assert M.link_up("wg-exit", run) is None
+
+
 def test_an_ip_link_query_that_fails_otherwise_waits_for_fail_threshold():
     """`ip` failing on the query for a reason other than a missing device must not
     withdraw a healthy route at once: it takes fail_threshold (3) such ticks in a row."""
@@ -953,20 +964,42 @@ def test_main_leaves_the_record_behind_a_failing_tick(tmp_path, monkeypatch, dea
     assert json.loads(deadman_record.read_text())["table"] == "egress"
 
 
+@pytest.mark.parametrize("failure", ["parent-is-a-file", "enospc", "eacces", "erofs",
+                                     "tmp-is-a-directory"])
 @pytest.mark.parametrize("readable", [True, False], ids=["tick-ok", "tick-fails"])
-def test_a_record_that_cannot_be_written_never_changes_the_ticks_exit(tmp_path, monkeypatch,
-                                                                      capsys, readable):
-    """Failing to write the record is worth an ERROR, not a failed tick: that would fire
-    the dead-man every 10 s and withdraw a healthy route."""
-    blocker = tmp_path / "blocker"
-    blocker.write_text("x")
-    monkeypatch.setattr(M, "DEADMAN_RECORD", str(blocker / "deadman.json"))
+def test_any_failure_to_write_the_record_never_changes_the_ticks_exit(
+        tmp_path, monkeypatch, capsys, deadman_record, failure, readable):
+    """Whatever stops the record write costs an ERROR line, never the tick: a failed
+    tick would fire the dead-man every 10 s and withdraw a healthy route. The causes
+    raise different OSErrors (a file where the record's directory goes, a full /run
+    tmpfs, a permission or read-only slip, a directory where the temporary file goes),
+    so a handler narrowed to some of them fails here."""
+    record = deadman_record
+    if failure == "parent-is-a-file":
+        blocker = tmp_path / "blocker"
+        blocker.write_text("x")
+        record = blocker / "deadman.json"   # mkdir raises FileExistsError
+        monkeypatch.setattr(M, "DEADMAN_RECORD", str(record))
+    elif failure == "tmp-is-a-directory":
+        (tmp_path / "deadman.json.tmp").mkdir()   # the real write path: IsADirectoryError
+    else:
+        exc = {"enospc": OSError(errno.ENOSPC, "No space left on device"),
+               "eacces": PermissionError(errno.EACCES, "Permission denied"),
+               "erofs": OSError(errno.EROFS, "Read-only file system")}[failure]
+        real = M._write_json
+
+        def write(path, obj):
+            if str(path) == M.DEADMAN_RECORD:
+                raise exc
+            return real(path, obj)   # the state file still saves
+
+        monkeypatch.setattr(M, "_write_json", write)
     p = _main_config(tmp_path)
     monkeypatch.setattr(M, "IpRoute", lambda: (FakeIp if readable else _NoTable)(BASE))
     assert M.main(["--config", str(p)]) == (0 if readable else 1)
-    err = capsys.readouterr().err
-    assert f"ERROR: cannot write the dead-man record {blocker / 'deadman.json'}: " in err
+    assert f"ERROR: cannot write the dead-man record {record}: " in capsys.readouterr().err
     assert json.loads((tmp_path / "state.json").read_text())["last_check"] > 0   # the tick ran
+    assert not record.exists()
 
 
 def test_the_record_is_replaced_whole(tmp_path, monkeypatch, deadman_record):
@@ -2065,6 +2098,29 @@ def test_deadman_leaves_the_live_route_alone_when_a_shadow_runs_config_breaks(
     capsys.readouterr()
     assert D.main(["--config", str(p)], runner=_never) == 0
     assert "skipping (the last tick was a dry run" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("live", [{"dry_run": False}, {}], ids=["dry-run-false", "dry-run-absent"])
+def test_deadman_fails_open_when_going_live_with_a_config_the_actuator_rejects(
+        tmp_path, monkeypatch, capsys, deadman_record, live):
+    """A config that parses with a usable table is the operator's latest word, so it
+    outranks a record's "dry_run": true. End to end: a shadow tick records a dry run,
+    then the operator goes live with a config the actuator rejects (a fetch timeout
+    over the 5 s cap), so no tick writes a new record. The dead-man must still fail
+    open, not skip on the stale record."""
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    p = _main_config(tmp_path, dry_run=True)
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    assert M.main(["--config", str(p)]) == 0                    # the shadow tick
+    assert json.loads(deadman_record.read_text())["dry_run"] is True
+    p.write_text(json.dumps({"table": "egress", "client": {"fetch_timeout_s": 10}, **live}))
+    assert M.main(["--config", str(p)]) == 2                    # rejected: no new record
+    assert "fetch_timeout_s must be at most 5 s" in capsys.readouterr().err
+    assert json.loads(deadman_record.read_text())["dry_run"] is True
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
 
 
 @pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],
