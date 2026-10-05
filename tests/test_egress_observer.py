@@ -442,6 +442,26 @@ def test_stop_during_the_settle_ends_the_thread_without_a_check():
     assert calls == []
 
 
+def test_every_thread_start_makes_is_a_daemon():
+    # sbfd-ctl never joins these threads, and its main() sets `stop` only on SIGTERM or
+    # Ctrl+C. A thread that is not a daemon would turn a controller crash into a hang at
+    # exit: the thread waits for a stop that never comes, the interpreter waits for the
+    # thread, and the process never exits for systemd to restart it.
+    o, _ = _fast_observer()
+    o.set_selected("relay_backbone")
+    stop = threading.Event()
+    before = set(threading.enumerate())
+    o.start(stop)
+    try:
+        new = [t for t in threading.enumerate() if t not in before]
+        # at least the check thread and its stop watcher
+        assert o._thread in new and len(new) >= 2, [t.name for t in new]
+        assert all(t.daemon for t in new), [(t.name, t.daemon) for t in new]
+    finally:
+        exited = _stop_and_join(o, stop)
+    assert exited
+
+
 class FakeStop:
     """A stop Event whose waits return at once, so `_run` can be driven on the test's own thread."""
 
