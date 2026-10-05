@@ -614,6 +614,19 @@ def test_an_exemption_that_cannot_be_added_withdraws_the_preferred_route(seeded)
     assert _exempt_error(HOST_EXEMPT) in lines
 
 
+def test_an_exemption_that_cannot_be_added_withdraws_every_preferred_default():
+    """Two preferred defaults stand (one per upstream). A missing exemption must take
+    both away: either one left behind would carry the exempt prefix into its upstream."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone"), _preferred_route(c, "vpn")],
+                fail={HOST_EXEMPT})
+    new, rc, lines = run_tick(c, _healthy_state("backbone", route="backbone"), 100.0, ip,
+                              {"vpn": OK_VPN, "backbone": OK_BB})
+    assert rc == 0 and new["route"] is None
+    assert ip.preferred() == [] and _replaces_default(ip) == []
+    assert _exempt_error(HOST_EXEMPT) in lines
+
+
 def test_the_preferred_route_returns_once_the_exemption_is_in_place():
     c, ip = cfg(), FakeIp(BASE, fail={HOST_EXEMPT})
     probes = {"vpn": OK_VPN, "backbone": OK_BB}
