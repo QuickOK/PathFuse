@@ -813,8 +813,8 @@ class EventDetector:
                 raise
             _fsync_parent(path)
         except OSError as e:
-            logging.warning("egress alert: cannot record the fallback in %s durably, so a "
-                            "restart may page it again: %s", path, e)
+            logging.warning("egress alert: cannot record the fallback in %s durably, so "
+                            "a restart may page it again: %s", path, e)
 
     def _remove_egress_alert(self, failure_level: int = logging.WARNING) -> None:
         path = self._egress_alert_path
@@ -823,8 +823,9 @@ class EventDetector:
         try:
             remove_egress_alert_record(path)
         except OSError as e:
-            logging.log(failure_level, "egress alert: cannot remove the record %s durably, "
-                        "so a restart may take its fallback for still standing: %s", path, e)
+            logging.log(failure_level, "egress alert: cannot remove the record %s "
+                        "durably, so a restart may take its fallback for still "
+                        "standing: %s", path, e)
 
     def _read_egress_alert(self) -> Optional[str]:
         """The selected mode the record names, or None when there is no usable
