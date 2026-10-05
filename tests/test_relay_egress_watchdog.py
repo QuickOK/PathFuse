@@ -122,6 +122,24 @@ def run_tick(c, state, now, ip, probes, mode="relay_backbone", fetch_err=None):
     return new, rc, lines
 
 
+def _healthy_state(name, route=None):
+    """A state where upstream `name` has been healthy for a while, with `route` installed."""
+    return {"route": route, "upstreams": {name: dict(M.new_health(), healthy=True,
+                                                     first_pass_seen=True, consecutive_pass=5)}}
+
+
+def _preferred_route(c, name):
+    """The preferred default toward upstream `name`, as `ip -j route show` lists it."""
+    r = c["upstreams"][name]["route"]
+    return dict({"dst": "default", "dev": r["dev"], "metric": 100},
+                **({"gateway": r["via"]} if r["via"] else {}))
+
+
+def _replaces_default(ip):
+    """Every `ip route replace default ...` the tick ran."""
+    return [call for call in ip.calls if call[:3] == ["route", "replace", "default"]]
+
+
 # --- vocabulary ---------------------------------------------------------------
 
 def test_vocabulary_includes_relay_backbone():
@@ -194,12 +212,30 @@ def test_default_mode_defaults_to_relay_direct():
     (lambda c: c["exempt"].update(prefixes=["0.0.0.0/0"]), "prefix length 0"),
     pytest.param(lambda c: c["exempt"].update(prefixes=["not-a-prefix"]), "exempt.prefixes",
                  id="exempt-unparsable"),
+    # A tick must end within the unit's TimeoutStartSec=25 (see MAX_PROBE_TIMEOUT_S).
+    pytest.param(lambda c: c["upstreams"]["vpn"]["probe"].update(timeout_s=10.5),
+                 r"^upstreams\.vpn\.probe\.timeout_s must be at most 10 s",
+                 id="probe-timeout-over-10"),
+    pytest.param(lambda c: c["client"].update(fetch_timeout_s=10.5),
+                 r"^client\.fetch_timeout_s must be at most 10 s", id="fetch-timeout-over-10"),
+    pytest.param(lambda c: c["client"].update(bootstrap_timeout_s=15.5),
+                 r"^client\.bootstrap_timeout_s must be at most 15 s",
+                 id="bootstrap-timeout-over-15"),
 ])
 def test_validate_config_rejects(mutate, match):
     raw = raw_cfg()
     mutate(raw)
     with pytest.raises(M.ConfigError, match=match):
         M.validate_config(raw)
+
+
+def test_validate_config_accepts_timeouts_at_their_caps():
+    raw = raw_cfg()
+    raw["upstreams"]["vpn"]["probe"]["timeout_s"] = 10
+    raw["client"].update(fetch_timeout_s=10, bootstrap_timeout_s=15)
+    c = M.validate_config(raw)
+    assert (c["upstreams"]["vpn"]["probe"]["timeout_s"], c["client"]["fetch_timeout_s"],
+            c["client"]["bootstrap_timeout_s"]) == (10.0, 10.0, 15.0)
 
 
 @pytest.mark.parametrize("url", ["", "https://relay.example.net/api/desired_egress",
@@ -301,7 +337,7 @@ def _runner(flags=("UP", "LOWER_UP"), body="vpn=on\n", rc=0):
 
 
 def test_run_probe_ok():
-    assert M.run_probe(cfg()["upstreams"]["vpn"], _runner()) == (True, "vpn=on")
+    assert M.run_probe(cfg()["upstreams"]["vpn"], _runner()) == (True, "vpn=on", False)
 
 
 def test_run_probe_link_down_skips_curl():
@@ -311,15 +347,52 @@ def test_run_probe_link_down_skips_curl():
         calls.append(argv)
         return R(out=json.dumps([{"flags": ["BROADCAST"]}]))
 
-    ok, detail = M.run_probe(cfg()["upstreams"]["vpn"], run)
-    assert not ok and detail == "link veth-vpn down" and len(calls) == 1
+    ok, detail, hard = M.run_probe(cfg()["upstreams"]["vpn"], run)
+    assert not ok and detail == "link veth-vpn down" and hard and len(calls) == 1
 
 
 def test_run_probe_curl_failure_and_unexpected_body():
+    """Soft failures: the hysteresis decides when they make the upstream unhealthy."""
     up = cfg()["upstreams"]["vpn"]
-    ok, detail = M.run_probe(up, _runner(rc=28))
-    assert not ok and detail.startswith("curl rc=28")
-    assert M.run_probe(up, _runner(body="vpn=off\n")) == (False, "unexpected body")
+    ok, detail, hard = M.run_probe(up, _runner(rc=28))
+    assert not ok and detail.startswith("curl rc=28") and not hard
+    assert M.run_probe(up, _runner(body="vpn=off\n")) == (False, "unexpected body", False)
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param(R(rc=1, err='Device "veth-vpn" does not exist.'), id="missing"),
+    pytest.param(R(out=json.dumps([{"ifname": "veth-vpn", "flags": ["BROADCAST", "NOARP"]}])),
+                 id="not-admin-up"),
+])
+def test_run_probe_a_missing_or_downed_link_is_a_hard_failure(answer):
+    """`wg-quick down` deletes its device; `ip link set ... down` clears UP. Either way
+    the upstream cannot carry traffic, so the failure skips the hysteresis."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return answer
+
+    assert M.run_probe(cfg()["upstreams"]["vpn"], run) == (False, "link veth-vpn down", True)
+    assert calls == [["ip", "-j", "link", "show", "dev", "veth-vpn"]]   # and no curl
+
+
+@pytest.mark.parametrize("answer", [
+    pytest.param(subprocess.TimeoutExpired("ip", 2), id="ip-hangs"),
+    pytest.param(OSError("No such file or directory: 'ip'"), id="ip-cannot-run"),
+    pytest.param(R(out="not json"), id="garbage"),
+    pytest.param(R(out="[]"), id="empty-list"),
+])
+def test_run_probe_a_link_state_ip_cannot_tell_is_a_soft_failure(answer):
+    """Only a link known to be missing or down skips the hysteresis. A hiccup of `ip`
+    itself is an ordinary failure."""
+    def run(argv, **kw):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    assert M.run_probe(cfg()["upstreams"]["vpn"], run) == (
+        False, "cannot check link veth-vpn", False)
 
 
 # --- selection and planning -----------------------------------------------------------
@@ -397,6 +470,61 @@ def test_tick_fails_open_after_fail_threshold():
     assert any(line.startswith("HEALTH: backbone healthy -> unhealthy") for line in lines)
 
 
+def _real_probe(missing=(), curl_rc=0):
+    """The real run_probe over a fake runner: `ip -j link show` fails for a link in
+    `missing`, as for a deleted device, and finds any other link UP; curl prints a
+    body both upstreams' probes accept, or fails with `curl_rc`."""
+    def run(argv, **kw):
+        if argv[:3] == ["ip", "-j", "link"]:
+            if argv[-1] in missing:
+                return R(rc=1, err=f'Device "{argv[-1]}" does not exist.')
+            return R(out=json.dumps([{"ifname": argv[-1], "flags": ["UP", "LOWER_UP"]}]))
+        if curl_rc:
+            return R(rc=curl_rc, err="curl: (28) Operation timed out")
+        return R(out="vpn=on\nip=203.0.113.10\n")
+    return lambda up: M.run_probe(up, run)
+
+
+def _backbone(url, timeout):
+    return "relay_backbone", "wan2", None
+
+
+@pytest.mark.parametrize("route_left", [True, False], ids=["route-still-listed", "route-gone"])
+def test_a_link_that_goes_down_withdraws_its_route_on_the_first_tick(route_left):
+    """The fail-open drill: stopping the backbone's tunnel deletes its device, and the
+    kernel drops the routes through it. Waiting out fail_threshold would leave the
+    upstream "healthy" for two more ticks, each trying to re-install its route on the
+    missing device: an ERROR, exit 1 and a dead-man run every 10 s."""
+    c = cfg()
+    ip = FakeIp(BASE + ([_preferred_route(c, "backbone")] if route_left else []),
+                fail={"wg-exit"})   # the device is gone: any command naming it fails
+    lines: list[str] = []
+    new, rc = M.tick(c, _healthy_state("backbone", route="backbone"), 100.0, ip=ip,
+                     probe=_real_probe(missing={"wg-exit"}), fetch=_backbone, log=lines.append)
+    assert rc == 0 and new["route"] is None and ip.preferred() == []
+    assert _replaces_default(ip) == []
+    assert not any(line.startswith("ERROR") for line in lines)
+    assert "HEALTH: backbone healthy -> unhealthy (link wg-exit down)" in lines
+    assert "ROUTE: backbone -> none (mode=relay_backbone)" in lines
+
+
+def test_a_failing_probe_on_an_up_link_still_waits_for_fail_threshold():
+    """Only a missing or downed link skips the hysteresis. The probe itself failing,
+    a blip on the path, still takes fail_threshold (3) failures in a row."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone")])
+    state = _healthy_state("backbone", route="backbone")
+    probe = _real_probe(curl_rc=28)
+    for t in range(2):
+        state, rc = M.tick(c, state, 100.0 + t, ip=ip, probe=probe, fetch=_backbone,
+                           log=lambda line: None)
+        assert rc == 0 and state["route"] == "backbone" and len(ip.preferred()) == 1
+        assert state["upstreams"]["backbone"]["last_probe"].startswith("curl rc=28")
+    state, rc = M.tick(c, state, 102.0, ip=ip, probe=probe, fetch=_backbone,
+                       log=lambda line: None)
+    assert rc == 0 and state["route"] is None and ip.preferred() == []
+
+
 def test_tick_falls_back_to_relay_direct_past_grace():
     c, ip = cfg(), FakeIp(BASE)
     state, _, _ = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB}, mode="relay_vpn")
@@ -451,11 +579,64 @@ def test_preferred_failure_fails_open_and_exits_1():
     assert any(line.startswith("ERROR: ip route replace default dev wg-exit") for line in lines)
 
 
-def test_exemption_failure_is_logged_but_keeps_the_preferred_route():
-    c, ip = cfg(), FakeIp(BASE, fail={"10.0.0.0/8"})
-    _new, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
-    assert rc == 0 and ip.preferred()[0]["dev"] == "wg-exit"
-    assert any("ERROR: ip route replace 10.0.0.0/8" in line for line in lines)
+HOST_EXEMPT = "198.51.100.7/32"   # the exemption these tests make fail
+EXEMPT_ALL = raw_cfg()["exempt"]["prefixes"]
+
+
+def _exempt_error(named):
+    return f"ERROR: exemption {named} not in place: no preferred route this tick (fail open)"
+
+
+@pytest.mark.parametrize("fail", [[HOST_EXEMPT], EXEMPT_ALL], ids=["one", "all"])
+def test_an_exemption_that_cannot_be_added_blocks_the_preferred_route(fail):
+    """The selected upstream is healthy, but an exempt prefix would follow its default
+    into the upstream. Exit 0: the tick has failed open itself, and a failed tick
+    would only fire the dead-man every 10 s."""
+    c, ip = cfg(), FakeIp(BASE, fail=fail)
+    new, rc, lines = run_tick(c, {}, 100.0, ip, {"vpn": OK_VPN, "backbone": OK_BB})
+    assert rc == 0 and new["route"] is None and new["target"] == "backbone"
+    assert ip.preferred() == [] and _replaces_default(ip) == []   # not even for a moment
+    assert _exempt_error(", ".join(fail)) in lines
+    assert any(line.startswith(f"ERROR: ip route replace {HOST_EXEMPT} ") for line in lines)
+
+
+@pytest.mark.parametrize("seeded", ["backbone", "vpn"], ids=["would-keep", "would-switch"])
+def test_an_exemption_that_cannot_be_added_withdraws_the_preferred_route(seeded):
+    """Whether the tick would keep the route it finds (backbone, already right) or
+    switch it (vpn, to backbone), a missing exemption leaves no preferred route."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, seeded)], fail={HOST_EXEMPT})
+    new, rc, lines = run_tick(c, _healthy_state(seeded, route=seeded), 100.0, ip,
+                              {"vpn": OK_VPN, "backbone": OK_BB})
+    assert rc == 0 and new["route"] is None and ip.preferred() == []
+    assert _replaces_default(ip) == []
+    assert f"ROUTE: {seeded} -> none (mode=relay_backbone)" in lines
+    assert _exempt_error(HOST_EXEMPT) in lines
+
+
+def test_the_preferred_route_returns_once_the_exemption_is_in_place():
+    c, ip = cfg(), FakeIp(BASE, fail={HOST_EXEMPT})
+    probes = {"vpn": OK_VPN, "backbone": OK_BB}
+    state, rc, _ = run_tick(c, {}, 100.0, ip, probes)
+    assert rc == 0 and ip.preferred() == []
+    ip.fail = set()   # the WAN route can be added again
+    state, rc, lines = run_tick(c, state, 110.0, ip, probes)
+    assert rc == 0 and state["route"] == "backbone"
+    assert {"dst": "198.51.100.7", "gateway": GW, "dev": "eth0"} in ip.routes
+    assert ip.preferred() == [_preferred_route(c, "backbone")]
+    assert "ROUTE: none -> backbone (mode=relay_backbone)" in lines
+    assert not any(line.startswith("ERROR") for line in lines)
+
+
+def test_an_exemption_failure_whose_withdraw_also_fails_exits_1():
+    """A preferred default may then still stand, so the dead-man must get its turn."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone")], fail={HOST_EXEMPT, "del"})
+    new, rc, lines = run_tick(c, _healthy_state("backbone", route="backbone"), 100.0, ip,
+                              {"vpn": OK_VPN, "backbone": OK_BB})
+    assert rc == 1 and new["route"] is None
+    assert any(line.startswith("ERROR: ip route del default metric 100 table egress: ")
+               for line in lines)
 
 
 def test_unreadable_table_fails_open():
@@ -514,6 +695,30 @@ def test_main_returns_2_on_bad_config(tmp_path, capsys):
     p.write_text("{}")
     assert M.main(["--config", str(p)]) == 2
     assert "CONFIG ERROR" in capsys.readouterr().err
+
+
+def test_every_tick_writes_the_config_table_into_the_state():
+    """The dead-man reads it there when the config is unreadable. Written every tick,
+    so a renamed table replaces the old name."""
+    new, _, _ = run_tick(cfg(), {"table": "old-name"}, 100.0, FakeIp(BASE),
+                         {"vpn": OK_VPN, "backbone": OK_BB})
+    assert new["table"] == "egress"
+
+
+@pytest.mark.parametrize("readable", [True, False], ids=["tick-ok", "tick-fails"])
+def test_main_saves_the_table_even_from_a_failing_tick(tmp_path, monkeypatch, readable):
+    """A failing tick is what fires the dead-man, so its state must name the table too."""
+    class Broken(FakeIp):
+        def show_table(self, table):
+            raise RuntimeError("table id value is invalid")
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"table": "old-name"}))
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "state_path": str(state)}))
+    monkeypatch.setattr(M, "IpRoute", lambda: (FakeIp if readable else Broken)(BASE))
+    assert M.main(["--config", str(p)]) == (0 if readable else 1)
+    assert json.loads(state.read_text())["table"] == "egress"
 
 
 # --- the real fetch path against a stub client endpoint -------------------------------
@@ -913,6 +1118,34 @@ def test_tick_keeps_the_last_known_mode_within_grace_when_the_fetch_fails():
     assert [r["dev"] for r in ip.preferred()] == ["veth-vpn"]
 
 
+def test_tick_keeps_the_last_known_mode_within_grace_when_the_fetch_raises():
+    """A poll that RAISES is the same glitch as one that returns an error: within
+    grace the last-known mode holds and its healthy route stays. The fetch guard
+    must only count the failure, never drop the mode, or one malformed reply
+    withdraws a working backbone route at once instead of after grace_s."""
+    c, ip = cfg(), FakeIp(BASE)
+    probes = {"vpn": OK_VPN, "backbone": OK_BB}
+
+    def ok(url, timeout):
+        return "relay_backbone", "wan2", None
+
+    def boom(url, timeout):
+        raise ValueError("Invalid IPv6 URL")
+
+    state, rc = M.tick(c, {}, 100.0, ip=ip, probe=lambda up: probes[up["name"]],
+                       fetch=ok, log=lambda line: None)
+    assert rc == 0 and [r["dev"] for r in ip.preferred()] == ["wg-exit"]
+
+    state, rc = M.tick(c, state, 130.0, ip=ip, probe=lambda up: probes[up["name"]],
+                       fetch=boom, log=lambda line: None)
+    assert rc == 0
+    assert state["desired_mode"] == "relay_backbone"
+    assert state["desired_mode_fetched_at"] == 100.0       # a failed poll does not refresh it
+    assert state["desired_mode_fetch_fail"] == 1
+    assert state["effective_mode"] == "relay_backbone"
+    assert [r["dev"] for r in ip.preferred()] == ["wg-exit"]
+
+
 @pytest.mark.parametrize("mode", ["banana", "", ["relay_vpn"], {"mode": "relay_vpn"}, 123],
                          ids=["unknown", "empty", "list", "dict", "int"])
 def test_with_defaults_resets_a_mode_that_is_not_a_known_name(mode):
@@ -1111,6 +1344,26 @@ def test_deadman_honours_dry_run(tmp_path):
     assert D.main(["--config", str(p)], runner=run) == 0
 
 
+def test_deadman_deletes_when_the_config_says_dry_run_false(tmp_path):
+    """After the shadow run the live config carries an explicit "dry_run": false.
+    The dead-man must read that as live and fail open, exactly as when the key is
+    absent; only a real true skips it."""
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "preferred_metric": 100, "dry_run": False}))
+    calls, left = [], [1]
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if left[0]:
+            left[0] -= 1
+            return R()
+        return R(rc=2, err="RTNETLINK answers: No such process")
+
+    assert D.main(["--config", str(p)], runner=run) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "egress"]] * 2
+
+
 @pytest.mark.parametrize("value", ["yes", "true", 1], ids=["yes", "string-true", "one"])
 def test_deadman_fails_open_on_a_dry_run_that_is_not_a_real_true(tmp_path, value):
     """The actuator rejects such a config (exit 2) rather than reading it as a dry run,
@@ -1146,6 +1399,7 @@ def test_deadman_falls_back_to_env_table(tmp_path, monkeypatch):
 def test_deadman_without_any_table_exits_1(tmp_path, monkeypatch):
     D = _load_deadman()
     monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(tmp_path / "no-state.json"))   # not this box's
     assert D.main(["--config", str(tmp_path / "missing.json")], runner=lambda *a, **k: R()) == 1
 
 
@@ -1254,8 +1508,8 @@ def test_deadman_metric_below_1_defaults_to_100_keeps_table(tmp_path, metric):
 # A config that reads fine but names no usable table: null, "", a number, a list.
 BAD_TABLES = [pytest.param(None, id="null"), pytest.param("", id="empty-string"),
               pytest.param(5, id="number"), pytest.param(["x"], id="list")]
-NO_TABLE_MSG = ("relay-egress-deadman: no table "
-                "(config has no usable table and EGRESS_TABLE is unset/empty)")
+NO_TABLE_MSG = ("relay-egress-deadman: no table (config has no usable table, EGRESS_TABLE "
+                "is unset/empty, and the state file {} names none)")
 
 
 @pytest.mark.parametrize("bad", BAD_TABLES)
@@ -1283,6 +1537,8 @@ def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
         monkeypatch.delenv("EGRESS_TABLE", raising=False)
     else:
         monkeypatch.setenv("EGRESS_TABLE", env)
+    no_state = str(tmp_path / "no-state.json")
+    monkeypatch.setattr(D, "DEFAULT_STATE", no_state)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": bad}))
 
@@ -1292,7 +1548,132 @@ def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
     with _deadman_stderr() as err:
         assert D.main(["--config", str(p)], runner=run) == 1
     assert capsys.readouterr().out == ""
-    assert err.getvalue() == NO_TABLE_MSG + "\n"
+    assert err.getvalue() == NO_TABLE_MSG.format(no_state) + "\n"
+
+
+DEL_EGRESS = ["ip", "route", "del", "default", "metric", "100", "table", "egress"]
+
+
+def _nothing_left(calls):
+    """A dead-man runner that records each call and finds nothing to delete."""
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2, err="RTNETLINK answers: No such process")
+    return run
+
+
+@pytest.mark.parametrize("config", [None, "{not json", "", "[]", '{"table": null}'],
+                         ids=["missing", "truncated-json", "empty-file", "list", "null-table"])
+def test_deadman_takes_the_table_from_the_state_file_when_the_config_names_none(
+        tmp_path, monkeypatch, config):
+    """The shipped unit sets no EGRESS_TABLE, so with a broken config the actuator's
+    own state file is the dead-man's last way to the table."""
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"table": "egress", "route": "backbone"}))
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
+    p = tmp_path / "c.json"
+    if config is not None:
+        p.write_text(config)
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
+
+
+def test_deadman_reads_the_state_path_from_a_readable_config(tmp_path, monkeypatch):
+    """A config that names no usable table may still say where the state file is."""
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    default = tmp_path / "default-state.json"
+    default.write_text(json.dumps({"table": "wrong"}))
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(default))
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"table": "egress"}))
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": None, "state_path": str(state)}))
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
+
+
+@pytest.mark.parametrize("bad", [None, "", 5, ["state.json"]],
+                         ids=["null", "empty-string", "number", "list"])
+def test_deadman_falls_back_to_the_default_state_path(tmp_path, monkeypatch, bad):
+    """The actuator rejects such a state_path, so its state file is at the default."""
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"table": "egress"}))
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": None, "state_path": bad}))
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
+
+
+def test_deadman_default_state_path_is_the_actuators():
+    """Drift here would quietly cut the dead-man's last way to the table."""
+    assert _load_deadman().DEFAULT_STATE == M.validate_config({"table": "t"})["state_path"]
+
+
+def test_deadman_takes_the_config_table_then_env_then_the_state_file(tmp_path, monkeypatch):
+    D = _load_deadman()
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"table": "statetable"}))
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
+    monkeypatch.setenv("EGRESS_TABLE", "envtable")
+    p = tmp_path / "c.json"
+    tables = []
+    for config in [{"table": "egress"}, {"table": None}]:
+        p.write_text(json.dumps(config))
+        calls: list = []
+        assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+        tables.append(calls[0][-1])
+    assert tables == ["egress", "envtable"]
+
+
+def test_deadman_finds_the_table_the_actuator_saved_once_the_config_breaks(
+        tmp_path, monkeypatch, capsys):
+    """End to end: a good tick saves the table; an edit then breaks the config, the
+    tick exits 2, and the dead-man (no EGRESS_TABLE) still finds the table."""
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    state = tmp_path / "state.json"
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))   # where the actuator keeps it
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress", "state_path": str(state)}))
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    assert M.main(["--config", str(p)]) == 0
+    p.write_text('{"table": "egress", "state_pa')
+    assert M.main(["--config", str(p)]) == 2
+    assert "CONFIG ERROR" in capsys.readouterr().err
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
+
+
+@pytest.mark.parametrize("text", [
+    None, "{not json", "", "[]", "null", '"egress"', "{}", '{"table": null}', '{"table": ""}',
+    '{"table": 5}', '{"table": ["egress"]}', "[" * DEEP,
+], ids=["missing", "truncated-json", "empty-file", "list", "null", "string", "no-table",
+        "null-table", "empty-table", "number-table", "list-table", "nested-too-deep"])
+def test_deadman_with_no_env_and_no_usable_state_exits_1(tmp_path, monkeypatch, capsys, text):
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    state = tmp_path / "state.json"
+    if text is not None:
+        state.write_text(text)
+    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
+
+    def run(argv, **kw):
+        raise AssertionError(f"no usable table, so no ip command: {argv}")
+
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(tmp_path / "missing.json")], runner=run) == 1
+    assert capsys.readouterr().out == ""
+    assert err.getvalue() == NO_TABLE_MSG.format(state) + "\n"
 
 
 @pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],

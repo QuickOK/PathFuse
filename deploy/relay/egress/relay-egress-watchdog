@@ -10,7 +10,7 @@ things in it:
 
   * the single *preferred* default route (metric `preferred_metric`), pointed at
     the upstream the current mode selects, present only while that upstream's
-    health probe passes; and
+    health probe passes and every exemption route is in place; and
   * the exemption routes: more-specific prefixes that always leave through the
     relay's own WAN, whatever the upstream.
 
@@ -32,7 +32,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from urllib.parse import urlsplit
 
 # Canonical client egress vocabulary, exactly as sbfd-ctl publishes it at
@@ -52,6 +52,17 @@ MODE_ALIASES = {
 }
 
 DEFAULT_CONFIG = "/etc/relay-egress-watchdog/config.json"
+
+# Caps on the waits one tick can make, in seconds. The unit gives a tick
+# TimeoutStartSec=25 and, past it, systemd kills the tick and the dead-man withdraws
+# the preferred route. The probes (curl --max-time timeout_s) run in parallel and the
+# client poll follows them, so a slow tick lasts about probe + poll: 20 s with both at
+# their caps, or 25 s on a cold start (no last-known mode yet), when the poll may wait
+# the bootstrap timeout instead.
+MAX_PROBE_TIMEOUT_S = 10
+MAX_FETCH_TIMEOUT_S = 10
+MAX_BOOTSTRAP_TIMEOUT_S = 15
+
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 _UPSTREAM_NAME = re.compile(r"[a-z0-9_-]{1,32}")
 _NETNS = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -70,7 +81,7 @@ def normalize_mode(mode):
 
 # --- config ------------------------------------------------------------------------
 
-def _positive(name: str, value) -> float:
+def _positive(name: str, value, maximum: Optional[float] = None) -> float:
     if isinstance(value, bool):
         raise ConfigError(f"{name} must be a number, got {value!r}")
     try:
@@ -79,6 +90,9 @@ def _positive(name: str, value) -> float:
         raise ConfigError(f"{name} must be a number, got {value!r}") from None
     if not 0 < f < float("inf"):
         raise ConfigError(f"{name} must be finite and > 0, got {value!r}")
+    if maximum is not None and f > maximum:
+        raise ConfigError(f"{name} must be at most {maximum:g} s so a tick ends within the "
+                          f"unit's TimeoutStartSec, got {value!r}")
     return f
 
 
@@ -159,7 +173,7 @@ def _validate_upstream(name, raw) -> dict:
         "link": link,
         "probe": {"url": url, "netns": netns, "source": source, "expect": expect,
                   "timeout_s": _positive(f"upstreams.{name}.probe.timeout_s",
-                                         probe.get("timeout_s", 5))},
+                                         probe.get("timeout_s", 5), MAX_PROBE_TIMEOUT_S)},
         "fail_threshold": _count(f"upstreams.{name}.fail_threshold",
                                  raw.get("fail_threshold", 3)),
         "pass_threshold": _count(f"upstreams.{name}.pass_threshold",
@@ -225,9 +239,11 @@ def validate_config(raw) -> dict:
                           f"{sorted(VALID_DESIRED_MODES)}, got {default_mode!r}")
     client = {
         "control_url": url,
-        "fetch_timeout_s": _positive("client.fetch_timeout_s", craw.get("fetch_timeout_s", 1)),
+        "fetch_timeout_s": _positive("client.fetch_timeout_s", craw.get("fetch_timeout_s", 1),
+                                     MAX_FETCH_TIMEOUT_S),
         "bootstrap_timeout_s": _positive("client.bootstrap_timeout_s",
-                                         craw.get("bootstrap_timeout_s", 5)),
+                                         craw.get("bootstrap_timeout_s", 5),
+                                         MAX_BOOTSTRAP_TIMEOUT_S),
         "grace_s": _positive("client.grace_s", craw.get("grace_s", 60)),
         "default_mode": default_mode,
     }
@@ -379,40 +395,55 @@ def probe_matches(body: str, expect: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
-def link_up(iface: str, runner=subprocess.run) -> bool:
+def link_up(iface: str, runner=subprocess.run) -> Optional[bool]:
+    """True when `iface` is admin-UP; False when it is missing (`ip` fails on it, as
+    after `wg-quick down` deletes a tunnel) or not UP; None when `ip` cannot tell
+    (it hangs, cannot run, or prints something unreadable)."""
     try:
         r = runner(["ip", "-j", "link", "show", "dev", iface],
                    capture_output=True, text=True, timeout=2)
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return None
     if r.returncode != 0:
         return False
     try:
         flags = json.loads(r.stdout)[0].get("flags", [])
     except (ValueError, IndexError, AttributeError, TypeError):
-        return False
+        return None
     return "UP" in flags
 
 
-def run_probe(upstream: dict, runner=subprocess.run) -> tuple:
-    """(ok, detail) for one upstream: the link check, then the HTTP probe."""
+class ProbeResult(NamedTuple):
+    """One upstream's probe. `hard` marks a failure that skips the hysteresis: the
+    upstream's link is missing or down, so it cannot carry traffic at all."""
+    ok: bool
+    detail: str
+    hard: bool = False
+
+
+def run_probe(upstream: dict, runner=subprocess.run) -> ProbeResult:
+    """The link check, then the HTTP probe."""
     link = upstream.get("link")
-    if link and not link_up(link, runner):
-        return False, f"link {link} down"
+    if link:
+        state = link_up(link, runner)
+        if state is None:
+            return ProbeResult(False, f"cannot check link {link}")
+        if not state:
+            return ProbeResult(False, f"link {link} down", hard=True)
     p = upstream["probe"]
     try:
         r = runner(probe_argv(p), capture_output=True, text=True, timeout=p["timeout_s"] + 3)
     except subprocess.TimeoutExpired:
-        return False, "timeout"
+        return ProbeResult(False, "timeout")
     except OSError as e:
-        return False, f"cannot run probe: {e}"
+        return ProbeResult(False, f"cannot run probe: {e}")
     if r.returncode != 0:
         err = (r.stderr or "").strip().replace("\n", " ")[:80]
-        return False, f"curl rc={r.returncode}: {err}"
+        return ProbeResult(False, f"curl rc={r.returncode}: {err}")
     hit = probe_matches(r.stdout or "", p["expect"])
     if hit is None:
-        return False, "unexpected body"
-    return True, hit
+        return ProbeResult(False, "unexpected body")
+    return ProbeResult(True, hit)
 
 
 # --- route selection and reconcile ----------------------------------------------------------
@@ -571,6 +602,8 @@ def with_defaults(state: dict, cfg: dict) -> dict:
 # --- one tick -----------------------------------------------------------------------------------
 
 def _probe_all(cfg: dict, probe: Callable) -> dict:
+    """{upstream name: ProbeResult}, probing all of them in parallel. `probe` returns
+    the ProbeResult fields: (ok, detail), or (ok, detail, hard)."""
     names = list(cfg["upstreams"])
     if not names:
         return {}
@@ -579,9 +612,9 @@ def _probe_all(cfg: dict, probe: Callable) -> dict:
         futures = {n: pool.submit(probe, cfg["upstreams"][n]) for n in names}
         for n, f in futures.items():
             try:
-                out[n] = f.result()
+                out[n] = ProbeResult(*f.result())
             except Exception as e:  # a broken probe must not kill the tick
-                out[n] = (False, f"probe error: {e}")
+                out[n] = ProbeResult(False, f"probe error: {e}")
     return out
 
 
@@ -596,23 +629,32 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
          fetch: Optional[Callable] = None, log: Callable = print) -> tuple:
     """Run one tick. Returns (new_state, exit_code).
 
-    The exit code is 1 only when the preferred route could not be read or set.
-    The tick has then already tried to fail open, and systemd's OnFailure runs
-    the dead-man switch as a second line. Exemption-route errors are logged but
-    do not fail the tick: failing it would make the dead-man switch withdraw a
-    healthy preferred route every 10 s.
+    The exit code is 1 only when the table could not be read or a preferred-route
+    command failed. The tick has then already tried to fail open, and systemd's
+    OnFailure runs the dead-man switch as a second line.
+
+    The exemption routes gate the preferred route: while one of them cannot be put
+    in place, its prefix would follow a preferred default into the upstream, so the
+    tick withdraws every preferred default instead (fail open) and logs an ERROR.
+    It still exits 0: it has failed open itself, and a failed tick would only fire
+    the dead-man switch every 10 s. The next tick retries the exemption.
     """
     fetch = fetch or fetch_desired_mode
     s = with_defaults(state, cfg)
     s["last_check"] = now
+    s["table"] = cfg["table"]   # for the dead-man, should the config become unreadable
     dry = cfg["dry_run"]
     tag = "DRY-RUN " if dry else ""
 
-    for name, (ok, detail) in _probe_all(cfg, probe).items():
+    for name, (ok, detail, hard) in _probe_all(cfg, probe).items():
         up = cfg["upstreams"][name]
         before = s["upstreams"][name]["healthy"]
+        # A hard failure (the link is missing or down) skips the hysteresis: the
+        # upstream cannot carry traffic, so it is unhealthy on this very tick, and its
+        # preferred route goes now instead of failing to re-install for a few ticks.
         s["upstreams"][name] = advance_health(s["upstreams"][name], ok, detail, now,
-                                              up["fail_threshold"], up["pass_threshold"])
+                                              1 if hard else up["fail_threshold"],
+                                              up["pass_threshold"])
         after = s["upstreams"][name]["healthy"]
         if before != after:
             log(f"HEALTH: {name} {'healthy' if before else 'unhealthy'} -> "
@@ -646,7 +688,9 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
         routes, installed, rc = None, None, 1
     if routes is not None:
         preferred, exempt = plan_actions(cfg, routes, route)
-        # Apply exemptions first so they never briefly route through an upstream
+        # Exemptions first, so they never briefly route through an upstream; and none
+        # may be missing while a preferred default stands (see the docstring).
+        missing = []
         for argv in exempt:
             if dry:
                 log(f"DRY-RUN would run: ip {' '.join(argv)}")
@@ -654,6 +698,12 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
             ok, err = ip.apply(argv)
             if not ok:
                 log(f"ERROR: ip {' '.join(argv)}: {err}")
+                missing.append(argv[2])
+        if missing:
+            log(f"ERROR: exemption {', '.join(missing)} not in place: no preferred route "
+                f"this tick (fail open)")
+            preferred, _ = plan_actions(cfg, routes, None)   # delete every preferred default
+            installed = None
         # Apply preferred routes; any failure causes immediate sweep
         for argv in preferred:
             if dry:

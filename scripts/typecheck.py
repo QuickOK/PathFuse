@@ -8,7 +8,8 @@ not list must have none. Fixing errors only lowers the counts: afterwards run
 `scripts/typecheck.py --update-baseline` to record the new floor.
 
 Exit 0 when every file is at or under its baseline, 1 when one is above it,
-2 when a checker is missing or crashes.
+2 when a checker is missing, crashes or hangs (git and each checker run with a
+time limit, so a hung tool cannot stall preflight).
 """
 from __future__ import annotations
 
@@ -24,6 +25,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "scripts/typecheck-baseline.json"
 MYPY_LINE = re.compile(r"^(?P<file>[^:]+):\d+(?::\d+)?: error:")
+GIT_TIMEOUT_S = 60        # `git ls-files` takes well under a second
+CHECKER_TIMEOUT_S = 900   # each of pyright and mypy, over the whole repo with a cold cache
+
+
+def _run(argv: list[str], timeout: float,
+         check: bool = False) -> subprocess.CompletedProcess[str]:
+    """Run a tool in the repo root and capture its output; RuntimeError if it hangs."""
+    try:
+        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, check=check,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{argv[0]} timed out after {timeout:g} s") from None
 
 
 def python_files() -> list[str]:
@@ -32,8 +45,7 @@ def python_files() -> list[str]:
     A tracked file missing from the working tree (deleted, deletion not yet
     staged) is skipped: there is nothing left to check.
     """
-    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True,
-                             text=True, check=True).stdout.split("\0")
+    tracked = _run(["git", "ls-files", "-z"], GIT_TIMEOUT_S, check=True).stdout.split("\0")
     files = []
     for f in tracked:
         p = ROOT / f
@@ -55,8 +67,7 @@ def _interpreter() -> str:
 
 
 def pyright_counts(files: list[str], py: str) -> Counter[str]:
-    r = subprocess.run(["pyright", "--outputjson", "--pythonpath", py, *files],
-                       cwd=ROOT, capture_output=True, text=True)
+    r = _run(["pyright", "--outputjson", "--pythonpath", py, *files], CHECKER_TIMEOUT_S)
     if r.returncode not in (0, 1):
         raise RuntimeError(f"pyright failed (rc={r.returncode}): {r.stderr.strip()[:300]}")
     report = json.loads(r.stdout)
@@ -73,8 +84,8 @@ def pyright_counts(files: list[str], py: str) -> Counter[str]:
 
 
 def mypy_counts(files: list[str], py: str) -> Counter[str]:
-    r = subprocess.run(["mypy", "--python-executable", py, "--no-error-summary", *files],
-                       cwd=ROOT, capture_output=True, text=True)
+    r = _run(["mypy", "--python-executable", py, "--no-error-summary", *files],
+             CHECKER_TIMEOUT_S)
     if r.returncode not in (0, 1):
         raise RuntimeError(f"mypy failed (rc={r.returncode}): "
                            f"{(r.stderr or r.stdout).strip()[:300]}")
@@ -106,8 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         if shutil.which(tool) is None:
             print(f"typecheck: {tool} is not installed (see MAINTAINING.md)", file=sys.stderr)
             return 2
-    files, py = python_files(), _interpreter()
     try:
+        files, py = python_files(), _interpreter()
         by_tool = {"pyright": pyright_counts(files, py), "mypy": mypy_counts(files, py)}
     except (RuntimeError, ValueError) as e:
         print(f"typecheck: {e}", file=sys.stderr)

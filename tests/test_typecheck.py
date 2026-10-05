@@ -195,3 +195,28 @@ def test_main_exits_2_when_a_checker_is_missing_or_crashes(tmp_path, monkeypatch
         monkeypatch.setattr(T, "pyright_counts", pyright)
     assert T.main([]) == 2
     assert msg in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tool", ["git", "pyright", "mypy"])
+def test_main_exits_2_and_names_a_tool_that_hangs(tmp_path, monkeypatch, capsys, tool):
+    """Each tool runs with a time limit, so a hung one cannot stall preflight."""
+    order, limit = ["git", "pyright", "mypy"], {"git": 60, "pyright": 900, "mypy": 900}
+    (tmp_path / "a.py").write_text("")
+    limits = {}
+
+    def run(argv, **kw):
+        limits[argv[0]] = kw.get("timeout")
+        if argv[0] == tool:
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        out = {"git": "a.py\0", "mypy": "",
+               "pyright": json.dumps({"generalDiagnostics": [], "summary": {"filesAnalyzed": 1}})}
+        return subprocess.CompletedProcess(argv, 0, out[argv[0]], "")
+
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    monkeypatch.setattr(T, "shutil", SimpleNamespace(which=lambda t: f"/usr/bin/{t}"))
+    monkeypatch.setattr(T, "subprocess", SimpleNamespace(
+        run=run, TimeoutExpired=subprocess.TimeoutExpired))
+    assert T.main([]) == 2
+    assert capsys.readouterr().err == f"typecheck: {tool} timed out after {limit[tool]} s\n"
+    # Every tool that ran had its limit, the hung one included.
+    assert limits == {t: limit[t] for t in order[:order.index(tool) + 1]}

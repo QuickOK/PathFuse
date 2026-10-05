@@ -26,15 +26,24 @@ check, and an HTTP probe whose body must match a regex.
 Each 10 s tick:
 1. probes every upstream in parallel; each has its own hysteresis (unhealthy
    after `fail_threshold` straight failures, healthy after `pass_threshold`
-   passes, the first pass ever counts at once);
+   passes, the first pass ever counts at once). A `link` that is missing or not
+   admin-UP is a hard failure: that upstream is unhealthy at once, without
+   waiting for `fail_threshold`;
 2. polls the client for the desired mode. Within `grace_s` of the last good
    poll that mode holds; after that `default_mode` applies. Unknown names are
    rejected and counted in `desired_mode_fetch_fail`;
-3. re-adds any missing exemption route (applied first, so exempt prefixes never
-   briefly exit via an upstream);
+3. re-adds any missing exemption route. The exemptions go first, so exempt
+   prefixes never briefly exit via an upstream, and they gate step 4: if one
+   cannot be added, the tick logs an `ERROR` naming its prefix and deletes every
+   preferred default (fail open), whatever the mode and health say. The tick
+   still exits 0. The next tick retries the exemption, and once it is in place
+   step 4 installs the preferred route again;
 4. installs the mode's upstream as the single preferred default with an atomic
    `ip route replace`, or deletes every preferred default when the mode uses no
    upstream or its upstream is unhealthy (fail open).
+
+Every tick also writes the config's `table` into its state file, where the
+dead-man switch can find it when the config is broken.
 
 `dry_run: true` logs `DRY-RUN would run: …` and changes nothing. Use it to
 shadow-run beside an existing actuator before taking over.
@@ -63,6 +72,7 @@ The actuator re-reads it every tick, so an edit takes effect within 10 s.
 - `preferred_metric`: the metric for the preferred route (default 100). Must be a positive integer.
 - `dry_run`: if `true`, logs `DRY-RUN would run: …` without changing routes. The example ships with `true` (safe by default); set to `false` to go live.
 - `client.control_url`: the client's desired-mode endpoint (e.g., `http://100.64.0.2:8081/api/desired_egress`). If set to `""` (empty string), polling is disabled and `default_mode` always applies (no HTTP call).
+- Timeouts, in seconds: `upstreams.<name>.probe.timeout_s` (default 5, at most 10), `client.fetch_timeout_s` (default 1, at most 10) and `client.bootstrap_timeout_s` (default 5, at most 15; it replaces the fetch timeout while there is no last-known mode, as after a reboot). The probes run in parallel and the poll follows them, so a tick lasts about probe + poll. It must end within the unit's `TimeoutStartSec=25`, or systemd kills it and the dead-man switch fires. A config above a cap is rejected.
 - `exempt.prefixes`: list of CIDR prefixes that always exit via the relay's own WAN. Include your site's private address ranges (e.g., the upstream VPN's subnet, the backbone exit's source space).
 
 Removing a prefix from `exempt.prefixes` does not delete its route: run
@@ -78,7 +88,14 @@ sudo install -D -m0644 config/relay-egress.example.json /etc/relay-egress-watchd
 sudo systemctl daemon-reload && sudo systemctl enable --now relay-egress-watchdog.timer
 ```
 
-**The dead-man switch** runs when a tick crashes, times out, exits 1 (table read failure or preferred-route command failure), or exits 2 (config error). It deletes every preferred default (fail open). Two cases do NOT trigger it, because the tick exits 0 in both: an unhealthy upstream (the tick itself fails open and deletes the preferred default) and an exemption-route error (only logged; the preferred route stays as it is). Suppress the dead-man during a shadow run by setting `dry_run: true` in the config—the dead-man then skips execution and exits 0, leaving the live actuator's routes untouched. If the config cannot be read during shadow run, the dead-man has no way to see the dry_run flag; keep the config readable, or do not wire the OnFailure hook until the shadow run is complete.
+**The dead-man switch** runs when a tick crashes, times out, exits 1 (table read failure or preferred-route command failure), or exits 2 (config error). It deletes every preferred default (fail open). Three cases do NOT trigger it, because in each the tick deletes the preferred default itself and exits 0:
+- an unhealthy upstream;
+- an upstream `link` that is missing or down, which makes the upstream unhealthy on the same tick. So the fail-open drill, stopping the tunnel that an upstream's `link` names (`systemctl stop wg-quick@<tunnel>`), logs no `ERROR` and runs no dead-man;
+- an exemption route that cannot be added (the tick logs an `ERROR`; see step 3 above).
+
+Suppress the dead-man during a shadow run by setting `dry_run: true` in the config—the dead-man then skips execution and exits 0, leaving the live actuator's routes untouched. If the config cannot be read during a shadow run, the dead-man has no way to see the dry_run flag, and it still finds the table (below), so it deletes the live actuator's preferred default; keep the config readable, or do not wire the OnFailure hook until the shadow run is complete.
+
+**How the dead-man finds the table.** It reads the table from the config. When the config names no usable table (as when the config cannot be parsed), it uses `$EGRESS_TABLE` if that is set and not empty. Failing that, it uses the `table` that every tick writes into the actuator's state file: the config's `state_path` when the config holds a usable one, else `/run/relay-egress-watchdog/state.json`. A missing or unreadable state file names no table. With no table from any of the three, the dead-man exits 1 and deletes nothing. Keep the `EGRESS_TABLE` drop-in below anyway: the state file lives under `/run`, so after a reboot it names no table until a tick succeeds.
 
 **Relay drop-in examples:**
 
