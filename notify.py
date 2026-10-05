@@ -79,7 +79,11 @@ class RateLimiter:
     """Per-kind coalescing: the first event of a kind sends immediately;
     further events of the same kind within min_interval_s are held and folded
     into one summary released when the window expires. Kinds are independent,
-    so e.g. a flapping WAN never delays an all-WANs-down alert."""
+    so e.g. a flapping WAN never delays an all-WANs-down alert.
+
+    A kind's events go out in the order they came: one whose kind has events
+    held joins them, even once the window has run out. The egress alert record
+    relies on that (see EventDetector)."""
 
     def __init__(self, min_interval_s: float, clock=time.monotonic):
         self.min_interval_s = float(min_interval_s)
@@ -156,7 +160,8 @@ class Notifier:
     on_sent, if it has one. A page that fails, or never reaches spool-notify
     (dropped from a full buffer, or still buffered when the process ends; stop()
     waits only so long), never runs it. An on_sent that raises is logged, and the
-    worker carries on with the next page."""
+    worker carries on with the next page. A kind's pages are handed over, and
+    their on_sents run, in the order the pages were made."""
 
     BUFFER_MAX = 50
     SUBPROCESS_TIMEOUT_S = 30.0
@@ -320,12 +325,15 @@ class EventDetector:
     cannot see one: the actual-exit check starts over at `checking`. So with
     egress_alert_path set, the record there follows the last egress page
     spool-notify accepted. A fallback page's on_sent writes it and a restore
-    page's removes it, both run by the Notifier once spool-notify has the page.
-    A page that never got that far (refused, or still buffered when the process
-    ended) leaves the record as it was, so a restart pages that fallback again,
-    or sends that restore again. An on_sent that runs after the alert has moved
-    on does nothing: the newer page settles the record. An alert that ends
-    without a page (a mode change, `skipped`) removes the record at once. The
+    page's removes it, both run by the Notifier once spool-notify has the page,
+    in the order the pages were made. So a page that goes out after its alert
+    has moved on still settles the record, as it is what the operator heard
+    last, and the pages after it settle the record again as they go out. A page
+    that never got that far (refused, or still buffered when the process ended)
+    leaves the record where the pages before it left it, so a restart pages a
+    fallback the operator never heard of, and sends a restore they never got.
+    An alert that ends without a page (a mode change, `skipped`) removes the
+    record at once, and a page made before that end no longer touches it. The
     alert itself changes at once in every case, so what a run pages does not
     wait for the Notifier.
 
@@ -372,10 +380,11 @@ class EventDetector:
         self._relay_fails = 0
         self._relay_alerted = False
         # The selected mode whose fallback has been announced; None when no
-        # egress alert stands. _egress_gen counts its transitions, so a page's
-        # on_sent can tell whether the alert has moved on since the page was made.
-        # _egress_lock covers every transition and every on_sent: the transitions
-        # run on the controller's thread, the on_sents on the Notifier's.
+        # egress alert stands. _egress_gen moves on at each change made without a
+        # page (a silent end, or the seed's), so a page's on_sent can tell that
+        # one happened after its page was made. _egress_lock covers every
+        # transition and every on_sent: the transitions run on the controller's
+        # thread, the on_sents on the Notifier's.
         self._egress_alert_mode: Optional[str] = None
         self._egress_gen = 0
         self._egress_lock = threading.Lock()
@@ -726,9 +735,16 @@ class EventDetector:
     # -- the egress alert record ------------------------------------------------
     #
     # The record follows the last egress page spool-notify accepted. Every
-    # transition below moves the alert at once and bumps _egress_gen; a page's
-    # on_sent touches the record only if no transition has happened since its
-    # page was made, because a newer page then settles it. Transitions and
+    # transition below moves the alert at once. The Notifier runs a kind's
+    # on_sents in the order their pages were made (a held run of pages goes out
+    # as one summary carrying the last one's), so a page's on_sent applies its
+    # page whatever the alert has done since. Whichever page went out last has
+    # the last word, and that is the page the operator received last.
+    #
+    # Only a change made without a page moves _egress_gen on: a silent end, and
+    # the seed's changes. Such a change settles the record itself, with no page to
+    # redo it, so a page made before it no longer touches the record: a late page
+    # would otherwise undo a silent end's removal for good. Transitions and
     # on_sents all hold _egress_lock, so an on_sent never lands between a
     # transition's change and its file I/O, or the other way round.
     #
@@ -740,32 +756,35 @@ class EventDetector:
         """The fallback page: the alert stands for `mode` now. Returns the page's
         on_sent, which writes the record."""
         with self._egress_lock:
-            self._egress_gen += 1
             self._egress_alert_mode = mode
             return functools.partial(self._fallback_page_sent, self._egress_gen, mode)
 
     def _fallback_page_sent(self, gen: int, mode) -> None:
+        """spool-notify took the fallback page. Unless a change made without a page
+        came after it, the record now names its mode, even if the alert moved on."""
         with self._egress_lock:
-            if self._egress_gen == gen and self._egress_alert_mode == mode:
+            if self._egress_gen == gen:
                 self._write_egress_alert(mode)
 
     def _restore_egress_alert(self) -> Callable[[], None]:
         """The restore page: the alert ends now. Returns the page's on_sent, which
         removes the record. Until then a restart must still send a restore."""
         with self._egress_lock:
-            self._egress_gen += 1
             self._egress_alert_mode = None
             return functools.partial(self._restore_page_sent, self._egress_gen)
 
     def _restore_page_sent(self, gen: int) -> None:
+        """spool-notify took the restore page. Unless a change made without a page
+        came after it, the record goes, even if a new fallback stands by now."""
         with self._egress_lock:
-            if self._egress_gen == gen and self._egress_alert_mode is None:
+            if self._egress_gen == gen:
                 self._remove_egress_alert()
 
     def _end_egress_alert(self, failure_level: int = logging.WARNING) -> None:
         """A silent end (a mode change, `skipped`, a record for another mode at the
         seed, or a seed with the check off). No page goes out, so nothing would
-        confirm a deferred removal: the record goes now. A removal that fails is
+        confirm a deferred removal: the record goes now, and the generation moves
+        on, so no page made before the end brings it back. A removal that fails is
         logged at failure_level."""
         with self._egress_lock:
             self._egress_gen += 1

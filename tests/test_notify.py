@@ -97,6 +97,22 @@ def test_admit_after_quiet_window_sends_immediately():
     assert rl.admit(ev(title="b")) is not None
 
 
+def test_a_kinds_events_go_out_in_the_order_they_came():
+    # An event whose kind has events held joins them, even once the window has run out
+    # and flush_due() has not yet released them: the worker admits a batch before it
+    # flushes. So a kind's events never overtake each other, nor do the on_sents they
+    # carry. The egress alert record relies on that.
+    clk = FakeClock()
+    rl = notify.RateLimiter(30.0, clock=clk)
+    assert rl.admit(ev(title="first")) is not None
+    clk.advance(5)
+    assert rl.admit(ev(title="second")) is None
+    clk.advance(30)                           # the window has run out, nothing released yet
+    assert rl.admit(ev(title="third")) is None
+    [summary] = rl.flush_due()
+    assert "third" in summary.title and "×2" in summary.title
+
+
 import json
 import os
 import stat
@@ -1491,11 +1507,14 @@ def test_egress_a_restart_with_the_check_off_ends_the_saved_alert(tmp_path):
 
 # -- the record follows the pages spool-notify took -----------------------------------
 #
-# The record says what the operator was last paged about, so it changes only when
+# The record says what the operator was last paged about, so it changes when
 # spool-notify takes a page: a fallback page's on_sent writes it, a restore page's
-# removes it. A page that never got that far changes nothing, so a restart sends it
-# again. Where a test needs the worker, the detector's pages go to a real Notifier with
-# a stand-in spool-notify; the others run on_sent by hand.
+# removes it. The worker hands egress pages over in the order they were made, so a page
+# that goes out late still settles the record, and the pages after it settle it again.
+# A page that never got that far changes nothing, so a restart sends it again. Only an
+# alert that ends without a page changes the record otherwise. Where a test needs the
+# worker, the detector's pages go to a real Notifier with a stand-in spool-notify; the
+# others run on_sent by hand.
 
 
 def _broken_spool_notify(tmp_path, monkeypatch, failure):
@@ -1602,41 +1621,141 @@ def test_egress_a_restore_page_spool_notify_refused_is_sent_again_after_a_restar
     pytest.param([], id="restored"),
     pytest.param([_eg("mismatch")], id="restored-and-fallen-back-again"),
 ])
-def test_egress_a_fallback_page_that_goes_out_after_its_alert_moved_on_writes_no_record(
+def test_egress_a_fallback_page_that_goes_out_after_its_alert_moved_on_still_writes_the_record(
         tmp_path, then):
-    # Pages queue in the Notifier, so a page can go out after its alert has moved on.
-    # Its on_sent then writes nothing: the newer page settles the record.
+    # Pages queue in the Notifier, so a page can go out after its alert has moved on. The
+    # worker hands an egress page over only after every earlier one, so the record follows
+    # each page as it goes out. The late fallback page writes it: that page is now the
+    # operator's latest news. Each newer page then settles the record again in turn.
     path = tmp_path / "egress_alert.json"
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     [late] = d.observe(obs(egress=_eg("mismatch")))
-    assert _titles(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    newer = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
     for e in then:                            # the same mode falls back again
-        assert _titles(d.observe(obs(egress=e))) == [FALLBACK]
+        newer += d.observe(obs(egress=e))
+    assert _titles(newer) == [RESTORED, FALLBACK][:1 + len(then)]
     late.on_sent()
-    assert not path.exists()
+    assert path.exists() and json.loads(path.read_text())["selected"] == "relay_backbone"
+    for page in newer:
+        page.on_sent()
+        assert path.exists() == (page.title == FALLBACK), page.title
 
 
 @pytest.mark.parametrize("then", [
     pytest.param([], id="fallen-back-again"),
     pytest.param([_eg("match", observed="relay_backbone")], id="fallen-back-again-and-restored"),
 ])
-def test_egress_a_restore_page_that_goes_out_after_a_new_fallback_leaves_the_record(
+def test_egress_a_restore_page_that_goes_out_after_a_new_fallback_still_removes_the_record(
         tmp_path, then):
-    # The reverse order. A restore page that goes out late removes nothing once a newer
-    # page exists: a new fallback, and perhaps its restore. The record waits for the
-    # newest page.
+    # The reverse order. The late restore page removes the record although a new fallback
+    # stands, since "restored" is now the operator's latest news. The new fallback's page
+    # writes the record again when it goes out.
     path = tmp_path / "egress_alert.json"
     _write_record(path, "relay_backbone")      # paged before a restart
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))   # taken over
     [late] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
-    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    newer = d.observe(obs(egress=_eg("mismatch")))
     for e in then:
-        assert _titles(d.observe(obs(egress=e))) == [RESTORED]
+        newer += d.observe(obs(egress=e))
+    assert _titles(newer) == [FALLBACK, RESTORED][:1 + len(then)]
     late.on_sent()
-    assert json.loads(path.read_text()) == {"selected": "relay_backbone",
-                                            "announced_at": ANNOUNCED_AT}
+    assert not path.exists()
+    for page in newer:
+        page.on_sent()
+        assert path.exists() == (page.title == FALLBACK), page.title
+
+
+def test_egress_a_restore_page_taken_after_the_next_fallback_leaves_that_fallback_to_a_restart(
+        tmp_path):
+    # The restore page goes out only after the next fallback was raised (a slow
+    # spool-notify, or a backlog in the worker), and that fallback page is then lost
+    # (refused, or it died with the process). The operator's last page says "restored",
+    # and the fallback stands, so a restart must page it.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    [restore] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    [_lost] = d.observe(obs(egress=_eg("mismatch")))
+    restore.on_sent()                          # spool-notify takes the restore page
+    after = notify.EventDetector(egress_alert_path=str(path))   # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+
+
+def test_egress_a_fallback_page_taken_after_its_restore_leaves_the_restore_to_a_restart(tmp_path):
+    # The reverse order: the fallback page goes out only after the restore was raised,
+    # and the restore page is then lost. The operator's last page says "fallback", and
+    # the exit matches again, so a restart must send the restore.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    [_lost] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    fallback.on_sent()                         # spool-notify takes the fallback page
+    after = notify.EventDetector(egress_alert_path=str(path))   # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _titles(after.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+
+
+@pytest.mark.parametrize("race", ["restore-taken-late", "fallback-taken-late"])
+def test_egress_pages_queued_in_the_worker_leave_the_record_at_the_last_one_taken(tmp_path, race):
+    # The two races above, through a real Notifier. The detector makes both pages before
+    # the worker hands either over, and spool-notify takes the first and refuses the
+    # second. The record must say what the first page said, so a restart in the state the
+    # second described sends the second again.
+    path = tmp_path / "egress_alert.json"
+    if race == "restore-taken-late":
+        _write_record(path, "relay_backbone")  # its fallback was paged before a restart
+        first, second = _eg("match", observed="relay_backbone"), _eg("mismatch")
+    else:
+        first, second = _eg("mismatch"), _eg("match", observed="relay_backbone")
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    pages = d.observe(obs(egress=first)) + d.observe(obs(egress=second))
+    script, log = _spool_notify(tmp_path, refuse=pages[1].title)
+    n = notify.Notifier("pathfusetest", min_interval_s=0, command=script)
+    for page in pages:
+        n.notify(page)
+    n.start()                                 # one batch, handed over in order
+    n.stop()
+    assert _handed(log) == _titles(pages)     # the first taken, the second refused
+    after = notify.EventDetector(egress_alert_path=str(path))   # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _titles(after.observe(obs(egress=second))) == _titles(pages[1:])
+
+
+def test_egress_a_fallback_page_made_before_a_silent_end_writes_no_record(tmp_path):
+    # An alert that ends without a page (here a mode change) removes the record at once,
+    # with no page to confirm the removal. So a page made before the end changes the
+    # record no more when it goes out. This one would bring the ended alert's record
+    # back, and a restart under that mode would take a new fallback for announced.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [late] = d.observe(obs(egress=_eg("mismatch")))
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []          # the silent end
+    late.on_sent()
+    assert not path.exists()
+
+
+def test_egress_a_restore_page_made_before_a_silent_end_removes_no_record(tmp_path):
+    # The same rule for a restore page: it must not remove the record of a fallback paged
+    # after the end. The rule does not lean on the order the pages go out in, so here the
+    # restore page goes out last.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    [late] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # it falls back again
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []          # the silent end
+    assert _sent(d.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
+    late.on_sent()
+    assert path.exists() and json.loads(path.read_text())["selected"] == "relay_vpn"
 
 
 def test_egress_a_summary_that_ends_in_a_restore_removes_the_record(tmp_path):
