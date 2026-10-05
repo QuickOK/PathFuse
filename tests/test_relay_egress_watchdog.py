@@ -1388,6 +1388,29 @@ def test_the_client_poll_waits_its_whole_timeout_for_a_slow_reply():
     assert got == ("relay_backbone", "wan2", None), f"{got!r} after {took:.2f} s"
 
 
+def test_a_poll_whose_request_runs_on_waits_its_whole_timeout(monkeypatch):
+    """The deadline ends a poll at its timeout, not before. The test above pins that
+    only down to about 0.6 of the timeout, since its reply is complete 1.2 s into a 2 s
+    poll. Here the request is still running when the poll gives up, so the poll must
+    have waited its whole timeout. Load can only make the poll end later, so this bound
+    cannot flake."""
+    release = threading.Event()
+
+    def request(url, timeout_s):
+        release.wait(10)
+        return ("relay_backbone", "wan2", None)
+
+    monkeypatch.setattr(M, "_request_desired_mode", request)
+    try:
+        start = time.monotonic()
+        got = M.fetch_desired_mode("http://127.0.0.1:9/x", 1.0)
+        took = time.monotonic() - start
+    finally:
+        release.set()
+    assert got == (None, None, "timeout")
+    assert took >= 0.99, f"a 1 s poll gave up after {took:.3f} s"
+
+
 def test_the_ticks_own_poll_ends_within_its_timeout():
     """The deadline is there for the tick's time budget, but the other deadline tests
     call fetch_desired_mode directly. tick(), with the fetch it uses on the relay (no
@@ -1538,6 +1561,27 @@ def test_choose_fetch_timeout_cold_start_uses_bootstrap():
 
 def test_choose_fetch_timeout_known_mode_uses_regular():
     assert M.choose_fetch_timeout("relay_backbone", 5.0, 1.0) == 1.0
+
+
+def test_the_tick_polls_with_the_bootstrap_timeout_only_until_it_knows_a_mode():
+    """choose_fetch_timeout is pinned on its own; this pins that tick() asks it the
+    right way round. With no mode known yet the poll gets the longer bootstrap timeout,
+    and once one is known, the regular one."""
+    c = cfg()
+    assert (c["client"]["bootstrap_timeout_s"], c["client"]["fetch_timeout_s"]) == (5.0, 1.0)
+    probes = {"vpn": OK_VPN, "backbone": OK_BB}
+    asked: list[float] = []
+
+    def fetch(url, timeout):
+        asked.append(timeout)
+        return ("relay_backbone", "wan2", None)
+
+    state: dict = {}
+    for now in (100.0, 110.0):
+        state, rc = M.tick(c, state, now, ip=FakeIp(BASE), probe=lambda up: probes[up["name"]],
+                           fetch=fetch, log=lambda line: None)
+        assert rc == 0
+    assert asked == [5.0, 1.0]
 
 
 def test_plan_actions_with_duplicate_stale_defaults():
