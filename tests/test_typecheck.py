@@ -253,6 +253,21 @@ def test_main_exits_2_when_git_cannot_be_run(tmp_path, monkeypatch, capsys):
         "typecheck: git could not be run: [Errno 2] No such file or directory: 'git'\n")
 
 
+def test_main_exits_2_when_git_cannot_be_executed(tmp_path, monkeypatch, capsys):
+    """A git on PATH with no execute bit raises PermissionError, an OSError that is not
+    FileNotFoundError: one line naming git, not a traceback."""
+    _stub_gate(monkeypatch, tmp_path, pyright={}, mypy={}, files=None)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    git = bin_dir / "git"
+    git.write_text("#!/bin/sh\nexit 0\n")
+    git.chmod(0o644)   # no execute bit at all, so execve refuses it, root included
+    monkeypatch.setenv("PATH", str(bin_dir))
+    assert T.main([]) == 2
+    assert capsys.readouterr().err == (
+        "typecheck: git could not be run: [Errno 13] Permission denied: 'git'\n")
+
+
 @pytest.mark.parametrize("raw, problem", [
     (b'{"a.py": {"pyright": 2}', "is not valid JSON ("),
     (b"\xff\xfe", "is not valid JSON ("),

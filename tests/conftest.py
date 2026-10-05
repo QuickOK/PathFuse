@@ -99,10 +99,13 @@ def http_servers():
     servers.stop_all()
 
 
-# The box's own config and state. A test that opens a file under one of these reads
-# what the running daemons read, and a test that writes there would overwrite their
-# data if the suite ran with enough privilege.
-LIVE_STATE_DIRS = ("/etc/sbfd-ctl", "/var/lib/sbfd-ctl", "/run/sbfd-ctl")
+# The box's own config and state: sbfd-ctl's, and the relay egress actuator's (its
+# config; its runtime dir with the dead-man record and the default state file). A
+# test that opens a file under one of these reads what the running daemons read, and
+# a test that writes there would overwrite their data if the suite ran with enough
+# privilege.
+LIVE_STATE_DIRS = ("/etc/sbfd-ctl", "/var/lib/sbfd-ctl", "/run/sbfd-ctl",
+                   "/etc/relay-egress-watchdog", "/run/relay-egress-watchdog")
 
 
 class LiveStateGuard:
@@ -117,7 +120,7 @@ class LiveStateGuard:
     """
 
     def __init__(self):
-        self.opened = None   # a list while a test runs
+        self.opened: list[str] | None = None   # a list while a test runs
 
     def audit(self, event, args):
         opened = self.opened
