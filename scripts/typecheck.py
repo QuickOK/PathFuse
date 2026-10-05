@@ -8,8 +8,9 @@ not list must have none. Fixing errors only lowers the counts: afterwards run
 `scripts/typecheck.py --update-baseline` to record the new floor.
 
 Exit 0 when every file is at or under its baseline, 1 when one is above it,
-2 when a checker is missing, crashes or hangs (git and each checker run with a
-time limit, so a hung tool cannot stall preflight).
+2 when there is no verdict to give: a checker is missing, crashes or hangs, git
+cannot list the files, or the baseline is not the JSON --update-baseline writes.
+Each checker and git run with a time limit, so a hung tool cannot stall preflight.
 """
 from __future__ import annotations
 
@@ -29,14 +30,17 @@ GIT_TIMEOUT_S = 60        # `git ls-files` takes well under a second
 CHECKER_TIMEOUT_S = 900   # each of pyright and mypy, over the whole repo with a cold cache
 
 
-def _run(argv: list[str], timeout: float,
-         check: bool = False) -> subprocess.CompletedProcess[str]:
-    """Run a tool in the repo root and capture its output; RuntimeError if it hangs."""
+def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run a tool in the repo root and capture its output.
+
+    RuntimeError, naming the tool, if it cannot be started or hangs.
+    """
     try:
-        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, check=check,
-                              timeout=timeout)
+        return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{argv[0]} timed out after {timeout:g} s") from None
+    except OSError as e:   # not installed, or not executable
+        raise RuntimeError(f"{argv[0]} could not be run: {e}") from None
 
 
 def python_files() -> list[str]:
@@ -45,9 +49,11 @@ def python_files() -> list[str]:
     A tracked file missing from the working tree (deleted, deletion not yet
     staged) is skipped: there is nothing left to check.
     """
-    tracked = _run(["git", "ls-files", "-z"], GIT_TIMEOUT_S, check=True).stdout.split("\0")
+    r = _run(["git", "ls-files", "-z"], GIT_TIMEOUT_S)
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-files failed (rc={r.returncode}): {r.stderr.strip()[:300]}")
     files = []
-    for f in tracked:
+    for f in r.stdout.split("\0"):
         p = ROOT / f
         if not p.is_file():   # also drops the empty name after the last NUL: ROOT / "" is ROOT
             continue
@@ -97,6 +103,26 @@ def mypy_counts(files: list[str], py: str) -> Counter[str]:
     return counts
 
 
+def load_baseline(path: Path) -> dict[str, dict[str, int]]:
+    """The per-file counts recorded at `path`, or {} when there is no file.
+
+    ValueError, naming the file, when it is not the {file: {tool: count}} JSON
+    that --update-baseline writes.
+    """
+    if not path.exists():
+        return {}
+    try:
+        baseline = json.loads(path.read_text())
+    except ValueError as e:   # UnicodeDecodeError is a ValueError too
+        raise ValueError(f"{path} is not valid JSON ({e}); restore it from git") from None
+    if not (isinstance(baseline, dict) and all(
+            isinstance(row, dict) and all(type(n) is int and n >= 0 for n in row.values())
+            for row in baseline.values())):
+        raise ValueError(f"{path} is not a {{file: {{tool: error count}}}} map; "
+                         f"restore it from git")
+    return baseline
+
+
 def regressions(current: dict, baseline: dict) -> list[str]:
     """Files whose error count from a tool exceeds the baseline (0 when unlisted)."""
     out = []
@@ -118,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"typecheck: {tool} is not installed (see MAINTAINING.md)", file=sys.stderr)
             return 2
     try:
+        # Read first, so a broken baseline costs no run of the checkers. Re-recording
+        # does not read it, so a broken one cannot block that.
+        baseline = {} if args.update_baseline else load_baseline(BASELINE)
         files, py = python_files(), _interpreter()
         by_tool = {"pyright": pyright_counts(files, py), "mypy": mypy_counts(files, py)}
     except (RuntimeError, ValueError) as e:
@@ -133,7 +162,6 @@ def main(argv: list[str] | None = None) -> int:
         BASELINE.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
         print(f"typecheck: baseline written ({total} errors in {len(current)} files)")
         return 0
-    baseline = json.loads(BASELINE.read_text()) if BASELINE.exists() else {}
     worse = regressions(current, baseline)
     if worse:
         print("TYPECHECK FAILED: errors above the baseline (run pyright/mypy on these files):",

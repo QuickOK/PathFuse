@@ -29,7 +29,8 @@ lower the floor. Install once per machine: `sudo npm install -g pyright` and `su
 The gate sees tracked files only, so `git add` a new file before running it. `--update-baseline`
 records the counts as they are, higher ones included, so its diff should only lower numbers. The
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
-so after upgrading either tool, re-record the baseline in a commit of its own.
+so after upgrading either tool, re-run `scripts/typecheck.py --update-baseline` and commit the new
+baseline in a commit of its own, with the versions named here updated.
 
 ## The rules the gate enforces (keep the repo public-safe)
 - **Generic vocabulary only.** No deployment-specific names (provider / ISP / host / hardware

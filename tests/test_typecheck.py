@@ -138,10 +138,14 @@ def test_pyright_counts_refuses_a_run_that_skipped_a_named_file(tmp_path, monkey
         T.pyright_counts(["docs/x.py", "top.py"], sys.executable)
 
 
-def _stub_gate(monkeypatch, tmp_path, pyright, mypy, baseline=None):
-    """main() over three files with canned counts and a baseline file in tmp_path."""
+def _stub_gate(monkeypatch, tmp_path, pyright, mypy, baseline=None,
+               files=("a.py", "b.py", "c.py")):
+    """main() over three files with canned counts and a baseline file in tmp_path.
+
+    files=None keeps the real python_files(), and so the `git ls-files` it runs."""
     monkeypatch.setattr(T, "shutil", SimpleNamespace(which=lambda tool: f"/usr/bin/{tool}"))
-    monkeypatch.setattr(T, "python_files", lambda: ["a.py", "b.py", "c.py"])
+    if files is not None:
+        monkeypatch.setattr(T, "python_files", lambda: list(files))
     monkeypatch.setattr(T, "pyright_counts", lambda files, py: Counter(pyright))
     monkeypatch.setattr(T, "mypy_counts", lambda files, py: Counter(mypy))
     monkeypatch.setattr(T, "BASELINE", tmp_path / "baseline.json")
@@ -213,6 +217,7 @@ def test_main_exits_2_and_names_a_tool_that_hangs(tmp_path, monkeypatch, capsys,
         return subprocess.CompletedProcess(argv, 0, out[argv[0]], "")
 
     monkeypatch.setattr(T, "ROOT", tmp_path)
+    monkeypatch.setattr(T, "BASELINE", tmp_path / "baseline.json")   # main() reads it first
     monkeypatch.setattr(T, "shutil", SimpleNamespace(which=lambda t: f"/usr/bin/{t}"))
     monkeypatch.setattr(T, "subprocess", SimpleNamespace(
         run=run, TimeoutExpired=subprocess.TimeoutExpired))
@@ -220,3 +225,66 @@ def test_main_exits_2_and_names_a_tool_that_hangs(tmp_path, monkeypatch, capsys,
     assert capsys.readouterr().err == f"typecheck: {tool} timed out after {limit[tool]} s\n"
     # Every tool that ran had its limit, the hung one included.
     assert limits == {t: limit[t] for t in order[:order.index(tool) + 1]}
+
+
+def test_main_exits_2_when_git_cannot_list_the_files(tmp_path, monkeypatch, capsys):
+    """Outside a work tree `git ls-files` exits 128: one line naming git, not a traceback."""
+    _stub_gate(monkeypatch, tmp_path, pyright={}, mypy={}, files=None)
+    stderr = "fatal: not a git repository (or any of the parent directories): .git\n"
+
+    def run(argv, **kw):
+        r = subprocess.CompletedProcess(argv, 128, "", stderr)
+        if kw.get("check"):
+            r.check_returncode()   # what subprocess.run(check=True) does
+        return r
+
+    monkeypatch.setattr(T, "subprocess", SimpleNamespace(
+        run=run, TimeoutExpired=subprocess.TimeoutExpired))
+    assert T.main([]) == 2
+    assert capsys.readouterr().err == f"typecheck: git ls-files failed (rc=128): {stderr}"
+
+
+def test_main_exits_2_when_git_cannot_be_run(tmp_path, monkeypatch, capsys):
+    """With no git on PATH, subprocess raises FileNotFoundError: one line, not a traceback."""
+    _stub_gate(monkeypatch, tmp_path, pyright={}, mypy={}, files=None)
+    monkeypatch.setenv("PATH", str(tmp_path / "no-such-dir"))
+    assert T.main([]) == 2
+    assert capsys.readouterr().err == (
+        "typecheck: git could not be run: [Errno 2] No such file or directory: 'git'\n")
+
+
+@pytest.mark.parametrize("raw, problem", [
+    (b'{"a.py": {"pyright": 2}', "is not valid JSON ("),
+    (b"\xff\xfe", "is not valid JSON ("),
+    (b'["a.py"]', "is not a {file: {tool: error count}} map"),
+    (b'{"a.py": 2}', "is not a {file: {tool: error count}} map"),
+    (b'{"a.py": {"pyright": "2"}}', "is not a {file: {tool: error count}} map"),
+    (b'{"a.py": {"pyright": true}}', "is not a {file: {tool: error count}} map"),
+    (b'{"a.py": {"pyright": -1}}', "is not a {file: {tool: error count}} map"),
+], ids=["truncated", "not-utf8", "a-list", "row-a-number", "count-a-string", "count-a-bool",
+        "count-negative"])
+def test_main_exits_2_on_a_malformed_baseline(tmp_path, monkeypatch, capsys, raw, problem):
+    """One line naming the file, not a traceback, and not a verdict from counts that are
+    not counts. The baseline is read first, so a broken one costs no checker run."""
+    _stub_gate(monkeypatch, tmp_path, pyright={}, mypy={})
+    ran = []
+
+    def pyright_counts(files, py):
+        ran.append(files)
+        return Counter({"a.py": 2})
+
+    monkeypatch.setattr(T, "pyright_counts", pyright_counts)
+    (tmp_path / "baseline.json").write_bytes(raw)
+    assert T.main([]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"typecheck: {tmp_path / 'baseline.json'} {problem}")
+    assert err.endswith("; restore it from git\n") and err.count("\n") == 1
+    assert ran == []
+
+
+def test_main_update_baseline_replaces_a_malformed_baseline(tmp_path, monkeypatch):
+    """Re-recording reads no baseline, so a broken one cannot block it."""
+    _stub_gate(monkeypatch, tmp_path, pyright={"a.py": 2}, mypy={})
+    (tmp_path / "baseline.json").write_text('{"a.py": {"pyright": 2}')
+    assert T.main(["--update-baseline"]) == 0
+    assert json.loads((tmp_path / "baseline.json").read_text()) == {"a.py": {"pyright": 2}}
