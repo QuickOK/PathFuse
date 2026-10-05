@@ -10,9 +10,13 @@ import http.client
 import importlib.util
 import io
 import json
+import os
+import re
 import subprocess
 import sys
 import threading
+import time
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -32,6 +36,17 @@ def _load(name, filename):
 
 
 M = _load("relay_egress_watchdog", "relay-egress-watchdog")
+
+
+@pytest.fixture(autouse=True)
+def deadman_record(tmp_path, monkeypatch):
+    """This test's dead-man record: a file in tmp_path, where main() writes it and the
+    dead-man (see _load_deadman) reads it. Never the box's own
+    /run/relay-egress-watchdog/deadman.json."""
+    path = tmp_path / "deadman.json"
+    monkeypatch.setattr(M, "DEADMAN_RECORD", str(path))
+    return path
+
 
 GW = "192.0.2.1"
 
@@ -213,14 +228,14 @@ def test_default_mode_defaults_to_relay_direct():
     pytest.param(lambda c: c["exempt"].update(prefixes=["not-a-prefix"]), "exempt.prefixes",
                  id="exempt-unparsable"),
     # A tick must end within the unit's TimeoutStartSec=25 (see MAX_PROBE_TIMEOUT_S).
-    pytest.param(lambda c: c["upstreams"]["vpn"]["probe"].update(timeout_s=10.5),
-                 r"^upstreams\.vpn\.probe\.timeout_s must be at most 10 s",
-                 id="probe-timeout-over-10"),
-    pytest.param(lambda c: c["client"].update(fetch_timeout_s=10.5),
-                 r"^client\.fetch_timeout_s must be at most 10 s", id="fetch-timeout-over-10"),
-    pytest.param(lambda c: c["client"].update(bootstrap_timeout_s=15.5),
-                 r"^client\.bootstrap_timeout_s must be at most 15 s",
-                 id="bootstrap-timeout-over-15"),
+    pytest.param(lambda c: c["upstreams"]["vpn"]["probe"].update(timeout_s=8.5),
+                 r"^upstreams\.vpn\.probe\.timeout_s must be at most 8 s",
+                 id="probe-timeout-over-8"),
+    pytest.param(lambda c: c["client"].update(fetch_timeout_s=5.5),
+                 r"^client\.fetch_timeout_s must be at most 5 s", id="fetch-timeout-over-5"),
+    pytest.param(lambda c: c["client"].update(bootstrap_timeout_s=8.5),
+                 r"^client\.bootstrap_timeout_s must be at most 8 s",
+                 id="bootstrap-timeout-over-8"),
 ])
 def test_validate_config_rejects(mutate, match):
     raw = raw_cfg()
@@ -231,11 +246,62 @@ def test_validate_config_rejects(mutate, match):
 
 def test_validate_config_accepts_timeouts_at_their_caps():
     raw = raw_cfg()
-    raw["upstreams"]["vpn"]["probe"]["timeout_s"] = 10
-    raw["client"].update(fetch_timeout_s=10, bootstrap_timeout_s=15)
+    raw["upstreams"]["vpn"]["probe"]["timeout_s"] = 8
+    raw["client"].update(fetch_timeout_s=5, bootstrap_timeout_s=8)
     c = M.validate_config(raw)
     assert (c["upstreams"]["vpn"]["probe"]["timeout_s"], c["client"]["fetch_timeout_s"],
-            c["client"]["bootstrap_timeout_s"]) == (10.0, 10.0, 15.0)
+            c["client"]["bootstrap_timeout_s"]) == (8.0, 5.0, 8.0)
+
+
+def test_the_slowest_tick_ends_within_the_units_timeout_with_headroom():
+    """systemd kills a tick still running at TimeoutStartSec, and the dead-man then
+    withdraws even a healthy route. The slowest tick the caps allow: the link check,
+    then curl at its cap plus the backstop that kills a curl overrunning it (the
+    upstreams are probed in parallel), then the cold-start poll at the bootstrap cap.
+    4 s must be left over for the `ip route` work."""
+    unit = (_DIR / "systemd/relay-egress-watchdog.service").read_text()
+    m = re.search(r"^TimeoutStartSec=(\d+)$", unit, re.MULTILINE)
+    assert m is not None
+    slowest = (M.LINK_TIMEOUT_S + M.MAX_PROBE_TIMEOUT_S + M.PROBE_BACKSTOP_S
+               + max(M.MAX_BOOTSTRAP_TIMEOUT_S, M.MAX_FETCH_TIMEOUT_S))
+    assert slowest <= int(m.group(1)) - 4
+
+
+def test_the_probe_waits_are_the_ones_the_slowest_tick_counts():
+    """The sum above holds only if the link check and curl's backstop use those waits."""
+    raw = raw_cfg()
+    raw["upstreams"]["vpn"]["probe"]["timeout_s"] = 8
+    up = M.validate_config(raw)["upstreams"]["vpn"]
+    timeouts = []
+
+    def run(argv, **kw):
+        timeouts.append(kw["timeout"])
+        return _runner()(argv, **kw)
+
+    assert M.run_probe(up, run) == (True, "vpn=on", False)
+    assert timeouts == [M.LINK_TIMEOUT_S, 8 + M.PROBE_BACKSTOP_S] == [2, 11]
+
+
+@pytest.mark.parametrize("prefix", [167772160, True, 0], ids=["int", "bool", "zero"])
+def test_validate_config_rejects_an_exempt_prefix_that_is_not_a_string(prefix):
+    """IPv4Network reads an int as an address: 167772160 would pass as 10.0.0.0/32, 0 as
+    0.0.0.0/32 (which the /0 check misses) and True as the /32 of address 1, each a host
+    route nobody asked for."""
+    raw = raw_cfg()
+    raw["exempt"]["prefixes"] = ["10.0.0.0/8", prefix]
+    with pytest.raises(M.ConfigError, match=rf"^exempt\.prefixes: {prefix!r}: must be a string"):
+        M.validate_config(raw)
+
+
+@pytest.mark.parametrize("key", ["grace_s", "fetch_timeout_s"])
+def test_main_rejects_a_number_too_big_for_a_float_with_exit_2(tmp_path, capsys, key):
+    """JSON puts no limit on an integer's size, and float() raises OverflowError (not
+    ValueError) past about 1.8e308: that crashed main() (exit 1, a traceback) instead of
+    a CONFIG ERROR (exit 2)."""
+    p = tmp_path / "c.json"
+    p.write_text('{"table": "egress", "client": {"%s": 1%s}}' % (key, "0" * 400))
+    assert M.main(["--config", str(p)]) == 2
+    assert f"CONFIG ERROR: client.{key} must be finite and > 0" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("url", ["", "https://relay.example.net/api/desired_egress",
@@ -377,9 +443,14 @@ def test_run_probe_a_missing_or_downed_link_is_a_hard_failure(answer):
     assert calls == [["ip", "-j", "link", "show", "dev", "veth-vpn"]]   # and no curl
 
 
+NETLINK_ERR = "Cannot open netlink socket: Too many open files"
+
+
 @pytest.mark.parametrize("answer", [
     pytest.param(subprocess.TimeoutExpired("ip", 2), id="ip-hangs"),
     pytest.param(OSError("No such file or directory: 'ip'"), id="ip-cannot-run"),
+    pytest.param(R(rc=1, err=NETLINK_ERR), id="ip-fails-otherwise"),
+    pytest.param(R(rc=-9), id="ip-killed"),
     pytest.param(R(out="not json"), id="garbage"),
     pytest.param(R(out="[]"), id="empty-list"),
 ])
@@ -393,6 +464,63 @@ def test_run_probe_a_link_state_ip_cannot_tell_is_a_soft_failure(answer):
 
     assert M.run_probe(cfg()["upstreams"]["vpn"], run) == (
         False, "cannot check link veth-vpn", False)
+
+
+def _link(flags):
+    return R(out=json.dumps([{"ifname": "wg-exit", "flags": flags}]))
+
+
+@pytest.mark.parametrize("answer, want", [
+    pytest.param(_link(["POINTOPOINT", "NOARP", "UP", "LOWER_UP"]), True, id="up"),
+    pytest.param(_link(["POINTOPOINT", "NOARP"]), False, id="admin-down"),
+    pytest.param(R(rc=1, err='Device "wg-exit" does not exist.\n'), False, id="missing"),
+    pytest.param(R(rc=1, err=NETLINK_ERR), None, id="other-error"),
+    pytest.param(R(rc=1), None, id="no-stderr"),
+    pytest.param(R(rc=-9), None, id="killed"),
+    pytest.param(R(out="not json"), None, id="garbage"),
+    pytest.param(R(out="[]"), None, id="empty-list"),
+    pytest.param(R(out=json.dumps([{"ifname": "wg-exit"}])), None, id="no-flags"),
+    pytest.param(_link("UP"), None, id="flags-not-a-list"),
+    pytest.param(subprocess.TimeoutExpired("ip", 2), None, id="hangs"),
+    pytest.param(FileNotFoundError(2, "No such file or directory", "ip"), None, id="cannot-run"),
+])
+def test_link_up_tells_a_missing_or_downed_link_from_an_ip_that_cannot_tell(answer, want):
+    """True: admin-UP. False, a hard failure: admin-down, or `ip` says the device does
+    not exist. None, an ordinary failure: anything else, since an `ip` that fails some
+    other way, hangs, cannot run or prints what cannot be read says nothing about the
+    link."""
+    def run(argv, **kw):
+        assert argv == ["ip", "-j", "link", "show", "dev", "wg-exit"]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    assert M.link_up("wg-exit", run) is want
+
+
+def test_an_ip_link_query_that_fails_otherwise_waits_for_fail_threshold():
+    """`ip` failing on the query for a reason other than a missing device must not
+    withdraw a healthy route at once: it takes fail_threshold (3) such ticks in a row."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone")])
+    state = _healthy_state("backbone", route="backbone")
+
+    def run(argv, **kw):
+        if argv[:3] == ["ip", "-j", "link"]:
+            return R(rc=1, err=NETLINK_ERR)
+        return R(out="vpn=on\nip=203.0.113.10\n")
+
+    def probe(up):
+        return M.run_probe(up, run)
+
+    for t in range(2):
+        state, rc = M.tick(c, state, 100.0 + t, ip=ip, probe=probe, fetch=_backbone,
+                           log=lambda line: None)
+        assert rc == 0 and state["route"] == "backbone" and len(ip.preferred()) == 1
+        assert state["upstreams"]["backbone"]["last_probe"] == "cannot check link wg-exit"
+    state, rc = M.tick(c, state, 102.0, ip=ip, probe=probe, fetch=_backbone,
+                       log=lambda line: None)
+    assert rc == 0 and state["route"] is None and ip.preferred() == []
 
 
 # --- selection and planning -----------------------------------------------------------
@@ -694,9 +822,12 @@ def test_unreadable_table_fails_open():
 
 # --- state and entry point ----------------------------------------------------------
 
+NOW = 1.7e9   # "now" for with_defaults: a tick in 2023
+
+
 def test_with_defaults_drops_unknown_upstreams_and_keeps_known_health():
     s = M.with_defaults({"upstreams": {"gone": {"healthy": True},
-                                       "vpn": {"healthy": True}}}, cfg())
+                                       "vpn": {"healthy": True}}}, cfg(), NOW)
     assert set(s["upstreams"]) == {"vpn", "backbone"}
     assert s["upstreams"]["vpn"]["healthy"] is True
     assert s["upstreams"]["backbone"] == M.new_health()
@@ -720,6 +851,31 @@ def test_load_state_tolerates_a_deeply_nested_file(tmp_path, text):
     assert M.load_state(p) == {}
 
 
+@pytest.mark.parametrize("text", ["[" * DEEP, '{"a":' * DEEP], ids=["lists", "objects"])
+def test_main_rejects_a_config_nested_too_deep_with_exit_2(tmp_path, capsys, text):
+    """The parser's RecursionError is not a ValueError: it escaped load_config, and
+    main() crashed (exit 1, a traceback) instead of a CONFIG ERROR (exit 2)."""
+    p = tmp_path / "c.json"
+    p.write_text(text)
+    with pytest.raises(M.ConfigError, match=r"^cannot read .*: maximum recursion depth"):
+        M.load_config(p)
+    assert M.main(["--config", str(p)]) == 2
+    assert "CONFIG ERROR: cannot read" in capsys.readouterr().err
+
+
+def test_load_config_turns_any_parse_failure_into_a_config_error(tmp_path, monkeypatch):
+    """Whatever the parser raises, even an error no handler names, is a CONFIG ERROR."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+
+    def loads(text):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(M, "json", types.SimpleNamespace(loads=loads))
+    with pytest.raises(M.ConfigError, match=r"^cannot read .*: parser bug$"):
+        M.load_config(p)
+
+
 def test_main_runs_the_tick_over_a_deeply_nested_state_file(tmp_path, monkeypatch):
     """The state file is only the tick's own memory, so a corrupt one means a fresh start.
     Raised out of main(), it would fail every tick until someone deleted the file, each
@@ -740,28 +896,107 @@ def test_main_returns_2_on_bad_config(tmp_path, capsys):
     assert "CONFIG ERROR" in capsys.readouterr().err
 
 
-def test_every_tick_writes_the_config_table_into_the_state():
-    """The dead-man reads it there when the config is unreadable. Written every tick,
-    so a renamed table replaces the old name."""
-    new, _, _ = run_tick(cfg(), {"table": "old-name"}, 100.0, FakeIp(BASE),
-                         {"vpn": OK_VPN, "backbone": OK_BB})
-    assert new["table"] == "egress"
+def _main_config(tmp_path, **over):
+    """A config file main() can run (no upstreams, no polling), its state in tmp_path."""
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(dict({"table": "egress", "state_path": str(tmp_path / "state.json")},
+                                 **over)))
+    return p
+
+
+class _NoTable(FakeIp):
+    def show_table(self, table):
+        raise RuntimeError("table id value is invalid")
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry-run"])
+def test_main_writes_the_deadman_record_before_any_route_work(tmp_path, monkeypatch,
+                                                              deadman_record, dry_run):
+    """The dead-man reads the record when the config has become unreadable. A dry run
+    records itself too: that is how the dead-man knows to leave the table alone."""
+    seen = []
+
+    class Watching(FakeIp):
+        def show_table(self, table):
+            seen.append(json.loads(deadman_record.read_text()))
+            return super().show_table(table)
+
+    p = _main_config(tmp_path, preferred_metric=50, dry_run=dry_run)
+    monkeypatch.setattr(M, "IpRoute", lambda: Watching(BASE))
+    before = time.time()
+    assert M.main(["--config", str(p)]) == 0
+    after = time.time()
+    assert len(seen) == 1
+    rec = seen[0]
+    assert sorted(rec) == ["dry_run", "preferred_metric", "table", "written_at"]
+    assert rec["table"] == "egress" and rec["preferred_metric"] == 50
+    assert rec["dry_run"] is dry_run
+    assert type(rec["written_at"]) is float and before <= rec["written_at"] <= after
+
+
+@pytest.mark.parametrize("failure", ["exits-1", "crashes"])
+def test_main_leaves_the_record_behind_a_failing_tick(tmp_path, monkeypatch, deadman_record,
+                                                      failure):
+    """A failing tick is what fires the dead-man, so it must find the record then."""
+    class Crashing(FakeIp):
+        def show_table(self, table):
+            raise KeyError("a bug")
+
+    p = _main_config(tmp_path)
+    broken = _NoTable if failure == "exits-1" else Crashing
+    monkeypatch.setattr(M, "IpRoute", lambda: broken(BASE))
+    if failure == "exits-1":
+        assert M.main(["--config", str(p)]) == 1
+    else:
+        with pytest.raises(KeyError):
+            M.main(["--config", str(p)])
+    assert json.loads(deadman_record.read_text())["table"] == "egress"
 
 
 @pytest.mark.parametrize("readable", [True, False], ids=["tick-ok", "tick-fails"])
-def test_main_saves_the_table_even_from_a_failing_tick(tmp_path, monkeypatch, readable):
-    """A failing tick is what fires the dead-man, so its state must name the table too."""
-    class Broken(FakeIp):
-        def show_table(self, table):
-            raise RuntimeError("table id value is invalid")
-
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"table": "old-name"}))
-    p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": "egress", "state_path": str(state)}))
-    monkeypatch.setattr(M, "IpRoute", lambda: (FakeIp if readable else Broken)(BASE))
+def test_a_record_that_cannot_be_written_never_changes_the_ticks_exit(tmp_path, monkeypatch,
+                                                                      capsys, readable):
+    """Failing to write the record is worth an ERROR, not a failed tick: that would fire
+    the dead-man every 10 s and withdraw a healthy route."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    monkeypatch.setattr(M, "DEADMAN_RECORD", str(blocker / "deadman.json"))
+    p = _main_config(tmp_path)
+    monkeypatch.setattr(M, "IpRoute", lambda: (FakeIp if readable else _NoTable)(BASE))
     assert M.main(["--config", str(p)]) == (0 if readable else 1)
-    assert json.loads(state.read_text())["table"] == "egress"
+    err = capsys.readouterr().err
+    assert f"ERROR: cannot write the dead-man record {blocker / 'deadman.json'}: " in err
+    assert json.loads((tmp_path / "state.json").read_text())["last_check"] > 0   # the tick ran
+
+
+def test_the_record_is_replaced_whole(tmp_path, monkeypatch, deadman_record):
+    """Written to a temporary file that is then renamed over the record, so the dead-man
+    reads the old record or the new one, never part of one. The rename gives the path a
+    new inode: a hard link to the old record keeps the old text, where writing the
+    record in place would change that too."""
+    deadman_record.write_text('{"table": "old"}')
+    twin = tmp_path / "twin"
+    os.link(deadman_record, twin)
+    p = _main_config(tmp_path)
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    assert M.main(["--config", str(p)]) == 0
+    assert json.loads(deadman_record.read_text())["table"] == "egress"
+    assert twin.read_text() == '{"table": "old"}'
+    assert sorted(f.name for f in tmp_path.iterdir()) == [
+        "c.json", "deadman.json", "state.json", "twin"]   # no temporary file left over
+
+
+def test_the_deadman_reads_the_record_where_the_actuator_writes_it():
+    """Each script names the path itself (the dead-man must not depend on the actuator),
+    so pin them together, inside the runtime directory the actuator's unit keeps
+    between ticks (RuntimeDirectory=, RuntimeDirectoryPreserve=yes)."""
+    actuator = _load("relay_egress_watchdog_unpatched", "relay-egress-watchdog")
+    deadman = _load("relay_egress_deadman", "relay-egress-deadman")
+    unit = (_DIR / "systemd/relay-egress-watchdog.service").read_text()
+    m = re.search(r"^RuntimeDirectory=(\S+)$", unit, re.MULTILINE)
+    assert m is not None
+    assert (deadman.DEADMAN_RECORD == actuator.DEADMAN_RECORD
+            == f"/run/{m.group(1)}/deadman.json" == "/run/relay-egress-watchdog/deadman.json")
 
 
 # --- the real fetch path against a stub client endpoint -------------------------------
@@ -1097,7 +1332,7 @@ def test_with_defaults_tolerates_bad_state_file():
         }
     }
 
-    result = M.with_defaults(bad_state, c)
+    result = M.with_defaults(bad_state, c, NOW)
 
     # Scalars should be reset
     assert result["desired_mode"] is None
@@ -1193,39 +1428,43 @@ def test_tick_keeps_the_last_known_mode_within_grace_when_the_fetch_raises():
                          ids=["unknown", "empty", "list", "dict", "int"])
 def test_with_defaults_resets_a_mode_that_is_not_a_known_name(mode):
     """The fetch time is valid, so only the mode check can drop it."""
-    s = M.with_defaults({"desired_mode": mode, "desired_mode_fetched_at": 95.0}, cfg())
+    s = M.with_defaults({"desired_mode": mode, "desired_mode_fetched_at": 95.0}, cfg(), NOW)
     assert s["desired_mode"] is None
 
 
 @pytest.mark.parametrize("fails", [True, "x", 1.5, None], ids=["bool", "str", "float", "none"])
 def test_with_defaults_resets_a_fail_count_that_is_not_an_int(fails):
-    s = M.with_defaults({"desired_mode_fetch_fail": fails}, cfg())
+    s = M.with_defaults({"desired_mode_fetch_fail": fails}, cfg(), NOW)
     assert s["desired_mode_fetch_fail"] == 0 and type(s["desired_mode_fetch_fail"]) is int
 
 
 @pytest.mark.parametrize("fetched_at", BAD_TIMES)
 def test_with_defaults_drops_the_mode_along_with_an_unusable_fetch_time(fetched_at):
     """tick() reads a fetch time of 0 as no age, so a mode kept here would never age out."""
-    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at}, cfg())
+    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at},
+                        cfg(), NOW)
     assert s["desired_mode"] is None and s["desired_mode_fetched_at"] == 0.0
 
 
 @pytest.mark.parametrize("extra", [{}, {"desired_mode_fetched_at": 0}, {"desired_mode_fetched_at": 0.0}],
                          ids=["missing", "int-zero", "float-zero"])
 def test_with_defaults_drops_a_mode_that_has_no_fetch_time(extra):
-    assert M.with_defaults({"desired_mode": "relay_vpn", **extra}, cfg())["desired_mode"] is None
+    s = M.with_defaults({"desired_mode": "relay_vpn", **extra}, cfg(), NOW)
+    assert s["desired_mode"] is None
 
 
 @pytest.mark.parametrize("fetched_at", [1.7e9, 1700000000, 1e11], ids=["float", "int", "the-limit"])
 def test_with_defaults_keeps_a_mode_with_a_usable_fetch_time(fetched_at):
-    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at}, cfg())
+    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": fetched_at},
+                        cfg(), fetched_at + 10)   # fetched 10 s ago
     assert s["desired_mode"] == "relay_vpn" and s["desired_mode_fetched_at"] == fetched_at
 
 
 @pytest.mark.parametrize("bad", BAD_TIMES)
 def test_with_defaults_resets_every_unusable_timestamp(bad):
     s = M.with_defaults({"desired_mode_fetched_at": bad, "last_route_change": bad,
-                         "last_check": bad, "upstreams": {"vpn": {"last_change": bad}}}, cfg())
+                         "last_check": bad, "upstreams": {"vpn": {"last_change": bad}}},
+                        cfg(), NOW)
     assert (s["desired_mode_fetched_at"], s["last_route_change"], s["last_check"],
             s["upstreams"]["vpn"]["last_change"]) == (0.0, 0.0, 0.0, 0.0)
 
@@ -1233,9 +1472,60 @@ def test_with_defaults_resets_every_unusable_timestamp(bad):
 def test_with_defaults_keeps_usable_timestamps():
     s = M.with_defaults({"desired_mode_fetched_at": 1.7e9, "last_route_change": 1700000001,
                          "last_check": 1.7e9 + 2, "upstreams": {"vpn": {"last_change": 1.7e9 + 5}}},
-                        cfg())
+                        cfg(), NOW + 10)
     assert (s["desired_mode_fetched_at"], s["last_route_change"], s["last_check"],
             s["upstreams"]["vpn"]["last_change"]) == (1.7e9, 1700000001, 1.7e9 + 2, 1.7e9 + 5)
+
+
+def _counters(s):
+    return (s["desired_mode_fetch_fail"], s["upstreams"]["vpn"]["consecutive_pass"],
+            s["upstreams"]["vpn"]["consecutive_fail"])
+
+
+@pytest.mark.parametrize("bad", [-1, 10 ** 9 + 1, 10 ** 400, True, "5", 1.5, None],
+                         ids=["negative", "past-the-limit", "huge", "bool", "str", "float",
+                              "none"])
+def test_with_defaults_resets_every_unusable_counter(bad):
+    """A count is an int from 0 to 10**9. A negative consecutive_pass would keep a
+    recovered upstream unhealthy for that many extra passes."""
+    s = M.with_defaults({"desired_mode_fetch_fail": bad,
+                         "upstreams": {"vpn": {"consecutive_pass": bad, "consecutive_fail": bad}}},
+                        cfg(), NOW)
+    assert _counters(s) == (0, 0, 0)
+    assert all(type(n) is int for n in _counters(s))
+
+
+@pytest.mark.parametrize("count", [1, 10 ** 9], ids=["one", "the-limit"])
+def test_with_defaults_keeps_usable_counters(count):
+    """(0 is usable too, but a counter reset to its default reads 0 all the same.)"""
+    s = M.with_defaults({"desired_mode_fetch_fail": count,
+                         "upstreams": {"vpn": {"consecutive_pass": count,
+                                               "consecutive_fail": count}}},
+                        cfg(), NOW)
+    assert _counters(s) == (count, count, count)
+
+
+@pytest.mark.parametrize("ahead, kept", [(300, True), (301, False), (86400, False)],
+                         ids=["300s-ahead", "301s-ahead", "a-day-ahead"])
+def test_with_defaults_drops_a_mode_fetched_in_the_future(ahead, kept):
+    """A fetch time more than 300 s ahead of now means the clock has stepped back. The
+    mode's age would read as negative, so it would hold "within grace" until the clock
+    caught up, however long the polls failed. Drop it, as for any unusable fetch time."""
+    s = M.with_defaults({"desired_mode": "relay_vpn", "desired_mode_fetched_at": NOW + ahead},
+                        cfg(), NOW)
+    want = ("relay_vpn", NOW + ahead) if kept else (None, 0.0)
+    assert (s["desired_mode"], s["desired_mode_fetched_at"]) == want
+
+
+def test_tick_does_not_pin_a_mode_when_the_clock_steps_back():
+    """The poll succeeds once, then the clock steps back an hour and every poll fails:
+    the default mode applies at once, not an hour later."""
+    c, ip = cfg(), FakeIp(BASE)
+    probes = {"vpn": OK_VPN, "backbone": OK_BB}
+    state, _, _ = run_tick(c, {}, NOW, ip, probes, mode="relay_vpn")
+    assert [r["dev"] for r in ip.preferred()] == ["veth-vpn"]
+    state, rc, _ = run_tick(c, state, NOW - 3600, ip, probes, fetch_err="timeout")
+    assert rc == 0 and state["effective_mode"] == "relay_direct" and ip.preferred() == []
 
 
 def test_main_with_unwritable_state_path(tmp_path, capsys, monkeypatch):
@@ -1300,8 +1590,11 @@ def test_effective_mode_past_grace_falls_back_to_default():
 # --- dead-man switch, units, example config -------------------------------------------
 
 def _load_deadman():
-    """Load the dead-man module lazily so a broken script doesn't break test collection."""
-    return _load("relay_egress_deadman", "relay-egress-deadman")
+    """Load the dead-man module lazily so a broken script doesn't break test collection.
+    It reads its record where the autouse deadman_record fixture put the actuator's."""
+    D = _load("relay_egress_deadman", "relay-egress-deadman")
+    setattr(D, "DEADMAN_RECORD", M.DEADMAN_RECORD)   # a plain assignment upsets pyright
+    return D
 
 
 class _ThreadStderr(io.StringIO):
@@ -1356,6 +1649,22 @@ def test_deadman_stderr_keeps_only_the_test_threads_writes(capsys):
     # The other thread's line went on to capsys. `in`, not `==`: capsys also holds
     # whatever any other thread wrote meanwhile, the very noise this helper keeps out.
     assert "stray line from another thread\n" in capsys.readouterr().err
+
+
+DEL_EGRESS = ["ip", "route", "del", "default", "metric", "100", "table", "egress"]
+
+
+def _nothing_left(calls):
+    """A dead-man runner that records each call and finds nothing to delete."""
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=2, err="RTNETLINK answers: No such process")
+    return run
+
+
+def _never(argv, **kw):
+    """A dead-man runner for a run that must not touch the table."""
+    raise AssertionError(f"the dead-man ran {argv}")
 
 
 def test_deadman_deletes_every_preferred_default(tmp_path):
@@ -1429,34 +1738,23 @@ def test_deadman_fails_open_on_a_dry_run_that_is_not_a_real_true(tmp_path, value
 def test_deadman_falls_back_to_env_table(tmp_path, monkeypatch):
     D = _load_deadman()
     monkeypatch.setenv("EGRESS_TABLE", "egress2")
-    calls = []
-
-    def run(argv, **kw):
-        calls.append(argv)
-        return R(rc=2)
-
-    assert D.main(["--config", str(tmp_path / "missing.json")], runner=run) == 0
+    calls: list = []
+    assert D.main(["--config", str(tmp_path / "missing.json")], runner=_nothing_left(calls)) == 0
     assert calls[0][-1] == "egress2"
 
 
 def test_deadman_without_any_table_exits_1(tmp_path, monkeypatch):
     D = _load_deadman()
     monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(tmp_path / "no-state.json"))   # not this box's
-    assert D.main(["--config", str(tmp_path / "missing.json")], runner=lambda *a, **k: R()) == 1
+    assert D.main(["--config", str(tmp_path / "missing.json")], runner=_never) == 1
 
 
 def test_deadman_uses_config_metric(tmp_path):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress", "preferred_metric": 50}))
-    calls = []
-
-    def run(argv, **kw):
-        calls.append(argv)
-        return R(rc=2)
-
-    assert D.main(["--config", str(p)], runner=run) == 0
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
     assert calls[0][5] == "50"  # metric argument
 
 
@@ -1464,13 +1762,8 @@ def test_deadman_bad_metric_defaults_to_100(tmp_path):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress", "preferred_metric": "bad"}))
-    calls = []
-
-    def run(argv, **kw):
-        calls.append(argv)
-        return R(rc=2)
-
-    assert D.main(["--config", str(p)], runner=run) == 0
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
     assert calls[0][5] == "100"  # metric defaults to 100
 
 
@@ -1478,13 +1771,8 @@ def test_deadman_bool_metric_defaults_to_100(tmp_path):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress", "preferred_metric": True}))
-    calls = []
-
-    def run(argv, **kw):
-        calls.append(argv)
-        return R(rc=2)
-
-    assert D.main(["--config", str(p)], runner=run) == 0
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
     assert calls[0][5] == "100"
 
 
@@ -1509,10 +1797,10 @@ def test_deadman_timeout_stops_loop_says_so_and_exits_1(tmp_path, capsys, ok_bef
     # The hung call is not retried.
     assert len(calls) == ok_before + 1
     out = capsys.readouterr().out
-    # What was removed, then why it stopped. A bare "(fail open)" would hide the hang.
-    assert out == (f"relay-egress-deadman: removed {ok_before} preferred default(s) from "
-                   "table egress (fail open)\n"
-                   "relay-egress-deadman: ip route del timed out after 5 s\n")
+    # Why it stopped, then what was removed. A bare "(fail open)" would hide the hang.
+    assert out == ("relay-egress-deadman: ip route del timed out after 5 s\n"
+                   f"relay-egress-deadman: removed {ok_before} preferred default(s) from "
+                   "table egress (fail open)\n")
     assert err.getvalue() == ""
 
 
@@ -1524,7 +1812,7 @@ def test_deadman_timeout_passes_timeout_kwarg(tmp_path):
 
     def run(argv, **kw):
         timeout_values.append(kw.get("timeout"))
-        return R(rc=2)
+        return R(rc=2, err="RTNETLINK answers: No such process")
 
     D.main(["--config", str(p)], runner=run)
     assert timeout_values[0] == 5
@@ -1537,13 +1825,8 @@ def test_deadman_metric_below_1_defaults_to_100_keeps_table(tmp_path, metric):
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "mytable", "preferred_metric": metric}))
-    calls = []
-
-    def run(argv, **kw):
-        calls.append(argv)
-        return R(rc=2)
-
-    assert D.main(["--config", str(p)], runner=run) == 0
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
     assert calls[0][5] == "100"
     assert calls[0][7] == "mytable"
 
@@ -1551,8 +1834,9 @@ def test_deadman_metric_below_1_defaults_to_100_keeps_table(tmp_path, metric):
 # A config that reads fine but names no usable table: null, "", a number, a list.
 BAD_TABLES = [pytest.param(None, id="null"), pytest.param("", id="empty-string"),
               pytest.param(5, id="number"), pytest.param(["x"], id="list")]
-NO_TABLE_MSG = ("relay-egress-deadman: no table (config has no usable table, EGRESS_TABLE "
-                "is unset/empty, and the state file {} names none)")
+NO_TABLE_MSG = ("relay-egress-deadman: no table (the config {config} names no usable table, "
+                "the record {record} is missing or names none, and EGRESS_TABLE is unset "
+                "or empty)")
 
 
 @pytest.mark.parametrize("bad", BAD_TABLES)
@@ -1574,148 +1858,141 @@ def test_deadman_bad_table_falls_back_to_env(tmp_path, monkeypatch, bad):
 @pytest.mark.parametrize("env", [None, ""], ids=["env-unset", "env-empty"])
 @pytest.mark.parametrize("bad", BAD_TABLES)
 def test_deadman_bad_table_and_no_env_exits_1_with_the_exact_message(
-        tmp_path, monkeypatch, capsys, bad, env):
+        tmp_path, monkeypatch, capsys, deadman_record, bad, env):
     D = _load_deadman()
     if env is None:
         monkeypatch.delenv("EGRESS_TABLE", raising=False)
     else:
         monkeypatch.setenv("EGRESS_TABLE", env)
-    no_state = str(tmp_path / "no-state.json")
-    monkeypatch.setattr(D, "DEFAULT_STATE", no_state)
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": bad}))
 
-    def run(argv, **kw):
-        raise AssertionError(f"no usable table, so no ip command: {argv}")
-
     with _deadman_stderr() as err:
-        assert D.main(["--config", str(p)], runner=run) == 1
+        assert D.main(["--config", str(p)], runner=_never) == 1
     assert capsys.readouterr().out == ""
-    assert err.getvalue() == NO_TABLE_MSG.format(no_state) + "\n"
+    assert err.getvalue() == NO_TABLE_MSG.format(config=p, record=deadman_record) + "\n"
 
 
-DEL_EGRESS = ["ip", "route", "del", "default", "metric", "100", "table", "egress"]
+def _write_record(path, **fields):
+    """A dead-man record as the actuator writes it, with `fields` changed."""
+    path.write_text(json.dumps(dict({"table": "egress", "preferred_metric": 100,
+                                     "dry_run": False, "written_at": NOW}, **fields)))
 
 
-def _nothing_left(calls):
-    """A dead-man runner that records each call and finds nothing to delete."""
-    def run(argv, **kw):
-        calls.append(argv)
-        return R(rc=2, err="RTNETLINK answers: No such process")
-    return run
-
-
-@pytest.mark.parametrize("config", [None, "{not json", "", "[]", '{"table": null}'],
-                         ids=["missing", "truncated-json", "empty-file", "list", "null-table"])
-def test_deadman_takes_the_table_from_the_state_file_when_the_config_names_none(
-        tmp_path, monkeypatch, config):
-    """The shipped unit sets no EGRESS_TABLE, so with a broken config the actuator's
-    own state file is the dead-man's last way to the table."""
-    D = _load_deadman()
-    monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"table": "egress", "route": "backbone"}))
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
+def _config(tmp_path, text):
+    """tmp_path/c.json holding `text`, or missing when `text` is None."""
     p = tmp_path / "c.json"
-    if config is not None:
-        p.write_text(config)
-    calls: list = []
-    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
-    assert calls == [DEL_EGRESS]
+    if text is not None:
+        p.write_text(text)
+    return p
 
 
-@pytest.mark.parametrize("env", [None, ""], ids=["env-unset", "env-empty"])
-def test_deadman_takes_the_state_table_when_egress_table_is_unset_or_empty(
-        tmp_path, monkeypatch, env):
-    """Only a NON-EMPTY $EGRESS_TABLE outranks the state file. A drop-in that sets
-    `Environment=EGRESS_TABLE=` (empty) must not cut the dead-man off from the table
-    the actuator saved."""
+# A config the dead-man takes no table from: missing, not JSON, not an object, nested
+# too deep, or an object without a usable table (and without "dry_run": true).
+NO_CONFIG_TABLE = [pytest.param(None, id="missing"),
+                   pytest.param("{not json", id="truncated-json"),
+                   pytest.param("", id="empty-file"), pytest.param("[]", id="list"),
+                   pytest.param('{"table": null}', id="null-table"),
+                   pytest.param("[" * DEEP, id="nested-too-deep")]
+
+
+@pytest.mark.parametrize("config", NO_CONFIG_TABLE)
+def test_deadman_takes_the_table_and_metric_from_the_record(tmp_path, monkeypatch,
+                                                            deadman_record, config):
+    """Every tick writes the record at a fixed path, so the dead-man finds the table
+    with the config broken, wherever the state file lives, and with the metric the
+    actuator's routes really carry (50 here, not the default 100). The record outranks
+    EGRESS_TABLE: it says what the actuator last ran with."""
     D = _load_deadman()
-    if env is None:
-        monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    else:
-        monkeypatch.setenv("EGRESS_TABLE", env)
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"table": "egress"}))
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
-    p = tmp_path / "c.json"
-    p.write_text('{"table": "egress", "state_pa')   # a broken edit: unparseable
-    calls: list = []
-    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
-    assert calls == [DEL_EGRESS]
-
-
-def test_deadman_reads_the_state_path_from_a_readable_config(tmp_path, monkeypatch):
-    """A config that names no usable table may still say where the state file is."""
-    D = _load_deadman()
-    monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    default = tmp_path / "default-state.json"
-    default.write_text(json.dumps({"table": "wrong"}))
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(default))
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"table": "egress"}))
-    p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": None, "state_path": str(state)}))
-    calls: list = []
-    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
-    assert calls == [DEL_EGRESS]
-
-
-@pytest.mark.parametrize("bad", [None, "", 5, ["state.json"]],
-                         ids=["null", "empty-string", "number", "list"])
-def test_deadman_falls_back_to_the_default_state_path(tmp_path, monkeypatch, bad):
-    """The actuator rejects such a state_path, so its state file is at the default."""
-    D = _load_deadman()
-    monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"table": "egress"}))
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
-    p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": None, "state_path": bad}))
-    calls: list = []
-    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
-    assert calls == [DEL_EGRESS]
-
-
-def test_deadman_default_state_path_is_the_actuators():
-    """Drift here would quietly cut the dead-man's last way to the table."""
-    assert _load_deadman().DEFAULT_STATE == M.validate_config({"table": "t"})["state_path"]
-
-
-def test_deadman_takes_the_config_table_then_env_then_the_state_file(tmp_path, monkeypatch):
-    D = _load_deadman()
-    state = tmp_path / "state.json"
-    state.write_text(json.dumps({"table": "statetable"}))
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
     monkeypatch.setenv("EGRESS_TABLE", "envtable")
-    p = tmp_path / "c.json"
-    tables = []
-    for config in [{"table": "egress"}, {"table": None}]:
-        p.write_text(json.dumps(config))
-        calls: list = []
-        assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
-        tables.append(calls[0][-1])
-    assert tables == ["egress", "envtable"]
+    _write_record(deadman_record, preferred_metric=50)
+    calls: list = []
+    assert D.main(["--config", str(_config(tmp_path, config))],
+                  runner=_nothing_left(calls)) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "50", "table", "egress"]]
 
 
-def test_deadman_finds_the_table_the_actuator_saved_once_the_config_breaks(
-        tmp_path, monkeypatch, capsys):
-    """End to end: a good tick saves the table; an edit then breaks the config, the
-    tick exits 2, and the dead-man (no EGRESS_TABLE) still finds the table."""
+@pytest.mark.parametrize("config", NO_CONFIG_TABLE)
+def test_deadman_skips_when_the_record_says_the_last_tick_was_a_dry_run(
+        tmp_path, monkeypatch, capsys, deadman_record, config):
+    """The shadow-run hazard: a dry-run actuator runs beside a live one, and an edit
+    leaves its config unusable. The preferred default in the table is the live
+    actuator's, so the dead-man must leave it alone, though EGRESS_TABLE names the
+    table."""
     D = _load_deadman()
-    monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    state = tmp_path / "state.json"
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))   # where the actuator keeps it
-    p = tmp_path / "c.json"
-    p.write_text(json.dumps({"table": "egress", "state_path": str(state)}))
-    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
-    assert M.main(["--config", str(p)]) == 0
-    p.write_text('{"table": "egress", "state_pa')
-    assert M.main(["--config", str(p)]) == 2
-    assert "CONFIG ERROR" in capsys.readouterr().err
+    monkeypatch.setenv("EGRESS_TABLE", "egress")
+    _write_record(deadman_record, dry_run=True)
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(_config(tmp_path, config))], runner=_never) == 0
+    assert capsys.readouterr().out == ("relay-egress-deadman: skipping (the last tick was a "
+                                       f"dry run, per {deadman_record})\n")
+    assert err.getvalue() == ""
+
+
+@pytest.mark.parametrize("config", ['{"table": "egress", "dry_run": true}', '{"dry_run": true}'],
+                         ids=["with-table", "without-table"])
+def test_deadman_skips_on_a_config_dry_run_whatever_the_record_says(tmp_path, capsys,
+                                                                     deadman_record, config):
+    """A config that parses is the operator's latest word, so it is read first."""
+    D = _load_deadman()
+    _write_record(deadman_record, dry_run=False)
+    assert D.main(["--config", str(_config(tmp_path, config))], runner=_never) == 0
+    assert capsys.readouterr().out == "relay-egress-deadman: skipping (dry_run in config)\n"
+
+
+def test_deadman_takes_the_records_metric_over_one_from_a_config_without_a_table(
+        tmp_path, deadman_record):
+    """The actuator rejects a config without a usable table, so its routes carry the
+    metric of the last config it ran with: the record's (70), not this config's (50)."""
+    D = _load_deadman()
+    _write_record(deadman_record, preferred_metric=70)
+    p = _config(tmp_path, json.dumps({"table": "", "preferred_metric": 50}))
     calls: list = []
     assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "70", "table", "egress"]]
+
+
+@pytest.mark.parametrize("metric", [True, 0, -1, "50", 1.5, None, "missing"],
+                         ids=["bool", "zero", "negative", "str", "float", "null", "missing"])
+def test_deadman_record_metric_that_is_not_usable_gives_100(tmp_path, deadman_record, metric):
+    D = _load_deadman()
+    rec = {"table": "egress", "dry_run": False, "written_at": NOW}
+    if metric != "missing":
+        rec["preferred_metric"] = metric
+    deadman_record.write_text(json.dumps(rec))
+    calls: list = []
+    assert D.main(["--config", str(tmp_path / "missing.json")],
+                  runner=_nothing_left(calls)) == 0
     assert calls == [DEL_EGRESS]
+
+
+@pytest.mark.parametrize("dry_run", ["true", 1, "yes", None],
+                         ids=["string-true", "one", "yes", "null"])
+def test_deadman_fails_open_on_a_record_dry_run_that_is_not_a_real_true(tmp_path,
+                                                                        deadman_record,
+                                                                        dry_run):
+    """The actuator writes only true or false. Anything else is no dry run, so the
+    dead-man deletes (fails open), as for such a value in the config."""
+    D = _load_deadman()
+    _write_record(deadman_record, dry_run=dry_run)
+    calls: list = []
+    assert D.main(["--config", str(tmp_path / "missing.json")],
+                  runner=_nothing_left(calls)) == 0
+    assert calls == [DEL_EGRESS]
+
+
+@pytest.mark.parametrize("table", [None, "", 5, ["egress"]],
+                         ids=["null", "empty-string", "number", "list"])
+def test_deadman_record_without_a_usable_table_falls_back_to_env(tmp_path, monkeypatch,
+                                                                 deadman_record, table):
+    """With metric 100: $EGRESS_TABLE knows nothing of the record's metric."""
+    D = _load_deadman()
+    monkeypatch.setenv("EGRESS_TABLE", "envtable")
+    _write_record(deadman_record, table=table, preferred_metric=50)
+    calls: list = []
+    assert D.main(["--config", str(tmp_path / "missing.json")],
+                  runner=_nothing_left(calls)) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "100", "table", "envtable"]]
 
 
 @pytest.mark.parametrize("text", [
@@ -1723,21 +2000,71 @@ def test_deadman_finds_the_table_the_actuator_saved_once_the_config_breaks(
     '{"table": 5}', '{"table": ["egress"]}', "[" * DEEP,
 ], ids=["missing", "truncated-json", "empty-file", "list", "null", "string", "no-table",
         "null-table", "empty-table", "number-table", "list-table", "nested-too-deep"])
-def test_deadman_with_no_env_and_no_usable_state_exits_1(tmp_path, monkeypatch, capsys, text):
+def test_deadman_with_no_usable_record_and_no_env_exits_1(tmp_path, monkeypatch, capsys,
+                                                          deadman_record, text):
     D = _load_deadman()
     monkeypatch.delenv("EGRESS_TABLE", raising=False)
-    state = tmp_path / "state.json"
     if text is not None:
-        state.write_text(text)
-    monkeypatch.setattr(D, "DEFAULT_STATE", str(state))
-
-    def run(argv, **kw):
-        raise AssertionError(f"no usable table, so no ip command: {argv}")
-
+        deadman_record.write_text(text)
+    config = tmp_path / "missing.json"
     with _deadman_stderr() as err:
-        assert D.main(["--config", str(tmp_path / "missing.json")], runner=run) == 1
+        assert D.main(["--config", str(config)], runner=_never) == 1
     assert capsys.readouterr().out == ""
-    assert err.getvalue() == NO_TABLE_MSG.format(state) + "\n"
+    assert err.getvalue() == NO_TABLE_MSG.format(config=config, record=deadman_record) + "\n"
+
+
+def test_deadman_takes_the_config_then_the_record_then_env(tmp_path, monkeypatch,
+                                                           deadman_record):
+    D = _load_deadman()
+    monkeypatch.setenv("EGRESS_TABLE", "envtable")
+    _write_record(deadman_record, table="recordtable")
+    p = tmp_path / "c.json"
+    tables = []
+    for config, keep_record in [({"table": "configtable"}, True), ({"table": None}, True),
+                                ({"table": None}, False)]:
+        if not keep_record:
+            deadman_record.unlink()
+        p.write_text(json.dumps(config))
+        calls: list = []
+        assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+        tables.append(calls[0][-1])
+    assert tables == ["configtable", "recordtable", "envtable"]
+
+
+def test_deadman_finds_the_recorded_table_and_metric_once_the_config_breaks(
+        tmp_path, monkeypatch, capsys):
+    """End to end: a good tick records its table and metric, an edit then breaks the
+    config (the tick exits 2), and the dead-man, with no EGRESS_TABLE, deletes the
+    actuator's route. The state file sits at a custom path the dead-man never learns."""
+    D = _load_deadman()
+    monkeypatch.delenv("EGRESS_TABLE", raising=False)
+    p = _main_config(tmp_path, preferred_metric=50,
+                     state_path=str(tmp_path / "elsewhere" / "state.json"))
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    assert M.main(["--config", str(p)]) == 0
+    p.write_text('{"table": "egress", "preferred_metric": 50, "state_pa')
+    assert M.main(["--config", str(p)]) == 2
+    assert "CONFIG ERROR" in capsys.readouterr().err
+    calls: list = []
+    assert D.main(["--config", str(p)], runner=_nothing_left(calls)) == 0
+    assert calls == [["ip", "route", "del", "default", "metric", "50", "table", "egress"]]
+
+
+def test_deadman_leaves_the_live_route_alone_when_a_shadow_runs_config_breaks(
+        tmp_path, monkeypatch, capsys):
+    """End to end, the shadow-run hazard: a dry-run tick records itself, an edit breaks
+    the config (the tick exits 2), and the dead-man runs no `ip` at all, though an
+    EGRESS_TABLE drop-in names the table."""
+    D = _load_deadman()
+    monkeypatch.setenv("EGRESS_TABLE", "egress")
+    p = _main_config(tmp_path, dry_run=True)
+    monkeypatch.setattr(M, "IpRoute", lambda: FakeIp(BASE))
+    assert M.main(["--config", str(p)]) == 0
+    p.write_text('{"table": "egress", "dry_run": tr')
+    assert M.main(["--config", str(p)]) == 2
+    capsys.readouterr()
+    assert D.main(["--config", str(p)], runner=_never) == 0
+    assert "skipping (the last tick was a dry run" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("text", ["{not json", "", "[]", "null", '"egress"'],
@@ -1789,9 +2116,68 @@ def test_deadman_stderr_not_no_such_process_exits_1_with_summary(tmp_path, capsy
     assert "Permission denied" in out
 
 
+@pytest.mark.parametrize("ok_before", [0, 2], ids=["ip-missing", "fails-after-two"])
+def test_deadman_an_ip_that_cannot_run_exits_1(tmp_path, capsys, ok_before):
+    """An OSError from the runner (no `ip` binary, say) is a failure, not a crash: say
+    why, then what was removed."""
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls, left = [], [ok_before]
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if left[0]:
+            left[0] -= 1
+            return R()
+        raise FileNotFoundError(2, "No such file or directory", "ip")
+
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == 1
+    assert len(calls) == ok_before + 1
+    assert capsys.readouterr().out == (
+        "relay-egress-deadman: cannot run ip: [Errno 2] No such file or directory: 'ip'\n"
+        f"relay-egress-deadman: removed {ok_before} preferred default(s) from table egress "
+        "(fail open)\n")
+    assert err.getvalue() == ""
+
+
+@pytest.mark.parametrize("rc, stderr, shown", [
+    pytest.param(2, "", "(no stderr)", id="no-stderr"),
+    pytest.param(-9, "", "(no stderr)", id="killed"),
+    pytest.param(1, "RTNETLINK answers: Permission denied\n",
+                 "RTNETLINK answers: Permission denied", id="permission-denied"),
+    pytest.param(255, 'Error: argument "egress" is wrong: "table" value is invalid\n',
+                 'Error: argument "egress" is wrong: "table" value is invalid',
+                 id="unknown-table"),
+])
+def test_deadman_a_delete_that_fails_for_another_reason_exits_1(tmp_path, capsys, rc, stderr,
+                                                               shown):
+    """Only "No such process" (no route left) and "FIB table does not exist" (no table)
+    mean nothing is left to delete. Any other failure, even one with nothing on stderr
+    or with `ip` killed by a signal (a negative rc), may leave a preferred default
+    standing."""
+    D = _load_deadman()
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"table": "egress"}))
+    calls: list = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return R(rc=rc, err=stderr)
+
+    with _deadman_stderr() as err:
+        assert D.main(["--config", str(p)], runner=run) == 1
+    assert calls == [DEL_EGRESS]
+    assert capsys.readouterr().out == (
+        f"relay-egress-deadman: ip route del failed (rc={rc}): {shown}\n"
+        "relay-egress-deadman: removed 0 preferred default(s) from table egress (fail open)\n")
+    assert err.getvalue() == ""
+
+
 def test_deadman_real_error_after_deletes_reports_the_true_count(tmp_path, capsys):
     """Two deletes work, then one fails for a reason other than "nothing left": the
-    summary must say 2 were removed, not 0, before it says why it stopped."""
+    dead-man says why it stopped, then that 2 were removed, not 0."""
     D = _load_deadman()
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"table": "egress"}))
@@ -1808,10 +2194,10 @@ def test_deadman_real_error_after_deletes_reports_the_true_count(tmp_path, capsy
         assert D.main(["--config", str(p)], runner=run) == 1
     assert len(calls) == 3
     out = capsys.readouterr().out
-    assert out == ("relay-egress-deadman: removed 2 preferred default(s) from table egress "
-                   "(fail open)\n"
-                   "relay-egress-deadman: ip route del failed: "
-                   "RTNETLINK answers: Operation not permitted\n")
+    assert out == ("relay-egress-deadman: ip route del failed (rc=2): "
+                   "RTNETLINK answers: Operation not permitted\n"
+                   "relay-egress-deadman: removed 2 preferred default(s) from table egress "
+                   "(fail open)\n")
     assert err.getvalue() == ""
 
 
@@ -1835,3 +2221,20 @@ def test_units_wire_the_deadman_and_the_paths():
     dead = (_DIR / "systemd/relay-egress-deadman.service").read_text()
     assert "ExecStart=/usr/local/sbin/relay-egress-deadman --config " in dead
     assert "Type=oneshot" in dead
+
+
+README = _DIR / "README.md"
+
+
+@pytest.mark.parametrize("field, default, cap", [
+    ("upstreams.<name>.probe.timeout_s", 5, "MAX_PROBE_TIMEOUT_S"),
+    ("client.fetch_timeout_s", 1, "MAX_FETCH_TIMEOUT_S"),
+    ("client.bootstrap_timeout_s", 5, "MAX_BOOTSTRAP_TIMEOUT_S"),
+])
+def test_the_readme_gives_each_timeouts_cap(field, default, cap):
+    """An operator sizes the timeouts from the README; a config over a cap exits 2."""
+    assert f"`{field}` (default {default}, at most {getattr(M, cap)}" in README.read_text()
+
+
+def test_the_readme_names_the_deadman_record():
+    assert "`/run/relay-egress-watchdog/deadman.json`" in README.read_text()

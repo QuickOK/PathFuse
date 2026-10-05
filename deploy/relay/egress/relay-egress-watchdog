@@ -17,9 +17,10 @@ things in it:
 A lower-priority WAN default, installed by something else, stays in the table.
 With no preferred route, traffic falls through to it (fail open).
 
-Fired as a Type=oneshot by a 10 s timer. Each tick probes every upstream, polls
-the client for the desired mode, then reconciles the table. README.md beside this
-file documents the mode vocabulary and the config format.
+Fired as a Type=oneshot by a 10 s timer. Each tick records what it runs with for the
+dead-man switch (DEADMAN_RECORD), probes every upstream, polls the client for the
+desired mode, then reconciles the table. README.md beside this file documents the
+mode vocabulary, the config format and the dead-man switch.
 """
 from __future__ import annotations
 
@@ -53,15 +54,26 @@ MODE_ALIASES = {
 
 DEFAULT_CONFIG = "/etc/relay-egress-watchdog/config.json"
 
+# The dead-man record. Every tick writes here the table, preferred metric and dry_run
+# it runs with, as soon as its config has validated, for relay-egress-deadman to read
+# should the config become unreadable. A fixed path (in the unit's RuntimeDirectory),
+# so the dead-man needs nothing from the config to find it; relay-egress-deadman names
+# the same path.
+DEADMAN_RECORD = "/run/relay-egress-watchdog/deadman.json"
+
 # Caps on the waits one tick can make, in seconds. The unit gives a tick
-# TimeoutStartSec=25 and, past it, systemd kills the tick and the dead-man withdraws
-# the preferred route. The probes (curl --max-time timeout_s) run in parallel and the
-# client poll follows them, so a slow tick lasts about probe + poll: 20 s with both at
-# their caps, or 25 s on a cold start (no last-known mode yet), when the poll may wait
-# the bootstrap timeout instead.
-MAX_PROBE_TIMEOUT_S = 10
-MAX_FETCH_TIMEOUT_S = 10
-MAX_BOOTSTRAP_TIMEOUT_S = 15
+# TimeoutStartSec=25; past it, systemd kills the tick and the dead-man withdraws the
+# preferred route. The upstreams are probed in parallel, each with a link check (`ip`,
+# LINK_TIMEOUT_S) and then curl (--max-time timeout_s, killed PROBE_BACKSTOP_S later
+# should it overrun). The client poll follows them and waits the fetch timeout, or the
+# longer bootstrap timeout on a cold start (no last-known mode yet). The slowest tick:
+#   link check 2 + probe (8 + 3 backstop) + bootstrap 8 = 21 s < 25,
+# leaving 4 s for the `ip route` work.
+MAX_PROBE_TIMEOUT_S = 8
+MAX_FETCH_TIMEOUT_S = 5
+MAX_BOOTSTRAP_TIMEOUT_S = 8
+LINK_TIMEOUT_S = 2
+PROBE_BACKSTOP_S = 3
 
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 _UPSTREAM_NAME = re.compile(r"[a-z0-9_-]{1,32}")
@@ -86,6 +98,8 @@ def _positive(name: str, value, maximum: Optional[float] = None) -> float:
         raise ConfigError(f"{name} must be a number, got {value!r}")
     try:
         f = float(value)
+    except OverflowError:   # an int too big for a float: JSON sets no limit on its size
+        f = float("inf")
     except (TypeError, ValueError):
         raise ConfigError(f"{name} must be a number, got {value!r}") from None
     if not 0 < f < float("inf"):
@@ -192,6 +206,9 @@ def _validate_exempt(raw) -> dict:
         raise ConfigError("exempt.prefixes must be a list")
     norm = []
     for p in prefixes:
+        if not isinstance(p, str):
+            # IPv4Network would read an int (or a bool) as one address: a /32.
+            raise ConfigError(f"exempt.prefixes: {p!r}: must be a string")
         try:
             net = ipaddress.IPv4Network(p, strict=True)
         except (ValueError, TypeError) as e:  # AddressValueError is a ValueError
@@ -276,7 +293,7 @@ def validate_config(raw) -> dict:
 def load_config(path) -> dict:
     try:
         raw = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as e:
+    except Exception as e:   # OSError, ValueError, RecursionError (nested too deep), ...
         raise ConfigError(f"cannot read {path}: {e}") from None
     return validate_config(raw)
 
@@ -396,19 +413,23 @@ def probe_matches(body: str, expect: str) -> Optional[str]:
 
 
 def link_up(iface: str, runner=subprocess.run) -> Optional[bool]:
-    """True when `iface` is admin-UP; False when it is missing (`ip` fails on it, as
-    after `wg-quick down` deletes a tunnel) or not UP; None when `ip` cannot tell
-    (it hangs, cannot run, or prints something unreadable)."""
+    """True when `iface` is admin-UP. False when it is admin-down, or missing: `ip` says
+    it does not exist, as after `wg-quick down` deletes a tunnel. None when `ip` cannot
+    tell: it fails for any other reason, hangs, cannot run, or prints something
+    unreadable. False is a hard failure; None says nothing about the link, so it is an
+    ordinary one."""
     try:
         r = runner(["ip", "-j", "link", "show", "dev", iface],
-                   capture_output=True, text=True, timeout=2)
+                   capture_output=True, text=True, timeout=LINK_TIMEOUT_S)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if r.returncode != 0:
-        return False
+        return False if "does not exist" in (r.stderr or "") else None
     try:
-        flags = json.loads(r.stdout)[0].get("flags", [])
-    except (ValueError, IndexError, AttributeError, TypeError):
+        flags = json.loads(r.stdout)[0]["flags"]
+    except (ValueError, LookupError, TypeError, RecursionError):
+        return None
+    if not isinstance(flags, list):
         return None
     return "UP" in flags
 
@@ -422,17 +443,20 @@ class ProbeResult(NamedTuple):
 
 
 def run_probe(upstream: dict, runner=subprocess.run) -> ProbeResult:
-    """The link check, then the HTTP probe."""
+    """The link check, then the HTTP probe. Only a link known to be missing or down is
+    a hard failure; a link `ip` cannot tell about fails the probe softly, as a curl
+    failure does."""
     link = upstream.get("link")
     if link:
         state = link_up(link, runner)
         if state is None:
-            return ProbeResult(False, f"cannot check link {link}")
+            return ProbeResult(False, f"cannot check link {link}", hard=False)
         if not state:
             return ProbeResult(False, f"link {link} down", hard=True)
     p = upstream["probe"]
     try:
-        r = runner(probe_argv(p), capture_output=True, text=True, timeout=p["timeout_s"] + 3)
+        r = runner(probe_argv(p), capture_output=True, text=True,
+                   timeout=p["timeout_s"] + PROBE_BACKSTOP_S)
     except subprocess.TimeoutExpired:
         return ProbeResult(False, "timeout")
     except OSError as e:
@@ -531,15 +555,29 @@ def load_state(path) -> dict:
     return s if isinstance(s, dict) else {}
 
 
-def save_state(path, state: dict) -> None:
+def _write_json(path, obj) -> None:
+    """Write `obj` to `path` whole: into a temporary file, then renamed over `path`, so
+    a reader finds the old content or the new, never part of it."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
     tmp.replace(p)
 
 
+def save_state(path, state: dict) -> None:
+    _write_json(path, state)
+
+
+def write_deadman_record(path, cfg: dict, now: float) -> None:
+    """Record for the dead-man switch what this tick runs with (see DEADMAN_RECORD)."""
+    _write_json(path, {"table": cfg["table"], "preferred_metric": cfg["preferred_metric"],
+                       "dry_run": cfg["dry_run"], "written_at": now})
+
+
 _MAX_TS = 1e11  # about the year 5138: a later "timestamp" in a state file is corrupt
+_MAX_COUNT = 10 ** 9   # a larger "count" in a state file is corrupt
+_MAX_FUTURE_S = 300    # a fetch time further ahead than this: the clock has stepped back
 
 
 def _is_ts(v) -> bool:
@@ -549,7 +587,12 @@ def _is_ts(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= _MAX_TS
 
 
-def with_defaults(state: dict, cfg: dict) -> dict:
+def _is_count(v) -> bool:
+    """A usable counter: an int (not a bool) from 0 to _MAX_COUNT."""
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_COUNT
+
+
+def with_defaults(state: dict, cfg: dict, now: float) -> dict:
     """`state` with every key a tick needs and every value usable; upstreams no longer
     configured are dropped. The file can be hand-edited, so a wrong-typed or absurd
     value is reset to its default rather than trusted: it must never crash a tick
@@ -565,12 +608,16 @@ def with_defaults(state: dict, cfg: dict) -> dict:
     for key in ("desired_mode_fetched_at", "last_route_change", "last_check"):
         if not _is_ts(s[key]):
             s[key] = 0.0
+    if s["desired_mode_fetched_at"] > now + _MAX_FUTURE_S:
+        # The clock has stepped back. The mode's age would read as negative, holding it
+        # "within grace" until the clock caught up, however long the fetches failed.
+        s["desired_mode_fetched_at"] = 0.0
     if s["desired_mode"] is not None and s["desired_mode_fetched_at"] <= 0:
         # tick() reads a fetch time of 0 as "no age", so a mode kept without one would
         # never age out while the fetches fail. Drop it: the default stands in.
         s["desired_mode"] = None
 
-    if not isinstance(s.get("desired_mode_fetch_fail"), int) or isinstance(s.get("desired_mode_fetch_fail"), bool):
+    if not _is_count(s["desired_mode_fetch_fail"]):
         s["desired_mode_fetch_fail"] = 0
 
     old = state.get("upstreams")
@@ -587,7 +634,7 @@ def with_defaults(state: dict, cfg: dict) -> dict:
                 if not isinstance(h[key], bool):
                     h[key] = new_health()[key]
             elif key in ("consecutive_pass", "consecutive_fail"):
-                if not isinstance(h[key], int) or isinstance(h[key], bool):
+                if not _is_count(h[key]):
                     h[key] = new_health()[key]
             elif key == "last_probe":
                 if not isinstance(h[key], str):
@@ -640,9 +687,8 @@ def tick(cfg: dict, state: dict, now: float, *, ip, probe: Callable = run_probe,
     the dead-man switch every 10 s. The next tick retries the exemption.
     """
     fetch = fetch or fetch_desired_mode
-    s = with_defaults(state, cfg)
+    s = with_defaults(state, cfg, now)
     s["last_check"] = now
-    s["table"] = cfg["table"]   # for the dead-man, should the config become unreadable
     dry = cfg["dry_run"]
     tag = "DRY-RUN " if dry else ""
 
@@ -743,7 +789,16 @@ def main(argv=None) -> int:
     except ConfigError as e:
         print(f"CONFIG ERROR: {e}", file=sys.stderr, flush=True)
         return 2
-    state, rc = tick(cfg, load_state(cfg["state_path"]), time.time(), ip=IpRoute(),
+    now = time.time()
+    # Before any route work, so the record stands even if this tick then fails. A write
+    # that fails leaves the last record in place (or none): worth an ERROR, not a failed
+    # tick, which would fire the dead-man every 10 s.
+    try:
+        write_deadman_record(DEADMAN_RECORD, cfg, now)
+    except OSError as e:
+        print(f"ERROR: cannot write the dead-man record {DEADMAN_RECORD}: {e}",
+              file=sys.stderr, flush=True)
+    state, rc = tick(cfg, load_state(cfg["state_path"]), now, ip=IpRoute(),
                      log=lambda line: print(line, flush=True))
     try:
         save_state(cfg["state_path"], state)
