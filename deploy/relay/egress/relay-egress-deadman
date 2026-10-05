@@ -7,20 +7,32 @@ systemd runs this (OnFailure=) when a relay-egress-watchdog tick fails:
 - the actuator exits 2 (it rejected its config),
 - the actuator crashes, or
 - the tick times out.
-It deletes every preferred default (metric 100 unless the config says otherwise)
-from the egress table, so the client's traffic falls through to the relay's own
-WAN default. It is independent of the main script on purpose: it must work while
-that script is broken.
+It deletes every preferred default from the egress table, so the client's traffic
+falls through to the relay's own WAN default. It is independent of the main script on
+purpose: it must work while that script is broken.
 
-The table comes from the config. When the config names no usable table (it may be
-the very thing that broke), it comes from $EGRESS_TABLE if that is set and not
-empty, else from the "table" the actuator writes into its state file every tick
-(the config's state_path when the config holds a usable one, else
-/run/relay-egress-watchdog/state.json). With none of these, it exits 1.
+It takes the table and the preferred metric from the first of these that has them:
+1. The config, when it parses as a JSON object. "dry_run": true there skips the
+   dead-man (exit 0). Otherwise its "table", if a non-empty string, is used with its
+   "preferred_metric" (100 unless that is an integer >= 1).
+2. The record each actuator tick writes, as soon as its config has validated, at
+   /run/relay-egress-watchdog/deadman.json: the table, preferred_metric and dry_run
+   that tick ran with. "dry_run": true there (the last tick was a dry run) skips the
+   dead-man (exit 0). Otherwise its table, if a non-empty string, is used with its
+   preferred_metric (100 unless an integer >= 1).
+3. $EGRESS_TABLE, when set and not empty, with metric 100.
+With none of these it deletes nothing and exits 1.
 
-If the config has "dry_run": true, this script skips execution (does not run
-any ip commands) and exits 0. This prevents the dead-man from undoing a
-shadow run's dry-run state.
+Only a real true is a dry run: the actuator rejects any other dry_run value rather
+than read it as one, so the dead-man fails open on it.
+
+The record is what keeps a shadow run safe. While a dry-run actuator runs beside a
+live one, the preferred default belongs to the live one; should an edit leave the
+dry-run actuator's config unusable, the record still tells the dead-man to keep off.
+
+A delete that fails for any reason but "nothing left to delete" stops the dead-man
+with exit 1, as does an `ip` that hangs or cannot run. So does a delete that still
+succeeds after MAX_DELETES (16) have: preferred defaults may remain.
 """
 import argparse
 import json
@@ -29,112 +41,111 @@ import subprocess
 import sys
 
 IP_TIMEOUT_S = 5   # one `ip route del` may take this long before it counts as hung
-DEFAULT_STATE = "/run/relay-egress-watchdog/state.json"   # the actuator's default state_path
+MAX_DELETES = 16   # then one more attempt must find nothing left (see delete_preferred)
+DEADMAN_RECORD = "/run/relay-egress-watchdog/deadman.json"   # the actuator's DEADMAN_RECORD
+DEFAULT_METRIC = 100
+# What `ip route del` says when there is nothing to delete: no such route (any more),
+# or no such table.
+NOTHING_LEFT = ("No such process", "FIB table does not exist")
 
 
-def read_config(config_path):
-    """(table, metric, dry_run, state_path) from the config. Each value the config
-    does not hold in usable form falls back on its own: the table to None, the
-    metric to 100, dry_run to False and state_path to DEFAULT_STATE. An unreadable
-    config gives all four fallbacks.
-
-    - unusable metric (non-int, bool, < 1) falls back to 100 without discarding a good table
-    - missing/null/empty/non-str table or state_path falls back
-    """
-    dry_run = False
-    table = None
-    metric = 100
-    state_path = DEFAULT_STATE
-
+def read_object(path):
+    """The JSON object in the file at `path`, or None when the file is missing,
+    unreadable, not JSON, nested too deep or not an object."""
     try:
-        with open(config_path) as f:
+        with open(path) as f:
             raw = json.load(f)
-
-        # Parse table: must be non-empty string
-        t = raw.get("table")
-        if isinstance(t, str) and t:
-            table = t
-
-        # Parse metric: must be int >= 1 (not bool)
-        m = raw.get("preferred_metric", 100)
-        if isinstance(m, int) and not isinstance(m, bool) and m >= 1:
-            metric = m
-
-        # Parse dry_run: must be bool
-        d = raw.get("dry_run", False)
-        if isinstance(d, bool):
-            dry_run = d
-
-        # Parse state_path: must be non-empty string
-        p = raw.get("state_path")
-        if isinstance(p, str) and p:
-            state_path = p
-
-    except Exception:
-        pass  # fall back to defaults
-
-    return table, metric, dry_run, state_path
-
-
-def state_table(state_path):
-    """The table the actuator last wrote into its state file, or None when the file
-    is missing or unreadable or names no usable table."""
-    try:
-        with open(state_path) as f:
-            t = json.load(f).get("table")
-    except Exception:   # missing, garbage, not an object, nested too deep
+    except Exception:   # OSError, ValueError, RecursionError, ...
         return None
+    return raw if isinstance(raw, dict) else None
+
+
+def usable_table(raw):
+    """raw's "table" when it is a non-empty string, else None."""
+    t = raw.get("table")
     return t if isinstance(t, str) and t else None
+
+
+def usable_metric(raw):
+    """raw's "preferred_metric" when it is an integer >= 1 (not a bool), else 100."""
+    m = raw.get("preferred_metric")
+    return m if isinstance(m, int) and not isinstance(m, bool) and m >= 1 else DEFAULT_METRIC
+
+
+def resolve(config_path, record_path, env_table):
+    """(table, metric, skip), from the first source that has them (see above). `skip`,
+    when set, says why there is nothing of the actuator's to delete; `table` is None
+    when no source names one."""
+    config = read_object(config_path)
+    if config is not None:
+        if config.get("dry_run") is True:
+            return None, DEFAULT_METRIC, "dry_run in config"
+        table = usable_table(config)
+        if table:
+            return table, usable_metric(config), None
+    # The actuator rejects a config without a usable table, so the record holds what it
+    # last ran with: its table, and the metric of the routes that tick installed.
+    record = read_object(record_path)
+    if record is not None:
+        if record.get("dry_run") is True:
+            return None, DEFAULT_METRIC, f"the last tick was a dry run, per {record_path}"
+        table = usable_table(record)
+        if table:
+            return table, usable_metric(record), None
+    if env_table:
+        return env_table, DEFAULT_METRIC, None
+    return None, DEFAULT_METRIC, None
+
+
+def delete_preferred(table, metric, runner):
+    """Delete preferred defaults until none is left. Returns (removed, error): error is
+    None once `ip` reports nothing left to delete, else why the dead-man stopped.
+
+    After MAX_DELETES deletes it makes one more attempt, which must find nothing left.
+    Should that one delete a default too, more may remain: that is an error as well,
+    never a clean fail open."""
+    argv = ["ip", "route", "del", "default", "metric", str(metric), "table", table]
+    removed = 0
+    for _ in range(MAX_DELETES + 1):   # the last attempt confirms that none is left
+        try:
+            r = runner(argv, capture_output=True, text=True, timeout=IP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return removed, f"ip route del timed out after {IP_TIMEOUT_S} s"
+        except OSError as e:
+            return removed, f"cannot run ip: {e}"
+        if r.returncode == 0:
+            removed += 1
+            continue
+        err = (r.stderr or "").strip()
+        if any(s in err for s in NOTHING_LEFT):
+            return removed, None
+        # Anything else, an empty stderr or a signal (rc < 0) included, may leave a
+        # preferred default standing.
+        return removed, f"ip route del failed (rc={r.returncode}): {err or '(no stderr)'}"
+    return removed, (f"gave up after {removed} deletes that all succeeded: preferred "
+                     "defaults may remain")
 
 
 def main(argv=None, runner=subprocess.run) -> int:
     ap = argparse.ArgumentParser(description="Delete every preferred egress default (fail open).")
     ap.add_argument("--config", default="/etc/relay-egress-watchdog/config.json")
     args = ap.parse_args(argv)
-    table, metric, dry_run, state_path = read_config(args.config)
-
-    # If the config says dry_run, skip execution (safe for shadow runs)
-    if dry_run:
-        print("relay-egress-deadman: skipping (dry_run in config)", flush=True)
+    table, metric, skip = resolve(args.config, DEADMAN_RECORD, os.environ.get("EGRESS_TABLE"))
+    if skip:
+        print(f"relay-egress-deadman: skipping ({skip})", flush=True)
         return 0
-
-    table = table or os.environ.get("EGRESS_TABLE") or state_table(state_path)
     if not table:
-        msg = (f"relay-egress-deadman: no table (config has no usable table, EGRESS_TABLE "
-               f"is unset/empty, and the state file {state_path} names none)")
-        print(msg, file=sys.stderr, flush=True)
+        print(f"relay-egress-deadman: no table (the config {args.config} names no usable "
+              f"table, the record {DEADMAN_RECORD} is missing or names none, and "
+              f"EGRESS_TABLE is unset or empty)", file=sys.stderr, flush=True)
         return 1
 
-    removed = 0
-    for _ in range(16):
-        try:
-            r = runner(["ip", "route", "del", "default", "metric", str(metric), "table", table],
-                       capture_output=True, text=True, timeout=IP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            # A hung ip is not success: report what was removed, say why we stopped, exit 1
-            print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
-                  f"{table} (fail open)", flush=True)
-            print(f"relay-egress-deadman: ip route del timed out after {IP_TIMEOUT_S} s",
-                  flush=True)
-            return 1
-
-        if r.returncode != 0:
-            # Stop looping if we get a return code
-            stderr = r.stderr if hasattr(r, 'stderr') else ""
-            # "No such process" and "FIB table does not exist" both mean nothing to delete
-            if stderr and "No such process" not in stderr and "FIB table does not exist" not in stderr:
-                # Real error; print summary and exit 1
-                print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
-                      f"{table} (fail open)", flush=True)
-                print(f"relay-egress-deadman: ip route del failed: {stderr.strip()}", flush=True)
-                return 1
-            break
-
-        removed += 1
-
+    removed, error = delete_preferred(table, metric, runner)
+    if error:
+        print(f"relay-egress-deadman: {error}", flush=True)
     print(f"relay-egress-deadman: removed {removed} preferred default(s) from table "
           f"{table} (fail open)", flush=True)
-    return 0
+    return 1 if error else 0
 
 
 if __name__ == "__main__":

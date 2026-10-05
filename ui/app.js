@@ -4,7 +4,10 @@ const $  = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 const EGRESS_LABELS = {relay_vpn: "relay-VPN", relay_backbone: "relay Backbone",
                        relay_direct: "relay Direct", local_direct: "Local Direct"};
-const egressLabel = (m) => EGRESS_LABELS[m] || m || "unknown";
+// Own keys only: a mode named "constructor" or "toString" must render as itself,
+// not as the Object.prototype member of that name.
+const egressLabel = (m) => Object.prototype.hasOwnProperty.call(EGRESS_LABELS, m)
+  ? EGRESS_LABELS[m] : (m || "unknown");
 
 /* ---------- layout toggle (ops | wall) ---------- */
 (function initLayoutToggle(){
@@ -658,7 +661,9 @@ function renderFec(s){
   const dirs = fec.directions || {};
   const sub  = $("#fec-sub");
   const desiredMode = fec.desired_mode || (fec.desired_enabled ? "adaptive" : "off");
-  const modeLabel   = FEC_MODE_LABELS[desiredMode] || desiredMode;
+  // Own keys only, as in egressLabel: a mode named "constructor" must render as itself.
+  const modeLabel   = Object.prototype.hasOwnProperty.call(FEC_MODE_LABELS, desiredMode)
+    ? FEC_MODE_LABELS[desiredMode] : desiredMode;
   if (sub) sub.textContent = !fec.configured ? "not configured"
                         : (desiredMode === "fixed"
                             ? `fixed ${fec.desired_fixed_ratio || ""}`.trim()
@@ -1551,11 +1556,14 @@ function renderLocationFec(s){
   });
 }
 
-/* Move the single "default" tag onto the configured default egress mode. */
+/* Move the single "default" tag onto the configured default egress mode. The radio
+   is found by comparing values, never by a selector built from server data: a quote
+   in the mode would make querySelector throw and end the render. */
 function renderEgressDefault(s){
   const tag = $("#egress-default-tag");
-  const input = s.egress_default_mode &&
-    document.querySelector(`input[name="egress_mode"][value="${s.egress_default_mode}"]`);
+  const want = s.egress_default_mode;
+  const input = want &&
+    Array.from(document.querySelectorAll('input[name="egress_mode"]')).find(r => r.value === want);
   const span = input && input.nextElementSibling;
   if (!tag || !span || tag.parentElement === span) return;
   span.insertBefore(tag, span.querySelector(".tip"));

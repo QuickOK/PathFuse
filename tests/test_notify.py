@@ -968,6 +968,32 @@ def test_egress_a_new_mismatch_pages_again_after_the_alert_ends(ending):
     assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
 
 
+def test_egress_mismatch_at_startup_counts_as_announced():
+    # As with a WAN already down at startup: a restart must not page on a fallback
+    # it finds in place, but the recovery from it is still news.
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # seed
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # no page: already announced
+    evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert len(evs) == 1 and evs[0].kind == "egress" and "restored" in evs[0].title.lower()
+
+
+@pytest.mark.parametrize("first", [
+    pytest.param(_eg("checking"), id="checking"),
+    pytest.param(_eg("pending"), id="pending"),
+    pytest.param(_eg("error"), id="error"),
+    pytest.param(_eg("match", observed="relay_backbone"), id="match"),
+    pytest.param(_eg("skipped", selected="local_direct"), id="skipped"),
+])
+def test_egress_only_a_mismatch_at_startup_counts_as_announced(first):
+    # Anything short of a confirmed mismatch at startup leaves the page armed:
+    # seeding it as announced would swallow the first real fallback.
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=first)) == []                    # seed
+    evs = d.observe(obs(egress=_eg("mismatch")))
+    assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
+
+
 def test_egress_none_is_ignored():
     d = notify.EventDetector()
     d.observe(obs())

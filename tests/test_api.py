@@ -722,7 +722,10 @@ def test_run_controller_pushes_wan_profile_and_signal_floor_to_relay(tmp_path, m
                          floor_ratio="8:0", signal_floor_fec="12:1")}),
         cell=M.CellTelemetryCfg(state_path=str(cell_state), wan="wan1",
                                 stale_after_s=30.0, rsrq_degrade_db=-12.0,
-                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0),
+                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0,
+                                # Never written, so no handoff window. Unset, it
+                                # is the box's live file.
+                                handoff_path=str(tmp_path / "cell_handoff.json")),
     )
     # RSRQ well past the degrade threshold -> signal floor engages this tick.
     cell_state.write_text(json.dumps({"rsrq": -13.0, "rsrp": None,
@@ -799,7 +802,10 @@ def test_run_controller_suppresses_signal_floor_when_full_mode_backoff_gate_clos
                          floor_ratio="8:0", signal_floor_fec="12:1")}),
         cell=M.CellTelemetryCfg(state_path=str(cell_state), wan="wan1",
                                 stale_after_s=30.0, rsrq_degrade_db=-12.0,
-                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0),
+                                rsrq_recover_db=-10.0, rsrp_degrade_dbm=-110.0,
+                                # Never written, so no handoff window. Unset, it
+                                # is the box's live file.
+                                handoff_path=str(tmp_path / "cell_handoff.json")),
     )
     # RSRQ well past the degrade threshold -> would engage the signal floor
     # if not for the full-mode-backoff gate below.
@@ -1484,10 +1490,22 @@ def test_run_controller_reposts_when_only_the_location_level_changes(
     assert levels[-1] == 1, f"expected a re-post at the new level, got {levels}"
 
 
+def _map_paths(tmp_path):
+    """A `map` config section naming each file /api/map reads, all under tmp_path.
+
+    Left unset, each one defaults to the box's live file (sbfd_ctl._MAP_DEFAULTS)."""
+    return {"stations_path": str(tmp_path / "stations.json"),
+            "labels_path": str(tmp_path / "station_labels.json"),
+            "environ_points_path": str(tmp_path / "environ_points.json"),
+            "location_store_path": str(tmp_path / "location_fec_store.json"),
+            "location_config_path": str(tmp_path / "location-fec.json"),
+            "location_zones_path": str(tmp_path / "location_zones.json")}
+
+
 def _zone_cfg(cfg, tmp_path):
-    cfg.map = {"location_zones_path": str(tmp_path / "location_zones.json")}
+    cfg.map = paths = _map_paths(tmp_path)
     Path(cfg.published_state).write_text("{}")
-    return str(tmp_path / "location_zones.json")
+    return paths["location_zones_path"]
 
 
 def _post_zone(port, payload):
@@ -1608,13 +1626,7 @@ def test_api_post_location_zone_uses_the_driving_profiles_table(cfg_with_fec, tm
 def test_api_map_explains_every_fec_level(cfg_with_fec, tmp_path):
     """The zone editor cannot ask for "level 3" intuitively without being told
     what level 3 is on the link driving FEC, so /api/map has to pass cfg.fec."""
-    cfg_with_fec.map = {"location_zones_path":
-                        str(tmp_path / "location_zones.json"),
-                        "location_store_path": str(tmp_path / "store.json"),
-                        "location_config_path": str(tmp_path / "lf.json"),
-                        "stations_path": str(tmp_path / "s.json"),
-                        "labels_path": str(tmp_path / "l.json"),
-                        "environ_points_path": str(tmp_path / "e.json")}
+    cfg_with_fec.map = _map_paths(tmp_path)
     Path(cfg_with_fec.published_state).write_text(json.dumps(
         {"fec": {"floor_ratio": "8:2", "profile": {"driver_wan": "wan2"}},
          "wan_labels": {"wan1": "Cellular", "wan2": "Satellite"}}))

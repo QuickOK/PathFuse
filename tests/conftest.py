@@ -1,4 +1,5 @@
 # tests/conftest.py
+import os
 import socket
 import sys
 import threading
@@ -96,3 +97,62 @@ def http_servers():
     servers = HttpServers()
     yield servers
     servers.stop_all()
+
+
+# The box's own config and state: sbfd-ctl's, and the relay egress actuator's (its
+# config; its runtime dir with the dead-man record and the default state file). A
+# test that opens a file under one of these reads what the running daemons read, and
+# a test that writes there would overwrite their data if the suite ran with enough
+# privilege.
+LIVE_STATE_DIRS = ("/etc/sbfd-ctl", "/var/lib/sbfd-ctl", "/run/sbfd-ctl",
+                   "/etc/relay-egress-watchdog", "/run/relay-egress-watchdog")
+
+
+class LiveStateGuard:
+    """Records each path under LIVE_STATE_DIRS that is opened while a test runs.
+
+    It is an audit hook, so it sees every thread: a request handler or a controller
+    loop working for the test counts as the test. The `open` event fires before the
+    file is opened, so an open that then fails (a missing file, or a write the user
+    may not make) is recorded too. Paths are made absolute but symlinks are not
+    followed. An audit hook cannot be removed, so this one is installed once per
+    session and records nothing between tests.
+    """
+
+    def __init__(self):
+        self.opened: list[str] | None = None   # a list while a test runs
+
+    def audit(self, event, args):
+        opened = self.opened
+        if event != "open" or opened is None:
+            return
+        try:
+            path = os.path.abspath(os.fsdecode(args[0]))
+        except TypeError:   # open(fd) names no path
+            return
+        if any(path == d or path.startswith(d + "/") for d in LIVE_STATE_DIRS):
+            opened.append(path)
+
+
+@pytest.fixture(scope="session")
+def live_state_guard():
+    """The session's LiveStateGuard, its audit hook installed."""
+    guard = LiveStateGuard()
+    sys.addaudithook(guard.audit)
+    return guard
+
+
+@pytest.fixture(autouse=True)
+def no_live_state(live_state_guard):
+    """Fails a test that opened a file under the box's live config or state dirs.
+
+    Being autouse, this is set up before the test's other function-scoped fixtures
+    and torn down after them, so what they open counts too, at teardown included.
+    """
+    live_state_guard.opened = []
+    yield
+    opened, live_state_guard.opened = live_state_guard.opened, None
+    if opened:
+        pytest.fail("the test opened files under the box's live state dirs; "
+                    "point these paths at tmp_path:\n"
+                    + "\n".join(f"  {p}" for p in sorted(set(opened))), pytrace=False)

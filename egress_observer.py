@@ -230,7 +230,8 @@ class EgressObserver:
     the selected mode changes. The relay applies a new mode on its next 10 s tick,
     so an immediate check would still report the old exit. Every check that follows
     a mode change waits a full settle first, including a change that lands during
-    the settle."""
+    the settle. Setting the stop flag ends the thread promptly, whether it is
+    settling or waiting out the interval."""
 
     def __init__(self, cfg: ObserveCfg, fetch=fetch_trace, clock=time.time,
                  settle_s: float = 15.0):
@@ -288,7 +289,15 @@ class EgressObserver:
                 self.check_once()
             except Exception:  # the thread must outlive any one bad check
                 logging.exception("egress observer: check failed")
-            self._kick.wait(self.cfg.interval_s)   # a mode change cuts the wait short
+            # A mode change cuts the wait short, and so does a stop (see _kick_on_stop).
+            # Either way the loop test runs next, so a stop returns before any settle.
+            self._kick.wait(self.cfg.interval_s)
+
+    def _kick_on_stop(self, stop: StopSignal) -> None:
+        """Set the kick once `stop` is set. The loop's interval wait sleeps on the
+        kick, so without this a stop would wait out up to interval_s."""
+        stop.wait()
+        self._kick.set()
 
     def start(self, stop: threading.Event) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -296,3 +305,5 @@ class EgressObserver:
         self._thread = threading.Thread(target=self._run, args=(stop,),
                                         name="egress-observer", daemon=True)
         self._thread.start()
+        threading.Thread(target=self._kick_on_stop, args=(stop,),
+                         name="egress-observer-stop", daemon=True).start()

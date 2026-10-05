@@ -9,6 +9,8 @@ def _make_cfg(tmp_path):
         "poll_interval_s": 60, "lookahead_s": 300, "min_speed_ms": 2.0, "max_stale_s": 600,
         "gpsd": {"host": "127.0.0.1", "port": 2947},
         "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        # poll_once publishes its points here. Unset, it is the box's live file.
+        "points_path": str(tmp_path / "environ_points.json"),
         "signals": {"precip": {"enabled": True, "url": "http://fc",
                                "current_field": "precipitation", "on_thresh": 0.5,
                                "off_thresh": 0.1, "wet_confirm": 1, "dry_confirm": 2,
@@ -209,6 +211,7 @@ def test_poll_once_weather_code_storm_triggers_full(tmp_path, monkeypatch):
         "poll_interval_s": 60, "lookahead_s": 0, "min_speed_ms": 2.0, "max_stale_s": 600,
         "gpsd": {"host": "127.0.0.1", "port": 2947},
         "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        "points_path": str(tmp_path / "environ_points.json"),
         "signals": {
             "weather": {"enabled": True, "url": "http://fc", "current_field": "weather_code",
                         "hazard_codes": [80, 81, 82, 95, 96, 99], "on_thresh": 1.0,
@@ -234,6 +237,7 @@ def test_poll_once_weather_code_fog_does_not_trigger(tmp_path, monkeypatch):
         "poll_interval_s": 60, "lookahead_s": 0, "min_speed_ms": 2.0, "max_stale_s": 600,
         "gpsd": {"host": "127.0.0.1", "port": 2947},
         "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        "points_path": str(tmp_path / "environ_points.json"),
         "signals": {
             "weather": {"enabled": True, "url": "http://fc", "current_field": "weather_code",
                         "hazard_codes": [80, 81, 82, 95, 96, 99], "on_thresh": 1.0,
@@ -284,6 +288,7 @@ def test_poll_once_partial_fetch_failure_holds_and_writes(tmp_path, monkeypatch)
         "poll_interval_s": 60, "lookahead_s": 0, "min_speed_ms": 2.0, "max_stale_s": 600,
         "gpsd": {"host": "127.0.0.1", "port": 2947},
         "auto_override": {"path": str(tmp_path / "auto_override.json")},
+        "points_path": str(tmp_path / "environ_points.json"),
         "signals": {
             "precip": {"enabled": True, "url": "http://fc", "current_field": "precipitation",
                        "on_thresh": 0.5, "off_thresh": 0.1, "wet_confirm": 1, "dry_confirm": 2,

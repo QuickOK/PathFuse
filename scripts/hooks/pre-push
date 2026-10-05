@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
 # PathFuse pre-push gate. Enable with:  git config core.hooksPath scripts/hooks
-# Blocks a push if tests fail or the sanitization gate finds real IPs / vocab / secrets.
+# Runs scripts/preflight.sh and blocks the push if any of its checks fails:
+#   tests            the pytest suite
+#   render check     deploy/render.py --check
+#   types            pyright + mypy against scripts/typecheck-baseline.json (scripts/typecheck.py)
+#   vocabulary gate  no deployment-specific names in tracked files
+#   IP gate          every IP literal in tracked files is an RFC-reserved example
+#   secrets gate     no private-key material in tracked files
 exec "$(git rev-parse --show-toplevel)/scripts/preflight.sh"
