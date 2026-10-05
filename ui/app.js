@@ -661,7 +661,9 @@ function renderFec(s){
   const dirs = fec.directions || {};
   const sub  = $("#fec-sub");
   const desiredMode = fec.desired_mode || (fec.desired_enabled ? "adaptive" : "off");
-  const modeLabel   = FEC_MODE_LABELS[desiredMode] || desiredMode;
+  // Own keys only, as in egressLabel: a mode named "constructor" must render as itself.
+  const modeLabel   = Object.prototype.hasOwnProperty.call(FEC_MODE_LABELS, desiredMode)
+    ? FEC_MODE_LABELS[desiredMode] : desiredMode;
   if (sub) sub.textContent = !fec.configured ? "not configured"
                         : (desiredMode === "fixed"
                             ? `fixed ${fec.desired_fixed_ratio || ""}`.trim()
