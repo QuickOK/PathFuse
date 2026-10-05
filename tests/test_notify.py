@@ -330,6 +330,31 @@ def test_notifier_logs_an_on_sent_that_raises_and_keeps_sending(tmp_path, caplog
     assert "egress" in logged[0].getMessage()
 
 
+def test_notifier_takes_a_new_page_while_an_on_sent_runs(tmp_path):
+    # on_sent runs on the worker, outside the lock notify() takes, so the control loop
+    # never waits for a record's write and fsyncs. Here an on_sent is stuck (a disk that
+    # will not sync), and notify() must still return at once.
+    script, _log = _spool_notify(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    def stuck():
+        entered.set()
+        release.wait(10)
+
+    n = notify.Notifier("pathfusetest", command=script)
+    n.start()
+    try:
+        n.notify(notify.Event("egress", "first", "m", "high", on_sent=stuck))
+        assert entered.wait(5)
+        start = time.monotonic()
+        n.notify(notify.Event("relay", "second", "m", "high"))
+        took = time.monotonic() - start
+    finally:
+        release.set()
+        n.stop()
+    assert took < 2.0, f"notify() waited {took:.2f} s for an on_sent"
+
+
 # -- EventDetector tests ------------------------------------------------
 
 
@@ -1745,6 +1770,28 @@ def test_egress_alert_record_is_made_durable_around_its_rename(tmp_path, monkeyp
     assert ("fsync", _file_id(tmp_path)) in events[at + 1:], events   # the rename, after
 
 
+def test_egress_alert_record_data_is_in_the_file_when_it_is_synced(tmp_path, monkeypatch):
+    # The record's data is flushed out of Python's buffer before its fsync. Without the
+    # flush the fsync syncs an empty file, and the data reaches the file only at close,
+    # unsynced: a power loss after the rename can leave an empty record.
+    path = tmp_path / "egress_alert.json"
+    sizes: list = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode):
+            sizes.append(st.st_size)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "fdatasync", fsync, raising=False)
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert sizes == [path.stat().st_size] and sizes[0] > 0, sizes
+
+
 @pytest.mark.parametrize("failing", ["the-record", "the-directory"])
 def test_egress_alert_a_failed_fsync_is_logged_and_costs_no_page(
         tmp_path, caplog, monkeypatch, failing):
@@ -1766,6 +1813,48 @@ def test_egress_alert_a_failed_fsync_is_logged_and_costs_no_page(
     assert len(_warnings(caplog)) == 1                  # the sync that failed
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
     assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+
+
+@pytest.mark.parametrize("op", ["write", "remove"])
+def test_egress_alert_a_directory_sync_that_fails_still_closes_the_directory(
+        tmp_path, monkeypatch, op):
+    # The directory opened for its fsync is closed in a `finally`, so a disk that will
+    # not sync a directory costs a warning each time, not a file descriptor each time.
+    path = tmp_path / "egress_alert.json"
+    opened: list = []
+    closed: list = []
+    real_open, real_close, real_fsync = os.open, os.close, os.fsync
+
+    def open_(p, flags, *a, **kw):
+        fd = real_open(p, flags, *a, **kw)
+        if os.fspath(p) == str(tmp_path):
+            opened.append(fd)
+        return fd
+
+    def close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_fsync(fd)
+
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    if op == "remove":
+        assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+        assert path.exists()
+    monkeypatch.setattr(os, "open", open_)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "fdatasync", fsync, raising=False)
+    if op == "write":
+        assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    else:
+        assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []   # a silent end
+    monkeypatch.undo()
+    assert opened and set(opened) <= set(closed), (opened, closed)
 
 
 @pytest.mark.parametrize("ending, want", [

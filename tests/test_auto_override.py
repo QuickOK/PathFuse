@@ -1335,3 +1335,23 @@ def test_a_saved_alert_a_run_cannot_end_is_logged_and_the_run_goes_on(
     warned = [r.getMessage() for r in caplog.records
               if r.levelno == logging.WARNING and str(record) in r.getMessage()]
     assert len(warned) == 1, warned
+
+
+def test_a_check_off_run_ends_the_saved_alert_at_its_configured_path(tmp_path, monkeypatch, caplog):
+    # A run that cannot keep the record ends it at notifications.egress_alert_path when
+    # that is set, and falls back to the default path only when it is not. The configured
+    # record here cannot be removed (it is a directory), so the run warns once, naming it;
+    # a record at the default path belongs to no one here and is left alone. The
+    # detector's seed also tries the configured path, but quietly, so only the startup
+    # clean-up can produce the warning.
+    record = tmp_path / "egress_alert.json"
+    record.mkdir()
+    default = tmp_path / "default-egress_alert.json"
+    default.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    monkeypatch.setattr(notify, "DEFAULT_EGRESS_ALERT_PATH", str(default))
+    assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, _keeping(record),
+                                  observe=False, pages=[]) == 3
+    warned = [r.getMessage() for r in caplog.records
+              if r.levelno == logging.WARNING and "egress alert" in r.getMessage()]
+    assert len(warned) == 1 and str(record) in warned[0], warned
+    assert default.exists()
