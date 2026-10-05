@@ -1819,6 +1819,57 @@ def test_egress_an_on_sent_waits_for_a_transition_in_progress(tmp_path, page):
     assert not t.is_alive() and path.exists() != before
 
 
+class _LockThatLetsAWaiterIn:
+    """Stands in for EventDetector._egress_lock. Each time the `pausing` thread releases
+    it, that thread sleeps a moment, so a thread waiting on the lock gets in before the
+    `pausing` thread runs another line. `waiting` is set when any other thread asks for it."""
+
+    def __init__(self, pausing):
+        self._lock = threading.Lock()
+        self._pausing = pausing
+        self.waiting = threading.Event()
+
+    def __enter__(self):
+        if threading.current_thread() is not self._pausing:
+            self.waiting.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        if threading.current_thread() is self._pausing:
+            time.sleep(0.3)
+        return False
+
+
+def test_egress_an_on_sent_that_waited_out_a_silent_end_leaves_the_record_alone(
+        tmp_path, monkeypatch):
+    # A page's on_sent can be waiting on the lock while a silent end removes the record.
+    # The end moves the generation on in that same critical section, so the on_sent, once
+    # it has the lock, sees the end and writes nothing. If the generation moved on only
+    # after the lock was let go, the on_sent could get in first and record the alert that
+    # had just ended, and a restart under its mode would count a new fallback as paged.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [late] = d.observe(obs(egress=_eg("mismatch")))
+    lock = _LockThatLetsAWaiterIn(threading.current_thread())
+    monkeypatch.setattr(d, "_egress_lock", lock)
+    worker = threading.Thread(target=late.on_sent, daemon=True)
+    real_remove = notify.remove_egress_alert_record
+
+    def remove(p):
+        worker.start()                         # spool-notify has just taken the page
+        assert lock.waiting.wait(5)            # and its on_sent waits on the lock
+        return real_remove(p)
+
+    monkeypatch.setattr(notify, "remove_egress_alert_record", remove)
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []      # the silent end
+    worker.join(5)
+    assert not worker.is_alive()
+    assert not path.exists()
+
+
 @pytest.mark.parametrize("step, want", [
     pytest.param(_eg("mismatch"), [FALLBACK], id="fallback"),
     pytest.param(_eg("match", observed="relay_backbone"), [RESTORED], id="restore"),
