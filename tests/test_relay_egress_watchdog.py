@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -265,7 +266,8 @@ def _unit_timeout_s():
 
 # The link check, then curl at its cap plus the backstop that kills a curl overrunning
 # it (the upstreams are probed in parallel), then the cold-start poll at the bootstrap
-# cap: the slowest a tick can be before its route work starts.
+# cap: the slowest a tick can be before its route work starts. The poll counts as its
+# timeout because it stops waiting then (test_the_client_poll_ends_within_its_timeout).
 SLOWEST_PROBE_AND_POLL = (M.LINK_TIMEOUT_S + M.MAX_PROBE_TIMEOUT_S + M.PROBE_BACKSTOP_S
                           + max(M.MAX_BOOTSTRAP_TIMEOUT_S, M.MAX_FETCH_TIMEOUT_S))
 
@@ -1292,6 +1294,125 @@ def test_fetch_handles_http_bad_status_line():
     port = server_badline()
     mode, master, err = M.fetch_desired_mode(f"http://127.0.0.1:{port}/x", 2.0)
     assert mode is None and err is not None and "protocol" in err
+
+
+@contextlib.contextmanager
+def _dribbling_client(pieces, gap_s):
+    """A client endpoint that sends its reply in `pieces`, `gap_s` apart, then closes.
+    Each piece comes within a per-read timeout longer than gap_s, so only a bound on the
+    whole request cuts the reply off. Yields the URL; on exit it stops sending."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    srv.settimeout(30)   # a client that never connects must not strand the thread
+    done = threading.Event()
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        with conn:
+            conn.recv(4096)                 # the request
+            for piece in pieces:
+                if done.wait(gap_s):
+                    return
+                try:
+                    conn.sendall(piece)
+                except OSError:             # the client has gone
+                    return
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{srv.getsockname()[1]}/api/desired_egress"
+    finally:
+        done.set()
+        t.join(timeout=5)
+        srv.close()
+
+
+def test_the_client_poll_ends_within_its_timeout():
+    """Final review of PR #23. urlopen's timeout bounds each socket operation, not the
+    request: a reply that arrived in pieces, each inside the timeout, kept a 1 s poll
+    waiting 3 s. The tick's time budget (the comment above the caps, the README, the
+    unit's TimeoutStartSec) counts the poll as its timeout at most, so the poll must
+    stop waiting then."""
+    body = b'{"mode": "relay_backbone"}'
+    pieces = [b"HTTP/1.0 200 OK\r\n", b"Content-Type: application/json\r\n",
+              b"Content-Length: %d\r\n\r\n" % len(body), body[:8], body[8:]]
+    with _dribbling_client(pieces, 0.6) as url:   # each gap inside the 1 s per-read timeout
+        start = time.monotonic()
+        mode, _master, err = M.fetch_desired_mode(url, 1.0)
+        took = time.monotonic() - start
+    assert took < 1.5, f"a 1 s poll took {took:.1f} s (mode={mode!r}, err={err!r})"
+    assert (mode, err) == (None, "timeout")
+
+
+def test_the_client_poll_ends_within_its_timeout_while_the_name_lookup_stalls(monkeypatch):
+    """urlopen's timeout does not cover the name lookup at all, and validate_config
+    accepts a control_url that names a host. A lookup that stalls (here for 3 s) must not
+    hold the poll past its timeout either."""
+    release = threading.Event()
+
+    def stalled_lookup(*args, **kwargs):
+        release.wait(3)
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled_lookup)
+    try:
+        start = time.monotonic()
+        mode, _master, err = M.fetch_desired_mode("http://client.example.invalid:8081/x", 1.0)
+        took = time.monotonic() - start
+    finally:
+        release.set()
+    assert took < 1.5, f"a 1 s poll took {took:.1f} s (mode={mode!r}, err={err!r})"
+    assert (mode, err) == (None, "timeout")
+
+
+@pytest.mark.parametrize("exc", [ValueError("Invalid IPv6 URL"), SystemExit(3)],
+                         ids=["error", "exit"])
+def test_the_poll_raises_what_its_request_raised(monkeypatch, exc):
+    """The request runs on a thread of its own, but what it raises must still reach the
+    caller: the tick logs an error as a fetch error, and an exit stops it. Neither may
+    turn into a "timeout", which would hide the cause."""
+    def request(url, timeout_s):
+        raise exc
+
+    monkeypatch.setattr(M, "_request_desired_mode", request)
+    with pytest.raises(type(exc)) as raised:
+        M.fetch_desired_mode("http://127.0.0.1:9/x", 5.0)
+    assert raised.value is exc
+
+
+# One poll in a process of its own, as the oneshot tick runs it: argv is the watchdog's
+# path, the URL and the timeout.
+_POLL_IN_A_PROCESS = """\
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("relay_egress_watchdog", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(mod)
+print(mod.fetch_desired_mode(sys.argv[2], float(sys.argv[3])))
+"""
+
+
+def test_a_process_whose_poll_ran_out_of_time_exits_without_waiting_for_the_request():
+    """The poll stops waiting at its timeout, but the request it leaves behind can run
+    on: a reply still arriving in pieces, or a name lookup that hangs. systemd's
+    TimeoutStartSec runs until the tick's process exits, so that process must not wait
+    for the request when it exits. Here the reply dribbles for about 9 s; the process
+    must be gone soon after its 1 s poll."""
+    pieces = [b"HTTP/1.0 200 OK\r\n"] + [b"X-Pad: %d\r\n" % i for i in range(29)]
+    with _dribbling_client(pieces, 0.3) as url:   # 30 pieces 0.3 s apart: about 9 s
+        start = time.monotonic()
+        r = subprocess.run([sys.executable, "-B", "-c", _POLL_IN_A_PROCESS,
+                            str(_DIR / "relay-egress-watchdog"), url, "1.0"],
+                           capture_output=True, text=True, timeout=60)
+        took = time.monotonic() - start
+    assert (r.returncode, r.stdout) == (0, "(None, None, 'timeout')\n"), r.stderr
+    assert took < 4, f"the process exited {took:.1f} s after its 1 s poll began"
 
 
 def test_tick_with_fetch_error_counts_failure():

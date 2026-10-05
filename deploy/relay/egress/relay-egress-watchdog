@@ -31,6 +31,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -70,11 +71,14 @@ DEADMAN_RECORD = "/run/relay-egress-watchdog/deadman.json"
 # preferred route. The upstreams are probed in parallel, each with a link check (`ip`,
 # LINK_TIMEOUT_S) and then curl (--max-time timeout_s, killed PROBE_BACKSTOP_S later
 # should it overrun). The client poll follows them and waits the fetch timeout, or the
-# longer bootstrap timeout on a cold start (no last-known mode yet). Then each `ip`
-# command of the route work may wait IP_TIMEOUT_S: the table read, and each route
-# change. The slowest tick that changes one route:
+# longer bootstrap timeout on a cold start (no last-known mode yet), and no longer:
+# fetch_desired_mode stops waiting for the request then. Then each `ip` command of the
+# route work may wait IP_TIMEOUT_S: the table read, and each route change. The slowest
+# tick that changes one route:
 #   link check 2 + probe (8 + 3 backstop) + bootstrap 8 + table read 5
 #   + one route change 5 = 31 s < 35, leaving 4 s.
+# A tick that also re-adds missing exemptions (after a reboot or a table flush) runs one
+# more `ip` per missing prefix, so several stalled ones can still take it past 35 s.
 MAX_PROBE_TIMEOUT_S = 8
 MAX_FETCH_TIMEOUT_S = 5
 MAX_BOOTSTRAP_TIMEOUT_S = 8
@@ -310,11 +314,42 @@ def load_config(path) -> dict:
 # --- desired mode (client poll) ---------------------------------------------------------
 
 def fetch_desired_mode(url: str, timeout_s: float) -> tuple:
-    """GET the client's /api/desired_egress and return (mode, master_wan, err).
+    """GET the client's /api/desired_egress and return (mode, master_wan, err), within
+    timeout_s by the wall clock.
 
     Success: (mode, master_wan, None), mode normalized into VALID_DESIRED_MODES.
     Failure: (None, None, "<reason>"); the caller keeps last-known or the default.
+
+    urlopen's timeout bounds each socket operation (the connect, then each read), not
+    the request, and it does not cover the name lookup at all. So a slow connect and
+    then a slow reply, a reply that arrives in pieces, or a stalled lookup outlasts it,
+    while the tick's time budget counts the poll as timeout_s. The request therefore
+    runs on a daemon thread, and the poll stops waiting for it after timeout_s
+    ("timeout"). The tick is a oneshot, so a request left behind dies with its process.
+    An exception the request raises is raised here, for the caller to handle.
     """
+    result: list[tuple] = []
+    error: list[BaseException] = []
+
+    def request() -> None:
+        try:
+            result.append(_request_desired_mode(url, timeout_s))
+        except BaseException as e:   # raised again below, in the caller's thread
+            error.append(e)
+
+    worker = threading.Thread(target=request, name="relay-egress-poll", daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    if error:
+        raise error[0]
+    if result:
+        return result[0]
+    return (None, None, "timeout")
+
+
+def _request_desired_mode(url: str, timeout_s: float) -> tuple:
+    """fetch_desired_mode's request, run on its thread. The same return, but timeout_s
+    bounds only each socket operation."""
     import http.client
     import socket
     import urllib.error
