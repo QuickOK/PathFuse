@@ -1,5 +1,6 @@
 import builtins
 import errno
+import gc
 import io
 import logging
 import threading
@@ -8,6 +9,24 @@ from typing import Any, Optional
 
 import pytest
 import notify
+
+
+@pytest.fixture(autouse=True)
+def detectors_closed(monkeypatch):
+    """Closes each EventDetector a test makes once the test ends. A detector with a
+    record path runs a record keeper thread from its first observation on, and one left
+    running could log into the next test."""
+    made: list = []
+    real_init = notify.EventDetector.__init__
+
+    def init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        made.append(self)
+
+    monkeypatch.setattr(notify.EventDetector, "__init__", init)
+    yield
+    for d in made:
+        d.close(timeout=2.0)
 
 
 class FakeClock:
@@ -1161,9 +1180,11 @@ def test_egress_none_is_ignored():
 # -- an egress alert across a restart -----------------------------------------------
 #
 # With egress_alert_path set, the detector records each fallback it announces and
-# removes the record when the alert ends. A restart is a second detector on the same
-# path, fed what a fresh observer reports: `checking` until its first check (its settle
-# alone outlasts many ticks), then its verdicts.
+# removes the record when the alert ends. Its record keeper does that file I/O on a
+# thread of its own, so a test waits for it (drain()) before it looks at the file. A
+# restart is a second detector on the same path, made once the first is closed (as
+# run_controller closes it at shutdown), fed what a fresh observer reports: `checking`
+# until its first check (its settle alone outlasts many ticks), then its verdicts.
 
 FALLBACK, RESTORED = "🧭 Egress fallback", "🧭 Egress restored"
 ANNOUNCED_AT = 1_780_000_000.0   # a wall-clock epoch
@@ -1177,11 +1198,19 @@ def _write_record(path, selected):
     path.write_text(json.dumps({"selected": selected, "announced_at": ANNOUNCED_AT}))
 
 
-def _warnings(caplog):
-    # The detector runs on the test's own thread; a thread another test left running
-    # must not change the count.
-    me = threading.get_ident()
-    return [r for r in caplog.records if r.levelno == logging.WARNING and r.thread == me]
+def _keeper_thread(d):
+    """The thread that does `d`'s record I/O. It starts at d's first observation."""
+    keeper = d._keeper
+    assert keeper is not None and keeper._thread is not None
+    return keeper._thread
+
+
+def _warnings(caplog, *detectors):
+    # The detector runs on the test's own thread and each of `detectors` does its record
+    # I/O on its keeper's thread; a thread another test left running must not change
+    # the count.
+    threads = {threading.get_ident()} | {_keeper_thread(d).ident for d in detectors}
+    return [r for r in caplog.records if r.levelno == logging.WARNING and r.thread in threads]
 
 
 def _sent(evs):
@@ -1199,6 +1228,7 @@ def test_egress_a_fallback_announced_before_a_restart_is_not_paged_again(tmp_pat
     assert before.observe(obs(egress=_eg_checking("relay_backbone"))) == []
     assert before.observe(obs(egress=_eg("pending"))) == []
     assert _sent(before.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert before.close()
     assert path.exists()
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # its seed
@@ -1208,6 +1238,7 @@ def test_egress_a_fallback_announced_before_a_restart_is_not_paged_again(tmp_pat
     assert after.observe(obs(egress=_eg("mismatch"))) == []
     evs = after.observe(obs(egress=_eg("match", observed="relay_backbone")))
     assert _sent(evs) == [RESTORED]
+    assert after.drain()
     assert not path.exists()
     assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
 
@@ -1222,12 +1253,15 @@ def test_egress_a_fallback_standing_across_two_restarts_is_paged_once(tmp_path):
     for e in (_eg_checking("relay_backbone"), _eg("pending"), _eg("mismatch")):
         pages += _sent(d.observe(obs(egress=e)))
     for restart in ("the deploy", "the reboot"):
+        assert d.close()
         d = notify.EventDetector(egress_alert_path=str(path))
         for e in (_eg_checking("relay_backbone"), _eg_checking("relay_backbone"),
                   _eg("pending"), _eg("mismatch"), _eg("mismatch")):
             pages += _sent(d.observe(obs(egress=e)))
+        assert d.drain()
         assert path.exists(), f"the fallback still stands after {restart}, so must its record"
     pages += _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone"))))
+    assert d.close()
     assert pages == [FALLBACK, RESTORED]
     assert not path.exists()
 
@@ -1247,6 +1281,7 @@ def test_egress_a_restart_that_takes_the_alert_over_leaves_its_record_as_written
                                  wall_clock=FakeClock(ANNOUNCED_AT + 3600.0))
     for e in (seed, _eg("mismatch"), _eg("mismatch")):
         assert _sent(after.observe(obs(egress=e))) == []
+    assert after.drain()
     assert json.loads(path.read_text()) == {"selected": "relay_backbone",
                                             "announced_at": ANNOUNCED_AT}
 
@@ -1259,7 +1294,8 @@ def test_egress_a_fallback_that_began_while_down_pages_after_the_restart(tmp_pat
     assert after.observe(obs(egress=_eg("pending"))) == []
     assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
     assert after.observe(obs(egress=_eg("mismatch"))) == []
-    assert _warnings(caplog) == []            # no record is the normal case, not a fault
+    assert after.drain()
+    assert _warnings(caplog, after) == []     # no record is the normal case, not a fault
 
 
 @pytest.mark.parametrize("seed", [
@@ -1273,6 +1309,7 @@ def test_egress_a_fallback_that_recovered_while_down_pages_the_restore(tmp_path,
     assert after.observe(obs(egress=seed)) == []
     evs = after.observe(obs(egress=_eg("match", observed="relay_backbone")))
     assert _sent(evs) == [RESTORED]
+    assert after.drain()
     assert not path.exists()
     assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
 
@@ -1284,9 +1321,23 @@ def test_egress_a_record_for_another_mode_is_dropped_at_the_restart(tmp_path):
     _write_record(path, "relay_backbone")
     after = notify.EventDetector(egress_alert_path=str(path))
     assert after.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    assert after.drain()
     assert not path.exists()
     assert after.observe(obs(egress=_eg("match", selected="relay_vpn", observed="relay_vpn"))) == []
     assert _titles(after.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
+
+
+def test_egress_a_skipped_check_at_the_restart_ends_the_saved_alert(tmp_path):
+    # Every `skipped` ends the saved record, the seed's as well: the check is not
+    # running, so this run cannot follow the alert. The record goes unread, and a match
+    # after it is no restore.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg("skipped", observed=None, ip=None))) == []
+    assert after.drain()
+    assert not path.exists()
+    assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
 
 
 @pytest.mark.parametrize("prior", [None, "relay_backbone"], ids=["no-record", "record-for-another-mode"])
@@ -1296,6 +1347,7 @@ def test_egress_a_fallback_found_at_startup_is_recorded_like_any_other(tmp_path,
         _write_record(path, prior)
     first = notify.EventDetector(egress_alert_path=str(path))
     assert first.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))) == []   # counted as announced
+    assert first.close()
     assert json.loads(path.read_text())["selected"] == "relay_vpn"
     again = notify.EventDetector(egress_alert_path=str(path))   # so a restart keeps it announced
     assert again.observe(obs(egress=_eg_checking("relay_vpn"))) == []
@@ -1309,13 +1361,16 @@ def test_egress_a_mode_change_ends_the_alert_and_its_record(tmp_path):
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
     assert path.exists()
     assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    assert d.drain()
     assert not path.exists()
     # The alert was about relay Backbone, so relay-VPN holding is no recovery,
     assert d.observe(obs(egress=_eg("match", selected="relay_vpn", observed="relay_vpn"))) == []
     # and a fallback on relay-VPN is news.
     assert _sent(d.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
+    assert d.drain()
     assert json.loads(path.read_text())["selected"] == "relay_vpn"
 
 
@@ -1327,8 +1382,10 @@ def test_egress_skipped_ends_the_alert_and_its_record(tmp_path, selected):
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
     assert path.exists()
     assert d.observe(obs(egress=_eg("skipped", selected=selected, observed=None, ip=None))) == []
+    assert d.drain()
     assert not path.exists()
     assert d.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []   # no restore
     assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
@@ -1348,9 +1405,27 @@ def test_egress_an_alert_whose_record_is_already_gone_ends_without_a_warning(
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
     path.unlink()
     assert _sent(d.observe(obs(egress=ending))) == want
-    assert _warnings(caplog) == []
+    assert d.drain()
+    assert _warnings(caplog, d) == []
+
+
+def test_egress_a_mode_change_with_no_record_ends_it_without_a_warning(tmp_path, caplog):
+    # Every change of the selected mode, and every `skipped`, ends the saved record
+    # whether or not one exists, so most of them find nothing to remove. That is the
+    # usual case and logs nothing.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    for e in (_eg_checking("relay_backbone"), _eg_checking("relay_vpn"),
+              _eg_checking("local_direct"),
+              _eg("skipped", selected="local_direct", observed=None, ip=None),
+              _eg_checking("relay_backbone")):
+        assert d.observe(obs(egress=e)) == []
+    assert d.drain()
+    assert not path.exists()
+    assert _warnings(caplog, d) == []
 
 
 @pytest.mark.parametrize("body", [
@@ -1385,7 +1460,8 @@ def test_egress_an_unreadable_record_is_left_in_place(tmp_path, caplog, monkeypa
     monkeypatch.setattr(io, "open", refuse_the_record)
     after = notify.EventDetector(egress_alert_path=str(path))
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
-    assert len(_warnings(caplog)) == 1
+    assert after.drain()
+    assert len(_warnings(caplog, after)) == 1
     assert path.exists()
 
 
@@ -1399,18 +1475,22 @@ def test_egress_alert_io_failures_are_logged_and_never_raise(tmp_path, caplog, l
         path.mkdir()                                       # reads, replaces and removes fail
     d = notify.EventDetector(egress_alert_path=str(path))
     assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
-    assert len(_warnings(caplog)) == 1                     # the read
+    assert d.drain()
+    assert len(_warnings(caplog, d)) == 1                  # the read
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
-    assert len(_warnings(caplog)) == 2                     # the write
+    assert d.drain()
+    assert len(_warnings(caplog, d)) == 2                  # the write
     assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
-    assert len(_warnings(caplog)) == 3                     # the remove
+    assert d.drain()
+    assert len(_warnings(caplog, d)) == 3                  # the remove
     left = {"parent-is-a-file": ["state"], "path-is-a-directory": ["egress_alert.json"]}[layout]
     assert sorted(p.name for p in tmp_path.iterdir()) == left   # no temp file left behind
 
 
 def test_egress_alert_path_none_does_no_file_io(monkeypatch):
     # Every file operation the detector could reach fails on this thread, and is noted.
-    # Each page is handed over too, so its on_sent runs here as well.
+    # Each page is handed over too, so its on_sent runs here as well. Nor is there a
+    # record keeper, whose thread would do the I/O elsewhere.
     me, attempted = threading.get_ident(), []
 
     def refusing(name, real):
@@ -1436,14 +1516,15 @@ def test_egress_alert_path_none_does_no_file_io(monkeypatch):
         pages += _sent(d.observe(obs(egress=e)))
     assert pages == [RESTORED, FALLBACK, FALLBACK]
     assert attempted == []
+    assert d._keeper is None
 
 
 def test_notify_cfg_keeps_its_record_in_the_state_directory_by_default():
-    # The detector alone keeps no record by default; the controller's config does, in
-    # sbfd-ctl's StateDirectory. load_config passes the path explicitly, so its tests
-    # cannot see this default.
-    assert notify.DEFAULT_EGRESS_ALERT_PATH == "/var/lib/sbfd-ctl/egress_alert.json"
-    assert notify.NotifyCfg(topic="t").egress_alert_path == notify.DEFAULT_EGRESS_ALERT_PATH
+    # The detector alone keeps no record by default; the controller's config does, at
+    # the one fixed place in sbfd-ctl's StateDirectory. load_config passes the switch
+    # explicitly, so its tests cannot see this default.
+    assert notify.EGRESS_ALERT_PATH == "/var/lib/sbfd-ctl/egress_alert.json"
+    assert notify.NotifyCfg(topic="t").egress_alert_record is True
 
 
 def test_egress_alert_record_is_written_whole_in_a_directory_made_for_it(tmp_path, monkeypatch):
@@ -1460,6 +1541,7 @@ def test_egress_alert_record_is_written_whole_in_a_directory_made_for_it(tmp_pat
                              wall_clock=FakeClock(ANNOUNCED_AT))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
     want = {"selected": "relay_backbone", "announced_at": ANNOUNCED_AT}
     # A reader never sees part of it: the record is written whole to a temp file beside
     # the path, and only then renamed over it.
@@ -1478,11 +1560,13 @@ def test_egress_alert_record_is_read_at_a_seed_with_the_check_on_and_only_then(t
     assert _warnings(caplog) == []            # constructing reads nothing,
     assert off.observe(obs()) == []           # nor does a seed with the check off. That
     assert off.observe(obs()) == []           # one ends the saved alert, and quietly: the
-    assert _warnings(caplog) == []            # controller warns when it cannot
+    assert off.drain()                        # controller warns when it cannot
+    assert _warnings(caplog, off) == []
     assert path.is_dir()
     on = notify.EventDetector(egress_alert_path=str(path))
     assert on.observe(obs(egress=_eg_checking("relay_backbone"))) == []
-    assert len(_warnings(caplog)) == 1        # whereas a seed with it on reads the record
+    assert on.drain()
+    assert len(_warnings(caplog, on)) == 1    # whereas a seed with it on reads the record
 
 
 def test_egress_a_restart_with_the_check_off_ends_the_saved_alert(tmp_path):
@@ -1494,11 +1578,14 @@ def test_egress_a_restart_with_the_check_off_ends_the_saved_alert(tmp_path):
     first = notify.EventDetector(egress_alert_path=str(path))
     first.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(first.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert first.close()
     assert path.exists()
     off = notify.EventDetector(egress_alert_path=str(path))   # restarted with the check off
     assert off.observe(obs()) == []
+    assert off.drain()
     assert not path.exists()
     assert off.observe(obs()) == []
+    assert off.close()
     on = notify.EventDetector(egress_alert_path=str(path))    # and later with it back on
     assert on.observe(obs(egress=_eg_checking("relay_backbone"))) == []
     assert on.observe(obs(egress=_eg("pending"))) == []
@@ -1514,7 +1601,8 @@ def test_egress_a_restart_with_the_check_off_ends_the_saved_alert(tmp_path):
 # A page that never got that far changes nothing, so a restart sends it again. Only an
 # alert that ends without a page changes the record otherwise. Where a test needs the
 # worker, the detector's pages go to a real Notifier with a stand-in spool-notify; the
-# others run on_sent by hand.
+# others run on_sent by hand. Either way on_sent only queues the change, and the
+# detector's record keeper makes it.
 
 
 def _broken_spool_notify(tmp_path, monkeypatch, failure):
@@ -1538,6 +1626,7 @@ def test_egress_a_fallback_page_spool_notify_took_is_recorded(tmp_path):
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     evs = d.observe(obs(egress=_eg("mismatch")))
     assert _titles(evs) == [FALLBACK]
+    assert d.drain()
     assert not path.exists()                  # raised, but not yet handed over
     n = notify.Notifier("pathfusetest", command=script)
     n.start()
@@ -1545,6 +1634,7 @@ def test_egress_a_fallback_page_spool_notify_took_is_recorded(tmp_path):
         n.notify(e)
     n.stop()                                  # the worker sends what it holds, then ends
     assert _handed(log) == [FALLBACK]
+    assert d.drain()
     assert json.loads(path.read_text()) == {"selected": "relay_backbone",
                                             "announced_at": ANNOUNCED_AT}
 
@@ -1562,6 +1652,7 @@ def test_egress_a_fallback_page_left_in_the_buffer_is_paged_again_after_a_restar
     before.observe(obs(egress=_eg_checking("relay_backbone")))
     for e in before.observe(obs(egress=_eg("mismatch"))):
         n.notify(e)
+    assert before.close()
     assert _handed(log) == []
     assert not path.exists()
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
@@ -1588,6 +1679,7 @@ def test_egress_a_fallback_page_spool_notify_did_not_take_is_paged_again_after_a
     assert worker is not None and not worker.is_alive()
     logged = [r.levelno for r in caplog.records if r.thread == worker.ident]
     assert logged == [logging.WARNING]        # the send was tried, and failed
+    assert before.close()
     assert not path.exists()
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
@@ -1610,11 +1702,68 @@ def test_egress_a_restore_page_spool_notify_refused_is_sent_again_after_a_restar
     n.stop()
     assert _handed(log) == [RESTORED]          # handed over, and refused
     assert d.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []
+    assert d.close()
     assert json.loads(path.read_text()) == {"selected": "relay_backbone",
                                             "announced_at": ANNOUNCED_AT}
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
     assert _titles(after.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+
+
+def test_a_mode_change_after_a_refused_restore_ends_the_saved_alert(tmp_path):
+    # Found collecting the bots' round 2 on PR #24. The restore page is refused, so the
+    # record keeps the fallback (by design: a restart then sends the restore again). The
+    # alert has already ended in memory, and a mode change used to end the record only
+    # while an alert stood. So after the mode left and came back, a restart took the
+    # record over, and a NEW fallback on that mode paged nothing, though the same run
+    # without the restart pages it. Every change of the selected mode now ends the
+    # saved record, alert or no alert.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    fallback.on_sent()                                         # spool-notify took it
+    [_refused] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []        # the mode leaves...
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # ...and comes back
+    assert d.close()
+    after = notify.EventDetector(egress_alert_path=str(path))            # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
+        "a record the mode change should have ended swallowed the new fallback's page"
+
+
+def test_a_skipped_check_after_a_refused_restore_ends_the_saved_alert(tmp_path):
+    # The same with `skipped` in place of the mode change: every `skipped` ends the saved
+    # record too, alert or no alert.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    fallback.on_sent()                                         # spool-notify took it
+    [_refused] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert d.observe(obs(egress=_eg("skipped", observed=None, ip=None))) == []
+    assert d.close()
+    after = notify.EventDetector(egress_alert_path=str(path))            # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
+        "a record the skipped check should have ended swallowed the new fallback's page"
+
+
+def test_the_same_run_without_a_restart_does_page_that_fallback(tmp_path):
+    # Control: the in-run behaviour the restart should match.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    fallback.on_sent()
+    [_refused] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    d.observe(obs(egress=_eg_checking("relay_vpn")))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert d.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
 
 
 @pytest.mark.parametrize("then", [
@@ -1636,9 +1785,11 @@ def test_egress_a_fallback_page_that_goes_out_after_its_alert_moved_on_still_wri
         newer += d.observe(obs(egress=e))
     assert _titles(newer) == [RESTORED, FALLBACK][:1 + len(then)]
     late.on_sent()
+    assert d.drain()
     assert path.exists() and json.loads(path.read_text())["selected"] == "relay_backbone"
     for page in newer:
         page.on_sent()
+        assert d.drain()
         assert path.exists() == (page.title == FALLBACK), page.title
 
 
@@ -1661,9 +1812,11 @@ def test_egress_a_restore_page_that_goes_out_after_a_new_fallback_still_removes_
         newer += d.observe(obs(egress=e))
     assert _titles(newer) == [FALLBACK, RESTORED][:1 + len(then)]
     late.on_sent()
+    assert d.drain()
     assert not path.exists()
     for page in newer:
         page.on_sent()
+        assert d.drain()
         assert path.exists() == (page.title == FALLBACK), page.title
 
 
@@ -1680,6 +1833,7 @@ def test_egress_a_restore_page_taken_after_the_next_fallback_leaves_that_fallbac
     [restore] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
     [_lost] = d.observe(obs(egress=_eg("mismatch")))
     restore.on_sent()                          # spool-notify takes the restore page
+    assert d.close()
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
     assert after.observe(obs(egress=_eg("pending"))) == []
@@ -1696,6 +1850,7 @@ def test_egress_a_fallback_page_taken_after_its_restore_leaves_the_restore_to_a_
     [fallback] = d.observe(obs(egress=_eg("mismatch")))
     [_lost] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
     fallback.on_sent()                         # spool-notify takes the fallback page
+    assert d.close()
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
     assert _titles(after.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
@@ -1722,6 +1877,7 @@ def test_egress_pages_queued_in_the_worker_leave_the_record_at_the_last_one_take
         n.notify(page)
     n.start()                                 # one batch, handed over in order
     n.stop()
+    assert d.close()
     assert _handed(log) == _titles(pages)     # the first taken, the second refused
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
@@ -1739,6 +1895,7 @@ def test_egress_a_fallback_page_made_before_a_silent_end_writes_no_record(tmp_pa
     [late] = d.observe(obs(egress=_eg("mismatch")))
     assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []          # the silent end
     late.on_sent()
+    assert d.drain()
     assert not path.exists()
 
 
@@ -1755,6 +1912,7 @@ def test_egress_a_restore_page_made_before_a_silent_end_removes_no_record(tmp_pa
     assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []          # the silent end
     assert _sent(d.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
     late.on_sent()
+    assert d.drain()
     assert path.exists() and json.loads(path.read_text())["selected"] == "relay_vpn"
 
 
@@ -1776,6 +1934,7 @@ def test_egress_a_summary_that_ends_in_a_restore_removes_the_record(tmp_path):
     n.start()               # one batch: the first page goes out and the other two are held,
     n.stop()                # until stop() sends them as one summary
     assert _handed(log) == [RESTORED, f"{RESTORED} (×2 in 30s)"]
+    assert d.drain()
     assert not path.exists()
 
 
@@ -1793,81 +1952,142 @@ def test_egress_a_summary_that_ends_in_a_fallback_writes_the_record(tmp_path):
     n.start()
     n.stop()
     assert _handed(log) == [FALLBACK, f"{FALLBACK} (×2 in 30s)"]
+    assert d.drain()
     assert json.loads(path.read_text())["selected"] == "relay_backbone"
 
 
-@pytest.mark.parametrize("page", ["fallback", "restore"])
-def test_egress_an_on_sent_waits_for_a_transition_in_progress(tmp_path, page):
-    # on_sent runs on the Notifier's thread and the transitions on the controller's. The
-    # lock keeps one from landing in the middle of the other: an on_sent that had checked
-    # its generation just before a mode change could otherwise write the record back
-    # after the change removed it.
+@pytest.mark.parametrize("rc, kept", [pytest.param(0, False, id="taken"),
+                                      pytest.param(1, True, id="refused")])
+def test_egress_a_restore_page_removes_the_record_once_spool_notify_takes_it(
+        tmp_path, rc, kept):
+    # The record goes with the restore page, through the Notifier and the record keeper:
+    # a restore page spool-notify takes removes it, and one it refuses leaves it, so a
+    # restart sends the restore again.
     path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")      # its fallback was paged before a restart
+    script, log = _spool_notify(tmp_path, rc=rc)
     d = notify.EventDetector(egress_alert_path=str(path))
-    d.observe(obs(egress=_eg_checking("relay_backbone")))
-    [late] = d.observe(obs(egress=_eg("mismatch")))
-    if page == "restore":
-        late.on_sent()
-        [late] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
-    before = path.exists()
-    with d._egress_lock:                       # a transition is in progress
-        t = threading.Thread(target=late.on_sent, daemon=True)
-        t.start()
-        t.join(0.2)
-        assert t.is_alive() and path.exists() == before
-    t.join(5)
-    assert not t.is_alive() and path.exists() != before
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # taken over
+    n = notify.Notifier("pathfusetest", command=script)
+    n.start()
+    for e in d.observe(obs(egress=_eg("match", observed="relay_backbone"))):
+        n.notify(e)
+    n.stop()
+    assert _handed(log) == [RESTORED]
+    assert d.drain()
+    assert path.exists() == kept
 
 
-class _LockThatLetsAWaiterIn:
-    """Stands in for EventDetector._egress_lock. Each time the `pausing` thread releases
-    it, that thread sleeps a moment, so a thread waiting on the lock gets in before the
-    `pausing` thread runs another line. `waiting` is set when any other thread asks for it."""
-
-    def __init__(self, pausing):
-        self._lock = threading.Lock()
-        self._pausing = pausing
-        self.waiting = threading.Event()
-
-    def __enter__(self):
-        if threading.current_thread() is not self._pausing:
-            self.waiting.set()
-        self._lock.acquire()
-        return self
-
-    def __exit__(self, *exc):
-        self._lock.release()
-        if threading.current_thread() is self._pausing:
-            time.sleep(0.3)
-        return False
+# -- the record keeper: the disk never holds up the control loop ---------------------
+#
+# Notifications must never affect failover. All of the record's file I/O runs on the
+# detector's record keeper thread, one operation at a time in the order they were
+# queued. After the seed's one read, observe() only queues, and so does a page's
+# on_sent on the Notifier's thread, so a disk that stalls in a sync stalls the keeper
+# alone. A stalled disk here is os.fsync blocking until the test lets it go.
 
 
-def test_egress_an_on_sent_that_waited_out_a_silent_end_leaves_the_record_alone(
-        tmp_path, monkeypatch):
-    # A page's on_sent can be waiting on the lock while a silent end removes the record.
-    # The end moves the generation on in that same critical section, so the on_sent, once
-    # it has the lock, sees the end and writes nothing. If the generation moved on only
-    # after the lock was let go, the on_sent could get in first and record the alert that
-    # had just ended, and a restart under its mode would count a new fallback as paged.
+def _stalling_fsync(monkeypatch, directories_only=False):
+    """Makes os.fsync block until `release` is set, as a flash card that will not sync
+    can, or only a directory's fsync when `directories_only`. `entered` is set when a
+    blocked fsync starts. Returns (entered, release)."""
+    real_fsync = os.fsync
+    entered, release = threading.Event(), threading.Event()
+
+    def fsync(fd):
+        if not directories_only or stat.S_ISDIR(os.fstat(fd).st_mode):
+            entered.set()
+            release.wait(10)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "fdatasync", fsync, raising=False)
+    return entered, release
+
+
+def _timed_observe(d, egress):
+    """d.observe() of `egress`, on a thread of its own standing in for the control loop:
+    (the seconds the call took, its events). A call still running after 2 s counts as
+    taking forever, so a stalled disk cannot hang the test. The garbage collector waits
+    while the call runs, so a full collection cannot land in the measurement."""
+    out: dict = {}
+
+    def run():
+        gc.disable()
+        try:
+            start = time.monotonic()
+            out["evs"] = d.observe(obs(egress=egress))
+            out["took"] = time.monotonic() - start
+        finally:
+            gc.enable()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(2.0)
+    return out.get("took", float("inf")), out.get("evs", [])
+
+
+def _record_changes(monkeypatch, path):
+    """Notes, in order, each rename onto `path` ("replace") and each removal of it
+    ("remove"), on any thread."""
+    changes: list = []
+    real_replace, real_remove = os.replace, os.remove
+
+    def replace(src, dst, *a, **kw):
+        if os.fspath(dst) == str(path):
+            changes.append("replace")
+        return real_replace(src, dst, *a, **kw)
+
+    def remove(p, *a, **kw):
+        if os.fspath(p) == str(path):
+            changes.append("remove")
+        return real_remove(p, *a, **kw)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    return changes
+
+
+def test_egress_observe_does_not_wait_for_a_stalled_record_disk(tmp_path, monkeypatch):
+    # Greptile and CodeRabbit on PR #24: a disk stalled in a sync stalled failover. Here
+    # the directory sync stalls from the seed's write on, and the keeper with it. A
+    # fallback counted as announced at the seed, a restore, a fallback, a silent end and
+    # a fallback on the new mode each still return within 50 ms, and every page still
+    # goes out: the Notifier runs each page's on_sent without waiting for the disk
+    # either. The seed's record is on disk all along, so a removal made on the
+    # controller's thread would stall as well. Once the disk recovers, the record
+    # follows all of it, in order.
     path = tmp_path / "egress_alert.json"
+    entered, release = _stalling_fsync(monkeypatch, directories_only=True)
+    script, log = _spool_notify(tmp_path)
+    n = notify.Notifier("pathfusetest", min_interval_s=0, command=script)
     d = notify.EventDetector(egress_alert_path=str(path))
-    d.observe(obs(egress=_eg_checking("relay_backbone")))
-    [late] = d.observe(obs(egress=_eg("mismatch")))
-    lock = _LockThatLetsAWaiterIn(threading.current_thread())
-    monkeypatch.setattr(d, "_egress_lock", lock)
-    worker = threading.Thread(target=late.on_sent, daemon=True)
-    real_remove = notify.remove_egress_alert_record
-
-    def remove(p):
-        worker.start()                         # spool-notify has just taken the page
-        assert lock.waiting.wait(5)            # and its on_sent waits on the lock
-        return real_remove(p)
-
-    monkeypatch.setattr(notify, "remove_egress_alert_record", remove)
-    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []      # the silent end
-    worker.join(5)
-    assert not worker.is_alive()
-    assert not path.exists()
+    handed: list = []
+    n.start()
+    try:
+        for step, egress, want in [
+                ("a fallback at the seed", _eg("mismatch"), []),
+                ("a restore", _eg("match", observed="relay_backbone"), [RESTORED]),
+                ("a fallback", _eg("mismatch"), [FALLBACK]),
+                ("a silent end", _eg_checking("relay_vpn"), []),
+                ("a fallback on the new mode", _eg("mismatch", selected="relay_vpn"),
+                 [FALLBACK])]:
+            took, evs = _timed_observe(d, egress)
+            assert took < 0.05, f"{step}: observe() took {took:.3f} s"
+            assert _titles(evs) == want, step
+            assert entered.wait(5), step       # the keeper is stuck in the seed's write
+            for e in evs:
+                n.notify(e)
+            handed += want
+            assert wait_for(lambda: _handed(log) == handed), step
+        n.stop()                               # and the worker has run every on_sent
+        assert n._thread is not None and not n._thread.is_alive()
+        assert path.exists() and not release.is_set()   # the seed's record, its sync stuck
+    finally:
+        release.set()
+    assert d.close()
+    assert json.loads(path.read_text())["selected"] == "relay_vpn"
 
 
 @pytest.mark.parametrize("step, want", [
@@ -1877,21 +2097,276 @@ def test_egress_an_on_sent_that_waited_out_a_silent_end_leaves_the_record_alone(
     pytest.param(_eg("skipped", selected="local_direct", observed=None, ip=None), [],
                  id="skipped"),
 ])
-def test_egress_a_transition_waits_for_an_on_sent_in_progress(tmp_path, step, want):
+def test_egress_a_transition_does_not_wait_for_a_record_write_in_progress(
+        tmp_path, monkeypatch, step, want):
+    # CodeRabbit and Greptile on PR #24: a transition took the lock an on_sent held
+    # through its write and syncs, so a disk that stalled there stalled the control loop.
+    # Here spool-notify takes a fallback page, its on_sent queues the record's write, and
+    # the disk stalls in that write's sync. The controller's next transition, paged or
+    # silent, still returns at once with its pages. Its own record operation waits behind
+    # the stalled one, and the record catches up once the disk does.
     path = tmp_path / "egress_alert.json"
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
-    if step["status"] != "mismatch":
-        assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # an alert stands
-    got: list = []
-    with d._egress_lock:                       # an on_sent is in progress
-        t = threading.Thread(target=lambda: got.extend(d.observe(obs(egress=step))),
-                             daemon=True)
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    if step["status"] == "mismatch":
+        # A new fallback needs the alert ended first: by a restore, here one refused.
+        [_refused] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    entered, release = _stalling_fsync(monkeypatch)
+    try:
+        threading.Thread(target=fallback.on_sent, daemon=True).start()   # the Notifier's
+        assert entered.wait(5)                 # the keeper is inside the write's sync
+        took, evs = _timed_observe(d, step)
+        assert took < 0.05, f"observe() took {took:.3f} s"
+        assert _titles(evs) == want
+    finally:
+        release.set()
+    assert d.drain()
+    assert path.exists() == bool(want)         # the fallback's record, unless a silent end
+
+
+def test_egress_a_restore_raised_while_the_fallback_write_is_stalled_still_settles_in_order(
+        tmp_path, monkeypatch):
+    # CodeRabbit on PR #24. No lock orders a transition against the record's I/O any
+    # more, so pin that the record still follows the pages: a restore raised while the
+    # fallback page's write is stuck in its sync, then handed over after it, leaves no
+    # record once the disk recovers. The write lands first, then the removal.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    changes = _record_changes(monkeypatch, path)
+    entered, release = _stalling_fsync(monkeypatch)
+    try:
+        threading.Thread(target=fallback.on_sent, daemon=True).start()   # the Notifier's
+        assert entered.wait(5)                 # the fallback page's write is mid-flight
+        took, got = _timed_observe(d, _eg("match", observed="relay_backbone"))
+        assert took < 0.05, f"observe() took {took:.3f} s"
+        [restore] = got
+        restore.on_sent()                      # spool-notify takes the restore page too
+    finally:
+        release.set()
+    assert d.drain()
+    assert changes == ["replace", "remove"]
+    assert not path.exists()
+
+
+def test_egress_a_silent_end_leaves_its_removal_to_the_keeper(tmp_path, monkeypatch):
+    # Greptile on PR #24: with no on_sent in flight at all, a mode change while an alert
+    # stood removed the record and synced its directory on the controller's own thread.
+    # Now the end only queues the removal, and the stalled disk holds up the keeper alone.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()         # the record is written, nothing in flight
+    entered, release = _stalling_fsync(monkeypatch)
+    try:
+        took, evs = _timed_observe(d, _eg_checking("relay_vpn"))
+        assert took < 0.05, f"observe() took {took:.3f} s"
+        assert evs == []
+        assert entered.wait(5)                 # the keeper is in the removal's sync
+    finally:
+        release.set()
+    assert d.drain()
+    assert not path.exists()
+
+
+def _file_io_by_thread(monkeypatch, root):
+    """Notes each file operation on a path under `root`, and each fsync, as (the ident of
+    the thread that made it, its name)."""
+    calls: list = []
+
+    def noting(name, real, any_path=False):
+        def call(*a, **kw):
+            p = a[0] if a else None
+            if any_path or (isinstance(p, (str, os.PathLike))
+                            and str(os.fspath(p)).startswith(str(root))):
+                calls.append((threading.get_ident(), name))
+            return real(*a, **kw)
+        return call
+
+    for name in ("open", "replace", "rename", "remove", "unlink", "makedirs", "mkdir"):
+        monkeypatch.setattr(os, name, noting(f"os.{name}", getattr(os, name)))
+    monkeypatch.setattr(os, "fsync", noting("os.fsync", os.fsync, any_path=True))
+    monkeypatch.setattr(builtins, "open", noting("open", builtins.open))
+    monkeypatch.setattr(io, "open", noting("open", io.open))
+    return calls
+
+
+def test_egress_record_io_happens_on_the_keeper_thread_only(tmp_path, monkeypatch):
+    # The threading rule. The seed reads the record once, on the controller's thread.
+    # After that the controller's thread does no record I/O at all, nor does the
+    # Notifier's, which only queues each page's change. Every write, removal and sync is
+    # the record keeper's.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_vpn")           # another mode's: the seed ends it
+    calls = _file_io_by_thread(monkeypatch, tmp_path)
+    controller, notifiers = threading.get_ident(), set()
+
+    def hand_over(evs):                        # the Notifier's worker; spool-notify takes all
+        def run():
+            notifiers.add(threading.get_ident())
+            for e in evs:
+                if e.on_sent is not None:
+                    e.on_sent()
+        t = threading.Thread(target=run)
         t.start()
-        t.join(0.2)
-        assert t.is_alive() and got == []
-    t.join(5)
-    assert not t.is_alive() and _titles(got) == want
+        t.join(5)
+
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg("mismatch"))) == []      # the seed: counted as announced
+    assert [name for ident, name in calls if ident == controller] == ["open"]   # its read
+    for e in (_eg("match", observed="relay_backbone"), _eg("mismatch"),
+              _eg_checking("relay_vpn"), _eg("mismatch", selected="relay_vpn"),
+              _eg("skipped", selected="local_direct", observed=None, ip=None)):
+        hand_over(d.observe(obs(egress=e)))
+    assert d.close()
+    by = [ident for ident, _name in calls]
+    assert by.count(controller) == 1           # the seed's read, and nothing since
+    assert not notifiers & set(by)
+    assert _keeper_thread(d).ident in by
+
+
+@pytest.mark.parametrize("order", ["queued-before-the-end", "queued-after-the-end"])
+def test_egress_a_late_fallback_page_leaves_no_record_after_a_silent_end(
+        tmp_path, monkeypatch, order):
+    # A fallback page made before a silent end goes out around the end, while the disk is
+    # slow. Its write reaches the keeper's queue before the end's removal, and the queue
+    # runs them in that order, so the removal comes last; or after it, and the end had
+    # moved the generation on before it queued anything, so by the write's turn the page
+    # is out of date and the write does nothing. Either way the ended alert leaves no
+    # record, and the one on disk from before is gone.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")      # a fallback paged before a restart
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))   # taken over
+    [_refused] = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    [late] = d.observe(obs(egress=_eg("mismatch")))          # it falls back again
+    entered, release = _stalling_fsync(monkeypatch)
+    try:
+        if order == "queued-before-the-end":
+            late.on_sent()
+            assert entered.wait(5)             # its write is in the keeper's hands
+        _took, evs = _timed_observe(d, _eg_checking("relay_vpn"))   # the silent end
+        assert evs == []
+        if order == "queued-after-the-end":
+            assert entered.wait(5)             # the end's removal is in the keeper's hands
+            late.on_sent()
+    finally:
+        release.set()
+    assert d.drain()
+    assert not path.exists()
+
+
+def test_egress_a_silent_end_moves_the_generation_on_before_it_queues_its_removal(
+        tmp_path, monkeypatch):
+    # The end's removal and a late page's write can reach the queue back to back, the
+    # write second, and the keeper can run both before the controller's thread runs
+    # another line. So the end must have moved the generation on before it queued
+    # anything. Else the write still finds its page's generation and records the alert
+    # that has just ended, and a restart under its mode counts a new fallback as paged.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [late] = d.observe(obs(egress=_eg("mismatch")))
+    keeper = d._keeper
+    assert keeper is not None
+    real_remove = keeper.remove
+
+    def remove(*a, **kw):
+        # The end's removal is queued, spool-notify takes the late page at once, and the
+        # keeper runs both, all before the end runs another line.
+        real_remove(*a, **kw)
+        notifier = threading.Thread(target=late.on_sent)
+        notifier.start()
+        notifier.join(5)
+        assert keeper.drain(5)
+
+    monkeypatch.setattr(keeper, "remove", remove)
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []      # the silent end
+    assert d.drain()
+    assert not path.exists()
+
+
+def test_egress_the_record_keeper_outlives_an_operation_that_raises(
+        tmp_path, caplog, monkeypatch):
+    # Any failure in a record operation is a warning, not only an OSError, and the
+    # keeper carries on with the next operation: its thread never dies.
+    path = tmp_path / "egress_alert.json"
+    real_makedirs, calls = os.makedirs, []
+
+    def makedirs(*a, **kw):
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("the first write breaks")
+        return real_makedirs(*a, **kw)
+
+    monkeypatch.setattr(os, "makedirs", makedirs)
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
+    [warning] = _warnings(caplog, d)
+    assert "the first write breaks" in warning.getMessage()
+    assert not path.exists()
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
+    assert json.loads(path.read_text())["selected"] == "relay_backbone"
+    assert len(_warnings(caplog, d)) == 1
+
+
+def test_egress_close_runs_every_queued_record_operation_before_it_returns(
+        tmp_path, monkeypatch):
+    # run_controller closes the detector at shutdown, after the Notifier's last pages.
+    # Their record operations may still be queued behind a slow disk. close() runs them
+    # all before it returns, then ends the keeper's thread, so the restart that follows
+    # finds the record the last page left.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")      # a fallback paged before a restart
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))   # taken over
+    real_fsync = os.fsync
+
+    def slow_fsync(fd):
+        time.sleep(0.05)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", slow_fsync)
+    for e in (_eg("match", observed="relay_backbone"), _eg("mismatch"),
+              _eg_checking("relay_vpn"), _eg("mismatch", selected="relay_vpn")):
+        _sent(d.observe(obs(egress=e)))        # each page taken as soon as it is made
+    assert d.close()
+    assert not _keeper_thread(d).is_alive()
+    assert json.loads(path.read_text())["selected"] == "relay_vpn"
+
+
+def test_egress_close_gives_up_on_a_stalled_record_disk_after_its_timeout(
+        tmp_path, monkeypatch):
+    # A disk that never recovers must not hold up the shutdown for good: close() waits
+    # for the keeper only as long as it is told to, then says it did not finish.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    entered, release = _stalling_fsync(monkeypatch)
+    out: dict = {}
+
+    def close():
+        start = time.monotonic()
+        out["closed"] = d.close(timeout=0.2)
+        out["took"] = time.monotonic() - start
+
+    try:
+        _sent(d.observe(obs(egress=_eg("mismatch"))))
+        assert entered.wait(5)                 # the keeper is stuck in the record's sync
+        t = threading.Thread(target=close, daemon=True)
+        t.start()
+        t.join(5)
+        assert out.get("closed") is False, out
+        assert 0.15 <= out["took"] < 2.0, out
+    finally:
+        release.set()
 
 
 # -- the egress alert record across a power loss ----------------------------------------
@@ -1935,6 +2410,7 @@ def test_egress_alert_record_is_made_durable_around_its_rename(tmp_path, monkeyp
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
     at = events.index(("replace", str(path)))
     assert ("fsync", _file_id(path)) in events[:at], events           # the data, before
     assert ("fsync", _file_id(tmp_path)) in events[at + 1:], events   # the rename, after
@@ -1959,6 +2435,7 @@ def test_egress_alert_record_data_is_in_the_file_when_it_is_synced(tmp_path, mon
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain()
     assert sizes == [path.stat().st_size] and sizes[0] > 0, sizes
 
 
@@ -1980,7 +2457,8 @@ def test_egress_alert_a_failed_fsync_is_logged_and_costs_no_page(
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
-    assert len(_warnings(caplog)) == 1                  # the sync that failed
+    assert d.drain()
+    assert len(_warnings(caplog, d)) == 1               # the sync that failed
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
     assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
 
@@ -2014,6 +2492,7 @@ def test_egress_alert_a_directory_sync_that_fails_still_closes_the_directory(
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     if op == "remove":
         assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+        assert d.drain()
         assert path.exists()
     monkeypatch.setattr(os, "open", open_)
     monkeypatch.setattr(os, "close", close)
@@ -2023,6 +2502,7 @@ def test_egress_alert_a_directory_sync_that_fails_still_closes_the_directory(
         assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
     else:
         assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []   # a silent end
+    assert d.drain()
     monkeypatch.undo()
     assert opened and set(opened) <= set(closed), (opened, closed)
 
@@ -2039,6 +2519,7 @@ def test_egress_alert_record_removal_is_made_durable(tmp_path, monkeypatch, endi
     d = notify.EventDetector(egress_alert_path=str(path))
     d.observe(obs(egress=_eg_checking("relay_backbone")))
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
     events: list = []
     _sync_recorder(monkeypatch, events)
     real_remove = os.remove
@@ -2051,6 +2532,7 @@ def test_egress_alert_record_removal_is_made_durable(tmp_path, monkeypatch, endi
     monkeypatch.setattr(os, "unlink", remove)
     parent = _file_id(tmp_path)
     assert _sent(d.observe(obs(egress=ending))) == want
+    assert d.drain()
     assert not path.exists()
     at = events.index(("remove", str(path)))
     assert ("fsync", parent) in events[at + 1:], events   # the removal, after it

@@ -11,12 +11,11 @@ import notify
 
 
 @pytest.fixture(autouse=True)
-def egress_alert_default_under_tmp(tmp_path, monkeypatch):
-    """A controller run that does not keep the egress alert record removes the one at
-    notify.DEFAULT_EGRESS_ALERT_PATH at startup, and that default is the box's live
-    state. Every test here points it under tmp_path instead."""
-    monkeypatch.setattr(notify, "DEFAULT_EGRESS_ALERT_PATH",
-                        str(tmp_path / "default-egress_alert.json"))
+def egress_alert_record_under_tmp(tmp_path, monkeypatch):
+    """The egress alert record lives at notify.EGRESS_ALERT_PATH, which is the box's
+    live state: a controller run keeps the record there, or removes it at startup.
+    Every test here points it under tmp_path instead."""
+    monkeypatch.setattr(notify, "EGRESS_ALERT_PATH", str(tmp_path / "egress_alert.json"))
 
 
 @pytest.fixture

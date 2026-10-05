@@ -1487,6 +1487,19 @@ def load_config(path: str) -> Config:
         raw_notif = raw.get("notifications")
         notif_cfg = None
         if raw_notif is not None:
+            # The record's place is fixed, so that every run can find it. The old key
+            # is refused rather than ignored: a config still naming a path expects it.
+            if "egress_alert_path" in raw_notif:
+                raise ValueError(
+                    "notifications.egress_alert_path is no longer read: the egress "
+                    f"alert record is always at {notify.EGRESS_ALERT_PATH}. Set "
+                    "notifications.egress_alert_record to true or false instead")
+            # bool("false") is True, as for location_fec.enabled above.
+            alert_record = raw_notif.get("egress_alert_record", True)
+            if not isinstance(alert_record, bool):
+                raise ValueError(
+                    f"notifications.egress_alert_record must be true or false, "
+                    f"got {alert_record!r}")
             notif_cfg = notify.NotifyCfg(
                 topic=raw_notif["topic"],
                 min_interval_s=float(raw_notif.get("min_interval_s", 30.0)),
@@ -1495,9 +1508,7 @@ def load_config(path: str) -> Config:
                 wan_down_hold_s=float(raw_notif.get("wan_down_hold_s", 10.0)),
                 switch_hold_s=float(raw_notif.get("switch_hold_s", 60.0)),
                 fec_alerts=bool(raw_notif.get("fec_alerts", False)),
-                # Absent: the default path. JSON null: None, which keeps no record.
-                egress_alert_path=raw_notif.get("egress_alert_path",
-                                                notify.DEFAULT_EGRESS_ALERT_PATH),
+                egress_alert_record=alert_record,
             )
 
         cfg = Config(
@@ -1603,11 +1614,6 @@ def load_config(path: str) -> Config:
             raise ValueError(
                 f"notifications.switch_hold_s must be >= 0, "
                 f"got {cfg.notifications.switch_hold_s}")
-        alert_path = cfg.notifications.egress_alert_path
-        if alert_path is not None and (not isinstance(alert_path, str) or not alert_path):
-            raise ValueError(
-                f"notifications.egress_alert_path must be a non-empty string or null, "
-                f"got {alert_path!r}")
 
     return cfg
 
@@ -3446,19 +3452,18 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
 
 # -- Main controller loop ----------------------------------------------------
 
-def end_saved_egress_alert(cfg: Config) -> None:
-    """Remove the saved egress alert (notify.EventDetector's record), for a run that
-    will not keep it up to date.
+def end_saved_egress_alert() -> None:
+    """Remove the saved egress alert (notify.EventDetector's record, at
+    notify.EGRESS_ALERT_PATH), for a run that will not keep it up to date.
 
-    Only a run with notifications on, the actual-exit check on and a record path
-    keeps it. Any other run cannot follow the alert: a fallback could end, or a new
-    one begin, unseen, and a later run that does keep the record would take a stale
-    alert over. The record is at notifications.egress_alert_path when that is set,
-    and otherwise at the default path, where a run with the default left it. No
-    record is the usual case; any other failure is a warning, and startup goes on."""
-    n = cfg.notifications
-    path = (n.egress_alert_path if n is not None and n.egress_alert_path is not None
-            else notify.DEFAULT_EGRESS_ALERT_PATH)
+    Only a run with notifications on, the actual-exit check on and
+    notifications.egress_alert_record on keeps it. Any other run cannot follow the
+    alert: a fallback could end, or a new one begin, unseen, and a later run that
+    does keep the record would take a stale alert over. The record has one fixed
+    place, so this always finds it. It runs once, on the calling thread, before the
+    control loop starts. No record is the usual case; any other failure is a
+    warning, and startup goes on."""
+    path = notify.EGRESS_ALERT_PATH
     try:
         if notify.remove_egress_alert_record(path):
             logging.info("egress alert: this run does not keep the record, so the saved "
@@ -3538,7 +3543,8 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             wan_down_hold_s=cfg.notifications.wan_down_hold_s,
             switch_hold_s=cfg.notifications.switch_hold_s,
             fec_alerts=cfg.notifications.fec_alerts,
-            egress_alert_path=cfg.notifications.egress_alert_path)
+            egress_alert_path=(notify.EGRESS_ALERT_PATH
+                               if cfg.notifications.egress_alert_record else None))
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -3549,13 +3555,13 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         egress_obs.start(stop_event)
 
     # The egress alert record follows the pages this run's detector hands over, so it
-    # needs the detector, the actual-exit check and a record path. A run short of any
-    # of them ends the saved alert before its first tick.
+    # needs the detector, the actual-exit check and the record switched on. A run
+    # short of any of them ends the saved alert before its first tick.
     keeps_egress_alert = (detector is not None and egress_obs is not None
                           and cfg.notifications is not None
-                          and cfg.notifications.egress_alert_path is not None)
+                          and cfg.notifications.egress_alert_record)
     if not keeps_egress_alert:
-        end_saved_egress_alert(cfg)
+        end_saved_egress_alert()
 
     while not stop_event.is_set():
         loop_start = time.time()
@@ -4148,6 +4154,11 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
 
     if notifier is not None:
         notifier.stop()
+    # Only after the Notifier: its stop() sends the pages it still holds, and their
+    # on_sents queue egress record operations. close() runs those, waiting a bounded
+    # time for the disk.
+    if detector is not None:
+        detector.close()
     # The keep-alive pool is process-global; don't leave a relay socket behind
     # for whatever runs after this loop.
     close_relay_conns()
