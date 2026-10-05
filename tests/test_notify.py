@@ -1432,15 +1432,36 @@ def test_egress_alert_record_is_written_whole_in_a_directory_made_for_it(tmp_pat
 
 def test_egress_alert_record_is_read_at_a_seed_with_the_check_on_and_only_then(tmp_path, caplog):
     path = tmp_path / "egress_alert.json"
-    path.mkdir()                              # any read of it fails, and says so
+    path.mkdir()                              # any read or removal of it fails
     off = notify.EventDetector(egress_alert_path=str(path))
     assert _warnings(caplog) == []            # constructing reads nothing,
-    assert off.observe(obs()) == []           # nor does a seed with the check off
-    assert off.observe(obs()) == []
-    assert _warnings(caplog) == []
+    assert off.observe(obs()) == []           # nor does a seed with the check off. That
+    assert off.observe(obs()) == []           # one ends the saved alert, and quietly: the
+    assert _warnings(caplog) == []            # controller warns when it cannot
+    assert path.is_dir()
     on = notify.EventDetector(egress_alert_path=str(path))
     assert on.observe(obs(egress=_eg_checking("relay_backbone"))) == []
     assert len(_warnings(caplog)) == 1        # whereas a seed with it on reads the record
+
+
+def test_egress_a_restart_with_the_check_off_ends_the_saved_alert(tmp_path):
+    # Greptile P1 on PR #24: a seed with the check off left the record alone, so a later
+    # restart with the check back on took it over. While the check was off the fallback
+    # could end unannounced and a new one begin, or the mode leave and come back, and the
+    # adopted alert then swallowed the new fallback's page.
+    path = tmp_path / "egress_alert.json"
+    first = notify.EventDetector(egress_alert_path=str(path))
+    first.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(first.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert path.exists()
+    off = notify.EventDetector(egress_alert_path=str(path))   # restarted with the check off
+    assert off.observe(obs()) == []
+    assert not path.exists()
+    assert off.observe(obs()) == []
+    on = notify.EventDetector(egress_alert_path=str(path))    # and later with it back on
+    assert on.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert on.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(on.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
 
 
 # -- the record follows the pages spool-notify took -----------------------------------

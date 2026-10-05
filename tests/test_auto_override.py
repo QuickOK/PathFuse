@@ -1,5 +1,7 @@
 import copy
 import json
+import logging
+import os
 import threading
 from pathlib import Path
 import pytest
@@ -10,6 +12,15 @@ import sbfd_ctl as M
 # The real ones, for runs that swap them out more than once in a test.
 _REAL_NOTIFIER = notify.Notifier
 _REAL_PUBLISH = M.publish_state
+
+
+@pytest.fixture(autouse=True)
+def egress_alert_default_under_tmp(tmp_path, monkeypatch):
+    """A controller run that does not keep the egress alert record removes the one at
+    notify.DEFAULT_EGRESS_ALERT_PATH at startup, and that default is the box's live
+    state. Every test here points it under tmp_path instead."""
+    monkeypatch.setattr(notify, "DEFAULT_EGRESS_ALERT_PATH",
+                        str(tmp_path / "default-egress_alert.json"))
 
 
 BASE_WITH_ENV = {
@@ -1243,3 +1254,84 @@ def test_a_controller_restart_takes_over_a_fallback_spool_notify_took(tmp_path, 
                            _keeping(record, working))
     assert _egress_pages(_handed(sent)) == [_FALLBACK, _RESTORED]
     assert not record.exists()
+
+
+# A run that cannot keep the record up to date: its actual-exit check is off, its
+# notifications are off, or its record path is null.
+_UNKEPT = ["check-off", "notifications-off", "null-path"]
+
+
+def _unkept_run(run, record):
+    """(notifications, observe) for one of the _UNKEPT runs."""
+    if run == "check-off":
+        return _keeping(record), False
+    if run == "notifications-off":
+        return None, True
+    return notify.NotifyCfg(topic="t", min_interval_s=0, egress_alert_path=None), True
+
+
+def _removals_and_syncs(monkeypatch):
+    """Records each os.remove (its path) and os.fsync (the synced file's device and
+    inode) from here on, in order."""
+    events: list = []
+    real_remove, real_fsync = os.remove, os.fsync
+
+    def remove(p, *a, **kw):
+        events.append(("remove", os.fspath(p)))
+        return real_remove(p, *a, **kw)
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        events.append(("fsync", (st.st_dev, st.st_ino)))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    monkeypatch.setattr(os, "fsync", fsync)
+    return events
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_controller_run_that_cannot_keep_the_record_ends_the_saved_alert(
+        tmp_path, monkeypatch, run):
+    # Greptile P1 on PR #24: a run that does not maintain the record left it in place.
+    # While it ran, the fallback could end unannounced and a new one begin, or the mode
+    # leave and come back. The next run that keeps the record then took the old alert
+    # over, and swallowed the new fallback's page or sent a restore for nothing. Such a
+    # run ends the saved alert at startup, durably: at its own path, or at the default
+    # one when it has none.
+    record = tmp_path / "egress_alert.json"
+    monkeypatch.setattr(notify, "DEFAULT_EGRESS_ALERT_PATH", str(record))
+    pages: list = []
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(record), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK] and record.exists()
+    notifications, observe = _unkept_run(run, record)
+    synced = _removals_and_syncs(monkeypatch)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
+                           observe=observe, pages=pages)
+    assert not record.exists()
+    at = synced.index(("remove", str(record)))
+    parent = os.stat(tmp_path)
+    assert ("fsync", (parent.st_dev, parent.st_ino)) in synced[at + 1:], synced
+    pages.clear()
+    _run_egress_controller(tmp_path, monkeypatch,
+                           ["checking", "checking", "pending", "mismatch", "mismatch"],
+                           _keeping(record), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK]
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_saved_alert_a_run_cannot_end_is_logged_and_the_run_goes_on(
+        tmp_path, monkeypatch, caplog, run):
+    # Ending the saved alert is best effort, like every record operation: a failure is
+    # one warning, and the controller starts all the same.
+    record = tmp_path / "egress_alert.json"
+    record.mkdir()                            # os.remove cannot remove it
+    monkeypatch.setattr(notify, "DEFAULT_EGRESS_ALERT_PATH", str(record))
+    notifications, observe = _unkept_run(run, record)
+    assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
+                                  observe=observe, pages=[]) == 3
+    warned = [r.getMessage() for r in caplog.records
+              if r.levelno == logging.WARNING and str(record) in r.getMessage()]
+    assert len(warned) == 1, warned

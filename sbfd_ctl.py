@@ -3446,6 +3446,29 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
 
 # -- Main controller loop ----------------------------------------------------
 
+def end_saved_egress_alert(cfg: Config) -> None:
+    """Remove the saved egress alert (notify.EventDetector's record), for a run that
+    will not keep it up to date.
+
+    Only a run with notifications on, the actual-exit check on and a record path
+    keeps it. Any other run cannot follow the alert: a fallback could end, or a new
+    one begin, unseen, and a later run that does keep the record would take a stale
+    alert over. The record is at notifications.egress_alert_path when that is set,
+    and otherwise at the default path, where a run with the default left it. No
+    record is the usual case; any other failure is a warning, and startup goes on."""
+    n = cfg.notifications
+    path = (n.egress_alert_path if n is not None and n.egress_alert_path is not None
+            else notify.DEFAULT_EGRESS_ALERT_PATH)
+    try:
+        if notify.remove_egress_alert_record(path):
+            logging.info("egress alert: this run does not keep the record, so the saved "
+                         "alert in %s has ended", path)
+    except OSError as e:
+        logging.warning("egress alert: cannot remove the saved alert %s, so a later run "
+                        "with the actual-exit check on may take it for standing: %s",
+                        path, e)
+
+
 def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=None):
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 
@@ -3524,6 +3547,15 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     if cfg.egress.observe is not None:
         egress_obs = egress_observer.EgressObserver(cfg.egress.observe)
         egress_obs.start(stop_event)
+
+    # The egress alert record follows the pages this run's detector hands over, so it
+    # needs the detector, the actual-exit check and a record path. A run short of any
+    # of them ends the saved alert before its first tick.
+    keeps_egress_alert = (detector is not None and egress_obs is not None
+                          and cfg.notifications is not None
+                          and cfg.notifications.egress_alert_path is not None)
+    if not keeps_egress_alert:
+        end_saved_egress_alert(cfg)
 
     while not stop_event.is_set():
         loop_start = time.time()

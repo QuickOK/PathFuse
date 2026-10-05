@@ -57,6 +57,9 @@ class NotifyCfg:
     # Where the egress fallback the operator was paged about is recorded, so a
     # restart in the middle of it does not page it again (see EventDetector). The
     # record follows the last egress page spool-notify accepted. None keeps no record.
+    # Only a run with notifications on, the actual-exit check on and a path keeps it
+    # up to date. Any other run removes it at startup, at this path or else at
+    # DEFAULT_EGRESS_ALERT_PATH (sbfd_ctl.end_saved_egress_alert).
     egress_alert_path: Optional[str] = DEFAULT_EGRESS_ALERT_PATH
 
 
@@ -439,8 +442,12 @@ class EventDetector:
         #   - No usable record: nothing stands, so a fallback pages as usual.
         # An exit already confirmed wrong at startup counts as announced too. No
         # page goes out for it, so it is recorded at once. A `pending` is not yet a
-        # fallback, so it stays armed. With the check off there is no egress, and
-        # nothing is read.
+        # fallback, so it stays armed.
+        # With the check off there is no egress, and this run cannot follow a saved
+        # alert: the fallback could end, or a new one begin, unseen. So it ends the
+        # alert and removes the record, unread, or a later run with the check on
+        # would take a stale alert over. Quietly: the controller has already tried
+        # to remove it at startup, and warned if it could not.
         if obs.egress:
             selected = obs.egress.get("selected")
             recorded = self._read_egress_alert()
@@ -451,6 +458,8 @@ class EventDetector:
                     self._end_egress_alert()
             if obs.egress.get("status") == "mismatch" and self._egress_alert_mode is None:
                 self._count_egress_alert_as_announced(selected)
+        else:
+            self._end_egress_alert(failure_level=logging.DEBUG)
         self._seeded = True
 
     # -- per-category edges ----------------------------------------------
@@ -753,14 +762,15 @@ class EventDetector:
             if self._egress_gen == gen and self._egress_alert_mode is None:
                 self._remove_egress_alert()
 
-    def _end_egress_alert(self) -> None:
-        """A silent end (a mode change, `skipped`, or a record for another mode at
-        the seed). No page goes out, so nothing would confirm a deferred removal:
-        the record goes now."""
+    def _end_egress_alert(self, failure_level: int = logging.WARNING) -> None:
+        """A silent end (a mode change, `skipped`, a record for another mode at the
+        seed, or a seed with the check off). No page goes out, so nothing would
+        confirm a deferred removal: the record goes now. A removal that fails is
+        logged at failure_level."""
         with self._egress_lock:
             self._egress_gen += 1
             self._egress_alert_mode = None
-            self._remove_egress_alert()
+            self._remove_egress_alert(failure_level)
 
     def _adopt_egress_alert(self, mode) -> None:
         """A record for the selected mode at the seed: its alert stands again, and
@@ -806,15 +816,15 @@ class EventDetector:
             logging.warning("egress alert: cannot record the fallback in %s durably, so a "
                             "restart may page it again: %s", path, e)
 
-    def _remove_egress_alert(self) -> None:
+    def _remove_egress_alert(self, failure_level: int = logging.WARNING) -> None:
         path = self._egress_alert_path
         if path is None:
             return
         try:
             remove_egress_alert_record(path)
         except OSError as e:
-            logging.warning("egress alert: cannot remove the record %s durably, so a "
-                            "restart may take its fallback for still standing: %s", path, e)
+            logging.log(failure_level, "egress alert: cannot remove the record %s durably, "
+                        "so a restart may take its fallback for still standing: %s", path, e)
 
     def _read_egress_alert(self) -> Optional[str]:
         """The selected mode the record names, or None when there is no usable

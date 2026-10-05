@@ -7,6 +7,16 @@ from pathlib import Path
 import pytest
 import sbfd_ctl as M
 import fec_control
+import notify
+
+
+@pytest.fixture(autouse=True)
+def egress_alert_default_under_tmp(tmp_path, monkeypatch):
+    """A controller run that does not keep the egress alert record removes the one at
+    notify.DEFAULT_EGRESS_ALERT_PATH at startup, and that default is the box's live
+    state. Every test here points it under tmp_path instead."""
+    monkeypatch.setattr(notify, "DEFAULT_EGRESS_ALERT_PATH",
+                        str(tmp_path / "default-egress_alert.json"))
 
 
 @pytest.fixture
