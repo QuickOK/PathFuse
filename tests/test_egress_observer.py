@@ -338,9 +338,8 @@ def _wait_for(pred, timeout=2.0):
 
 
 def _stop_and_join(o, stop):
-    """Stop the thread; True once it has exited. The loop sleeps on the kick, so wake it."""
+    """Stop the thread; True once it has exited. The stop alone must wake it."""
     stop.set()
-    o._kick.set()
     o._thread.join(timeout=2)
     return not o._thread.is_alive()
 
@@ -405,6 +404,42 @@ def test_start_is_a_no_op_while_the_thread_is_alive():
     finally:
         exited = _stop_and_join(o, stop2)
     assert exited
+
+
+def test_stop_ends_the_thread_without_waiting_out_the_interval():
+    # Between checks the loop sleeps on the kick for interval_s, two minutes here.
+    # Setting `stop` must end the thread at once, not when that sleep runs out.
+    o, _ = _observer()
+    o.cfg = E.ObserveCfg(url=URL, exits=RULES, interval_s=120)
+    o.settle_s = 0.0
+    o.set_selected("relay_backbone")
+    stop = threading.Event()
+    o.start(stop)
+    t = o._thread
+    assert t is not None
+    try:
+        assert _wait_for(lambda: o.snapshot()["status"] == "match")   # checked: now it sleeps
+    finally:
+        stop.set()
+    t.join(timeout=2)
+    assert not t.is_alive()
+
+
+def test_stop_during_the_settle_ends_the_thread_without_a_check():
+    o, calls = _observer()
+    o.settle_s = 120.0
+    o.set_selected("relay_backbone")                         # a pending kick: the thread settles first
+    stop = threading.Event()
+    o.start(stop)
+    t = o._thread
+    assert t is not None
+    try:
+        assert _wait_for(lambda: not o._kick.is_set())       # the settle has begun
+    finally:
+        stop.set()
+    t.join(timeout=2)
+    assert not t.is_alive()
+    assert calls == []
 
 
 class FakeStop:

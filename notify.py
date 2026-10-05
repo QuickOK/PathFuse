@@ -343,6 +343,10 @@ class EventDetector:
             self._all_down_alerted = True
         if obs.relay_polled and not obs.relay_ok:
             self._relay_fails = 1
+        # An exit already confirmed wrong counts as announced too; a later match
+        # still sends the restore. A `pending` is not yet a fallback, so it stays armed.
+        if obs.egress and obs.egress.get("status") == "mismatch":
+            self._egress_alerted = True
         self._seeded = True
 
     # -- per-category edges ----------------------------------------------
@@ -576,7 +580,8 @@ class EventDetector:
         failed check is not a recovery. A change of the selected mode ends an
         alert silently: the observer reports `checking` right after the change,
         and `skipped` while local_direct is selected. A fallback on the new mode
-        then pages afresh, and a match under it is not announced as a restore."""
+        then pages afresh, and a match under it is not announced as a restore.
+        A mismatch already present at startup counts as announced (see _seed)."""
         e = obs.egress
         if not e:
             return []
