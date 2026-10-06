@@ -418,6 +418,29 @@ def test_notifier_stop_says_whether_its_worker_ended(tmp_path, monkeypatch):
     assert n.stop() is True
 
 
+def test_an_idle_workers_stop_returns_at_once(tmp_path):
+    # run_controller gives stop() 35 s, on the ruling that an idle worker ends at once:
+    # one that never had a page, and one whose last page is long sent. Neither may make
+    # a normal shutdown wait.
+    script, log = _spool_notify(tmp_path)
+    never_paged = notify.Notifier("pathfusetest", min_interval_s=0, command=script)
+    never_paged.start()
+    start = time.monotonic()
+    assert never_paged.stop(timeout=5.0) is True
+    took = time.monotonic() - start
+    assert took < 1.0, f"an idle worker took {took:.2f} s to end"
+
+    n = notify.Notifier("pathfusetest", min_interval_s=0, command=script)
+    n.start()
+    n.notify(ev(kind="started", title="start", message="hello"))
+    assert wait_for(lambda: _handed(log) == ["start"])   # the page is sent; the worker idles
+    start = time.monotonic()
+    assert n.stop(timeout=5.0) is True
+    took = time.monotonic() - start
+    assert took < 1.0, f"an idle worker took {took:.2f} s to end after its last page"
+    assert n._thread is not None and not n._thread.is_alive()
+
+
 # -- EventDetector tests ------------------------------------------------
 
 
