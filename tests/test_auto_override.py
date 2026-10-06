@@ -1417,6 +1417,36 @@ def test_a_record_left_by_an_earlier_run_does_not_hide_a_new_fallback(
         "the earlier run's record swallowed the new fallback's page"
 
 
+@pytest.mark.parametrize("run", _UNKEPT + ["kept"])
+def test_a_start_that_aborts_has_already_ended_a_saved_alert_the_run_cannot_keep(
+        tmp_path, monkeypatch, run):
+    # CodeRabbit on PR #24 (sbfd_ctl.py:3477-3566): the clean-up ran after apply_nft_init
+    # and the observer's start, so a start that aborted at either left the record for a
+    # later run to adopt, and a confirmed fallback under it then stayed silent. The
+    # decision needs only the config, so the clean-up is now run_controller's first act.
+    # A run that keeps the record leaves it as it is, as before.
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    written = record.read_text()
+    notifications, observe = (_keeping(), True) if run == "kept" else _unkept_run(run)
+
+    def refuse(cfg):
+        raise RuntimeError("nft: command not found")
+
+    monkeypatch.setattr(M, "apply_nft_init", refuse)
+    cfg = base_cfg(
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=(
+            egress_observer.ObserveCfg(url="https://probe.example.net/trace")
+            if observe else None)),
+        notifications=notifications)
+    with pytest.raises(RuntimeError, match="nft: command not found"):
+        M.run_controller(cfg, stop_event=threading.Event())
+    if run == "kept":
+        assert record.read_text() == written
+    else:
+        assert not record.exists()
+
+
 def test_a_controller_run_closes_the_detector_after_its_notifier_sent_everything(
         tmp_path, monkeypatch):
     # At shutdown run_controller stops the Notifier first: stop() waits for the pages it

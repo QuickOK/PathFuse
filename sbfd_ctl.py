@@ -3460,9 +3460,10 @@ def end_saved_egress_alert() -> None:
     notifications.egress_alert_record on keeps it. Any other run cannot follow the
     alert: a fallback could end, or a new one begin, unseen, and a later run that
     does keep the record would take a stale alert over. The record has one fixed
-    place, so this always finds it. It runs once, on the calling thread, before the
-    control loop starts. No record is the usual case; any other failure is a
-    warning, and startup goes on."""
+    place, so this always finds it. It runs once, on the calling thread, first thing
+    in run_controller: before anything that can abort the start, since a record an
+    aborted start left would be adopted by a later run. No record is the usual case;
+    any other failure is a warning, and startup goes on."""
     path = notify.EGRESS_ALERT_PATH
     try:
         if notify.remove_egress_alert_record(path):
@@ -3475,6 +3476,16 @@ def end_saved_egress_alert() -> None:
 
 
 def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=None):
+    # The egress alert record follows the pages this run's detector hands over, so it
+    # needs notifications, the actual-exit check and the record switched on. A run
+    # short of any of them ends the saved alert first of all, before apply_nft_init
+    # or any thread can abort the start: a record an aborted start left would be one
+    # a later run adopts. The decision needs only the config.
+    keeps_egress_alert = (cfg.notifications is not None
+                          and cfg.notifications.egress_alert_record
+                          and cfg.egress.observe is not None)
+    if not keeps_egress_alert:
+        end_saved_egress_alert()
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 
     apply_nft_init(cfg)
@@ -3553,15 +3564,6 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
     if cfg.egress.observe is not None:
         egress_obs = egress_observer.EgressObserver(cfg.egress.observe)
         egress_obs.start(stop_event)
-
-    # The egress alert record follows the pages this run's detector hands over, so it
-    # needs the detector, the actual-exit check and the record switched on. A run
-    # short of any of them ends the saved alert before its first tick.
-    keeps_egress_alert = (detector is not None and egress_obs is not None
-                          and cfg.notifications is not None
-                          and cfg.notifications.egress_alert_record)
-    if not keeps_egress_alert:
-        end_saved_egress_alert()
 
     while not stop_event.is_set():
         loop_start = time.time()
