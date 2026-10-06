@@ -3914,3 +3914,75 @@ def test_an_until_past_float_range_suppresses_nothing_and_never_stops_a_tick(unt
     clk.advance(30)
     wclk.advance(30)
     assert kinds(d.observe(down)) == ["wan_down"]
+
+
+_PAD = "x" * (100 * 1024)   # 100 KiB: past _RECORD_MAX_BYTES (64 KiB)
+
+
+def _record_past_the_bound(path, **fields):
+    """A record for relay_backbone, valid JSON from end to end, `fields` added, padded past
+    the bound: read whole, it is a record; read up to the bound, it is not JSON."""
+    body = json.dumps({"selected": "relay_backbone", "announced_at": 1.0, **fields, "pad": _PAD})
+    assert len(body) > notify._RECORD_MAX_BYTES
+    path.write_text(body, encoding="utf-8")
+    assert notify._record_fields(path.read_bytes())[0] == "relay_backbone"   # whole, it reads
+    return body
+
+
+def test_egress_a_record_past_the_bound_counts_as_absent_at_the_seed(tmp_path, caplog):
+    # A record is a few hundred bytes: one past the bound is read only up to it, and what is
+    # read is no record, so it counts as absent, with the one warning, and nothing stands.
+    # Read whole, this one would be adopted, trusted (it carries this boot's clean-close
+    # mark), and the confirmed mismatch would stay silent.
+    path = tmp_path / "egress_alert.json"
+    _record_past_the_bound(path, closed_at=2.0, boot_id=notify._boot_id())
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert d.drain()
+    said = [r.getMessage() for r in _warnings(caplog, d)]
+    assert len(said) == 1, said
+    assert said[0].startswith(f"egress alert: the record {path} is not JSON (") \
+        and said[0].endswith(", so it counts as absent"), said
+    assert d.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # nothing stood
+    assert d.close()
+
+
+def test_egress_a_record_past_the_bound_is_not_marked_at_the_close(tmp_path):
+    # The close marks the record this run's pages wrote, if it still names the mode. One
+    # replaced meanwhile by something past the bound is no record, and is left as it is;
+    # read whole, it would name the mode, and be rewritten with the mark.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    body = _record_past_the_bound(path)
+    assert d.close()
+    assert path.read_text(encoding="utf-8") == body, "the record past the bound was rewritten"
+
+
+class _Unforeseen(Exception):
+    """An exception type _record_fields is not documented to raise."""
+
+
+def test_egress_whatever_the_parser_raises_the_seed_counts_the_record_as_absent(
+        tmp_path, caplog, monkeypatch):
+    # The seed reads the record on the controller's thread: whatever _record_fields raises,
+    # the record counts as absent, with the one warning, and the start goes on.
+    path = tmp_path / "egress_alert.json"
+    path.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}),
+                    encoding="utf-8")
+
+    def raise_unforeseen(raw):
+        raise _Unforeseen("is beyond its parser")
+
+    monkeypatch.setattr(notify, "_record_fields", raise_unforeseen)
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # and did not raise
+    assert d.drain()
+    assert [r.getMessage() for r in _warnings(caplog, d)] == [
+        f"egress alert: the record {path} is beyond its parser, so it counts as absent"]
+    assert d.observe(obs(egress=_eg("pending"))) == []
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # nothing stood
+    assert d.close()

@@ -1036,7 +1036,8 @@ class EventDetector:
         monotonic (seconds since boot) and would leave every window looking
         open, muting a WAN's alerts indefinitely.
 
-        `until` must also be FINITE, and must not be a bool. json.loads accepts
+        `until` must also be FINITE, and must not be a bool; an int past float
+        range is no timestamp either (math.isfinite raises on it). json.loads accepts
         bareword Infinity, and `now < inf` is true forever: a window file
         carrying one would silence that WAN's outages permanently, which is the
         single failure mode that can hide a real outage. (NaN fails the other
@@ -1047,7 +1048,7 @@ class EventDetector:
         if not isinstance(m, dict):
             return None
         wan, until = m.get("wan"), m.get("until")
-        if not isinstance(wan, str) or isinstance(until, bool):
+        if not isinstance(wan, str):
             return None
         if _finite(until) is None:   # not a number, a bool, non-finite, or past float range
             return None
