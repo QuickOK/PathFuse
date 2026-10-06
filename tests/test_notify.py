@@ -1374,6 +1374,30 @@ def test_egress_a_mode_change_ends_the_alert_and_its_record(tmp_path):
     assert json.loads(path.read_text())["selected"] == "relay_vpn"
 
 
+def test_egress_an_alert_on_a_mode_other_than_the_seeds_pages_once_and_restores(tmp_path):
+    # A change of the selected mode is a change from the last tick's mode, not from the
+    # mode the run started on. Compared against that one, every tick after a change
+    # would end the alert afresh: each mismatch on the new mode would page a fresh
+    # fallback, and its match would find no alert standing and page no restore. After
+    # a change, the new mode's fallback stands like any other: a run of mismatches
+    # pages once, and the match pages the restore and ends the record.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # the seed
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []        # the mode changes
+    pages: list = []
+    for _ in range(3):
+        pages += _sent(d.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))))
+    assert pages == [FALLBACK], "a standing fallback on the new mode paged again"
+    assert d.drain()
+    assert json.loads(path.read_text())["selected"] == "relay_vpn"
+    pages += _sent(d.observe(obs(egress=_eg("match", selected="relay_vpn",
+                                            observed="relay_vpn"))))
+    assert pages == [FALLBACK, RESTORED], "the new mode's restore never paged"
+    assert d.drain()
+    assert not path.exists()
+
+
 @pytest.mark.parametrize("selected", ["local_direct", "relay_backbone"])
 def test_egress_skipped_ends_the_alert_and_its_record(tmp_path, selected):
     # The observer skips its check while local_direct is selected. `skipped` ends an
@@ -2367,6 +2391,21 @@ def test_egress_close_gives_up_on_a_stalled_record_disk_after_its_timeout(
         assert 0.15 <= out["took"] < 2.0, out
     finally:
         release.set()
+
+
+def test_egress_the_record_keeper_is_one_daemon_thread_started_at_the_seed(tmp_path):
+    # Constructing a detector starts no thread: its first observation starts exactly
+    # one, the keeper's, and that one is a daemon. close() gives up on a disk that
+    # never recovers (above), and run_controller then returns; a keeper that was no
+    # daemon, still stuck in its sync, would hold the process at exit.
+    before = set(threading.enumerate())
+    d = notify.EventDetector(egress_alert_path=str(tmp_path / "egress_alert.json"))
+    assert set(threading.enumerate()) - before == set()
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    started = set(threading.enumerate()) - before
+    assert started == {_keeper_thread(d)}, started
+    assert _keeper_thread(d).daemon, \
+        "a keeper stuck in a sync must not hold the process at exit"
 
 
 # -- the egress alert record across a power loss ----------------------------------------
