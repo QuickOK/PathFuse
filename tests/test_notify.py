@@ -262,13 +262,14 @@ def test_notifier_survives_failing_command(tmp_path):
 # record hangs on it (see "the record follows the pages spool-notify took" below).
 
 
-def _spool_notify(tmp_path, name="spool-notify", rc=0, refuse=None):
-    """A spool-notify stand-in that logs the title it is handed, then exits rc, or 1
-    when the title is `refuse`."""
+def _spool_notify(tmp_path, name="spool-notify", rc=0, refuse=None, exit_after_s=0.0):
+    """A spool-notify stand-in that logs the title it is handed, lingers `exit_after_s`
+    seconds, then exits rc, or 1 when the title is `refuse`."""
     log = tmp_path / f"{name}.log"
     script = tmp_path / name
     refusal = f'[ "$1" = "{refuse}" ] && exit 1\n' if refuse is not None else ""
-    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> "{log}"\n{refusal}exit {rc}\n',
+    linger = f"sleep {exit_after_s}\n" if exit_after_s else ""
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> "{log}"\n{refusal}{linger}exit {rc}\n',
                       encoding="utf-8")
     script.chmod(0o755)
     return str(script), log
@@ -418,11 +419,16 @@ def test_notifier_stop_says_whether_its_worker_ended(tmp_path, monkeypatch):
     assert n.stop() is True
 
 
-def test_an_idle_workers_stop_returns_at_once(tmp_path):
+@pytest.mark.parametrize("exit_after_s", [0.0, 1.5],
+                         ids=["prompt-stand-in", "stand-in-lingers-1.5s-after-logging"])
+def test_an_idle_workers_stop_returns_at_once(tmp_path, exit_after_s):
     # run_controller gives stop() 35 s, on the ruling that an idle worker ends at once:
     # one that never had a page, and one whose last page is long sent. Neither may make
-    # a normal shutdown wait.
-    script, log = _spool_notify(tmp_path)
+    # a normal shutdown wait. The second half starts its clock only once the page's
+    # on_sent has run: the worker runs it after spool-notify exited 0, so the send is
+    # over and the worker idles. The stand-in's log line alone does not say that, since
+    # it is written before the stand-in exits, which the lingering stand-in shows.
+    script, log = _spool_notify(tmp_path, exit_after_s=exit_after_s)
     never_paged = notify.Notifier("pathfusetest", min_interval_s=0, command=script)
     never_paged.start()
     start = time.monotonic()
@@ -432,8 +438,10 @@ def test_an_idle_workers_stop_returns_at_once(tmp_path):
 
     n = notify.Notifier("pathfusetest", min_interval_s=0, command=script)
     n.start()
-    n.notify(ev(kind="started", title="start", message="hello"))
-    assert wait_for(lambda: _handed(log) == ["start"])   # the page is sent; the worker idles
+    sent = threading.Event()
+    n.notify(notify.Event("started", "start", "hello", "high", on_sent=sent.set))
+    assert sent.wait(5.0), "spool-notify did not take the page"   # the send is over; the worker idles
+    assert _handed(log) == ["start"]
     start = time.monotonic()
     assert n.stop(timeout=5.0) is True
     took = time.monotonic() - start
