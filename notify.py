@@ -505,9 +505,11 @@ class EventDetector:
 
     A restart reads the record at the seed: a fallback paged before the restart
     is not paged again and its restore still is, while one that began during the
-    restart pages as usual. With egress_alert_path None the detector has no
-    keeper and does no file I/O at all, and a restart in the middle of a
-    fallback pages it again."""
+    restart pages as usual. So does a mismatch the seed itself finds confirmed
+    with no record for it: it is unannounced, whether it began while the
+    controller was down or its record was lost, and the next tick pages it. With
+    egress_alert_path None the detector has no keeper and does no file I/O at
+    all, and a restart in the middle of a fallback pages it again."""
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
@@ -600,7 +602,9 @@ class EventDetector:
     def _seed(self, obs):
         # Whatever is already broken at startup is treated as announced: no
         # alert now, and none once the hold expires either. A later recovery
-        # still reports, which is the useful half of the edge.
+        # still reports, which is the useful half of the edge. (An egress
+        # fallback is the exception: its record says whether it was announced,
+        # and without one it pages. See _seed_egress.)
         #
         # ...unless it is broken under an open maintenance window, and that
         # exception is the whole point of consulting obs.maintenance here. A
@@ -653,9 +657,11 @@ class EventDetector:
         #   - A record for another mode: the selected mode changed while the
         #     controller was down, which ends an alert silently. Drop it.
         #   - No usable record: nothing stands, so a fallback pages as usual.
-        # An exit already confirmed wrong at startup counts as announced too. No
-        # page goes out for it, so it is recorded at once. A `pending` is not yet a
-        # fallback, so it stays armed.
+        # That holds for a `mismatch` already confirmed here as well: with no record
+        # for it, it is unannounced, whether it began while the controller was down
+        # or its record was lost, and both must page. Nothing stands, so the next
+        # tick pages it (see _egress_events) and the record follows that page, like
+        # any other. A `pending` is not yet a fallback, so it stays armed too.
         # A `skipped` ends the saved record, as it does on any later tick (see
         # _egress_events), so the record goes unread.
         status, selected = e.get("status"), e.get("selected")
@@ -669,8 +675,6 @@ class EventDetector:
                 self._adopt_egress_alert(recorded)
             else:
                 self._end_egress_alert()
-        if status == "mismatch" and self._egress_alert_mode is None:
-            self._count_egress_alert_as_announced(selected)
 
     # -- per-category edges ----------------------------------------------
 
@@ -918,7 +922,10 @@ class EventDetector:
         and after a mode change, and the mode comparison already covers a change.
         That leaves its start, after a restart, where an alert the record carried
         over (see _seed_egress) must stand until the first check confirms or
-        clears it.
+        clears it. A mismatch the seed found with no record for it left nothing
+        standing, so it pages here on the first tick after the seed: it is
+        unannounced, whether it began while the controller was down or its record
+        was lost.
 
         Each page carries the on_sent that settles the record once spool-notify
         accepts it (see the class docstring); a silent end settles it itself."""
@@ -1026,15 +1033,6 @@ class EventDetector:
         the record stays as written."""
         self._egress_gen += 1
         self._egress_alert_mode = mode
-
-    def _count_egress_alert_as_announced(self, mode) -> None:
-        """A fallback already confirmed at the seed, with no record for it, counts
-        as announced. No page goes out for it, so it is recorded now: the generation
-        moves on, and then the write is queued."""
-        self._egress_gen += 1
-        self._egress_alert_mode = mode
-        if self._keeper is not None:
-            self._keeper.write(mode, self._wall_clock())
 
     def _read_egress_alert(self) -> Optional[str]:
         """The selected mode the record names, or None when there is no usable

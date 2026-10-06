@@ -1173,12 +1173,16 @@ def test_egress_a_new_mismatch_pages_again_after_the_alert_ends(ending):
     assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
 
 
-def test_egress_mismatch_at_startup_counts_as_announced():
-    # As with a WAN already down at startup: a restart must not page on a fallback
-    # it finds in place, but the recovery from it is still news.
+def test_egress_a_mismatch_at_startup_is_unannounced_and_pages_on_the_next_tick():
+    # CodeRabbit on PR #24. Unlike a WAN already down at startup: a fallback the seed
+    # finds in place, with no record saying its page went out, is one the operator
+    # never heard of (it began while the controller was down, or its record was lost).
+    # So the next tick pages it, once, and the recovery from it is a restore.
     d = notify.EventDetector()
-    assert d.observe(obs(egress=_eg("mismatch"))) == []          # seed
-    assert d.observe(obs(egress=_eg("mismatch"))) == []          # no page: already announced
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # seed: silent, nothing stands
+    evs = d.observe(obs(egress=_eg("mismatch")))                 # the next tick pages it
+    assert len(evs) == 1 and evs[0].kind == "egress" and evs[0].priority == "high"
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # once
     evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
     assert len(evs) == 1 and evs[0].kind == "egress" and "restored" in evs[0].title.lower()
 
@@ -1189,10 +1193,12 @@ def test_egress_mismatch_at_startup_counts_as_announced():
     pytest.param(_eg("error"), id="error"),
     pytest.param(_eg("match", observed="relay_backbone"), id="match"),
     pytest.param(_eg("skipped", selected="local_direct"), id="skipped"),
+    pytest.param(_eg("mismatch"), id="mismatch"),
 ])
-def test_egress_only_a_mismatch_at_startup_counts_as_announced(first):
-    # Anything short of a confirmed mismatch at startup leaves the page armed:
-    # seeding it as announced would swallow the first real fallback.
+def test_egress_nothing_at_startup_counts_as_announced(first):
+    # Whatever the seed finds leaves the page armed, a confirmed mismatch included:
+    # with no record, nothing was announced, and seeding an alert as standing would
+    # swallow the first real fallback, or the one found.
     d = notify.EventDetector()
     assert d.observe(obs(egress=first)) == []                    # seed
     evs = d.observe(obs(egress=_eg("mismatch")))
@@ -1369,12 +1375,18 @@ def test_egress_a_skipped_check_at_the_restart_ends_the_saved_alert(tmp_path):
 
 
 @pytest.mark.parametrize("prior", [None, "relay_backbone"], ids=["no-record", "record-for-another-mode"])
-def test_egress_a_fallback_found_at_startup_is_recorded_like_any_other(tmp_path, prior):
+def test_egress_a_fallback_found_at_startup_is_paged_and_recorded_like_any_other(tmp_path, prior):
+    # Nothing says the operator heard of it: there is no record, or the record is
+    # another mode's, which the seed drops. So the next tick pages it, its page's
+    # on_sent records it, and a restart then keeps it announced.
     path = tmp_path / "egress_alert.json"
     if prior is not None:
         _write_record(path, prior)
     first = notify.EventDetector(egress_alert_path=str(path))
-    assert first.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))) == []   # counted as announced
+    assert first.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))) == []   # unannounced
+    assert first.drain()
+    assert not path.exists()                                    # and no record for it, yet
+    assert _sent(first.observe(obs(egress=_eg("mismatch", selected="relay_vpn")))) == [FALLBACK]
     assert first.close()
     assert json.loads(path.read_text())["selected"] == "relay_vpn"
     again = notify.EventDetector(egress_alert_path=str(path))   # so a restart keeps it announced
@@ -1382,6 +1394,34 @@ def test_egress_a_fallback_found_at_startup_is_recorded_like_any_other(tmp_path,
     assert again.observe(obs(egress=_eg("mismatch", selected="relay_vpn"))) == []
     evs = again.observe(obs(egress=_eg("match", selected="relay_vpn", observed="relay_vpn")))
     assert _titles(evs) == [RESTORED]
+
+
+def test_egress_a_mismatch_at_the_seed_with_no_record_pages_and_records_only_on_sent(tmp_path):
+    # CodeRabbit on PR #24: the seed counted a confirmed mismatch with no record for it
+    # as announced, and wrote the record, though no page had gone out; a restart then
+    # adopted that record and silenced a fallback the operator never heard of. With no
+    # record it is unannounced, whether it began while the controller was down or its
+    # record was lost: the seed leaves nothing standing and writes nothing, the next
+    # tick pages it, and the record follows that page's on_sent, like any other page's.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # the seed: no page
+    assert d.drain()
+    assert not path.exists()                                     # no record
+    assert d._egress_alert_mode is None                          # nothing standing
+    [page] = d.observe(obs(egress=_eg("mismatch")))              # the next tick pages it
+    assert page.title == FALLBACK
+    assert d.drain()
+    assert not path.exists()                                     # not until spool-notify takes it
+    page.on_sent()
+    assert d.drain()
+    assert json.loads(path.read_text())["selected"] == "relay_backbone"
+    assert d.observe(obs(egress=_eg("mismatch"))) == []          # paged once
+    assert d.close()
+    after = notify.EventDetector(egress_alert_path=str(path))    # a restart adopts it
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg("mismatch"))) == []      # confirmed: stays silent
+    assert after.close()
 
 
 def test_egress_a_mode_change_ends_the_alert_and_its_record(tmp_path):
@@ -1559,14 +1599,15 @@ def test_egress_alert_path_none_does_no_file_io(monkeypatch):
         monkeypatch.setattr(os, name, refusing(f"os.{name}", getattr(os, name)))
     d = notify.EventDetector()
     pages = []
-    for e in (_eg("mismatch"),                                   # the seed: counted as announced
+    for e in (_eg("mismatch"),                                   # the seed: unannounced, silent
+              _eg("mismatch"),                                   # a fallback
               _eg("match", observed="relay_backbone"),           # restored
               _eg("mismatch"),                                   # a fallback
               _eg_checking("relay_vpn"),                         # a mode change ends it
               _eg("mismatch", selected="relay_vpn"),             # a fallback
               _eg("skipped", selected="local_direct", observed=None, ip=None)):
         pages += _sent(d.observe(obs(egress=e)))
-    assert pages == [RESTORED, FALLBACK, FALLBACK]
+    assert pages == [FALLBACK, RESTORED, FALLBACK, FALLBACK]
     assert attempted == []
     assert d._keeper is None
 
@@ -2111,13 +2152,13 @@ def _record_changes(monkeypatch, path):
 
 def test_egress_observe_does_not_wait_for_a_stalled_record_disk(tmp_path, monkeypatch):
     # Greptile and CodeRabbit on PR #24: a disk stalled in a sync stalled failover. Here
-    # the directory sync stalls from the seed's write on, and the keeper with it. A
-    # fallback counted as announced at the seed, a restore, a fallback, a silent end and
-    # a fallback on the new mode each still return at once (_NO_WAIT_S), and every page still
-    # goes out: the Notifier runs each page's on_sent without waiting for the disk
-    # either. The seed's record is on disk all along, so a removal made on the
-    # controller's thread would stall as well. Once the disk recovers, the record
-    # follows all of it, in order.
+    # the directory sync stalls from the first fallback page's write on, and the keeper
+    # with it. A fallback found at the seed (unannounced), a fallback, a restore, a
+    # fallback, a silent end and a fallback on the new mode each still return at once
+    # (_NO_WAIT_S), and every page still goes out: the Notifier runs each page's on_sent
+    # without waiting for the disk either. The first fallback's record is on disk from
+    # then on, so a removal made on the controller's thread would stall as well. Once
+    # the disk recovers, the record follows all of it, in order.
     path = tmp_path / "egress_alert.json"
     entered, release = _stalling_fsync(monkeypatch, directories_only=True)
     script, log = _spool_notify(tmp_path)
@@ -2127,7 +2168,8 @@ def test_egress_observe_does_not_wait_for_a_stalled_record_disk(tmp_path, monkey
     n.start()
     try:
         for step, egress, want in [
-                ("a fallback at the seed", _eg("mismatch"), []),
+                ("a fallback at the seed", _eg("mismatch"), []),    # no page, so no write
+                ("a fallback", _eg("mismatch"), [FALLBACK]),        # its write sticks
                 ("a restore", _eg("match", observed="relay_backbone"), [RESTORED]),
                 ("a fallback", _eg("mismatch"), [FALLBACK]),
                 ("a silent end", _eg_checking("relay_vpn"), []),
@@ -2136,14 +2178,15 @@ def test_egress_observe_does_not_wait_for_a_stalled_record_disk(tmp_path, monkey
             took, evs = _timed_observe(d, egress)
             assert took < _NO_WAIT_S, f"{step}: observe() took {took:.3f} s"
             assert _titles(evs) == want, step
-            assert entered.wait(5), step       # the keeper is stuck in the seed's write
             for e in evs:
                 n.notify(e)
             handed += want
             assert wait_for(lambda: _handed(log) == handed), step
+            if handed:                         # the keeper is stuck in the first fallback's write
+                assert entered.wait(5), step
         n.stop()                               # and the worker has run every on_sent
         assert n._thread is not None and not n._thread.is_alive()
-        assert path.exists() and not release.is_set()   # the seed's record, its sync stuck
+        assert path.exists() and not release.is_set()   # the first fallback's record, its sync stuck
     finally:
         release.set()
     assert d.close()
@@ -2275,9 +2318,9 @@ def test_egress_record_io_happens_on_the_keeper_thread_only(tmp_path, monkeypatc
         t.join(5)
 
     d = notify.EventDetector(egress_alert_path=str(path))
-    assert d.observe(obs(egress=_eg("mismatch"))) == []      # the seed: counted as announced
+    assert d.observe(obs(egress=_eg("mismatch"))) == []      # the seed: ends that record
     assert [name for ident, name in calls if ident == controller] == ["open"]   # its read
-    for e in (_eg("match", observed="relay_backbone"), _eg("mismatch"),
+    for e in (_eg("mismatch"), _eg("match", observed="relay_backbone"), _eg("mismatch"),
               _eg_checking("relay_vpn"), _eg("mismatch", selected="relay_vpn"),
               _eg("skipped", selected="local_direct", observed=None, ip=None)):
         hand_over(d.observe(obs(egress=e)))
