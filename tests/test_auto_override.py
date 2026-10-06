@@ -1,8 +1,28 @@
 import copy
 import json
+import logging
+import os
+import signal
+import sys
+import threading
+import time
 from pathlib import Path
 import pytest
+import egress_observer
+import notify
 import sbfd_ctl as M
+
+# The real ones, for runs that swap them out more than once in a test.
+_REAL_NOTIFIER = notify.Notifier
+_REAL_PUBLISH = M.publish_state
+
+
+@pytest.fixture(autouse=True)
+def egress_alert_record_under_tmp(tmp_path, monkeypatch):
+    """The egress alert record lives at notify.EGRESS_ALERT_PATH, which is the box's
+    live state: a controller run keeps the record there, or removes it at startup.
+    Every test here points it at tmp_path/egress_alert.json instead."""
+    monkeypatch.setattr(notify, "EGRESS_ALERT_PATH", str(tmp_path / "egress_alert.json"))
 
 
 BASE_WITH_ENV = {
@@ -1016,15 +1036,19 @@ def test_published_snapshot_egress_observed_is_null_when_off(tmp_path, monkeypat
 
 
 def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path, monkeypatch):
-    # run_controller with notifications on. The tests above stop short of two wiring
-    # points: the observer runs on the controller's own stop event, and every tick's
+    # run_controller with notifications on. The tests above stop short of three wiring
+    # points: the observer runs on the controller's own stop event; every tick's
     # egress_observed reaches the detector, so a persistent fallback pages once and
-    # its end pages once.
+    # its end pages once; and the detector keeps the fallback's record at
+    # notify.EGRESS_ALERT_PATH while it stands. The stub takes each page as
+    # spool-notify would, so the page's on_sent runs as it is handed over.
     import egress_observer
     import notify
     import threading
     script = ["checking", "pending", "mismatch", "mismatch", "error", "match", "match"]
-    started, published, pages = [], [], []
+    started, published, pages, recorded = [], [], [], []
+    record = tmp_path / "egress_alert.json"
+    detectors = _detectors_made(monkeypatch)
 
     class FakeObserver:
         def __init__(self, cfg, **kw):
@@ -1046,17 +1070,21 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
                     "checked_at": 2.0, "error": None}
 
     class StubNotifier:
+        SUBPROCESS_TIMEOUT_S = _REAL_NOTIFIER.SUBPROCESS_TIMEOUT_S   # run_controller's shutdown bound
+
         def __init__(self, topic, **kw):
             pass
 
         def start(self):
             pass
 
-        def stop(self):
-            pass
+        def stop(self, timeout=None):
+            return True
 
         def notify(self, ev):
             pages.append(ev)
+            if ev.on_sent is not None:
+                ev.on_sent()
 
     monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
     monkeypatch.setattr(notify, "Notifier", StubNotifier)
@@ -1078,6 +1106,9 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
         # _stub_controller_io stops after one tick; this runs one tick per scripted status.
         real_publish(c, snap)
         published.append(snap["egress_observed"]["status"])
+        [detector] = detectors               # it has seen this tick by now, and
+        assert detector.drain()              # its keeper has done what that queued
+        recorded.append(record.exists())
         if len(published) == len(script):
             stop.set()
 
@@ -1086,8 +1117,724 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
 
     assert len(started) == 1 and started[0] is stop         # the controller's own stop event
     assert published == script                              # the whole script ran, one snapshot a tick
+    assert recorded == [False, False, True, True, True, False, False]
     assert [e.kind for e in pages] == ["started", "egress", "egress"]
     fallback, restored = pages[1], pages[2]
     assert "fallback" in fallback.title.lower() and fallback.priority == "high"
     assert "relay Backbone" in fallback.message and "198.51.100.20" in fallback.message
     assert "restored" in restored.title.lower() and restored.priority == "default"
+
+
+# -- the egress alert record across controller runs -------------------------------------
+#
+# Each run is one process lifetime, main() with its config loaded: the decision whether
+# the run keeps the record and, when it does not, the clean-up of a saved alert, then
+# run_controller, one tick per scripted egress status. The record follows the pages
+# spool-notify took (notify.EventDetector), and a run's clean close marks it.
+
+_FALLBACK, _RESTORED = "🧭 Egress fallback", "🧭 Egress restored"
+
+
+def _spool_notify(tmp_path, name, rc):
+    """A spool-notify stand-in: logs the title it is handed, then exits rc."""
+    log = tmp_path / f"{name}.log"
+    script = tmp_path / name
+    script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> "{log}"\nexit {rc}\n',
+                      encoding="utf-8")
+    script.chmod(0o755)
+    return str(script), log
+
+
+def _handed(log):
+    return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+
+def _egress_pages(titles):
+    return [t for t in titles if "Egress" in t]
+
+
+def _detectors_made(monkeypatch):
+    """The EventDetectors made from here on, run_controller's among them, in a list."""
+    made: list = []
+
+    class Recorded(notify.EventDetector):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+    monkeypatch.setattr(notify, "EventDetector", Recorded)
+    return made
+
+
+def _notifiers_made(monkeypatch):
+    """The Notifiers made from here on, run_controller's among them, in a list.
+    _run_egress_controller re-points notify.Notifier at the real class, so this wraps
+    the class's __init__ rather than replacing the name."""
+    made: list = []
+    real_init = notify.Notifier.__init__
+
+    def init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        made.append(self)
+
+    monkeypatch.setattr(notify.Notifier, "__init__", init)
+    return made
+
+
+def _shutdown_warnings(caplog):
+    """The warnings run_controller logged about its shutdown."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "shutdown" in r.getMessage()]
+
+
+def _keeping(command=notify.DEFAULT_COMMAND, record=True):
+    """Notifications with every page sent at once, that keep the egress alert record
+    (at notify.EGRESS_ALERT_PATH) unless `record` is False."""
+    return notify.NotifyCfg(topic="t", min_interval_s=0, command=command,
+                            egress_alert_record=record)
+
+
+def _egress_cfg(tmp_path, notifications, observe=True):
+    """A controller config with the actual-exit check on unless `observe` is False.
+    `notifications` is the run's NotifyCfg, or None for notifications off."""
+    return base_cfg(
+        runtime_state=str(tmp_path / "runtime.json"),
+        persist_state=str(tmp_path / "persist.json"),
+        published_state=str(tmp_path / "state.json"),
+        sbfd_local_state=str(tmp_path / "sbfd.json"),
+        egress=M.EgressCfg(default_mode="relay_backbone", observe=(
+            egress_observer.ObserveCfg(url="https://probe.example.net/trace")
+            if observe else None)),
+        notifications=notifications,
+    )
+
+
+def _main_with(monkeypatch, cfg, *, no_ui=True):
+    """Run main() on `cfg` as if from the command line: the config is `cfg` whatever
+    path argv names, the UI server is skipped unless `no_ui` is False, and the SIGTERM
+    handler and the logging set-up are left alone. Returns main()'s result."""
+    monkeypatch.setattr(M, "load_config", lambda path: cfg)
+    monkeypatch.setattr(sys, "argv", ["sbfd-ctl", "-c", "sbfd-ctl.json"]
+                        + (["--no-ui"] if no_ui else []))
+    monkeypatch.setattr(signal, "signal", lambda *a: None)
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: None)
+    return M.main()
+
+
+def _run_egress_controller(tmp_path, monkeypatch, statuses, notifications, *,
+                           observe=True, pages=None, before_stop=None):
+    """One process lifetime, main() on _egress_cfg's config, one tick per scripted
+    egress status. With `pages`, a stub Notifier takes each page as spool-notify would:
+    it appends the title and runs the page's on_sent. Without, the real Notifier runs
+    notifications.command. `before_stop`, if given, runs on the last tick, before the
+    run is told to stop. Returns the ticks run."""
+    ticks = []
+    taken = [] if pages is None else pages
+
+    class FakeObserver:
+        def __init__(self, cfg, **kw):
+            self.selected = None
+            self.i = 0
+
+        def start(self, stop):
+            pass
+
+        def set_selected(self, mode):
+            self.selected = mode
+
+        def snapshot(self):
+            status = statuses[min(self.i, len(statuses) - 1)]
+            self.i += 1
+            return {"selected": self.selected,
+                    "observed": "relay_backbone" if status == "match" else "relay_direct",
+                    "ip": "198.51.100.20", "status": status, "since": 1.0,
+                    "checked_at": 2.0, "error": None}
+
+    class AcceptingNotifier:
+        SUBPROCESS_TIMEOUT_S = _REAL_NOTIFIER.SUBPROCESS_TIMEOUT_S   # run_controller's shutdown bound
+
+        def __init__(self, topic, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self, timeout=None):
+            return True
+
+        def notify(self, ev):
+            taken.append(ev.title)
+            if ev.on_sent is not None:
+                ev.on_sent()
+
+    monkeypatch.setattr(egress_observer, "EgressObserver", FakeObserver)
+    monkeypatch.setattr(notify, "Notifier", _REAL_NOTIFIER if pages is None else AcceptingNotifier)
+    cfg = _egress_cfg(tmp_path, notifications, observe)
+    stopped: dict = {}
+    real_run_controller = M.run_controller
+
+    def run_controller(cfg, stop_event=None, **kw):
+        # main()'s own stop event, with no sleeping between ticks.
+        assert stop_event is not None
+        monkeypatch.setattr(stop_event, "wait", lambda timeout=None: stop_event.is_set())
+        stopped["event"] = stop_event
+        return real_run_controller(cfg, stop_event, **kw)
+
+    monkeypatch.setattr(M, "run_controller", run_controller)
+    _stub_controller_io(monkeypatch, threading.Event())
+
+    def one_tick_per_status(c, snap):
+        _REAL_PUBLISH(c, snap)
+        ticks.append(snap["egress_observed"])
+        if len(ticks) == len(statuses):
+            if before_stop is not None:
+                before_stop()
+            stopped["event"].set()
+
+    monkeypatch.setattr(M, "publish_state", one_tick_per_status)
+    _main_with(monkeypatch, cfg)
+    return len(ticks)
+
+
+def test_a_fallback_page_spool_notify_refused_is_paged_after_a_restart(tmp_path, monkeypatch):
+    # Greptile P1 on PR #24: the record said a fallback was announced as soon as the
+    # detector raised it, before spool-notify had the page. Here spool-notify refuses the
+    # page (a local fault: the Notifier logs it and drops it), and the restart that
+    # follows, with the fallback still standing, must page it. The operator never heard
+    # of it.
+    record = tmp_path / "egress_alert.json"
+    refusing, refused = _spool_notify(tmp_path, "refusing-spool-notify", 1)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(refusing))
+    assert _egress_pages(_handed(refused)) == [_FALLBACK]   # handed over, and refused
+    assert not record.exists()
+    working, sent = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch,
+                           ["checking", "checking", "pending", "mismatch", "mismatch"],
+                           _keeping(working))
+    assert _egress_pages(_handed(sent)) == [_FALLBACK]
+
+
+def test_a_controller_restart_takes_over_a_fallback_spool_notify_took(tmp_path, monkeypatch):
+    # The other half, through the real Notifier: spool-notify took the fallback page, so
+    # its record is written, and the restart in the middle of the fallback takes it over.
+    # It pages the restore, not the fallback again.
+    record = tmp_path / "egress_alert.json"
+    working, sent = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(working))
+    assert json.loads(record.read_text())["selected"] == "relay_backbone"
+    _run_egress_controller(tmp_path, monkeypatch,
+                           ["checking", "checking", "pending", "mismatch", "mismatch", "match"],
+                           _keeping(working))
+    assert _egress_pages(_handed(sent)) == [_FALLBACK, _RESTORED]
+    assert not record.exists()
+
+
+# A run that cannot keep the record up to date: its actual-exit check is off, its
+# notifications are off, or its record is switched off.
+_UNKEPT = ["check-off", "notifications-off", "switch-off"]
+
+
+def _unkept_run(run):
+    """(notifications, observe) for one of the _UNKEPT runs."""
+    if run == "check-off":
+        return _keeping(), False
+    if run == "notifications-off":
+        return None, True
+    return _keeping(record=False), True
+
+
+def _removals_and_syncs(monkeypatch):
+    """Records each os.remove (its path) and os.fsync (the synced file's device and
+    inode) from here on, in order."""
+    events: list = []
+    real_remove, real_fsync = os.remove, os.fsync
+
+    def remove(p, *a, **kw):
+        events.append(("remove", os.fspath(p)))
+        return real_remove(p, *a, **kw)
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        events.append(("fsync", (st.st_dev, st.st_ino)))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    monkeypatch.setattr(os, "fsync", fsync)
+    return events
+
+
+def _clean_up_keepers_made(monkeypatch):
+    """The clean-up keepers end_saved_egress_alert() makes from here on, main()'s
+    among them, in a list."""
+    made: list = []
+    real = M.end_saved_egress_alert
+
+    def end_saved_egress_alert():
+        keeper = real()
+        made.append(keeper)
+        return keeper
+
+    monkeypatch.setattr(M, "end_saved_egress_alert", end_saved_egress_alert)
+    return made
+
+
+def _clean_up_attempted(keepers):
+    """A `before_stop` for _run_egress_controller: the run ends only once the clean-up
+    keeper (the first of `keepers`) is past its queued removal, so that a refused
+    attempt has its retry's timer registered by the time main() closes the keeper,
+    which then makes the last attempt. The keeper's drain() returns once its thread
+    has run everything queued before it. Without this, under load, the first attempt
+    can land after close() has set the keeper closing, and a refused removal gets no
+    second attempt ("no retry once close() has been called"): the race rv-pr24g-r1
+    found in these tests."""
+    def wait():
+        assert keepers, "no clean-up keeper was made"
+        assert keepers[0].drain(), "the clean-up's first attempt was not made in time"
+    return wait
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_controller_run_that_cannot_keep_the_record_ends_the_saved_alert(
+        tmp_path, monkeypatch, run):
+    # Greptile P1 on PR #24: a run that does not maintain the record left it in place.
+    # While it ran, the fallback could end unannounced and a new one begin, or the mode
+    # leave and come back. The next run that keeps the record then took the old alert
+    # over, and swallowed the new fallback's page or sent a restore for nothing. Such a
+    # run ends the saved alert at startup, durably, at the record's one fixed place.
+    record = tmp_path / "egress_alert.json"
+    pages: list = []
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK] and record.exists()
+    notifications, observe = _unkept_run(run)
+    synced = _removals_and_syncs(monkeypatch)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
+                           observe=observe, pages=pages)
+    assert not record.exists()
+    at = synced.index(("remove", str(record)))
+    parent = os.stat(tmp_path)
+    assert ("fsync", (parent.st_dev, parent.st_ino)) in synced[at + 1:], synced
+    pages.clear()
+    _run_egress_controller(tmp_path, monkeypatch,
+                           ["checking", "checking", "pending", "mismatch", "mismatch"],
+                           _keeping(), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK]
+
+
+def test_a_controller_run_with_the_record_switched_off_keeps_none(tmp_path, monkeypatch):
+    # notifications.egress_alert_record false: the run pages as usual and keeps no
+    # record, since its detector is given no path at all.
+    record = tmp_path / "egress_alert.json"
+    pages: list = []
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(record=False), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK]
+    assert not record.exists()
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_saved_alert_a_run_cannot_end_is_logged_and_the_run_goes_on(
+        tmp_path, monkeypatch, caplog, run):
+    # Ending the saved alert is best effort, like every record operation: a failure is
+    # a warning, and the controller starts all the same. The clean-up rides on a record
+    # keeper of its own, so a removal the disk refuses is tried again for as long as the
+    # run lasts (the delays outlast this run), and once more when main() closes that
+    # keeper at shutdown: two warnings, the first refusal's and the last attempt's. The
+    # run ends only once the keeper is past its first attempt (see _clean_up_attempted).
+    # In the check-off run the detector's seed removes the record too, but quietly.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    record = tmp_path / "egress_alert.json"
+    record.mkdir()                            # os.remove cannot remove it
+    notifications, observe = _unkept_run(run)
+    keepers = _clean_up_keepers_made(monkeypatch)
+    assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
+                                  observe=observe, pages=[],
+                                  before_stop=_clean_up_attempted(keepers)) == 3
+    warned = [r.getMessage() for r in caplog.records
+              if r.levelno == logging.WARNING and str(record) in r.getMessage()]
+    assert len(warned) == 2, warned
+    assert "tries again" in warned[0] and "closing" in warned[1], warned
+
+
+@pytest.mark.parametrize("middle", ["notifications-off", "switch-off"])
+def test_a_record_left_by_an_earlier_run_does_not_hide_a_new_fallback(
+        tmp_path, monkeypatch, middle):
+    # Greptile P1 on PR #24, recast for the record's one fixed place. A run that could
+    # not keep the record (here notifications off, or the record switched off) cleaned
+    # up only the default path, so a record at a custom path outlived it. A later run
+    # with that path took the old alert over, and swallowed a new fallback's page. Now
+    # the record has one place, and every run that cannot keep it ends it there.
+    record = tmp_path / "egress_alert.json"
+    pages: list = []
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK]
+    assert json.loads(record.read_text())["selected"] == "relay_backbone"
+    # The middle run cannot keep the record, and the fallback ends unannounced under it.
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "match"],
+                           None if middle == "notifications-off" else _keeping(record=False),
+                           pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK]
+    assert not record.exists()
+    # Then the record is on again, and a new fallback on the same mode begins.
+    pages.clear()
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           _keeping(), pages=pages)
+    assert _egress_pages(pages) == [_FALLBACK], \
+        "the earlier run's record swallowed the new fallback's page"
+
+
+@pytest.mark.parametrize("aborts_at", ["the-ui-server", "nft-init"])
+@pytest.mark.parametrize("run", _UNKEPT + ["kept"])
+def test_a_start_that_aborts_has_already_ended_a_saved_alert_the_run_cannot_keep(
+        tmp_path, monkeypatch, run, aborts_at):
+    # CodeRabbit on PR #24 (sbfd_ctl.py:3477-3566): the clean-up ran after apply_nft_init
+    # and the observer's start, so a start that aborted at either left the record for a
+    # later run to adopt, and a confirmed fallback under it then stayed silent. The
+    # round-5 reviewer's M4: main() starts the UI server (a port in use aborts there)
+    # before run_controller. The decision needs only the config, so the clean-up is now
+    # main()'s first act once the config is loaded, and the keeper it rides on is closed
+    # on the way out of an aborted start too, so the removal has run by then. A run that
+    # keeps the record leaves it as it is, as before.
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0,
+                                  "closed_at": 2.0}))
+    written = record.read_text()
+    notifications, observe = (_keeping(), True) if run == "kept" else _unkept_run(run)
+
+    def refuse(*a, **kw):
+        raise RuntimeError(f"{aborts_at}: refused")
+
+    monkeypatch.setattr(M, "apply_nft_init", refuse)
+    monkeypatch.setattr(M, "start_ui_server", refuse)
+    cfg = _egress_cfg(tmp_path, notifications, observe)
+    with pytest.raises(RuntimeError, match=f"{aborts_at}: refused"):
+        _main_with(monkeypatch, cfg, no_ui=(aborts_at == "nft-init"))
+    if run == "kept":
+        assert record.read_text() == written
+    else:
+        assert not record.exists()
+
+
+def _wait_for(pred, timeout=5.0):
+    """True once pred() holds, polling for at most `timeout` seconds."""
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _refusing_remove(monkeypatch, path, refusals):
+    """os.remove of `path` raises EROFS the first `refusals` times; returns the list of
+    the calls made on it, refused or not."""
+    calls: list = []
+    real_remove = os.remove
+
+    def remove(p, *a, **kw):
+        if os.fspath(p) == str(path):
+            calls.append("remove")
+            if len(calls) <= refusals:
+                raise OSError(30, "Read-only file system", str(path))   # EROFS
+        return real_remove(p, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    return calls
+
+
+def test_a_run_that_does_not_keep_the_record_tries_its_startup_removal_again(
+        tmp_path, monkeypatch):
+    # CodeRabbit on PR #24 (sbfd_ctl.py:3476-3491): end_saved_egress_alert() made one try.
+    # A run without a keeper (the record switched off, notifications off, or the check
+    # off) had nothing to try again, so a disk that refused once left the record for a
+    # later record-keeping run. Now the clean-up rides on a record keeper of its own,
+    # which tries the removal again like any other operation.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (0.05, 0.1, 0.2))
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    calls = _refusing_remove(monkeypatch, record, refusals=1)
+    keeper = M.end_saved_egress_alert()
+    try:
+        deadline = time.monotonic() + 2.0
+        while record.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not record.exists(), "the startup removal was refused once and never tried again"
+        assert calls == ["remove", "remove"]
+    finally:
+        assert keeper.close()
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_run_that_does_not_keep_the_record_makes_a_last_attempt_at_shutdown(
+        tmp_path, monkeypatch, run):
+    # The clean-up's keeper lives as long as main() does: a removal the disk refused at
+    # startup, whose retry is still pending at shutdown (the delays outlast this run), is
+    # tried once more when main() closes the keeper on its way out, and a disk that works
+    # again by then takes it. The record is gone when main() returns, and the cancelled
+    # retry's timer thread ends. The run ends only once the keeper is past its first
+    # attempt (see _clean_up_attempted).
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0,
+                                  "closed_at": 2.0}))
+    notifications, observe = _unkept_run(run)
+    calls = _refusing_remove(monkeypatch, record, refusals=1)
+    keepers = _clean_up_keepers_made(monkeypatch)
+    assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
+                                  observe=observe, pages=[],
+                                  before_stop=_clean_up_attempted(keepers)) == 3
+    assert not record.exists(), "the refused startup removal was never tried again"
+    assert calls[:2] == ["remove", "remove"], calls
+    assert _wait_for(lambda: not [t for t in threading.enumerate()
+                                  if t.name == "egress-record-retry"], timeout=2.0), \
+        "the cancelled retry's timer thread did not end"
+
+
+def _clean_up_lines(caplog, level):
+    """What the clean-up of a saved alert logged at `level`."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == level and "does not keep the record" in r.getMessage()]
+
+
+@pytest.mark.parametrize("run", ["notifications-off", "switch-off"])
+def test_the_clean_up_is_news_only_once_it_has_ended_a_saved_alert(
+        tmp_path, monkeypatch, caplog, run):
+    # rv-pr24g-r1 (journal noise): round 6 had end_saved_egress_alert() say at info, at
+    # every start of a non-keeping run, that a saved alert "if any, is ended". As before
+    # round 6, the info line says the saved alert has ended only once a record has been
+    # removed, at the keeper's first attempt or a later one, main()'s last attempt at the
+    # close included; a start that finds no record is a debug line. (The check-off run is
+    # left out: its detector's seed ends the saved alert too, so which keeper's removal
+    # finds the record is a race between the two, and the alert ends either way.)
+    caplog.set_level(logging.DEBUG)
+    record = tmp_path / "egress_alert.json"
+    notifications, observe = _unkept_run(run)
+    ended = (f"egress alert: this run does not keep the record, so the saved alert in "
+             f"{record} has ended")
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                           observe=observe, pages=[])
+    assert _clean_up_lines(caplog, logging.INFO) == []            # no record: no news
+    assert len(_clean_up_lines(caplog, logging.DEBUG)) == 1
+    caplog.clear()
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                           observe=observe, pages=[])
+    assert not record.exists()
+    assert _clean_up_lines(caplog, logging.INFO) == [ended]       # removed: the news, once
+    caplog.clear()
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    calls = _refusing_remove(monkeypatch, record, refusals=1)
+    keepers = _clean_up_keepers_made(monkeypatch)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                           observe=observe, pages=[],
+                           before_stop=_clean_up_attempted(keepers))
+    assert not record.exists() and calls == ["remove", "remove"]
+    assert _clean_up_lines(caplog, logging.INFO) == [ended]       # at the last attempt: the news
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_start_that_aborts_still_makes_the_clean_ups_last_attempt(tmp_path, monkeypatch, run):
+    # rv-pr24g-r1: the clean-up keeper is closed on every way out of main(), an aborted
+    # start included. A removal the disk refused at startup, its retry still pending
+    # when apply_nft_init aborts the start (the delays outlast it), is tried once more
+    # then, and a disk that works again takes it. Left pending, the record would wait
+    # for a later run to adopt.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0,
+                                  "closed_at": 2.0}))
+    notifications, observe = _unkept_run(run)
+    calls = _refusing_remove(monkeypatch, record, refusals=1)
+
+    def refuse(*a, **kw):
+        # The keeper's first attempt (refused) has been made, and its retry's timer is
+        # running, by the time the start aborts: the timer is registered before it
+        # starts, so close() finds it. (Without this the abort can land between the
+        # refusal and the registration, and the refused operation gets no second
+        # attempt: "no retry once close() has been called", not a last attempt the
+        # test can pin.)
+        assert _wait_for(lambda: len(calls) >= 1)
+        assert _wait_for(lambda: any(t.name == "egress-record-retry"
+                                     for t in threading.enumerate()))
+        raise RuntimeError("nft-init: refused")
+
+    monkeypatch.setattr(M, "apply_nft_init", refuse)
+    cfg = _egress_cfg(tmp_path, notifications, observe)
+    with pytest.raises(RuntimeError, match="nft-init: refused"):
+        _main_with(monkeypatch, cfg)
+    assert not record.exists(), \
+        "the refused startup removal was not tried again on the way out of the aborted start"
+    assert calls[:2] == ["remove", "remove"], calls
+    assert _wait_for(lambda: not [t for t in threading.enumerate()
+                                  if t.name == "egress-record-retry"], timeout=2.0), \
+        "the cancelled retry's timer thread did not end"
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_run_that_does_not_keep_the_record_does_not_wait_for_its_clean_up(
+        tmp_path, monkeypatch, run):
+    # rv-pr24g-r1: nothing blocks startup. The removal is queued on the clean-up keeper's
+    # own thread, so with the disk stalled inside os.remove, main() still reaches
+    # run_controller at once, the clean-up in flight; only the close on the way out
+    # waits for the keeper, bounded.
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    notifications, observe = _unkept_run(run)
+    entered, release = threading.Event(), threading.Event()
+    real_remove = os.remove
+
+    def remove(p, *a, **kw):
+        if os.fspath(p) == str(record):
+            entered.set()
+            release.wait(10)
+        return real_remove(p, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    reached: dict = {}
+    real_run_controller = M.run_controller
+
+    def run_controller(cfg, stop_event=None, **kw):
+        reached["after_s"] = time.monotonic() - t0
+        reached["in_flight"] = entered.wait(2.0) and not release.is_set()
+        release.set()                       # let the clean-up finish during the run
+        return real_run_controller(cfg, stop_event, **kw)
+
+    monkeypatch.setattr(M, "run_controller", run_controller)
+    t0 = time.monotonic()
+    assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                                  observe=observe, pages=[]) == 2
+    assert reached["in_flight"], "the clean-up was not in flight when the controller started"
+    assert reached["after_s"] < 1.0, f"the start waited {reached['after_s']:.2f} s for the clean-up"
+    assert not record.exists()
+
+
+def test_a_controller_run_closes_the_detector_after_its_notifier_sent_everything(
+        tmp_path, monkeypatch):
+    # At shutdown run_controller stops the Notifier first: stop() waits for the pages it
+    # still holds or is sending, and their on_sents queue record operations. Only then
+    # does it close the detector, which runs those operations before it returns. Here
+    # the run takes over a saved fallback and sees it restored, spool-notify is slow,
+    # so the restore page is still on its way when the loop ends, and the disk is slow
+    # to remove the record. Only that order has the record gone when the run returns.
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    log = tmp_path / "slow-spool-notify.log"
+    slow = tmp_path / "slow-spool-notify"
+    slow.write_text(f'#!/bin/sh\nsleep 0.5\nprintf "%s\\n" "$1" >> "{log}"\nexit 0\n',
+                    encoding="utf-8")
+    slow.chmod(0o755)
+    real_remove = os.remove
+
+    def slow_remove(p, *a, **kw):
+        time.sleep(0.3)
+        return real_remove(p, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", slow_remove)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "match"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=str(slow)))
+    assert _egress_pages(_handed(log)) == [_RESTORED]
+    assert not record.exists()
+
+
+def test_a_page_spool_notify_takes_after_stop_gave_up_still_settles_the_record(
+        tmp_path, monkeypatch):
+    # Greptile P1 on PR #24, round 3. stop() joins the worker only so long, and one
+    # spool-notify run may take SUBPROCESS_TIMEOUT_S, so a page could be accepted after
+    # stop() returned. Its on_sent then queued the record change behind the keeper's
+    # exit marker, where it never ran, and the next start paged the fallback again. Here
+    # stop()'s own timeout gives up after 0.2 s, as 5 s does against a 30 s send, and
+    # spool-notify takes 0.6 s a page: run_controller must ask for longer, a send in
+    # flight and some, which costs an idle worker nothing.
+    record = tmp_path / "egress_alert.json"
+    log = tmp_path / "slow-spool-notify.log"
+    slow = tmp_path / "slow-spool-notify"
+    slow.write_text(f'#!/bin/sh\nsleep 0.6\nprintf "%s\\n" "$1" >> "{log}"\nexit 0\n',
+                    encoding="utf-8")
+    slow.chmod(0o755)
+    real_stop = notify.Notifier.stop
+    monkeypatch.setattr(notify.Notifier, "stop",
+                        lambda self, timeout=0.2: real_stop(self, timeout))
+    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 1.0)   # a 6 s bound, not 35
+    notifiers = _notifiers_made(monkeypatch)
+    detectors = _detectors_made(monkeypatch)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=str(slow)))
+    [n] = notifiers
+    [d] = detectors
+    assert n._thread is not None
+    n._thread.join(10)                       # the worker finishes its sends after the run
+    assert not n._thread.is_alive()
+    assert _egress_pages(_handed(log)) == [_FALLBACK]   # spool-notify took the page
+    assert d._keeper is not None and not d._keeper._thread.is_alive()   # the keeper closed
+    # The page the operator received last was the fallback, so the record must name it:
+    # a restart otherwise pages the same fallback again.
+    assert record.exists(), "the accepted fallback page's record change never ran"
+    assert json.loads(record.read_text())["selected"] == "relay_backbone"
+
+
+def test_a_controller_run_waits_for_a_send_in_flight_before_it_closes_the_keeper(
+        tmp_path, monkeypatch, caplog):
+    # One spool-notify run may take SUBPROCESS_TIMEOUT_S, and the shutdown flush can
+    # send several summaries, so run_controller gives stop() that long and five seconds
+    # more, and only then closes the record keeper. An idle worker ends at once, so the
+    # bound costs the normal case nothing, and that case ends without a warning. The
+    # constant also caps each spool-notify run, and a loaded runner can need more than
+    # a quarter second to fork the stand-in (Greptile on PR #24), so 2 s: the worker is
+    # idle by stop(), so the 7 s bound is never waited out.
+    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 2.0)
+    timeouts: list = []
+    real_stop = notify.Notifier.stop
+
+    def stop(self, timeout=5.0):
+        timeouts.append(timeout)
+        return real_stop(self, timeout)
+
+    monkeypatch.setattr(notify.Notifier, "stop", stop)
+    script, log = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
+    assert timeouts == [2.0 + 5.0]
+    assert _egress_pages(_handed(log)) == [_FALLBACK]
+    assert _shutdown_warnings(caplog) == []
+
+
+def test_a_controller_run_warns_when_its_notifier_is_still_sending_at_shutdown(
+        tmp_path, monkeypatch, caplog):
+    # When stop() gives up on a send, a page spool-notify takes from then on runs its
+    # on_sent too late to be recorded. The keeper closes all the same, since a record
+    # change lost that way costs one repeated page at the next start (a record that
+    # misses the page's change is never trusted there), and the run says so, once.
+    real_stop = notify.Notifier.stop
+    monkeypatch.setattr(notify.Notifier, "stop",
+                        lambda self, timeout=5.0: real_stop(self, timeout) and False)
+    detectors = _detectors_made(monkeypatch)
+    script, _log = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
+    [d] = detectors
+    assert d._keeper is not None and not d._keeper._thread.is_alive()   # closed anyway
+    warned = _shutdown_warnings(caplog)
+    assert len(warned) == 1, warned
+    assert "still sending" in warned[0] and "not recorded" in warned[0], warned
+
+
+def test_a_controller_run_warns_when_its_record_keeper_did_not_finish_at_shutdown(
+        tmp_path, monkeypatch, caplog):
+    # close() gives up on a disk that never recovers, and the operations it left unrun
+    # are gone with the process: the run says so, instead of returning without a line.
+    real_close = notify.EventDetector.close
+    monkeypatch.setattr(notify.EventDetector, "close",
+                        lambda self, timeout=5.0: real_close(self, timeout) and False)
+    script, _log = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
+    warned = _shutdown_warnings(caplog)
+    assert len(warned) == 1, warned
+    assert "record keeper" in warned[0] and "did not finish" in warned[0], warned

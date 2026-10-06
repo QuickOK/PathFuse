@@ -159,6 +159,7 @@
     "min_interval_s": 30,
     "wan_down_hold_s": 10,
     "switch_hold_s": 60,
+    "egress_alert_record": true,
     "fec_alerts": false
   }
 }

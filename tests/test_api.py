@@ -7,6 +7,15 @@ from pathlib import Path
 import pytest
 import sbfd_ctl as M
 import fec_control
+import notify
+
+
+@pytest.fixture(autouse=True)
+def egress_alert_record_under_tmp(tmp_path, monkeypatch):
+    """The egress alert record lives at notify.EGRESS_ALERT_PATH, which is the box's
+    live state: a controller run keeps the record there, or removes it at startup.
+    Every test here points it under tmp_path instead."""
+    monkeypatch.setattr(notify, "EGRESS_ALERT_PATH", str(tmp_path / "egress_alert.json"))
 
 
 @pytest.fixture

@@ -188,6 +188,62 @@ def test_load_config_notifications_minimal(tmp_path: Path):
     assert cfg.notifications.fec_alerts is False
 
 
+@pytest.mark.parametrize("notif, want", [
+    pytest.param({"topic": "pathfuse"}, True, id="absent"),
+    pytest.param({"topic": "pathfuse", "egress_alert_record": True}, True, id="true"),
+    # false keeps no record, so a restart pages a standing fallback again
+    pytest.param({"topic": "pathfuse", "egress_alert_record": False}, False, id="false"),
+])
+def test_load_config_notifications_egress_alert_record(tmp_path: Path, notif, want):
+    raw = dict(SAMPLE)
+    raw["notifications"] = notif
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(raw))
+    cfg = sbfd_ctl.load_config(str(p))
+    assert cfg.notifications is not None
+    assert cfg.notifications.egress_alert_record is want
+
+
+@pytest.mark.parametrize("value", [
+    pytest.param("false", id="a-string"),       # bool("false") is True
+    pytest.param(0, id="zero"),
+    pytest.param(1, id="one"),
+    pytest.param(None, id="null"),
+    pytest.param([True], id="a-list"),
+])
+def test_load_config_notifications_egress_alert_record_must_be_a_bool(tmp_path: Path, value):
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse", "egress_alert_record": value}
+    p = tmp_path / "bad.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="egress_alert_record must be true or false"):
+        sbfd_ctl.load_config(str(p))
+
+
+@pytest.mark.parametrize("value", [
+    pytest.param("/var/lib/sbfd-ctl/egress_alert.json", id="a-path"),
+    pytest.param(None, id="null"),
+])
+def test_load_config_rejects_the_old_egress_alert_path_key(tmp_path: Path, value):
+    # The record has one fixed place now, so the path is not configurable. The old key
+    # is refused rather than ignored, and the message names the switch that replaced it.
+    raw = dict(SAMPLE)
+    raw["notifications"] = {"topic": "pathfuse", "egress_alert_path": value}
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="egress_alert_path") as e:
+        sbfd_ctl.load_config(str(p))
+    assert "notifications.egress_alert_record" in str(e.value)
+
+
+def test_shipped_example_config_keeps_the_egress_alert_record():
+    # The example documents the switch with its default. load_config fills in an absent
+    # key, so loading the example cannot tell whether it is there.
+    raw = json.loads((ROOT / "config" / "sbfd-ctl.example.json").read_text())
+    assert raw["notifications"].get("egress_alert_record") is True
+    assert "egress_alert_path" not in raw["notifications"]
+
+
 def test_load_config_notifications_full(tmp_path: Path):
     raw = dict(SAMPLE)
     raw["notifications"] = {"topic": "pathfuse", "min_interval_s": 60,

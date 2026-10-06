@@ -1487,6 +1487,19 @@ def load_config(path: str) -> Config:
         raw_notif = raw.get("notifications")
         notif_cfg = None
         if raw_notif is not None:
+            # The record's place is fixed, so that every run can find it. The old key
+            # is refused rather than ignored: a config still naming a path expects it.
+            if "egress_alert_path" in raw_notif:
+                raise ValueError(
+                    "notifications.egress_alert_path is no longer read: the egress "
+                    f"alert record is always at {notify.EGRESS_ALERT_PATH}. Set "
+                    "notifications.egress_alert_record to true or false instead")
+            # bool("false") is True, as for location_fec.enabled above.
+            alert_record = raw_notif.get("egress_alert_record", True)
+            if not isinstance(alert_record, bool):
+                raise ValueError(
+                    f"notifications.egress_alert_record must be true or false, "
+                    f"got {alert_record!r}")
             notif_cfg = notify.NotifyCfg(
                 topic=raw_notif["topic"],
                 min_interval_s=float(raw_notif.get("min_interval_s", 30.0)),
@@ -1495,6 +1508,7 @@ def load_config(path: str) -> Config:
                 wan_down_hold_s=float(raw_notif.get("wan_down_hold_s", 10.0)),
                 switch_hold_s=float(raw_notif.get("switch_hold_s", 60.0)),
                 fec_alerts=bool(raw_notif.get("fec_alerts", False)),
+                egress_alert_record=alert_record,
             )
 
         cfg = Config(
@@ -3438,6 +3452,56 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
 
 # -- Main controller loop ----------------------------------------------------
 
+def keeps_egress_alert_record(cfg: Config) -> bool:
+    """Whether a run on `cfg` keeps the egress alert record (notify.EventDetector's,
+    at notify.EGRESS_ALERT_PATH) up to date: the record follows the pages the run's
+    detector hands over, so it needs notifications, the actual-exit check and
+    notifications.egress_alert_record switched on. Any other run cannot follow the
+    alert: a fallback could end, or a new one begin, unseen, and a later run that
+    does keep the record would take a stale alert over. So main() has such a run end
+    the saved alert (end_saved_egress_alert). The decision needs only the config."""
+    return (cfg.notifications is not None
+            and cfg.notifications.egress_alert_record
+            and cfg.egress.observe is not None)
+
+
+def end_saved_egress_alert() -> notify.EgressRecordKeeper:
+    """Have the saved egress alert (notify.EventDetector's record, at
+    notify.EGRESS_ALERT_PATH) removed, for a run that will not keep it up to date
+    (see keeps_egress_alert_record), on a record keeper of its own: a removal the
+    disk refuses is tried again for as long as the run lasts, and once more when
+    the keeper is closed, so a disk that refused at startup still takes it later
+    (CodeRabbit on PR #24: one try left the record for a later run to adopt).
+    Returns that keeper; main() closes it on its way out, an aborted start included.
+
+    The record has one fixed place, so this always finds it. Nothing blocks startup:
+    the removal is queued here, on the keeper's thread, first thing in main() once
+    the config is loaded, before the UI server, the wire tailer and run_controller's
+    apply_nft_init, any of which can abort the start, since a record an aborted
+    start left would be adopted by a later run. No record is the usual case, and a
+    debug line; a record removed, at whichever attempt, is one line at info; a
+    removal the disk refuses is a warning, and startup goes on. A run that keeps
+    the record never calls this: its record is its detector's to adopt, and one
+    left without a clean close in this boot is distrusted there (see
+    notify.EventDetector's trust rule; a run of this boot whose disk refused the
+    removal from its seed to its end leaves an earlier mark standing, the accepted
+    residual)."""
+    path = notify.EGRESS_ALERT_PATH
+    logging.debug("egress alert: this run does not keep the record, so a saved alert in "
+                  "%s, if any, is ended", path)
+
+    def ended() -> None:
+        # On the keeper's thread, once a record has been removed: the one line at
+        # info, and only then, since no record is the usual case.
+        logging.info("egress alert: this run does not keep the record, so the saved "
+                     "alert in %s has ended", path)
+
+    keeper = notify.EgressRecordKeeper(path, lambda: 0)
+    keeper.start()
+    keeper.remove(on_removed=ended)
+    return keeper
+
+
 def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=None):
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 
@@ -3506,7 +3570,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
             relay_fail_threshold=max(1, round(10.0 / remote_interval)),
             wan_down_hold_s=cfg.notifications.wan_down_hold_s,
             switch_hold_s=cfg.notifications.switch_hold_s,
-            fec_alerts=cfg.notifications.fec_alerts)
+            fec_alerts=cfg.notifications.fec_alerts,
+            egress_alert_path=(notify.EGRESS_ALERT_PATH
+                               if cfg.notifications.egress_alert_record else None))
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -4106,7 +4172,27 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         stop_event.wait(max(0.0, tick - elapsed))
 
     if notifier is not None:
-        notifier.stop()
+        # The worker may be inside one spool-notify run, which can take up to
+        # SUBPROCESS_TIMEOUT_S, and the shutdown flush can send several summaries.
+        # An idle worker ends at once, so the bound only matters while a send is in
+        # flight, and it must outlast one: the record keeper closes next.
+        if not notifier.stop(timeout=notify.Notifier.SUBPROCESS_TIMEOUT_S + 5.0):
+            logging.warning("notify: the worker is still sending at shutdown; a page "
+                            "spool-notify takes from now on is not recorded, so a "
+                            "restart may page it again")
+    # Only after the Notifier: its stop() sends the pages it still holds, and their
+    # on_sents queue egress record operations. close() runs those, then marks the
+    # record closed while a trusted alert stands (the one thing the next run trusts
+    # it for), waiting a bounded time for the disk. A page taken after stop() gave up
+    # queues its change too late, behind the keeper's exit: it fails toward a
+    # repeated page at the next start, since a record that misses the page's change
+    # is never trusted there.
+    if detector is not None:
+        if not detector.close():
+            logging.warning("egress alert: the record keeper did not finish at "
+                            "shutdown; a record operation still queued did not run, "
+                            "so a restart may page a fallback again, or send a "
+                            "restore again")
     # The keep-alive pool is process-global; don't leave a relay socket behind
     # for whatever runs after this loop.
     close_relay_conns()
@@ -4141,26 +4227,38 @@ def main():
     )
 
     cfg = load_config(args.config)
-    stop = threading.Event()
-
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-
-    fec_hist = fec_history.FecHistory() if cfg.fec else None
-    if not args.no_ui:
-        start_ui_server(cfg, stop, fec_hist=fec_hist)
-
+    # A run that cannot keep the egress alert record ends the saved alert first of
+    # all, before the UI server, the wire tailer or apply_nft_init can abort the
+    # start: a record an aborted start left would be one a later run adopts. The
+    # removal is queued, not waited for, and its keeper is closed on every way out,
+    # so a removal the disk refused at startup is tried once more then.
+    egress_cleanup = None if keeps_egress_alert_record(cfg) else end_saved_egress_alert()
     try:
-        wire_tracker = None
-        if cfg.fec:
-            wire_tracker = fec_report.FecWireTracker(
-                "client_to_server", cfg.fec.wire_stale_after_s)
-            fec_report.start_wire_tailer(cfg.fec.wire_unit, wire_tracker, stop)
-        run_controller(cfg, stop, wire_tracker=wire_tracker, fec_hist=fec_hist)
-    except KeyboardInterrupt:
-        logging.info("shutting down")
-        stop.set()
+        stop = threading.Event()
+
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+        fec_hist = fec_history.FecHistory() if cfg.fec else None
+        if not args.no_ui:
+            start_ui_server(cfg, stop, fec_hist=fec_hist)
+
+        try:
+            wire_tracker = None
+            if cfg.fec:
+                wire_tracker = fec_report.FecWireTracker(
+                    "client_to_server", cfg.fec.wire_stale_after_s)
+                fec_report.start_wire_tailer(cfg.fec.wire_unit, wire_tracker, stop)
+            run_controller(cfg, stop, wire_tracker=wire_tracker, fec_hist=fec_hist)
+        except KeyboardInterrupt:
+            logging.info("shutting down")
+            stop.set()
+        finally:
+            withdraw_managed_default(cfg)
     finally:
-        withdraw_managed_default(cfg)
+        if egress_cleanup is not None and not egress_cleanup.close():
+            logging.warning("egress alert: the clean-up of the saved alert %s did not "
+                            "finish at shutdown, so a later run with the actual-exit "
+                            "check on may find it", notify.EGRESS_ALERT_PATH)
 
 
 if __name__ == "__main__":

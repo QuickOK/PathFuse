@@ -916,6 +916,26 @@ def test_a_live_tick_that_could_not_write_its_record_installs_no_preferred_route
     assert [line for line in lines if line.startswith("ERROR")] == [_record_error()]
 
 
+@pytest.mark.parametrize("mode, backbone", [
+    pytest.param("relay_direct", OK_BB, id="mode-uses-no-upstream"),
+    pytest.param("relay_backbone", (False, "link wg-exit down", True), id="target-link-down"),
+])
+def test_a_live_tick_without_its_record_says_so_with_no_route_to_install(mode, backbone):
+    """The record ERROR does not hang on the mode or the upstream's health: a live tick
+    that could not write the dead-man record logs it whenever it runs, as one in
+    relay_direct (no upstream) or with its target's link down would. The preferred
+    default goes, as it would anyway, the exemptions still go in, and the tick exits 0."""
+    c = cfg()
+    ip = FakeIp(BASE + [_preferred_route(c, "backbone")])
+    new, rc, lines = run_tick(c, _healthy_state("backbone", route="backbone"), 100.0, ip,
+                              {"vpn": OK_VPN, "backbone": backbone}, mode=mode,
+                              record_ok=False)
+    assert rc == 0 and new["route"] is None
+    assert ip.preferred() == []
+    assert {"dst": "10.0.0.0/8", "gateway": GW, "dev": "eth0"} in ip.routes
+    assert [line for line in lines if line.startswith("ERROR")] == [_record_error()]
+
+
 def test_a_live_tick_without_its_record_whose_withdraw_fails_exits_1():
     """A preferred default may then still stand, so the dead-man must get its turn, as
     when the withdraw for a missing exemption fails."""
@@ -1350,6 +1370,71 @@ def test_the_client_poll_ends_within_its_timeout():
     assert (mode, err) == (None, "timeout")
 
 
+# A whole reply in three pieces: the status line, the headers, the body.
+_BODY = b'{"mode": "relay_backbone", "master_wan": "wan2"}'
+_REPLY = [b"HTTP/1.0 200 OK\r\n",
+          b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(_BODY), _BODY]
+
+
+def test_the_client_poll_waits_its_whole_timeout_for_a_slow_reply():
+    """The deadline ends a poll at its timeout, not before: a reply complete about 1.2 s
+    into a 2 s poll (3 pieces 0.4 s apart) is the client's mode. A deadline that fired
+    early would turn the relay's ordinary polls into timeouts, and after grace_s the
+    relay would drop the client's mode for default_mode."""
+    with _dribbling_client(_REPLY, 0.4) as url:
+        start = time.monotonic()
+        got = M.fetch_desired_mode(url, 2.0)
+        took = time.monotonic() - start
+    assert got == ("relay_backbone", "wan2", None), f"{got!r} after {took:.2f} s"
+
+
+def test_a_poll_whose_request_runs_on_waits_its_whole_timeout(monkeypatch):
+    """The deadline ends a poll at its timeout, not before. The test above pins that
+    only down to about 0.6 of the timeout, since its reply is complete 1.2 s into a 2 s
+    poll. Here the request is still running when the poll gives up, so the poll must
+    have waited its whole timeout. Load can only make the poll end later, so this bound
+    cannot flake."""
+    release = threading.Event()
+
+    def request(url, timeout_s):
+        release.wait(10)
+        return ("relay_backbone", "wan2", None)
+
+    monkeypatch.setattr(M, "_request_desired_mode", request)
+    try:
+        start = time.monotonic()
+        got = M.fetch_desired_mode("http://127.0.0.1:9/x", 1.0)
+        took = time.monotonic() - start
+    finally:
+        release.set()
+    assert got == (None, None, "timeout")
+    assert took >= 0.99, f"a 1 s poll gave up after {took:.3f} s"
+
+
+def test_the_ticks_own_poll_ends_within_its_timeout():
+    """The deadline is there for the tick's time budget, but the other deadline tests
+    call fetch_desired_mode directly. tick(), with the fetch it uses on the relay (no
+    fetch= override), must also stop waiting for the client at the poll's timeout. The
+    reply here dribbles for about 3 s, each piece inside the per-operation timeout, so
+    only the deadline in fetch_desired_mode cuts it off."""
+    pieces = [b"HTTP/1.0 200 OK\r\n", b"Content-Type: application/json\r\n",
+              b"Content-Length: %d\r\n\r\n" % len(_BODY), _BODY[:8], _BODY[8:]]
+    with _dribbling_client(pieces, 0.6) as url:
+        c = M.validate_config({
+            "table": "egress",
+            "client": {"control_url": url, "fetch_timeout_s": 1,
+                       "bootstrap_timeout_s": 1, "default_mode": "relay_direct"},
+        })
+        lines: list[str] = []
+        start = time.monotonic()
+        state, rc = M.tick(c, {}, 1000.0, ip=FakeIp(), probe=lambda up: (True, "ok"),
+                           log=lines.append)
+        took = time.monotonic() - start
+    assert took < 1.5, f"the tick's 1 s poll took {took:.1f} s: {lines}"
+    assert rc == 0 and state["desired_mode_fetch_fail"] == 1
+    assert any("fetch_err=timeout" in line for line in lines), lines
+
+
 def test_the_client_poll_ends_within_its_timeout_while_the_name_lookup_stalls(monkeypatch):
     """urlopen's timeout does not cover the name lookup at all, and validate_config
     accepts a control_url that names a host. A lookup that stalls (here for 3 s) must not
@@ -1476,6 +1561,27 @@ def test_choose_fetch_timeout_cold_start_uses_bootstrap():
 
 def test_choose_fetch_timeout_known_mode_uses_regular():
     assert M.choose_fetch_timeout("relay_backbone", 5.0, 1.0) == 1.0
+
+
+def test_the_tick_polls_with_the_bootstrap_timeout_only_until_it_knows_a_mode():
+    """choose_fetch_timeout is pinned on its own; this pins that tick() asks it the
+    right way round. With no mode known yet the poll gets the longer bootstrap timeout,
+    and once one is known, the regular one."""
+    c = cfg()
+    assert (c["client"]["bootstrap_timeout_s"], c["client"]["fetch_timeout_s"]) == (5.0, 1.0)
+    probes = {"vpn": OK_VPN, "backbone": OK_BB}
+    asked: list[float] = []
+
+    def fetch(url, timeout):
+        asked.append(timeout)
+        return ("relay_backbone", "wan2", None)
+
+    state: dict = {}
+    for now in (100.0, 110.0):
+        state, rc = M.tick(c, state, now, ip=FakeIp(BASE), probe=lambda up: probes[up["name"]],
+                           fetch=fetch, log=lambda line: None)
+        assert rc == 0
+    assert asked == [5.0, 1.0]
 
 
 def test_plan_actions_with_duplicate_stale_defaults():
