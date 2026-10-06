@@ -3452,40 +3452,46 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
 
 # -- Main controller loop ----------------------------------------------------
 
-def end_saved_egress_alert() -> None:
-    """Remove the saved egress alert (notify.EventDetector's record, at
-    notify.EGRESS_ALERT_PATH), for a run that will not keep it up to date.
-
-    Only a run with notifications on, the actual-exit check on and
-    notifications.egress_alert_record on keeps it. Any other run cannot follow the
+def keeps_egress_alert_record(cfg: Config) -> bool:
+    """Whether a run on `cfg` keeps the egress alert record (notify.EventDetector's,
+    at notify.EGRESS_ALERT_PATH) up to date: the record follows the pages the run's
+    detector hands over, so it needs notifications, the actual-exit check and
+    notifications.egress_alert_record switched on. Any other run cannot follow the
     alert: a fallback could end, or a new one begin, unseen, and a later run that
-    does keep the record would take a stale alert over. The record has one fixed
-    place, so this always finds it. It runs once, on the calling thread, first thing
-    in run_controller: before anything that can abort the start, since a record an
-    aborted start left would be adopted by a later run. No record is the usual case;
-    any other failure is a warning, and startup goes on."""
+    does keep the record would take a stale alert over. So main() has such a run end
+    the saved alert (end_saved_egress_alert). The decision needs only the config."""
+    return (cfg.notifications is not None
+            and cfg.notifications.egress_alert_record
+            and cfg.egress.observe is not None)
+
+
+def end_saved_egress_alert() -> notify.EgressRecordKeeper:
+    """Have the saved egress alert (notify.EventDetector's record, at
+    notify.EGRESS_ALERT_PATH) removed, for a run that will not keep it up to date
+    (see keeps_egress_alert_record), on a record keeper of its own: a removal the
+    disk refuses is tried again for as long as the run lasts, and once more when
+    the keeper is closed, so a disk that refused at startup still takes it later
+    (CodeRabbit on PR #24: one try left the record for a later run to adopt).
+    Returns that keeper; main() closes it on its way out, an aborted start included.
+
+    The record has one fixed place, so this always finds it. Nothing blocks startup:
+    the removal is queued here, on the keeper's thread, first thing in main() once
+    the config is loaded, before the UI server, the wire tailer and run_controller's
+    apply_nft_init, any of which can abort the start, since a record an aborted
+    start left would be adopted by a later run. No record is the usual case; a
+    removal the disk refuses is a warning, and startup goes on. A run that keeps
+    the record never calls this: its record is its detector's to adopt, and a
+    stale one is never trusted there (see notify.EventDetector)."""
     path = notify.EGRESS_ALERT_PATH
-    try:
-        if notify.remove_egress_alert_record(path):
-            logging.info("egress alert: this run does not keep the record, so the saved "
-                         "alert in %s has ended", path)
-    except OSError as e:
-        logging.warning("egress alert: cannot remove the saved alert %s, so a later run "
-                        "with the actual-exit check on may take it for standing: %s",
-                        path, e)
+    logging.info("egress alert: this run does not keep the record, so a saved alert in "
+                 "%s, if any, is ended", path)
+    keeper = notify.EgressRecordKeeper(path, lambda: 0)
+    keeper.start()
+    keeper.remove()
+    return keeper
 
 
 def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=None):
-    # The egress alert record follows the pages this run's detector hands over, so it
-    # needs notifications, the actual-exit check and the record switched on. A run
-    # short of any of them ends the saved alert first of all, before apply_nft_init
-    # or any thread can abort the start: a record an aborted start left would be one
-    # a later run adopts. The decision needs only the config.
-    keeps_egress_alert = (cfg.notifications is not None
-                          and cfg.notifications.egress_alert_record
-                          and cfg.egress.observe is not None)
-    if not keeps_egress_alert:
-        end_saved_egress_alert()
     sid_to_wan = {w.session_id: name for name, w in cfg.wans.items()}
 
     apply_nft_init(cfg)
@@ -4164,9 +4170,12 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
                             "spool-notify takes from now on is not recorded, so a "
                             "restart may page it again")
     # Only after the Notifier: its stop() sends the pages it still holds, and their
-    # on_sents queue egress record operations. close() runs those, waiting a bounded
-    # time for the disk. A page taken after stop() gave up queues its change too late,
-    # behind the keeper's exit: it fails toward a repeated page, never a missed one.
+    # on_sents queue egress record operations. close() runs those, then marks the
+    # record closed while a trusted alert stands (the one thing the next run trusts
+    # it for), waiting a bounded time for the disk. A page taken after stop() gave up
+    # queues its change too late, behind the keeper's exit: it fails toward a
+    # repeated page at the next start, since a record that misses the page's change
+    # is never trusted there.
     if detector is not None:
         if not detector.close():
             logging.warning("egress alert: the record keeper did not finish at "
@@ -4207,26 +4216,38 @@ def main():
     )
 
     cfg = load_config(args.config)
-    stop = threading.Event()
-
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-
-    fec_hist = fec_history.FecHistory() if cfg.fec else None
-    if not args.no_ui:
-        start_ui_server(cfg, stop, fec_hist=fec_hist)
-
+    # A run that cannot keep the egress alert record ends the saved alert first of
+    # all, before the UI server, the wire tailer or apply_nft_init can abort the
+    # start: a record an aborted start left would be one a later run adopts. The
+    # removal is queued, not waited for, and its keeper is closed on every way out,
+    # so a removal the disk refused at startup is tried once more then.
+    egress_cleanup = None if keeps_egress_alert_record(cfg) else end_saved_egress_alert()
     try:
-        wire_tracker = None
-        if cfg.fec:
-            wire_tracker = fec_report.FecWireTracker(
-                "client_to_server", cfg.fec.wire_stale_after_s)
-            fec_report.start_wire_tailer(cfg.fec.wire_unit, wire_tracker, stop)
-        run_controller(cfg, stop, wire_tracker=wire_tracker, fec_hist=fec_hist)
-    except KeyboardInterrupt:
-        logging.info("shutting down")
-        stop.set()
+        stop = threading.Event()
+
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+        fec_hist = fec_history.FecHistory() if cfg.fec else None
+        if not args.no_ui:
+            start_ui_server(cfg, stop, fec_hist=fec_hist)
+
+        try:
+            wire_tracker = None
+            if cfg.fec:
+                wire_tracker = fec_report.FecWireTracker(
+                    "client_to_server", cfg.fec.wire_stale_after_s)
+                fec_report.start_wire_tailer(cfg.fec.wire_unit, wire_tracker, stop)
+            run_controller(cfg, stop, wire_tracker=wire_tracker, fec_hist=fec_hist)
+        except KeyboardInterrupt:
+            logging.info("shutting down")
+            stop.set()
+        finally:
+            withdraw_managed_default(cfg)
     finally:
-        withdraw_managed_default(cfg)
+        if egress_cleanup is not None and not egress_cleanup.close():
+            logging.warning("egress alert: the clean-up of the saved alert %s did not "
+                            "finish at shutdown, so a later run with the actual-exit "
+                            "check on may find it", notify.EGRESS_ALERT_PATH)
 
 
 if __name__ == "__main__":
