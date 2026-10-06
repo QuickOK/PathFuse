@@ -1222,11 +1222,12 @@ def _main_with(monkeypatch, cfg, *, no_ui=True):
 
 
 def _run_egress_controller(tmp_path, monkeypatch, statuses, notifications, *,
-                           observe=True, pages=None):
+                           observe=True, pages=None, before_stop=None):
     """One process lifetime, main() on _egress_cfg's config, one tick per scripted
     egress status. With `pages`, a stub Notifier takes each page as spool-notify would:
     it appends the title and runs the page's on_sent. Without, the real Notifier runs
-    notifications.command. Returns the ticks run."""
+    notifications.command. `before_stop`, if given, runs on the last tick, before the
+    run is told to stop. Returns the ticks run."""
     ticks = []
     taken = [] if pages is None else pages
 
@@ -1286,6 +1287,8 @@ def _run_egress_controller(tmp_path, monkeypatch, statuses, notifications, *,
         _REAL_PUBLISH(c, snap)
         ticks.append(snap["egress_observed"])
         if len(ticks) == len(statuses):
+            if before_stop is not None:
+                before_stop()
             stopped["event"].set()
 
     monkeypatch.setattr(M, "publish_state", one_tick_per_status)
@@ -1363,6 +1366,36 @@ def _removals_and_syncs(monkeypatch):
     return events
 
 
+def _clean_up_keepers_made(monkeypatch):
+    """The clean-up keepers end_saved_egress_alert() makes from here on, main()'s
+    among them, in a list."""
+    made: list = []
+    real = M.end_saved_egress_alert
+
+    def end_saved_egress_alert():
+        keeper = real()
+        made.append(keeper)
+        return keeper
+
+    monkeypatch.setattr(M, "end_saved_egress_alert", end_saved_egress_alert)
+    return made
+
+
+def _clean_up_attempted(keepers):
+    """A `before_stop` for _run_egress_controller: the run ends only once the clean-up
+    keeper (the first of `keepers`) is past its queued removal, so that a refused
+    attempt has its retry's timer registered by the time main() closes the keeper,
+    which then makes the last attempt. The keeper's drain() returns once its thread
+    has run everything queued before it. Without this, under load, the first attempt
+    can land after close() has set the keeper closing, and a refused removal gets no
+    second attempt ("no retry once close() has been called"): the race rv-pr24g-r1
+    found in these tests."""
+    def wait():
+        assert keepers, "no clean-up keeper was made"
+        assert keepers[0].drain(), "the clean-up's first attempt was not made in time"
+    return wait
+
+
 @pytest.mark.parametrize("run", _UNKEPT)
 def test_a_controller_run_that_cannot_keep_the_record_ends_the_saved_alert(
         tmp_path, monkeypatch, run):
@@ -1408,15 +1441,18 @@ def test_a_saved_alert_a_run_cannot_end_is_logged_and_the_run_goes_on(
     # Ending the saved alert is best effort, like every record operation: a failure is
     # a warning, and the controller starts all the same. The clean-up rides on a record
     # keeper of its own, so a removal the disk refuses is tried again for as long as the
-    # run lasts (here a second is longer than the run), and once more when main() closes
-    # that keeper at shutdown: two warnings, the first refusal's and the last attempt's.
+    # run lasts (the delays outlast this run), and once more when main() closes that
+    # keeper at shutdown: two warnings, the first refusal's and the last attempt's. The
+    # run ends only once the keeper is past its first attempt (see _clean_up_attempted).
     # In the check-off run the detector's seed removes the record too, but quietly.
-    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (1.0, 1.0, 1.0))
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
     record = tmp_path / "egress_alert.json"
     record.mkdir()                            # os.remove cannot remove it
     notifications, observe = _unkept_run(run)
+    keepers = _clean_up_keepers_made(monkeypatch)
     assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
-                                  observe=observe, pages=[]) == 3
+                                  observe=observe, pages=[],
+                                  before_stop=_clean_up_attempted(keepers)) == 3
     warned = [r.getMessage() for r in caplog.records
               if r.levelno == logging.WARNING and str(record) in r.getMessage()]
     assert len(warned) == 2, warned
@@ -1483,6 +1519,16 @@ def test_a_start_that_aborts_has_already_ended_a_saved_alert_the_run_cannot_keep
         assert not record.exists()
 
 
+def _wait_for(pred, timeout=5.0):
+    """True once pred() holds, polling for at most `timeout` seconds."""
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def _refusing_remove(monkeypatch, path, refusals):
     """os.remove of `path` raises EROFS the first `refusals` times; returns the list of
     the calls made on it, refused or not."""
@@ -1529,28 +1575,24 @@ def test_a_run_that_does_not_keep_the_record_makes_a_last_attempt_at_shutdown(
     # The clean-up's keeper lives as long as main() does: a removal the disk refused at
     # startup, whose retry is still pending at shutdown (the delays outlast this run), is
     # tried once more when main() closes the keeper on its way out, and a disk that works
-    # again by then takes it. The record is gone when main() returns.
+    # again by then takes it. The record is gone when main() returns, and the cancelled
+    # retry's timer thread ends. The run ends only once the keeper is past its first
+    # attempt (see _clean_up_attempted).
     monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
     record = tmp_path / "egress_alert.json"
     record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0,
                                   "closed_at": 2.0}))
     notifications, observe = _unkept_run(run)
     calls = _refusing_remove(monkeypatch, record, refusals=1)
+    keepers = _clean_up_keepers_made(monkeypatch)
     assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 3, notifications,
-                                  observe=observe, pages=[]) == 3
+                                  observe=observe, pages=[],
+                                  before_stop=_clean_up_attempted(keepers)) == 3
     assert not record.exists(), "the refused startup removal was never tried again"
     assert calls[:2] == ["remove", "remove"], calls
-    assert not [t for t in threading.enumerate() if t.name == "egress-record-retry"]
-
-
-def _wait_for(pred, timeout=5.0):
-    """True once pred() holds, polling for at most `timeout` seconds."""
-    deadline = time.monotonic() + timeout
-    while not pred():
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.01)
-    return True
+    assert _wait_for(lambda: not [t for t in threading.enumerate()
+                                  if t.name == "egress-record-retry"], timeout=2.0), \
+        "the cancelled retry's timer thread did not end"
 
 
 @pytest.mark.parametrize("run", _UNKEPT)
