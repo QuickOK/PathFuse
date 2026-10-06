@@ -1250,9 +1250,10 @@ def test_egress_none_is_ignored():
 # restart is a second detector on the same path, made once the first is closed (as
 # run_controller closes it at shutdown), fed what a fresh observer reports: `checking`
 # until its first check (its settle alone outlasts many ticks), then its verdicts. A
-# clean close with the alert standing marks the record (`closed_at`), and only such a
-# record is trusted at the restart; _write_record writes one of those unless told not
-# to (see "the clean-close mark" below).
+# clean close with the alert standing marks the record (`closed_at`, and the id of the
+# boot), and only such a record, marked in this boot, is trusted at the restart;
+# _write_record writes one of those unless told not to (see "the clean-close mark"
+# below).
 
 FALLBACK, RESTORED = "🧭 Egress fallback", "🧭 Egress restored"
 ANNOUNCED_AT = 1_780_000_000.0   # a wall-clock epoch
@@ -1263,12 +1264,14 @@ def _titles(evs):
     return [e.title for e in evs]
 
 
-def _write_record(path, selected, closed=True):
+def _write_record(path, selected, closed=True, boot=None):
     """A record an earlier run left: at a clean close with the alert standing, so with
-    the mark, unless `closed` is False (a crash, a power cut, a refused removal)."""
+    the mark, of this boot (or of `boot`), unless `closed` is False (a crash, a power
+    cut, a refused removal)."""
     rec = {"selected": selected, "announced_at": ANNOUNCED_AT}
     if closed:
         rec["closed_at"] = CLOSED_AT
+        rec["boot_id"] = notify._boot_id() if boot is None else boot
     path.write_text(json.dumps(rec))
 
 
@@ -1322,15 +1325,16 @@ def test_egress_a_fallback_announced_before_a_restart_is_not_paged_again(tmp_pat
 
 
 def test_egress_a_fallback_standing_across_two_restarts_is_paged_once(tmp_path):
-    # A deploy restart and then a reboot, both during one fallback. The restart that
-    # takes the alert over must leave its record for the next one, or that one pages
-    # the fallback again.
+    # Two service restarts (a deploy, then another) during one fallback, within one
+    # boot. The restart that takes the alert over must leave its record for the next
+    # one, or that one pages the fallback again. (A reboot pages it once more: see "the
+    # clean-close mark" below.)
     path = tmp_path / "egress_alert.json"
     pages = []
     d = notify.EventDetector(egress_alert_path=str(path))
     for e in (_eg_checking("relay_backbone"), _eg("pending"), _eg("mismatch")):
         pages += _sent(d.observe(obs(egress=e)))
-    for restart in ("the deploy", "the reboot"):
+    for restart in ("the deploy", "the second restart"):
         assert d.close()
         d = notify.EventDetector(egress_alert_path=str(path))
         for e in (_eg_checking("relay_backbone"), _eg_checking("relay_backbone"),
@@ -3152,20 +3156,24 @@ def test_egress_a_removal_with_no_record_directory_is_no_failure(tmp_path):
 # refused, a crash after a restore page, a power cut), and nothing on disk told such a
 # record from one a standing fallback left: a rewrite that succeeds proves the disk works
 # now, not that the old removal ever happened. So the record carries a clean-close mark,
-# `closed_at`, which close() alone writes, and only while a trusted alert stands: through
-# run_controller's shutdown, onto the record the pages left (a page spool-notify refused
-# left none, and none is made for it). A crash, a power cut, or a disk that refused the
-# run's last operations leaves none. A restart trusts a record that carries the mark,
-# and the adoption rewrite drops it, so a crash of this run leaves it unmarked again; one
-# without the mark is adopted as distrusted from the start: the alert stands for its
-# restore, and a confirmed mismatch pages the fallback, a repeat at worst. The mark goes
-# only onto a record this run's own pages wrote, and not tried to remove since
-# (rv-pr24g-r1 F1: with the fallback page spool-notify refused, the close marked whatever
-# record named the mode, a stale one included, and the next run trusted it). So a stale
-# record is not trusted, because only a clean close with the alert standing marks it,
-# and every ending of a run that can write fails toward a repeated page; the one that
-# cannot, a run whose disk refuses every write from its seed to its end, leaves the mark
-# the run before it wrote (a residual of the design, awaiting a ruling; no test here).
+# `closed_at` with the id of the boot it was made in, which close() alone writes, and
+# only while a trusted alert stands: through run_controller's shutdown, onto the record
+# the pages left (a page spool-notify refused left none, and none is made for it). A
+# crash, a power cut, or a disk that refused the run's last operations leaves none. A
+# restart within the boot trusts a record that carries the mark, and the adoption
+# rewrite drops it, so a crash of this run leaves it unmarked again; one without the
+# mark, or with an earlier boot's, is adopted as distrusted from the start: the alert
+# stands for its restore, and a confirmed mismatch pages the fallback, a repeat at
+# worst. The mark goes only onto a record this run's own pages wrote, and not tried to
+# remove since (rv-pr24g-r1 F1: with the fallback page spool-notify refused, the close
+# marked whatever record named the mode, a stale one included, and the next run trusted
+# it). So a stale record is not trusted, because only a clean close with the alert
+# standing marks it, and every ending of a run that can write fails toward a repeated
+# page; the one that cannot, a run whose disk refuses every write from its seed to its
+# end, leaves the mark the run before it wrote, and only a reboot frees such a disk,
+# which puts that mark out of trust (rv-pr24g-r1 F2); a disk freed by hand within the
+# boot, and a restart after it, trust it still, the accepted residual. The price: a
+# reboot during a standing fallback pages it once more.
 
 
 def test_egress_a_clean_close_marks_the_record_and_the_next_run_trusts_it(tmp_path):
@@ -3180,7 +3188,7 @@ def test_egress_a_clean_close_marks_the_record_and_the_next_run_trusts_it(tmp_pa
     clock.advance(600.0)
     assert first.close()                                   # the clean close, the alert standing
     assert _record(path) == {"selected": "relay_backbone", "announced_at": ANNOUNCED_AT,
-                             "closed_at": CLOSED_AT}
+                             "closed_at": CLOSED_AT, "boot_id": notify._boot_id()}
     after = notify.EventDetector(egress_alert_path=str(path))   # the restart
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, trusted
     assert after.observe(obs(egress=_eg("pending"))) == []
@@ -3279,22 +3287,122 @@ def test_egress_a_close_with_a_distrusted_alert_standing_leaves_the_record_unmar
     assert _titles(again.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
 
 
+_THIS_BOOT = object()   # a `boot_id` resolved to notify._boot_id() when the test runs
+
+
 @pytest.mark.parametrize("mark", [
-    pytest.param("1780000600.0", id="a-string"),
-    pytest.param(True, id="a-bool"),
-    pytest.param(None, id="null"),
-    pytest.param(float("nan"), id="nan"),
-    pytest.param(float("inf"), id="infinity"),
-    pytest.param([CLOSED_AT], id="a-list"),
+    pytest.param({"closed_at": "1780000600.0", "boot_id": _THIS_BOOT}, id="a-string"),
+    pytest.param({"closed_at": True, "boot_id": _THIS_BOOT}, id="a-bool"),
+    pytest.param({"closed_at": None, "boot_id": _THIS_BOOT}, id="null"),
+    pytest.param({"closed_at": float("nan"), "boot_id": _THIS_BOOT}, id="nan"),
+    pytest.param({"closed_at": float("inf"), "boot_id": _THIS_BOOT}, id="infinity"),
+    pytest.param({"closed_at": [CLOSED_AT], "boot_id": _THIS_BOOT}, id="a-list"),
+    pytest.param({"closed_at": CLOSED_AT, "boot_id": "an-earlier-boot"}, id="another-boot"),
+    pytest.param({"closed_at": CLOSED_AT, "boot_id": ""}, id="boot-id-empty"),
+    pytest.param({"closed_at": CLOSED_AT, "boot_id": 5}, id="boot-id-not-a-string"),
+    pytest.param({"closed_at": CLOSED_AT, "boot_id": None}, id="boot-id-null"),
+    pytest.param({"closed_at": CLOSED_AT}, id="no-boot-id"),
 ])
-def test_egress_a_mark_that_is_not_a_number_reads_as_unmarked(tmp_path, mark):
+def test_egress_a_mark_that_is_not_a_number_or_not_this_boots_reads_as_unmarked(
+        tmp_path, mark):
+    # The mark is `closed_at`, a finite number, with `boot_id`, this boot's. Anything
+    # else is no mark, and the record is adopted as distrusted.
+    rec = {"selected": "relay_backbone", "announced_at": ANNOUNCED_AT, **mark}
+    if rec.get("boot_id") is _THIS_BOOT:
+        rec["boot_id"] = notify._boot_id()
     path = tmp_path / "egress_alert.json"
-    path.write_text(json.dumps({"selected": "relay_backbone", "announced_at": ANNOUNCED_AT,
-                                "closed_at": mark}))
+    path.write_text(json.dumps(rec))
     after = notify.EventDetector(egress_alert_path=str(path))
     assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, distrusted
     assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
     assert _titles(after.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+
+
+def test_the_boot_id_is_the_kernels_and_this_processs_own_where_there_is_none(
+        tmp_path, monkeypatch):
+    # The mark is trusted within the boot that made it, so the id must be the boot's:
+    # the kernel's, which every process of the boot reads alike, and the same at each
+    # call. Where the kernel gives none (another OS, a sandbox without /proc, an empty
+    # file), this process's own stands in, so no mark is trusted across a restart there.
+    try:
+        with open(notify._BOOT_ID_PATH) as f:
+            kernels = f.read().strip()
+    except OSError:
+        kernels = ""
+    if kernels:
+        assert notify._boot_id() == kernels == notify._boot_id()
+    monkeypatch.setattr(notify, "_BOOT_ID_PATH", str(tmp_path / "no-such-file"))
+    own = notify._boot_id()
+    assert own and own == notify._boot_id() and own != kernels
+    (tmp_path / "empty").write_text("\n")
+    monkeypatch.setattr(notify, "_BOOT_ID_PATH", str(tmp_path / "empty"))
+    assert notify._boot_id() == own
+
+
+def test_egress_a_reboot_during_a_standing_fallback_pages_it_once_more(
+        tmp_path, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)                        # the distrust at the seed is an info line
+    # The mark names the boot it was made in, and is trusted within that boot alone
+    # (the next test says why). Run 1 pages the fallback and closes cleanly; the box
+    # reboots; run 2 finds the mark, but an earlier boot's, so it adopts the alert as
+    # distrusted, with one line at info: the fallback it confirms pages once more, the
+    # price of a reboot during a standing fallback, and its record follows that page as
+    # usual. Run 2's clean close marks the record with this boot's id, and run 3, a
+    # service restart within the boot, trusts it: silent, as after any clean close.
+    path = tmp_path / "egress_alert.json"
+    first = notify.EventDetector(egress_alert_path=str(path))
+    first.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(first.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert first.close()
+    assert _record(path)["boot_id"] == notify._boot_id()
+    monkeypatch.setattr(notify, "_boot_id", lambda: "the-next-boot")    # the reboot
+    second = notify.EventDetector(egress_alert_path=str(path))
+    assert second.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, distrusted
+    assert [r.levelno for r in caplog.records if "earlier boot" in r.getMessage()] == [logging.INFO]
+    assert _warnings(caplog, second) == []
+    assert second.observe(obs(egress=_eg("pending"))) == []
+    assert _sent(second.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # once more
+    assert second.observe(obs(egress=_eg("mismatch"))) == []
+    assert second.close()
+    assert _record(path)["boot_id"] == "the-next-boot"
+    third = notify.EventDetector(egress_alert_path=str(path))   # a restart within the boot
+    assert third.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, trusted
+    assert third.observe(obs(egress=_eg("mismatch"))) == []     # paged in this boot already
+    assert _sent(third.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert third.drain()
+    assert not path.exists()
+
+
+def test_egress_a_mark_a_refusing_run_could_not_strip_is_not_trusted_after_the_reboot(
+        tmp_path, monkeypatch):
+    # rv-pr24g-r1 F2. Run N closed cleanly with the fallback standing, so its record is
+    # marked. Run N+1's disk refuses from its seed to its end (a card remounted read-only
+    # at that boot): the adoption rewrite never succeeds, so the alert is distrusted and
+    # the fallback pages again, a repeat; the restore pages, and its removal is refused
+    # too; the run closes with no alert standing, so it writes no mark, but it could not
+    # strip run N's either. Only a reboot frees such a disk, and the mark names run N's
+    # boot: run N+2 does not trust it, and the new fallback it confirms pages. The
+    # operator's last news was "Egress restored".
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")     # run N: a clean close with the fallback standing
+    disk = _RefusingDisk(monkeypatch, path)   # run N+1: the disk refuses from its seed to its end
+    second = notify.EventDetector(egress_alert_path=str(path))
+    assert second.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, trusted
+    assert wait_for(lambda: _unreliable(second))              # the rewrite failed for good
+    assert _sent(second.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # a repeat; refused
+    assert _sent(second.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: "remove" in disk.calls)           # the removal, refused
+    assert second.close()                                     # no alert standing: no mark
+    assert _record(path) == {"selected": "relay_backbone", "announced_at": ANNOUNCED_AT,
+                             "closed_at": CLOSED_AT, "boot_id": notify._boot_id()}  # run N's
+    disk.refuses.clear()                                      # the reboot frees the disk,
+    monkeypatch.setattr(notify, "_boot_id", lambda: "the-next-boot")   # and is a new boot
+    third = notify.EventDetector(egress_alert_path=str(path))
+    assert third.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, distrusted
+    assert third.drain()
+    assert _titles(third.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
+        "run N's mark outlived run N+1's refusing disk and the reboot that freed it"
 
 
 def test_egress_a_new_fallback_pages_after_a_restart_even_when_the_disk_works_again(

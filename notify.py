@@ -15,17 +15,21 @@ way: after the first observation, EventDetector.observe() only queues record
 operations, and the EgressRecordKeeper's thread does every write, removal and
 fsync of it, so a disk that stalls never holds up the control loop. A stale
 record is not trusted, because only a clean close with the alert standing
-marks it (`closed_at`, written by EventDetector.close() alone, onto a record
-the run's own pages wrote, and dropped again by the rewrite at the next
-adoption); every other ending fails toward a repeated page: an operation the
-disk refuses is tried again for as long as the run lasts, and once more at the
-close; one still queued when the process ends (a crash, a power loss, or a page
+marks it (`closed_at` and the id of the boot, written by EventDetector.close()
+alone, onto a record the run's own pages wrote, and dropped again by the
+rewrite at the next adoption), and the mark is trusted within that boot alone;
+every other ending fails toward a repeated page: an operation the disk refuses
+is tried again for as long as the run lasts, and once more at the close; one
+still queued when the process ends (a crash, a power loss, or a page
 spool-notify takes after the keeper has closed) is lost, and costs at most one
-repeated page at the next start; and a record without the mark, or one a
-restart cannot write again, is adopted as distrusted, so the fallback it names
-pages again rather than never. The one ending that cannot fail that way: a run
-whose disk refuses every write, from its seed to its end, leaves the mark the
-run before it wrote, for the run after it to trust (see EventDetector).
+repeated page at the next start; a record without the mark, or one a restart
+cannot write again, is adopted as distrusted, so the fallback it names pages
+again rather than never; and a run that could write nothing (a disk read-only
+from its seed to its end) leaves the mark the run before it wrote, which the
+reboot that frees such a disk puts out of trust (a disk freed by hand within the
+boot, and a restart after it, trust it still: the accepted residual). So a
+service restart during a standing fallback is silent, and a reboot during one
+pages it once more (see EventDetector).
 """
 import dataclasses
 import functools
@@ -38,6 +42,7 @@ import queue
 import subprocess
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
@@ -52,6 +57,12 @@ EGRESS_ALERT_PATH = "/var/lib/sbfd-ctl/egress_alert.json"
 # delays in turn, then every last one of them for as long as the run lasts (see
 # EgressRecordKeeper). Tests shorten them; empty, no operation is tried again.
 _RECORD_RETRY_DELAYS_S = (1.0, 5.0, 30.0)
+# The kernel's id of this boot: the record's clean-close mark names the boot it was
+# made in, and is trusted within that boot alone (see EventDetector).
+_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+# Stands in for the boot's id where the kernel gives none: this process's own, so
+# that no mark outlives the process there (see _boot_id).
+_PROCESS_ID = uuid.uuid4().hex
 
 # What the UI calls each egress mode; used in egress fallback messages.
 EGRESS_LABELS = {
@@ -362,12 +373,25 @@ def _finite(value, default=None):
     return value if math.isfinite(value) else default
 
 
-def _record_fields(raw: bytes) -> "tuple[str, float, bool]":
+def _boot_id() -> str:
+    """The id of this boot, the kernel's, which every process of the boot reads
+    alike; or this process's own where the kernel gives none, so that no mark is
+    trusted across a restart there, and a standing fallback pages once more: the
+    direction the record may fail in."""
+    try:
+        with open(_BOOT_ID_PATH, encoding="ascii") as f:
+            return f.read().strip() or _PROCESS_ID
+    except (OSError, ValueError):
+        return _PROCESS_ID
+
+
+def _record_fields(raw: bytes) -> "tuple[str, float, Optional[str]]":
     """The egress alert record's fields from its bytes: the selected mode it names,
-    when its fallback was paged, and whether it carries the clean-close mark (see
-    EventDetector). ValueError, saying why, when it is no record: not JSON, not an
-    object, or naming no selected mode. An `announced_at` that is not a finite
-    number reads as 0.0, and a `closed_at` that is not one as no mark."""
+    when its fallback was paged, and the id of the boot its clean-close mark was
+    made in, or None without the mark (see EventDetector). ValueError, saying why,
+    when it is no record: not JSON, not an object, or naming no selected mode. An
+    `announced_at` that is not a finite number reads as 0.0; a `closed_at` that is
+    not one, or a `boot_id` that is not a non-empty string, as no mark."""
     try:
         rec = json.loads(raw)
     except (ValueError, RecursionError) as e:   # not UTF-8, not JSON, or too deep
@@ -376,18 +400,21 @@ def _record_fields(raw: bytes) -> "tuple[str, float, bool]":
     if not isinstance(selected, str) or not selected:
         raise ValueError("names no selected mode")
     announced_at = _finite(rec.get("announced_at"), 0.0)
-    return selected, announced_at, _finite(rec.get("closed_at")) is not None
+    boot = rec.get("boot_id")
+    if _finite(rec.get("closed_at")) is None or not isinstance(boot, str) or not boot:
+        return selected, announced_at, None
+    return selected, announced_at, boot
 
 
 @dataclass(frozen=True)
 class _RecordOp:
     """One operation on the egress alert record: write a record naming `mode`,
     remove the record when `mode` is None, or, with `mark`, add the clean-close mark
-    (`closed_at`) to the record if it names `mode`. A page's operation carries the
-    generation the page was made under (see EventDetector); a change made without
-    a page carries None. `refresh` marks the seed's rewrite of a record it adopts.
-    `seq` is the operation's place in the queue, given as it is queued, and `tries`
-    how many times it has been run before."""
+    (`closed_at`, and this boot's id) to the record if it names `mode`. A page's
+    operation carries the generation the page was made under (see EventDetector);
+    a change made without a page carries None. `refresh` marks the seed's rewrite
+    of a record it adopts. `seq` is the operation's place in the queue, given as it
+    is queued, and `tries` how many times it has been run before."""
     mode: Optional[str]
     announced_at: float = 0.0
     gen: Optional[int] = None
@@ -415,16 +442,20 @@ class EgressRecordKeeper:
     removal fsyncs the directory too, whether or not there was a record.
 
     The record's trust rule (see EventDetector): a record is trusted at the next
-    start only if it carries the clean-close mark, `closed_at`, which close() alone
-    writes, as its last operation, and only while a trusted alert stands: it is
-    added to the record this run's pages left, never to a record of its own, since
-    a page spool-notify refused left none, and never to a record an earlier run
-    left behind, which such a refused page would otherwise have the next run
-    trust. So this thread remembers the mode of the record it last wrote to
-    completion, forgets it before any removal it attempts and any write it begins,
-    and marks only while that mode is the standing alert's (see _mark). Every
-    other write omits the mark, so a crash, a power cut, or a disk that refuses
-    the run's last operations leaves the record unmarked.
+    start only if it carries the clean-close mark of this boot, `closed_at` with the
+    boot's id, which close() alone writes, as its last operation, and only while a
+    trusted alert stands: it is added to the record this run's pages left, never to
+    a record of its own, since a page spool-notify refused left none, and never to
+    a record an earlier run left behind, which such a refused page would otherwise
+    have the next run trust. So this thread remembers the mode of the record it
+    last wrote to completion, forgets it before any removal it attempts and any
+    write it begins, and marks only while that mode is the standing alert's (see
+    _mark). Every other write omits the mark, so a crash, a power cut, or a disk
+    that refuses the run's last operations leaves the record unmarked; and a mark
+    of an earlier boot is no mark to the run that finds it, so a run that could
+    write nothing (a disk read-only from its seed to its end) leaves the mark the
+    run before it wrote only to a run of the same boot: a disk freed by hand, the
+    accepted residual (see EventDetector).
 
     An operation the disk refuses (an OSError) is tried again after each of
     _RECORD_RETRY_DELAYS_S in turn, then every last one of them, for as long as the
@@ -504,12 +535,12 @@ class EgressRecordKeeper:
               mark: "Optional[tuple[str, float]]" = None) -> bool:
         """Run every operation queued so far, then each operation whose retry is
         pending once more, in queue order, then, with `mark` (the standing alert's
-        mode, and the wall-clock time of this close), add the clean-close mark to the
-        record if it names that mode, and end the thread. Waits at most `timeout`
-        seconds, and returns True when the thread has ended; past that the thread
-        carries on alone, and ends once the queue is through. An operation queued
-        after this never runs, and no retry is made after this: a last attempt that
-        fails is one warning."""
+        mode, and the wall-clock time of this close), add the clean-close mark (that
+        time, and this boot's id) to the record if it names that mode, and end the
+        thread. Waits at most `timeout` seconds, and returns True when the thread
+        has ended; past that the thread carries on alone, and ends once the queue
+        is through. An operation queued after this never runs, and no retry is made
+        after this: a last attempt that fails is one warning."""
         if self._thread is None:
             return True
         with self._lock:
@@ -582,12 +613,12 @@ class EgressRecordKeeper:
         """Add the clean-close mark to the record, if this run wrote it (the last
         write to complete named `op.mode`, and no removal has been attempted since)
         and it still names `op.mode`: the record the pages left, as they left it,
-        with `closed_at` added. Otherwise the record is left as it is: none (a page
-        spool-notify refused left none, and the fallback it would name was never
-        paged), another mode's, or one this run never wrote, which an earlier run's
-        refused removal or power cut left behind, and which may name an alert long
-        restored; a later run then pages the fallback, a repeat at worst. True when
-        the record was written."""
+        with `closed_at` and this boot's id added. Otherwise the record is left as it
+        is: none (a page spool-notify refused left none, and the fallback it would
+        name was never paged), another mode's, or one this run never wrote, which an
+        earlier run's refused removal or power cut left behind, and which may name
+        an alert long restored; a later run then pages the fallback, a repeat at
+        worst. True when the record was written."""
         if self._settled != op.mode:
             logging.debug("egress alert: no record this run wrote in %s names %s, so "
                           "none is marked as closed", self.path, op.mode)
@@ -599,7 +630,7 @@ class EgressRecordKeeper:
             logging.debug("egress alert: no record in %s to mark as closed", self.path)
             return False
         try:
-            selected, announced_at, _closed = _record_fields(raw)
+            selected, announced_at, _mark_boot = _record_fields(raw)
         except ValueError as e:
             logging.debug("egress alert: the record %s %s, so it is not marked as closed",
                           self.path, e)
@@ -685,6 +716,7 @@ class EgressRecordKeeper:
         rec: dict = {"selected": mode, "announced_at": announced_at}
         if closed_at is not None:
             rec["closed_at"] = closed_at
+            rec["boot_id"] = _boot_id()
         body = json.dumps(rec)
         # A temp file beside the record, renamed over it, so a reader never meets
         # half a record. Its data is synced before the rename and the rename after
@@ -754,27 +786,31 @@ class EventDetector:
 
     The trust rule. A record can be stale: a restore page's removal the disk
     refused, a crash after a restore page, a power cut. So the record carries a
-    clean-close mark, `closed_at`, which close() alone writes, as the keeper's last
-    operation, and only while a trusted alert stands: through run_controller's
-    shutdown, and onto the record this run's pages left (a page spool-notify
-    refused left none, and none is made for it; a record an earlier run left is
-    never marked, even one naming the alert's mode, see EgressRecordKeeper). Every
-    other write omits it. A record with the mark, for the selected mode, is
-    adopted as trusted (a confirmed mismatch stays silent, a match pages the
-    restore), and written once more without the mark, so a crash of this run
-    leaves it unmarked; a rewrite the keeper cannot complete withdraws the trust.
-    One without the mark is adopted as distrusted from the start: the alert
-    stands for its restore, but its fallback counts as unannounced, so a
-    confirmed mismatch pages it, a repeat at worst, and the record follows that
-    page as usual. So the mark certifies that the last run to write the record
-    closed cleanly with that alert standing, and every other ending of a run that
-    can write fails toward a repeated page. What it cannot certify: a run whose
-    disk refuses every write, from its seed to its end, neither strips the mark
-    the run before it left nor removes the record, so the run after it, on a disk
-    that works again, trusts a mark the refusing run could not withdraw, and a new
-    fallback it confirms stays silent. With egress_alert_path None the detector
-    has no keeper and does no file I/O at all, and a restart in the middle of a
-    fallback pages it again."""
+    clean-close mark, `closed_at` with the id of the boot it was made in, which
+    close() alone writes, as the keeper's last operation, and only while a trusted
+    alert stands: through run_controller's shutdown, and onto the record this
+    run's pages left (a page spool-notify refused left none, and none is made for
+    it; a record an earlier run left is never marked, even one naming the alert's
+    mode, see EgressRecordKeeper). Every other write omits it. A record with the
+    mark of this boot, for the selected mode, is adopted as trusted (a confirmed
+    mismatch stays silent, a match pages the restore), and written once more
+    without the mark, so a crash of this run leaves it unmarked; a rewrite the
+    keeper cannot complete withdraws the trust. One without the mark, or with an
+    earlier boot's, is adopted as distrusted from the start: the alert stands for
+    its restore, but its fallback counts as unannounced, so a confirmed mismatch
+    pages it, a repeat at worst, and the record follows that page as usual. So the
+    mark certifies that the last run to write the record closed cleanly with that
+    alert standing, and every other ending of a run that can write fails toward a
+    repeated page. A run that can write nothing, its disk read-only from its seed
+    to its end, neither strips the mark the run before it left nor removes the
+    record; but only a reboot frees such a disk, and the mark is trusted within
+    the boot that made it alone, so the run after the reboot pages the fallback it
+    confirms. The cost: a reboot during a standing fallback pages it once more,
+    where a service restart stays silent. What remains, and is accepted: a disk
+    freed by hand within the boot (a remount), and a service restart after it,
+    trust that mark still, so a new fallback that restart confirms stays silent.
+    With egress_alert_path None the detector has no keeper and does no file I/O
+    at all, and a restart in the middle of a fallback pages it again."""
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
@@ -863,17 +899,19 @@ class EventDetector:
     def close(self, timeout: float = 5.0) -> bool:
         """Run the record operations queued so far, and once more each one whose
         retry is pending, then, while a trusted alert stands, have the record it
-        names marked as closed (`closed_at`, now), if this run's pages wrote that
-        record (see EgressRecordKeeper), waiting at most `timeout` seconds in all,
-        and stop the record keeper's thread. The mark is the one thing a
-        later run trusts the record for (see the class docstring): only this clean
-        close writes it, and a distrusted alert (an unmarked record adopted at the
-        seed, or one whose rewrite failed) leaves the record unmarked. For shutdown,
-        once the Notifier has stopped, or its stop() has given up on a send: its
-        stop() sends the pages it still holds, and their on_sents queue operations
-        of their own, ahead of the mark. True when the keeper finished in time, or
-        when there is no record to keep. An operation queued after this never runs,
-        as if the process had ended."""
+        names marked as closed (`closed_at`, now, and this boot's id), if this run's
+        pages wrote that record (see EgressRecordKeeper), waiting at most `timeout`
+        seconds in all, and stop the record keeper's thread. The mark is the one
+        thing a later run, within this boot, trusts the record for (see the class
+        docstring): only this clean close writes it, and a distrusted alert (a record
+        adopted at the seed without the mark or with an earlier boot's, or one whose
+        rewrite failed) leaves the record unmarked; a run of this boot that could
+        write nothing leaves an earlier mark standing, the accepted residual. For
+        shutdown, once the Notifier has stopped, or its stop() has given up on a
+        send: its stop() sends the pages it still holds, and their on_sents queue
+        operations of their own, ahead of the mark. True when the keeper finished in
+        time, or when there is no record to keep. An operation queued after this
+        never runs, as if the process had ended."""
         if self._keeper is None:
             return True
         self._distrust_if_unwritable()
@@ -934,20 +972,24 @@ class EventDetector:
         # egress pages spool-notify accepted, so it tells a fallback the operator was
         # paged about from one that began during the restart. Reading it is the one
         # piece of record I/O on the controller's thread: a single small read, once.
-        #   - A record for the selected mode, with the clean-close mark: the last run
-        #     ended through close() with this alert standing and trusted, so its
-        #     fallback page went out and no restore page has. The alert stands,
-        #     trusted: a confirmed mismatch stays silent and a match sends the
-        #     restore. The record is written once more, without the mark (see
-        #     _adopt_egress_alert): the one write per adoption, so a crash of this
-        #     run leaves it unmarked. A rewrite the keeper cannot complete withdraws
-        #     the trust (see _egress_events).
-        #   - A record for the selected mode, without the mark: the last run ended
-        #     some other way (a crash, a power cut, a disk that refused its last
-        #     operations), and nothing says whether the fallback still stood. The
-        #     alert stands, distrusted: it stands for its restore, but its fallback
-        #     counts as unannounced, so a confirmed mismatch pages it, a repeat at
-        #     worst, and the record follows that page as usual. Nothing is written.
+        #   - A record for the selected mode, with the clean-close mark of this boot:
+        #     the last run to write it ended through close() with this alert
+        #     standing and trusted, so its fallback page went out and no restore
+        #     page has (unless a run of this boot since could write nothing, its
+        #     disk freed by hand after: the accepted residual, see the class
+        #     docstring). The alert stands, trusted: a confirmed mismatch stays
+        #     silent and a match sends the restore. The record is written once more,
+        #     without the mark (see _adopt_egress_alert): the one write per
+        #     adoption, so a crash of this run leaves it unmarked. A rewrite the
+        #     keeper cannot complete withdraws the trust (see _egress_events).
+        #   - A record for the selected mode, without the mark, or with an earlier
+        #     boot's: the last run ended some other way (a crash, a power cut, a disk
+        #     that refused its last operations), or a reboot has come between, and
+        #     with it perhaps a run that could write nothing; nothing says whether
+        #     the fallback still stood. The alert stands, distrusted: it stands for
+        #     its restore, but its fallback counts as unannounced, so a confirmed
+        #     mismatch pages it, a repeat at worst, and the record follows that page
+        #     as usual. Nothing is written.
         #   - A record for another mode: the selected mode changed while the
         #     controller was down, which ends an alert silently. Drop it, mark or no.
         #   - No usable record: nothing stands, so a fallback pages as usual.
@@ -965,9 +1007,9 @@ class EventDetector:
             return
         recorded = self._read_egress_alert()
         if recorded is not None:
-            mode, announced_at, closed = recorded
+            mode, announced_at, mark_boot = recorded
             if mode == selected:
-                self._adopt_egress_alert(mode, announced_at, closed)
+                self._adopt_egress_alert(mode, announced_at, mark_boot)
             else:
                 self._end_egress_alert()
 
@@ -1340,22 +1382,30 @@ class EventDetector:
         if self._keeper is not None:
             self._keeper.remove(failure_level=failure_level)
 
-    def _adopt_egress_alert(self, mode, announced_at: float, closed: bool) -> None:
+    def _adopt_egress_alert(self, mode, announced_at: float,
+                            mark_boot: Optional[str]) -> None:
         """A record for the selected mode at the seed: its alert stands again. With
-        the clean-close mark (`closed`), it is trusted: the last run ended through
-        close() with this alert standing, so nothing stale can have been left. The
-        record is then written once more with its own `selected` and `announced_at`
-        and without the mark, so it still names the page, and a crash of this run
-        leaves it unmarked; a rewrite that fails for good sets the keeper's
-        `unreliable`, which _distrust_if_unwritable reads, and the trust is
-        withdrawn. Nothing else writes the record while the alert stands. Without
-        the mark the alert is distrusted from the start (see
-        _distrust_egress_alert), at info, since a power cut ends that way, and the
-        record is left as it is."""
+        the clean-close mark of this boot (`mark_boot`, the id of the boot the mark
+        was made in), it is trusted: the last run to write it ended through close()
+        with this alert standing, so nothing stale can have been left, and no
+        reboot has come between (a run of this boot that could write nothing, its
+        disk freed by hand after, is the accepted residual). The record is then
+        written once more with its own `selected` and `announced_at` and without the
+        mark, so it still names the page, and a crash of this run leaves it unmarked;
+        a rewrite that fails for good sets the keeper's `unreliable`, which
+        _distrust_if_unwritable reads, and the trust is withdrawn. Nothing else
+        writes the record while the alert stands. Without the mark, or with an
+        earlier boot's, the alert is distrusted from the start (see
+        _distrust_egress_alert), at info, since a power cut, and a reboot during a
+        standing fallback, end that way, and the record is left as it is."""
         self._egress_gen += 1
         self._egress_alert_mode = mode
-        if not closed:
+        if mark_boot is None:
             self._distrust_egress_alert("was not closed cleanly by the run that left it",
+                                        logging.INFO)
+            return
+        if mark_boot != _boot_id():
+            self._distrust_egress_alert("was closed cleanly, but in an earlier boot",
                                         logging.INFO)
             return
         self._egress_alert_adopted, self._egress_alert_unreliable = True, False
@@ -1385,12 +1435,13 @@ class EventDetector:
                     "mismatch pages it, perhaps again", self._egress_alert_path, why,
                     egress_label(self._egress_alert_mode))
 
-    def _read_egress_alert(self) -> "Optional[tuple[str, float, bool]]":
-        """The selected mode the record names, when its fallback was paged, and
-        whether it carries the clean-close mark, or None when there is no usable
-        record. Only a missing file passes without a warning. A file that cannot be
-        read is left where it is. An `announced_at` that is not a finite number
-        reads as 0.0, and a `closed_at` that is not one as no mark."""
+    def _read_egress_alert(self) -> "Optional[tuple[str, float, Optional[str]]]":
+        """The selected mode the record names, when its fallback was paged, and the
+        id of the boot its clean-close mark was made in (None without the mark), or
+        None when there is no usable record. Only a missing file passes without a
+        warning. A file that cannot be read is left where it is. An `announced_at`
+        that is not a finite number reads as 0.0; a `closed_at` that is not one, or
+        a `boot_id` that is not a non-empty string, as no mark."""
         path = self._egress_alert_path
         if path is None:
             return None

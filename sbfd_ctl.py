@@ -3481,8 +3481,10 @@ def end_saved_egress_alert() -> notify.EgressRecordKeeper:
     start left would be adopted by a later run. No record is the usual case; a
     removal the disk refuses is a warning, and startup goes on. A run that keeps
     the record never calls this: its record is its detector's to adopt, and one
-    left without a clean close is distrusted there (see notify.EventDetector's
-    trust rule)."""
+    left without a clean close in this boot is distrusted there (see
+    notify.EventDetector's trust rule; a run of this boot whose disk refused the
+    removal from its seed to its end leaves an earlier mark standing, the accepted
+    residual)."""
     path = notify.EGRESS_ALERT_PATH
     logging.info("egress alert: this run does not keep the record, so a saved alert in "
                  "%s, if any, is ended", path)
