@@ -3104,6 +3104,48 @@ def test_egress_a_removal_whose_directory_sync_failed_is_synced_when_tried_again
     assert len(directory_syncs) == 2
 
 
+def test_egress_a_removal_whose_directory_sync_fails_again_without_the_file_is_tried_again(
+        tmp_path, monkeypatch, caplog):
+    # rv-pr24g-r1, one step on from the test above: the removal unlinked the record and
+    # its directory sync failed; the retry finds no record and its sync fails too. That
+    # failure must raise as well, so the removal is tried again until a sync goes
+    # through: the ended alert's record could otherwise come back after a power loss.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    real_fsync, directory_syncs = os.fsync, []
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            directory_syncs.append(fd)
+            if len(directory_syncs) <= 2:
+                raise OSError(errno.EIO, "Input/output error")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "fdatasync", fsync, raising=False)
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: len(directory_syncs) == 3), \
+        "the retry found no record, its sync failed, and that was taken for success"
+    assert not path.exists()
+    warned = [r.getMessage() for r in _warnings(caplog, d)]
+    assert len(warned) == 2 and all("tries again" in w for w in warned), warned
+    assert d.close()
+    assert len(directory_syncs) == 3
+
+
+def test_egress_a_removal_with_no_record_directory_is_no_failure(tmp_path):
+    # The one exception kept: a directory that does not exist has nothing to remove and
+    # nothing to sync, so the removal reports no record and raises nothing (a raise
+    # would have the keeper try it again for the life of the run).
+    path = tmp_path / "missing" / "egress_alert.json"
+    assert notify.remove_egress_alert_record(str(path)) is False
+    assert not (tmp_path / "missing").exists()
+
+
 # -- the clean-close mark: when a restart trusts the record ------------------------------
 #
 # Greptile P1 4191966669 on PR #24: a record can be stale (a restore's removal the disk
@@ -3116,9 +3158,14 @@ def test_egress_a_removal_whose_directory_sync_failed_is_synced_when_tried_again
 # run's last operations leaves none. A restart trusts a record that carries the mark,
 # and the adoption rewrite drops it, so a crash of this run leaves it unmarked again; one
 # without the mark is adopted as distrusted from the start: the alert stands for its
-# restore, and a confirmed mismatch pages the fallback, a repeat at worst. A stale record
-# is never trusted, because only a clean close with the alert standing marks it; every
-# other ending fails toward a repeated page.
+# restore, and a confirmed mismatch pages the fallback, a repeat at worst. The mark goes
+# only onto a record this run's own pages wrote, and not tried to remove since
+# (rv-pr24g-r1 F1: with the fallback page spool-notify refused, the close marked whatever
+# record named the mode, a stale one included, and the next run trusted it). So a stale
+# record is not trusted, because only a clean close with the alert standing marks it,
+# and every ending of a run that can write fails toward a repeated page; the one that
+# cannot, a run whose disk refuses every write from its seed to its end, leaves the mark
+# the run before it wrote (a residual of the design, awaiting a ruling; no test here).
 
 
 def test_egress_a_clean_close_marks_the_record_and_the_next_run_trusts_it(tmp_path):
@@ -3279,6 +3326,96 @@ def test_egress_a_new_fallback_pages_after_a_restart_even_when_the_disk_works_ag
     assert after.drain()
     assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
         "a record a restore's failed removal left behind silenced a new fallback"
+
+
+def test_egress_a_refused_page_over_a_stale_record_does_not_let_the_close_mark_it(
+        tmp_path, monkeypatch):
+    # rv-pr24g-r1 F1. Run 1 pages the fallback and records it; its restore pages, but
+    # the disk refuses the removal for the rest of the run, the close's last attempt
+    # included: the ended alert's record stands, unmarked (no alert stood at the close).
+    # Run 2 adopts it as distrusted; the fallback it confirms is new to the operator, so
+    # it pages, but spool-notify refuses the page: its on_sent never runs, and the record
+    # on disk is still run 1's. The alert stands, trusted (the detector's own page), so
+    # close() queues the mark. It must not land on run 1's record: the operator's last
+    # accepted page was run 1's restore, and a run 3 trusting it would stay silent.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    first = notify.EventDetector(egress_alert_path=str(path))
+    first.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(first.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert first.drain() and path.exists()
+    disk = _RefusingDisk(monkeypatch, path, refuses={"remove"})
+    assert _sent(first.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: len(disk.calls) >= 2)
+    assert first.close()
+    assert path.exists() and "closed_at" not in _record(path)
+    disk.refuses.clear()                      # the disk works again (a reboot cleared the remount)
+    second = notify.EventDetector(egress_alert_path=str(path))
+    assert second.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, distrusted
+    assert _titles(second.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]  # refused: no on_sent
+    assert second.observe(obs(egress=_eg("mismatch"))) == []
+    assert second.close()
+    assert "replace" not in disk.calls, disk.calls        # nothing wrote run 1's record
+    assert "closed_at" not in _record(path), \
+        "run 2's close marked a record its pages never wrote"
+    third = notify.EventDetector(egress_alert_path=str(path))
+    assert third.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _titles(third.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
+        "run 3 trusted a record run 2's pages never wrote"
+
+
+def test_egress_a_refused_page_over_a_record_a_refused_removal_left_does_not_let_the_close_mark_it(
+        tmp_path, monkeypatch):
+    # The same within one run: the fallback page's write made the record, the restore
+    # paged, but the disk refuses its removal for the rest of the run; then the fallback
+    # returns and pages, and spool-notify refuses that page. The record on disk is this
+    # run's own, but the operator's last accepted page was the restore: a removal
+    # attempted since the write, refused or not, leaves the record in doubt, so the
+    # close marks nothing, and the next run pages the fallback.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    disk = _RefusingDisk(monkeypatch, path, refuses={"remove"})
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: len(disk.calls) >= 2)                 # refused, and again
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # refused: no on_sent
+    assert d.observe(obs(egress=_eg("mismatch"))) == []
+    assert d.close()                          # the removal's last attempt, refused; then the mark
+    assert path.exists() and "replace" not in disk.calls, disk.calls
+    assert "closed_at" not in _record(path), "the close marked a record a refused removal left"
+    disk.refuses.clear()
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
+        "the next run trusted a record whose restore was paged"
+
+
+def test_egress_a_page_whose_write_the_disk_refused_does_not_let_the_close_mark_a_stale_record(
+        tmp_path, monkeypatch):
+    # The write itself must complete before the record counts as this run's: run 2's
+    # fallback page is taken, but the disk refuses its write, at the close's last
+    # attempt too, and takes the next operation (the mark, were one made). The record on
+    # disk is still run 1's stale one, so the close marks nothing, and run 3 pages.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone", closed=False)   # run 1's, left by a refused removal
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    disk = _RefusingDisk(monkeypatch, path, refuses={"replace"}, refusals=2)
+    second = notify.EventDetector(egress_alert_path=str(path))
+    assert second.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, distrusted
+    assert _sent(second.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # taken; write refused
+    assert wait_for(lambda: disk.calls == ["replace"])      # once; its retry is due in 5 s
+    assert wait_for(lambda: any(t.name == "egress-record-retry" for t in threading.enumerate()))
+    assert second.observe(obs(egress=_eg("mismatch"))) == []
+    assert second.close()                                   # the last attempt, refused; the mark
+    assert disk.calls == ["replace"] * 2, disk.calls        # the mark wrote nothing
+    assert _record(path) == {"selected": "relay_backbone", "announced_at": ANNOUNCED_AT}
+    third = notify.EventDetector(egress_alert_path=str(path))
+    assert third.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _titles(third.observe(obs(egress=_eg("mismatch")))) == [FALLBACK], \
+        "the close marked a stale record the run's own write never replaced"
 
 
 # -- the egress alert record across a power loss ----------------------------------------
