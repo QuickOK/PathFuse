@@ -134,9 +134,9 @@ def test_a_kinds_events_go_out_in_the_order_they_came():
 
 import json
 import os
+import stat
 import subprocess
 import sys
-import stat
 import time
 
 
@@ -3771,7 +3771,7 @@ def test_egress_a_removals_retry_is_dropped_once_a_later_write_has_raised(
     assert d.drain() and path.exists()
     first = json.loads(path.read_text(encoding="utf-8"))
 
-    # From here the disk refuses: the record's removal once, and every write of it (the
+    # From here the disk refuses every removal of the record and every write of it (the
     # rename over it) for the rest of the run.
     refusing, calls = [True], []
     real_remove, real_replace = os.remove, os.replace
@@ -3782,7 +3782,7 @@ def test_egress_a_removals_retry_is_dropped_once_a_later_write_has_raised(
     def remove(p, *a, **kw):
         if os.fspath(p) == str(path):
             calls.append("remove")
-            if refusing[0] and calls.count("remove") == 1:
+            if refusing[0]:
                 refuse()
         return real_remove(p, *a, **kw)
 
@@ -3798,9 +3798,9 @@ def test_egress_a_removals_retry_is_dropped_once_a_later_write_has_raised(
     monkeypatch.setattr(os, "replace", replace)
 
     assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
-    assert wait_for(lambda: calls == ["remove"])          # refused; its retry is due in 1 s
+    assert wait_for(lambda: "remove" in calls)             # refused; its retry is due in 1 s
     assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
-    assert wait_for(lambda: calls[:2] == ["remove", "replace"])   # refused after it
+    assert wait_for(lambda: "replace" in calls)           # refused after it
 
     def dropped():
         return [r for r in caplog.records if r.thread == _keeper_thread(d).ident
@@ -3808,7 +3808,8 @@ def test_egress_a_removals_retry_is_dropped_once_a_later_write_has_raised(
 
     assert wait_for(dropped), "the removal's retry was not dropped once the write had raised"
     assert d.close()
-    assert calls.count("remove") == 1, calls              # not tried again, not at the close either
+    # Not tried again once the write had raised, not at the close either.
+    assert "remove" not in calls[calls.index("replace"):], calls
     assert path.exists(), "the record of the fallback the operator was paged about is gone"
     assert json.loads(path.read_text(encoding="utf-8")) == first   # as the first page left it
 
@@ -3895,3 +3896,21 @@ def test_egress_an_earlier_boots_mark_is_adopted_without_a_write(tmp_path, monke
         "an earlier boot's mark was rewritten at adoption: a distrusted record is left as it is"
     assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # and its fallback pages
     assert d.close()
+
+
+@pytest.mark.parametrize("until", [int(_HUGE_INT), -int(_HUGE_INT)],
+                         ids=["past-float-range", "negative-past-float-range"])
+def test_an_until_past_float_range_suppresses_nothing_and_never_stops_a_tick(until):
+    # The window file is JSON: `{"until": 1000...0}` (401 digits) is an int to json.loads,
+    # and math.isfinite raises OverflowError on it. Like Infinity, NaN and a bool (the cases
+    # test_non_finite_until_suppresses_nothing pins), it is no timestamp: the window must
+    # suppress nothing, and above all must never raise out of observe() on the control loop.
+    assert json.loads('{"until": %s}' % _HUGE_INT)["until"] == int(_HUGE_INT)
+    clk, wclk = FakeClock(), FakeClock()
+    d = seeded(clk, wclk)
+    win = {"wan": "wan2", "until": until}
+    down = obs(wan_states={"wan1": "UP", "wan2": "DOWN"}, maintenance=win)
+    assert d.observe(down) == []       # held: not down long enough yet (and no raise)
+    clk.advance(30)
+    wclk.advance(30)
+    assert kinds(d.observe(down)) == ["wan_down"]

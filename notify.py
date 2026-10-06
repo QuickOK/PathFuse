@@ -53,6 +53,7 @@ DEFAULT_COMMAND = "/usr/local/sbin/spool-notify"
 # configurable, so every run finds, and can end, a record an earlier run left.
 # sbfd_ctl reads it when it runs, never at import, so tests can point it elsewhere.
 EGRESS_ALERT_PATH = "/var/lib/sbfd-ctl/egress_alert.json"
+_RECORD_MAX_BYTES = 64 * 1024   # a record is a few hundred bytes; anything bigger is not one
 # A record operation that fails with an OSError is tried again after each of these
 # delays in turn, then every last one of them for as long as the run lasts (see
 # EgressRecordKeeper). Tests shorten them; empty, no operation is tried again.
@@ -636,7 +637,7 @@ class EgressRecordKeeper:
             return False
         try:
             with open(self.path, "rb") as f:
-                raw = f.read()
+                raw = f.read(_RECORD_MAX_BYTES)
         except FileNotFoundError:
             logging.debug("egress alert: no record in %s to mark as closed", self.path)
             return False
@@ -1048,7 +1049,7 @@ class EventDetector:
         wan, until = m.get("wan"), m.get("until")
         if not isinstance(wan, str) or isinstance(until, bool):
             return None
-        if not isinstance(until, (int, float)) or not math.isfinite(until):
+        if _finite(until) is None:   # not a number, a bool, non-finite, or past float range
             return None
         return wan if self._wall_clock() < until else None
 
@@ -1458,7 +1459,7 @@ class EventDetector:
             return None
         try:
             with open(path, "rb") as f:
-                raw = f.read()
+                raw = f.read(_RECORD_MAX_BYTES)
         except FileNotFoundError:
             return None
         except OSError as e:
@@ -1467,9 +1468,10 @@ class EventDetector:
             return None
         try:
             return _record_fields(raw)
-        except (ValueError, TypeError, OverflowError) as e:
-            # Whatever a malformed record raises, it counts as absent: the seed runs on
-            # the controller's thread, and a record file must never stop a start.
+        except Exception as e:
+            # Whatever a malformed record raises (_record_fields raises ValueError; the
+            # rest is belt and braces), it counts as absent: the seed runs on the
+            # controller's thread, and a record file must never stop a start.
             logging.warning("egress alert: the record %s %s, so it counts as absent",
                             path, e)
             return None
