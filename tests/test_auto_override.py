@@ -1543,6 +1543,93 @@ def test_a_run_that_does_not_keep_the_record_makes_a_last_attempt_at_shutdown(
     assert not [t for t in threading.enumerate() if t.name == "egress-record-retry"]
 
 
+def _wait_for(pred, timeout=5.0):
+    """True once pred() holds, polling for at most `timeout` seconds."""
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_start_that_aborts_still_makes_the_clean_ups_last_attempt(tmp_path, monkeypatch, run):
+    # rv-pr24g-r1: the clean-up keeper is closed on every way out of main(), an aborted
+    # start included. A removal the disk refused at startup, its retry still pending
+    # when apply_nft_init aborts the start (the delays outlast it), is tried once more
+    # then, and a disk that works again takes it. Left pending, the record would wait
+    # for a later run to adopt.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0,
+                                  "closed_at": 2.0}))
+    notifications, observe = _unkept_run(run)
+    calls = _refusing_remove(monkeypatch, record, refusals=1)
+
+    def refuse(*a, **kw):
+        # The keeper's first attempt (refused) has been made, and its retry's timer is
+        # running, by the time the start aborts: the timer is registered before it
+        # starts, so close() finds it. (Without this the abort can land between the
+        # refusal and the registration, and the refused operation gets no second
+        # attempt: "no retry once close() has been called", not a last attempt the
+        # test can pin.)
+        assert _wait_for(lambda: len(calls) >= 1)
+        assert _wait_for(lambda: any(t.name == "egress-record-retry"
+                                     for t in threading.enumerate()))
+        raise RuntimeError("nft-init: refused")
+
+    monkeypatch.setattr(M, "apply_nft_init", refuse)
+    cfg = _egress_cfg(tmp_path, notifications, observe)
+    with pytest.raises(RuntimeError, match="nft-init: refused"):
+        _main_with(monkeypatch, cfg)
+    assert not record.exists(), \
+        "the refused startup removal was not tried again on the way out of the aborted start"
+    assert calls[:2] == ["remove", "remove"], calls
+    assert _wait_for(lambda: not [t for t in threading.enumerate()
+                                  if t.name == "egress-record-retry"], timeout=2.0), \
+        "the cancelled retry's timer thread did not end"
+
+
+@pytest.mark.parametrize("run", _UNKEPT)
+def test_a_run_that_does_not_keep_the_record_does_not_wait_for_its_clean_up(
+        tmp_path, monkeypatch, run):
+    # rv-pr24g-r1: nothing blocks startup. The removal is queued on the clean-up keeper's
+    # own thread, so with the disk stalled inside os.remove, main() still reaches
+    # run_controller at once, the clean-up in flight; only the close on the way out
+    # waits for the keeper, bounded.
+    record = tmp_path / "egress_alert.json"
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    notifications, observe = _unkept_run(run)
+    entered, release = threading.Event(), threading.Event()
+    real_remove = os.remove
+
+    def remove(p, *a, **kw):
+        if os.fspath(p) == str(record):
+            entered.set()
+            release.wait(10)
+        return real_remove(p, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    reached: dict = {}
+    real_run_controller = M.run_controller
+
+    def run_controller(cfg, stop_event=None, **kw):
+        reached["after_s"] = time.monotonic() - t0
+        reached["in_flight"] = entered.wait(2.0) and not release.is_set()
+        release.set()                       # let the clean-up finish during the run
+        return real_run_controller(cfg, stop_event, **kw)
+
+    monkeypatch.setattr(M, "run_controller", run_controller)
+    t0 = time.monotonic()
+    assert _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                                  observe=observe, pages=[]) == 2
+    assert reached["in_flight"], "the clean-up was not in flight when the controller started"
+    assert reached["after_s"] < 1.0, f"the start waited {reached['after_s']:.2f} s for the clean-up"
+    assert not record.exists()
+
+
 def test_a_controller_run_closes_the_detector_after_its_notifier_sent_everything(
         tmp_path, monkeypatch):
     # At shutdown run_controller stops the Notifier first: stop() waits for the pages it

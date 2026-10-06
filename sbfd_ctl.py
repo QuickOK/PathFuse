@@ -3480,8 +3480,9 @@ def end_saved_egress_alert() -> notify.EgressRecordKeeper:
     apply_nft_init, any of which can abort the start, since a record an aborted
     start left would be adopted by a later run. No record is the usual case; a
     removal the disk refuses is a warning, and startup goes on. A run that keeps
-    the record never calls this: its record is its detector's to adopt, and a
-    stale one is never trusted there (see notify.EventDetector)."""
+    the record never calls this: its record is its detector's to adopt, and one
+    left without a clean close is distrusted there (see notify.EventDetector's
+    trust rule)."""
     path = notify.EGRESS_ALERT_PATH
     logging.info("egress alert: this run does not keep the record, so a saved alert in "
                  "%s, if any, is ended", path)
