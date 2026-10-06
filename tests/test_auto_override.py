@@ -1486,8 +1486,11 @@ def test_a_controller_run_waits_for_a_send_in_flight_before_it_closes_the_keeper
     # One spool-notify run may take SUBPROCESS_TIMEOUT_S, and the shutdown flush can
     # send several summaries, so run_controller gives stop() that long and five seconds
     # more, and only then closes the record keeper. An idle worker ends at once, so the
-    # bound costs the normal case nothing, and that case ends without a warning.
-    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 0.25)
+    # bound costs the normal case nothing, and that case ends without a warning. The
+    # constant also caps each spool-notify run, and a loaded runner can need more than
+    # a quarter second to fork the stand-in (Greptile on PR #24), so 2 s: the worker is
+    # idle by stop(), so the 7 s bound is never waited out.
+    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 2.0)
     timeouts: list = []
     real_stop = notify.Notifier.stop
 
@@ -1499,7 +1502,7 @@ def test_a_controller_run_waits_for_a_send_in_flight_before_it_closes_the_keeper
     script, log = _spool_notify(tmp_path, "spool-notify", 0)
     _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
                            notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
-    assert timeouts == [0.25 + 5.0]
+    assert timeouts == [2.0 + 5.0]
     assert _egress_pages(_handed(log)) == [_FALLBACK]
     assert _shutdown_warnings(caplog) == []
 
