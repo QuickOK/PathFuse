@@ -2029,6 +2029,14 @@ def _stalling_fsync(monkeypatch, directories_only=False):
     return entered, release
 
 
+# How long observe() may take while the record's disk is stalled: the one bound the
+# no-wait tests below share. A stalled disk holds observe() for seconds (a stalled fsync
+# waits on its test's `release`, set only after _timed_observe's 2 s join), so any bound
+# under 2 s tells a stall from scheduler noise, and 0.5 s leaves a loaded runner the room
+# that 50 ms did not (CodeRabbit on PR #24).
+_NO_WAIT_S = 0.5
+
+
 def _timed_observe(d, egress):
     """d.observe() of `egress`, on a thread of its own standing in for the control loop:
     (the seconds the call took, its events). A call still running after 2 s counts as
@@ -2077,7 +2085,7 @@ def test_egress_observe_does_not_wait_for_a_stalled_record_disk(tmp_path, monkey
     # Greptile and CodeRabbit on PR #24: a disk stalled in a sync stalled failover. Here
     # the directory sync stalls from the seed's write on, and the keeper with it. A
     # fallback counted as announced at the seed, a restore, a fallback, a silent end and
-    # a fallback on the new mode each still return within 50 ms, and every page still
+    # a fallback on the new mode each still return at once (_NO_WAIT_S), and every page still
     # goes out: the Notifier runs each page's on_sent without waiting for the disk
     # either. The seed's record is on disk all along, so a removal made on the
     # controller's thread would stall as well. Once the disk recovers, the record
@@ -2098,7 +2106,7 @@ def test_egress_observe_does_not_wait_for_a_stalled_record_disk(tmp_path, monkey
                 ("a fallback on the new mode", _eg("mismatch", selected="relay_vpn"),
                  [FALLBACK])]:
             took, evs = _timed_observe(d, egress)
-            assert took < 0.05, f"{step}: observe() took {took:.3f} s"
+            assert took < _NO_WAIT_S, f"{step}: observe() took {took:.3f} s"
             assert _titles(evs) == want, step
             assert entered.wait(5), step       # the keeper is stuck in the seed's write
             for e in evs:
@@ -2141,7 +2149,7 @@ def test_egress_a_transition_does_not_wait_for_a_record_write_in_progress(
         threading.Thread(target=fallback.on_sent, daemon=True).start()   # the Notifier's
         assert entered.wait(5)                 # the keeper is inside the write's sync
         took, evs = _timed_observe(d, step)
-        assert took < 0.05, f"observe() took {took:.3f} s"
+        assert took < _NO_WAIT_S, f"observe() took {took:.3f} s"
         assert _titles(evs) == want
     finally:
         release.set()
@@ -2165,7 +2173,7 @@ def test_egress_a_restore_raised_while_the_fallback_write_is_stalled_still_settl
         threading.Thread(target=fallback.on_sent, daemon=True).start()   # the Notifier's
         assert entered.wait(5)                 # the fallback page's write is mid-flight
         took, got = _timed_observe(d, _eg("match", observed="relay_backbone"))
-        assert took < 0.05, f"observe() took {took:.3f} s"
+        assert took < _NO_WAIT_S, f"observe() took {took:.3f} s"
         [restore] = got
         restore.on_sent()                      # spool-notify takes the restore page too
     finally:
@@ -2187,7 +2195,7 @@ def test_egress_a_silent_end_leaves_its_removal_to_the_keeper(tmp_path, monkeypa
     entered, release = _stalling_fsync(monkeypatch)
     try:
         took, evs = _timed_observe(d, _eg_checking("relay_vpn"))
-        assert took < 0.05, f"observe() took {took:.3f} s"
+        assert took < _NO_WAIT_S, f"observe() took {took:.3f} s"
         assert evs == []
         assert entered.wait(5)                 # the keeper is in the removal's sync
     finally:
