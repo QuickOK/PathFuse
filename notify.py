@@ -13,12 +13,17 @@ worker thread. Delivery reliability (spool + redeliver when the uplink is
 down) is spool-notify's job, not ours. The egress alert record works the same
 way: after the first observation, EventDetector.observe() only queues record
 operations, and the EgressRecordKeeper's thread does every write, removal and
-fsync of it, so a disk that stalls never holds up the control loop. An
-operation still queued when the process ends (a crash, a power loss, or a page
-spool-notify takes after the keeper has closed) is lost, and costs at most one
-repeated page at the next start, never a missed one.
+fsync of it, so a disk that stalls never holds up the control loop. The record
+fails toward a repeated page, never a missed one: an operation the disk refuses
+is tried again a few times; one still queued when the process ends (a crash, a
+power loss, or a page spool-notify takes after the keeper has closed) is lost,
+and costs at most one repeated page at the next start; and a record a restart
+adopts but cannot write again is not trusted, so the fallback it names pages
+again rather than never.
 """
+import dataclasses
 import functools
+import itertools
 import json
 import logging
 import math
@@ -37,6 +42,9 @@ DEFAULT_COMMAND = "/usr/local/sbin/spool-notify"
 # configurable, so every run finds, and can end, a record an earlier run left.
 # sbfd_ctl reads it when it runs, never at import, so tests can point it elsewhere.
 EGRESS_ALERT_PATH = "/var/lib/sbfd-ctl/egress_alert.json"
+# A record operation that fails with an OSError is tried again after each of these
+# delays in turn, and given up after the last (see EgressRecordKeeper). Tests shorten them.
+_RECORD_RETRY_DELAYS_S = (1.0, 5.0, 30.0)
 
 # What the UI calls each egress mode; used in egress fallback messages.
 EGRESS_LABELS = {
@@ -335,11 +343,16 @@ class _RecordOp:
     """One operation on the egress alert record: write a record naming `mode`, or
     remove the record when `mode` is None. A page's operation carries the
     generation the page was made under (see EventDetector); a change made without
-    a page carries None."""
+    a page carries None. `refresh` marks the seed's rewrite of a record it adopts.
+    `seq` is the operation's place in the queue, given as it is queued, and `tries`
+    how many times it has been run before."""
     mode: Optional[str]
     announced_at: float = 0.0
     gen: Optional[int] = None
     failure_level: int = logging.WARNING
+    refresh: bool = False
+    seq: int = 0
+    tries: int = 0
 
 
 class EgressRecordKeeper:
@@ -355,10 +368,20 @@ class EgressRecordKeeper:
     A write goes to a temp file beside the path, which is flushed, fsynced and
     renamed over the path, and then the directory is fsynced, so a reader never
     meets half a record and a power loss leaves the old record or the new one. A
-    removal fsyncs the directory too. The record only spares the operator a
-    repeated page, so every failure is a warning, and the thread carries on with
-    the next operation. For the same reason an operation lost at process end,
-    still queued, or queued once close() has ended the thread, costs at most one
+    removal fsyncs the directory too.
+
+    An operation the disk refuses (an OSError) is tried again after each of
+    _RECORD_RETRY_DELAYS_S in turn: a daemon timer queues it again, so this thread
+    never sleeps, and the operations behind it run meanwhile. Each failure is one
+    warning, and the last says the keeper gives up. A retried operation still
+    carries its generation, and is dropped as well once a later operation has had
+    its turn, since the record follows the later one. No retry is made once close()
+    has been called. Any other failure is a warning, and the thread carries on
+    with the next operation. A refresh, EventDetector's rewrite of the record it
+    adopts at the seed, that fails for good sets `unreliable`, which the detector
+    reads without I/O: that record is not to be trusted. The record only spares
+    the operator a repeated page, so an operation lost at process end, still
+    queued, or queued once close() has ended the thread, costs at most one
     repeated page at the next start, never a missed one."""
 
     def __init__(self, path: str, generation: Callable[[], int]):
@@ -367,22 +390,38 @@ class EgressRecordKeeper:
         # Operations, drain()'s markers, and close()'s None.
         self._ops: "queue.Queue[Union[_RecordOp, threading.Event, None]]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
+        # Set on this keeper's thread once a refresh has failed for good, and never
+        # cleared; the detector reads it.
+        self.unreliable = False
+        # Guards _closing and _timers, and keeps seq in the queue's order.
+        self._lock = threading.Lock()
         self._closing = False
+        self._seq = itertools.count(1)
+        self._timers: "dict[tuple[int, int], threading.Timer]" = {}   # (seq, tries)
+        self._last_seq = 0            # of the last operation run; the thread's own
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="egress-record",
                                         daemon=True)
         self._thread.start()
 
-    def write(self, mode: str, announced_at: float, gen: Optional[int] = None) -> None:
-        """Queue a write of the record naming `mode`, paged at `announced_at`."""
-        self._ops.put(_RecordOp(mode, announced_at, gen))
+    def write(self, mode: str, announced_at: float, gen: Optional[int] = None,
+              refresh: bool = False) -> None:
+        """Queue a write of the record naming `mode`, paged at `announced_at`. A
+        `refresh` is the seed's rewrite of a record it adopts, as it is."""
+        self._queue(_RecordOp(mode, announced_at, gen, refresh=refresh))
 
     def remove(self, gen: Optional[int] = None,
                failure_level: int = logging.WARNING) -> None:
         """Queue the record's removal. A failure to remove it is logged at
         failure_level; no record to remove is no failure."""
-        self._ops.put(_RecordOp(None, gen=gen, failure_level=failure_level))
+        self._queue(_RecordOp(None, gen=gen, failure_level=failure_level))
+
+    def _queue(self, op: _RecordOp) -> None:
+        # Its place in the queue goes with it, so a retry can tell whether a later
+        # operation has had its turn meanwhile.
+        with self._lock:
+            self._ops.put(dataclasses.replace(op, seq=next(self._seq)))
 
     def drain(self, timeout: float = 5.0) -> bool:
         """Wait at most `timeout` seconds for every operation queued so far to run.
@@ -397,12 +436,16 @@ class EgressRecordKeeper:
         """Run every operation queued so far, then end the thread. Waits at most
         `timeout` seconds, and returns True when the thread has ended; past that the
         thread carries on alone, and ends once the queue is through. An operation
-        queued after this never runs."""
+        queued after this never runs, and a retry due after this is not made."""
         if self._thread is None:
             return True
-        if not self._closing:
-            self._closing = True
-            self._ops.put(None)
+        with self._lock:
+            if not self._closing:
+                self._closing = True
+                self._ops.put(None)
+            timers, self._timers = list(self._timers.values()), {}
+        for timer in timers:
+            timer.cancel()
         self._thread.join(timeout)
         return not self._thread.is_alive()
 
@@ -414,19 +457,84 @@ class EgressRecordKeeper:
             if isinstance(op, threading.Event):
                 op.set()
                 continue
+            if op.seq < self._last_seq:
+                # A retry, and a later operation has had its turn since it failed:
+                # the record follows that one.
+                logging.debug("egress alert: a record operation the disk refused is "
+                              "dropped, a later one having run since")
+                continue
+            self._last_seq = op.seq
             try:
                 self._apply(op)
+            except OSError as e:
+                self._failed(op, e)
             except Exception as e:   # the thread must outlive any one operation
+                if op.refresh:
+                    self.unreliable = True
                 logging.warning("egress alert: a record operation failed, and the "
                                 "keeper carries on: %r", e, exc_info=True)
 
     def _apply(self, op: _RecordOp) -> None:
+        """Run `op`, unless its page is out of date. OSError when the disk refuses."""
         if op.gen is not None and op.gen != self._generation():
             return    # a change made without a page came after this page was made
         if op.mode is None:
-            self._remove(op.failure_level)
+            remove_egress_alert_record(self.path)
         else:
             self._write(op.mode, op.announced_at)
+
+    def _failed(self, op: _RecordOp, e: OSError) -> None:
+        """`op` raised `e`: log it, and have it tried again after the next delay, or
+        give it up after the last. A refresh given up marks the record unreliable."""
+        delays = _RECORD_RETRY_DELAYS_S
+        tried = op.tries + 1
+        what, so = self._describe(op)
+        if op.tries < len(delays):
+            delay = delays[op.tries]
+            if self._retry_after(delay, dataclasses.replace(op, tries=tried)):
+                logging.log(op.failure_level, "egress alert: cannot %s durably: %s; the "
+                            "keeper tries again in %g s (retry %d of %d)", what, e, delay,
+                            tried, len(delays))
+                return
+            why = "the keeper is closing"
+        else:
+            why = f"the keeper gives up after {tried} {'try' if tried == 1 else 'tries'}"
+        if op.refresh:
+            self.unreliable = True
+        logging.log(op.failure_level, "egress alert: cannot %s durably, and %s, so %s: %s",
+                    what, why, so, e)
+
+    def _describe(self, op: _RecordOp) -> "tuple[str, str]":
+        """(what the operation does, what its failure means), for its warnings."""
+        if op.mode is None:
+            return (f"remove the record {self.path}",
+                    "a restart may take its fallback for still standing")
+        if op.refresh:
+            return (f"write the record {self.path} again",
+                    "the fallback it names will count as unannounced")
+        return f"record the fallback in {self.path}", "a restart may page it again"
+
+    def _retry_after(self, delay: float, op: _RecordOp) -> bool:
+        """Have `op` queued again after `delay` seconds, by a daemon timer, so this
+        thread is free for the operations behind it. False once close() has been
+        called: no retry then."""
+        with self._lock:
+            if self._closing:
+                return False
+            key = (op.seq, op.tries)
+            timer = threading.Timer(delay, self._requeue, (key, op))
+            timer.daemon = True
+            timer.name = "egress-record-retry"
+            self._timers[key] = timer
+            timer.start()
+        return True
+
+    def _requeue(self, key: "tuple[int, int]", op: _RecordOp) -> None:
+        # On the timer's thread: back into the queue, unless close() has been called.
+        with self._lock:
+            self._timers.pop(key, None)
+            if not self._closing:
+                self._ops.put(op)
 
     def _write(self, mode: str, announced_at: float) -> None:
         path = self.path
@@ -436,32 +544,20 @@ class EgressRecordKeeper:
         # it, so a power loss leaves the old record or the new one. The temp name is
         # this writer's own.
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
             try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(body)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, path)
-            except BaseException:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-                raise
-            _fsync_parent(path)
-        except OSError as e:
-            logging.warning("egress alert: cannot record the fallback in %s durably, so "
-                            "a restart may page it again: %s", path, e)
-
-    def _remove(self, failure_level: int) -> None:
-        try:
-            remove_egress_alert_record(self.path)
-        except OSError as e:
-            logging.log(failure_level, "egress alert: cannot remove the record %s "
-                        "durably, so a restart may take its fallback for still "
-                        "standing: %s", self.path, e)
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        _fsync_parent(path)
 
 
 class EventDetector:
@@ -507,9 +603,14 @@ class EventDetector:
     is not paged again and its restore still is, while one that began during the
     restart pages as usual. So does a mismatch the seed itself finds confirmed
     with no record for it: it is unannounced, whether it began while the
-    controller was down or its record was lost, and the next tick pages it. With
-    egress_alert_path None the detector has no keeper and does no file I/O at
-    all, and a restart in the middle of a fallback pages it again."""
+    controller was down or its record was lost, and the next tick pages it. A
+    record the seed adopts is written once more, as it is, to prove the disk can
+    still take a write: the removal that should have ended it may have failed on
+    a disk that refuses. One the keeper cannot write again is not trusted: the
+    alert stands for its restore, but its fallback counts as unannounced, so a
+    confirmed mismatch pages it, a repeat at worst. With egress_alert_path None
+    the detector has no keeper and does no file I/O at all, and a restart in the
+    middle of a fallback pages it again."""
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
@@ -556,6 +657,12 @@ class EventDetector:
         # and _egress_skipped are what the last egress snapshot said, so a change
         # can be told from a repeat.
         self._egress_alert_mode: Optional[str] = None
+        # True while the standing alert is the one the seed adopted and its record has
+        # not been found wanting: only then is the keeper's `unreliable` read, once a
+        # tick. True once that record could not be written again: the alert stands
+        # for its restore, but its fallback counts as unannounced.
+        self._egress_alert_adopted = False
+        self._egress_alert_unreliable = False
         self._egress_gen = 0
         self._egress_selected: Optional[str] = None
         self._egress_skipped = False
@@ -653,7 +760,8 @@ class EventDetector:
         # piece of record I/O on the controller's thread: a single small read, once.
         #   - A record for the selected mode: its fallback page went out and no
         #     restore page has. The alert stands, so a confirmed mismatch stays
-        #     silent and a match sends the restore. The record stays as written.
+        #     silent and a match sends the restore. The record is written once
+        #     more, as it is (see _adopt_egress_alert): the one write per adoption.
         #   - A record for another mode: the selected mode changed while the
         #     controller was down, which ends an alert silently. Drop it.
         #   - No usable record: nothing stands, so a fallback pages as usual.
@@ -671,8 +779,9 @@ class EventDetector:
             return
         recorded = self._read_egress_alert()
         if recorded is not None:
-            if recorded == selected:
-                self._adopt_egress_alert(recorded)
+            mode, announced_at = recorded
+            if mode == selected:
+                self._adopt_egress_alert(mode, announced_at)
             else:
                 self._end_egress_alert()
 
@@ -927,8 +1036,21 @@ class EventDetector:
         unannounced, whether it began while the controller was down or its record
         was lost.
 
+        An alert the seed adopted stands on trust in the record. The keeper's
+        `unreliable`, read here at the start of each tick while such an alert
+        stands, says the record's rewrite at the seed failed for good: the disk that
+        refused it may have refused the removal that should have ended the alert
+        before the restart. The alert is then marked unreliable, with one warning,
+        and its fallback counts as unannounced: a confirmed mismatch pages the
+        fallback as if nothing stood (a repeat at worst), and that page's record
+        follows as usual; a confirmed match still pages the restore once and queues
+        the removal; a mode change or `skipped` ends it as any other.
+
         Each page carries the on_sent that settles the record once spool-notify
         accepts it (see the class docstring); a silent end settles it itself."""
+        if (self._egress_alert_adopted and self._keeper is not None
+                and self._keeper.unreliable):
+            self._distrust_egress_alert()
         e = obs.egress
         if not e:
             return []
@@ -937,7 +1059,8 @@ class EventDetector:
         if selected != self._egress_selected or (skipped and not self._egress_skipped):
             self._end_egress_alert()
         self._egress_selected, self._egress_skipped = selected, skipped
-        if status == "mismatch" and self._egress_alert_mode is None:
+        if status == "mismatch" and (self._egress_alert_mode is None
+                                     or self._egress_alert_unreliable):
             on_sent = self._raise_egress_alert(selected)
             ip = f" ({e['ip']})" if e.get("ip") else ""
             return [Event("egress", "🧭 Egress fallback",
@@ -992,9 +1115,11 @@ class EventDetector:
     # cost a page or stop the control loop.
 
     def _raise_egress_alert(self, mode) -> Callable[[], None]:
-        """The fallback page: the alert stands for `mode` now. Returns the page's
-        on_sent, which has the record written."""
+        """The fallback page: the alert stands for `mode` now, on its own page rather
+        than an adopted record. Returns the page's on_sent, which has the record
+        written."""
         self._egress_alert_mode = mode
+        self._egress_alert_adopted = self._egress_alert_unreliable = False
         return functools.partial(self._fallback_page_sent, self._egress_gen, mode)
 
     def _fallback_page_sent(self, gen: int, mode) -> None:
@@ -1008,6 +1133,7 @@ class EventDetector:
         """The restore page: the alert ends now. Returns the page's on_sent, which
         has the record removed. Until then a restart must still send a restore."""
         self._egress_alert_mode = None
+        self._egress_alert_adopted = self._egress_alert_unreliable = False
         return functools.partial(self._restore_page_sent, self._egress_gen)
 
     def _restore_page_sent(self, gen: int) -> None:
@@ -1025,19 +1151,40 @@ class EventDetector:
         that fails is logged at failure_level."""
         self._egress_gen += 1
         self._egress_alert_mode = None
+        self._egress_alert_adopted = self._egress_alert_unreliable = False
         if self._keeper is not None:
             self._keeper.remove(failure_level=failure_level)
 
-    def _adopt_egress_alert(self, mode) -> None:
-        """A record for the selected mode at the seed: its alert stands again, and
-        the record stays as written."""
+    def _adopt_egress_alert(self, mode, announced_at: float) -> None:
+        """A record for the selected mode at the seed: its alert stands again. The
+        record is written once more with its own `selected` and `announced_at`, so
+        it stays as written: a probe of the disk, since a record an earlier run could
+        not remove looks the same as one it kept. A write the keeper gives up on
+        sets its `unreliable`, which _egress_events reads (see there). Nothing else
+        writes the record while the alert stands."""
         self._egress_gen += 1
         self._egress_alert_mode = mode
+        self._egress_alert_adopted, self._egress_alert_unreliable = True, False
+        if self._keeper is not None:
+            self._keeper.write(mode, announced_at, self._egress_gen, refresh=True)
 
-    def _read_egress_alert(self) -> Optional[str]:
-        """The selected mode the record names, or None when there is no usable
-        record. Only a missing file passes without a warning. A file that cannot
-        be read is left where it is."""
+    def _distrust_egress_alert(self) -> None:
+        """The adopted alert's record could not be written again, so it is not
+        trusted: the disk that refused the write may have refused the removal that
+        should have ended the alert before the restart. The alert stands, for its
+        restore, but its fallback counts as unannounced: a confirmed mismatch pages
+        it, a repeat at worst, and that page's record follows as usual."""
+        self._egress_alert_adopted, self._egress_alert_unreliable = False, True
+        logging.warning("egress alert: the record %s could not be written again, so it "
+                        "is not trusted: the fallback it names (%s) counts as "
+                        "unannounced, and a confirmed mismatch pages it, perhaps again",
+                        self._egress_alert_path, egress_label(self._egress_alert_mode))
+
+    def _read_egress_alert(self) -> "Optional[tuple[str, float]]":
+        """The selected mode the record names and when its fallback was paged, or
+        None when there is no usable record. Only a missing file passes without a
+        warning. A file that cannot be read is left where it is. An `announced_at`
+        that is not a finite number reads as 0.0."""
         path = self._egress_alert_path
         if path is None:
             return None
@@ -1061,4 +1208,8 @@ class EventDetector:
             logging.warning("egress alert: the record %s names no selected mode, so "
                             "it counts as absent", path)
             return None
-        return selected
+        announced_at = rec.get("announced_at")
+        if (isinstance(announced_at, bool) or not isinstance(announced_at, (int, float))
+                or not math.isfinite(announced_at)):
+            announced_at = 0.0
+        return selected, announced_at

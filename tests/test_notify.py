@@ -1589,7 +1589,9 @@ def test_egress_an_unreadable_record_is_left_in_place(tmp_path, caplog, monkeypa
 
 
 @pytest.mark.parametrize("layout", ["parent-is-a-file", "path-is-a-directory"])
-def test_egress_alert_io_failures_are_logged_and_never_raise(tmp_path, caplog, layout):
+def test_egress_alert_io_failures_are_logged_and_never_raise(tmp_path, caplog, monkeypatch,
+                                                             layout):
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", ())   # no retries: one warning each
     if layout == "parent-is-a-file":
         (tmp_path / "state").write_text("not a directory")
         path = tmp_path / "state" / "egress_alert.json"   # reads, writes and removes all fail
@@ -2518,6 +2520,300 @@ def test_egress_the_record_keeper_is_one_daemon_thread_started_at_the_seed(tmp_p
         "a keeper stuck in a sync must not hold the process at exit"
 
 
+# -- the egress alert record on a disk that refuses -------------------------------------
+#
+# CodeRabbit on PR #24: a removal that failed was logged and dropped, so a restored
+# fallback's record stood, and the next run on that mode adopted it and swallowed the
+# next fallback's page. Now a record operation that fails with an OSError is tried again
+# from the keeper's own thread, after each of notify._RECORD_RETRY_DELAYS_S in turn, and
+# given up after the last (these tests shorten the delays). And a record the seed adopts
+# is written once more, as it is: a disk that cannot take that write may not have taken
+# the removal before the restart either, so such an adopted alert is not trusted, and its
+# fallback pages again rather than never. A retry rides on a timer, not the queue, so a
+# test waits for its outcome (wait_for), not for drain().
+
+_SHORT_RETRIES = (0.05, 0.1, 0.2)
+
+
+class _RefusingDisk:
+    """A record disk that refuses: os.remove and os.replace of `path` raise EROFS, as a
+    file system remounted read-only does, for each operation named in `refuses`, every
+    time, or only the first `refusals` times when that is given. `calls` notes every
+    call on the path, refused or not. With `stall`, the first call of that operation
+    sets `entered` and waits on `release`, so a test can act while the keeper is inside
+    it."""
+
+    def __init__(self, monkeypatch, path, refuses=("remove", "replace"),
+                 refusals: Optional[int] = None, stall: Optional[str] = None):
+        self.path = str(path)
+        self.refuses = set(refuses)
+        self.refusals = refusals
+        self.stall = stall
+        self.calls: list = []
+        self.entered, self.release = threading.Event(), threading.Event()
+        real_remove, real_replace = os.remove, os.replace
+
+        def note(what):
+            self.calls.append(what)
+            if what == self.stall:
+                self.stall = None
+                self.entered.set()
+                self.release.wait(10)
+            if what in self.refuses and self.refusals != 0:
+                if self.refusals is not None:
+                    self.refusals -= 1
+                raise OSError(errno.EROFS, "Read-only file system", self.path)
+
+        def remove(p, *a, **kw):
+            if os.fspath(p) == self.path:
+                note("remove")
+            return real_remove(p, *a, **kw)
+
+        def replace(src, dst, *a, **kw):
+            if os.fspath(dst) == self.path:
+                note("replace")
+            return real_replace(src, dst, *a, **kw)
+
+        monkeypatch.setattr(os, "remove", remove)
+        monkeypatch.setattr(os, "unlink", remove)
+        monkeypatch.setattr(os, "replace", replace)
+
+
+def _gave_up(caplog, d):
+    """Whether d's keeper has logged that it gives up on an operation."""
+    return any("gives up" in r.getMessage() for r in _warnings(caplog, d))
+
+
+def test_egress_a_removal_that_fails_is_tried_again_until_it_succeeds(
+        tmp_path, monkeypatch, caplog):
+    # The disk refuses the restore page's removal twice and takes the third try: the
+    # record goes, each refusal is one warning, and none says the keeper gave up.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    disk = _RefusingDisk(monkeypatch, path, refuses={"remove"}, refusals=2)
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: not path.exists()), "the record of a restored fallback stands"
+    assert disk.calls == ["remove"] * 3
+    warned = [r.getMessage() for r in _warnings(caplog, d)]
+    assert len(warned) == 2 and all("tries again in" in w for w in warned), warned
+    assert not _gave_up(caplog, d)
+
+
+def test_egress_a_removal_that_keeps_failing_is_given_up_after_three_retries(
+        tmp_path, monkeypatch, caplog):
+    # Four tries in all: the first, and one after each delay. The last warning says the
+    # keeper gives up, and there is no fifth try. The keeper's thread outlives that and
+    # still applies what comes next: a silent end's removal, once the disk takes it.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    disk = _RefusingDisk(monkeypatch, path, refuses={"remove"})
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: _gave_up(caplog, d))
+    assert disk.calls == ["remove"] * 4
+    warned = [r.getMessage() for r in _warnings(caplog, d)]
+    assert len(warned) == 4 and all("tries again in" in w for w in warned[:3]), warned
+    assert "gives up" in warned[3] and "tries again" not in warned[3], warned
+    assert path.exists()                       # the ended alert's record, still
+    time.sleep(0.3)                            # longer than any delay: no fifth try
+    assert disk.calls == ["remove"] * 4
+    assert _keeper_thread(d).is_alive()
+    disk.refuses.clear()
+    assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []   # a silent end
+    assert d.drain()
+    assert not path.exists()
+    assert disk.calls == ["remove"] * 5
+
+
+@pytest.mark.parametrize("later", ["a-silent-end", "a-later-page"])
+def test_egress_a_retried_operation_a_later_one_has_overtaken_is_dropped(
+        tmp_path, monkeypatch, later):
+    # A fallback page's write fails, and before its retry the alert ends: silently, by a
+    # mode change, which moves the generation on, or by a restore page, whose removal
+    # has its turn first. Run, the retry would record an alert that has ended, and the
+    # next restart would adopt it and swallow the next fallback's page. It is dropped.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (0.3,))
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    [fallback] = d.observe(obs(egress=_eg("mismatch")))
+    disk = _RefusingDisk(monkeypatch, path, refuses={"replace"}, refusals=1)
+    fallback.on_sent()                         # the write fails once; its retry is due in 0.3 s
+    assert wait_for(lambda: disk.calls == ["replace"])
+    if later == "a-silent-end":
+        assert d.observe(obs(egress=_eg_checking("relay_vpn"))) == []
+    else:
+        assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert d.drain()
+    assert disk.calls == ["replace", "remove"]   # the end's removal found no record
+    time.sleep(0.5)                            # past the retry's delay
+    assert d.drain()
+    assert not path.exists(), "the retried write recorded an alert that had ended"
+    assert disk.calls == ["replace", "remove"]
+
+
+@pytest.mark.parametrize("when", ["a-retry-pending", "a-failure-after-close"])
+def test_egress_no_retry_is_scheduled_once_the_keeper_has_closed(tmp_path, monkeypatch, when):
+    # close() runs what is queued and ends the thread, and the retries end with it: one
+    # pending when close() is called is dropped, and an operation that fails after it
+    # gets none. The process is ending; a retry queued into a closed keeper never runs.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (0.1, 0.1, 0.1))
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    stall = "remove" if when == "a-failure-after-close" else None
+    disk = _RefusingDisk(monkeypatch, path, refuses={"remove"}, stall=stall)
+    keeper = d._keeper
+    assert keeper is not None
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    if when == "a-retry-pending":
+        assert wait_for(lambda: disk.calls == ["remove"])   # failed once; a retry is due
+        assert d.close()
+    else:
+        assert disk.entered.wait(5)            # the keeper is inside the removal
+        closed: dict = {}
+        closing = threading.Thread(target=lambda: closed.update(ok=d.close(timeout=5.0)))
+        closing.start()
+        assert wait_for(lambda: keeper._closing)
+        disk.release.set()                     # now the removal fails
+        closing.join(5)
+        assert closed == {"ok": True}
+    assert not _keeper_thread(d).is_alive()
+    time.sleep(0.4)                            # longer than any delay
+    assert disk.calls == ["remove"]            # no retry ran, and none was queued: the
+    assert keeper._ops.empty()                 # thread is gone, so the queue is its only trace
+    assert path.exists()
+    assert not [t for t in threading.enumerate() if t.name == "egress-record-retry"]
+
+
+def test_egress_a_restart_that_takes_the_alert_over_rewrites_its_record_once_as_it_is(
+        tmp_path, monkeypatch):
+    # The one write per adoption, a probe of the disk (see the two tests after this
+    # one): the record is written again with its own `selected` and `announced_at`, so
+    # it still names the page, not the restart. Nothing else writes it while the alert
+    # stands, however many checks find it standing: a write per tick would wear the
+    # box's flash.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")      # paged an hour before the restart
+    changes = _record_changes(monkeypatch, path)
+    after = notify.EventDetector(egress_alert_path=str(path),
+                                 wall_clock=FakeClock(ANNOUNCED_AT + 3600.0))
+    for e in (_eg_checking("relay_backbone"), _eg_checking("relay_backbone"), _eg("pending"),
+              _eg("mismatch"), _eg("mismatch"), _eg("error"), _eg("mismatch")):
+        assert after.observe(obs(egress=e)) == []
+    assert after.drain()
+    assert changes == ["replace"]
+    assert json.loads(path.read_text()) == {"selected": "relay_backbone",
+                                            "announced_at": ANNOUNCED_AT}
+
+
+@pytest.mark.parametrize("disk_in_run_2", ["still-refuses", "works-again"])
+def test_egress_a_record_an_earlier_run_could_not_end_is_trusted_only_once_refreshed(
+        tmp_path, monkeypatch, caplog, disk_in_run_2):
+    # CodeRabbit's scenario, end to end with the real keeper. Run 1 pages a fallback and
+    # records it; its restore page goes out, but every removal fails, so the ended
+    # alert's record stands. Run 2 seeds on `checking`, reads it, and adopts it. On a
+    # disk that still refuses the refresh write fails too, and the adopted alert is not
+    # trusted: a confirmed mismatch pages the fallback (a repeat, at worst) and a match
+    # the restore. On a disk that works again the refresh succeeds and the adopted alert
+    # stands as before: a confirmed mismatch stays silent and a match pages the restore.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    first = notify.EventDetector(egress_alert_path=str(path))
+    first.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(first.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert first.drain() and path.exists()
+    disk = _RefusingDisk(monkeypatch, path)
+    assert _sent(first.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: _gave_up(caplog, first))
+    assert disk.calls == ["remove"] * 4
+    assert first.close()
+    assert path.exists()                       # the ended alert's record, for run 2 to find
+    if disk_in_run_2 == "works-again":
+        disk.refuses.clear()
+    disk.calls.clear()
+    caplog.clear()
+    after = notify.EventDetector(egress_alert_path=str(path))   # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopts it
+    assert after.observe(obs(egress=_eg("pending"))) == []
+    if disk_in_run_2 == "still-refuses":
+        assert wait_for(lambda: _gave_up(caplog, after))         # the refresh
+        assert disk.calls == ["replace"] * 4
+        assert _titles(after.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+        distrusted = [r.getMessage() for r in _warnings(caplog, after)
+                      if "not trusted" in r.getMessage()]
+        assert len(distrusted) == 1, distrusted
+        assert after.observe(obs(egress=_eg("mismatch"))) == []    # paged once
+        assert _titles(after.observe(obs(egress=_eg("match", observed="relay_backbone")))) \
+            == [RESTORED]
+        assert len(_warnings(caplog, after)) == 5                 # the keeper's 4, the detector's 1
+    else:
+        assert after.drain()
+        assert disk.calls == ["replace"]
+        assert after.observe(obs(egress=_eg("mismatch"))) == []    # paged before the restart
+        assert after.observe(obs(egress=_eg("mismatch"))) == []
+        assert _sent(after.observe(obs(egress=_eg("match", observed="relay_backbone")))) \
+            == [RESTORED]
+        assert after.drain()
+        assert not path.exists()
+        assert disk.calls == ["replace", "remove"]
+        assert _warnings(caplog, after) == []
+
+
+@pytest.mark.parametrize("ending, want", [
+    pytest.param(_eg("match", observed="relay_backbone"), [RESTORED], id="restore"),
+    pytest.param(_eg_checking("relay_vpn"), [], id="mode-change"),
+    pytest.param(_eg("skipped", selected="local_direct", observed=None, ip=None), [],
+                 id="skipped"),
+])
+def test_egress_an_adopted_alert_that_is_not_trusted_still_ends_as_any_other(
+        tmp_path, monkeypatch, caplog, ending, want):
+    # Withdrawing the trust withdraws nothing from the operator: the alert stands for
+    # its restore, which pages once and queues the removal, and a mode change or a
+    # `skipped` ends it silently, as for any standing alert.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", _SHORT_RETRIES)
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone")
+    disk = _RefusingDisk(monkeypatch, path)
+    after = notify.EventDetector(egress_alert_path=str(path))
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopts it
+    assert wait_for(lambda: _gave_up(caplog, after))                       # the refresh
+    assert _sent(after.observe(obs(egress=ending))) == want
+    distrusted = [r.getMessage() for r in _warnings(caplog, after)
+                  if "not trusted" in r.getMessage()]
+    assert len(distrusted) == 1, distrusted
+    assert wait_for(lambda: "remove" in disk.calls)                        # the removal, queued
+    assert after.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []   # ended once
+
+
+def test_egress_a_retrys_delay_does_not_hold_up_the_operations_behind_it(tmp_path, monkeypatch):
+    # The delay is a timer's, never a sleep on the keeper's thread: a failed removal
+    # waiting out a 2 s delay must not hold up the next page's write behind it, which
+    # the next restart reads.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (2.0, 2.0, 2.0))
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    disk = _RefusingDisk(monkeypatch, path, refuses={"remove"})
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: disk.calls == ["remove"])   # failed once; its retry is due in 2 s
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # the next fallback
+    assert d.drain(timeout=1.0), "the keeper sat out the delay with the write behind it"
+    assert disk.calls == ["remove", "replace"]
+    assert d.close()
+
+
 # -- the egress alert record across a power loss ----------------------------------------
 #
 # A reboot is one of the restarts the record is for, and the box can lose power
@@ -2593,6 +2889,7 @@ def test_egress_alert_a_failed_fsync_is_logged_and_costs_no_page(
         tmp_path, caplog, monkeypatch, failing):
     # The record only spares a repeated page. A disk that will not sync must not cost
     # the page itself or stop the tick, and leaves no temp file behind.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", ())   # no retries: one warning
     path = tmp_path / "egress_alert.json"
     real_fsync = os.fsync
 
@@ -2617,6 +2914,7 @@ def test_egress_alert_a_directory_sync_that_fails_still_closes_the_directory(
         tmp_path, monkeypatch, op):
     # The directory opened for its fsync is closed in a `finally`, so a disk that will
     # not sync a directory costs a warning each time, not a file descriptor each time.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", ())   # no retries: one try each
     path = tmp_path / "egress_alert.json"
     opened: list = []
     closed: list = []
