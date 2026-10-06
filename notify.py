@@ -413,8 +413,10 @@ class _RecordOp:
     (`closed_at`, and this boot's id) to the record if it names `mode`. A page's
     operation carries the generation the page was made under (see EventDetector);
     a change made without a page carries None. `refresh` marks the seed's rewrite
-    of a record it adopts. `seq` is the operation's place in the queue, given as it
-    is queued, and `tries` how many times it has been run before."""
+    of a record it adopts. A removal's `on_removed`, if any, is called on the
+    keeper's thread once it has removed a record, at whichever attempt that is, and
+    not when there was none to remove. `seq` is the operation's place in the queue,
+    given as it is queued, and `tries` how many times it has been run before."""
     mode: Optional[str]
     announced_at: float = 0.0
     gen: Optional[int] = None
@@ -422,6 +424,7 @@ class _RecordOp:
     refresh: bool = False
     mark: bool = False
     closed_at: float = 0.0
+    on_removed: Optional[Callable[[], None]] = None
     seq: int = 0
     tries: int = 0
 
@@ -511,10 +514,14 @@ class EgressRecordKeeper:
         self._queue(_RecordOp(mode, announced_at, gen, refresh=refresh))
 
     def remove(self, gen: Optional[int] = None,
-               failure_level: int = logging.WARNING) -> None:
+               failure_level: int = logging.WARNING,
+               on_removed: "Optional[Callable[[], None]]" = None) -> None:
         """Queue the record's removal. A failure to remove it is logged at
-        failure_level; no record to remove is no failure."""
-        self._queue(_RecordOp(None, gen=gen, failure_level=failure_level))
+        failure_level; no record to remove is no failure. `on_removed`, if given, is
+        called on this keeper's thread once a record has been removed, at whichever
+        attempt that is, and not when there was none."""
+        self._queue(_RecordOp(None, gen=gen, failure_level=failure_level,
+                              on_removed=on_removed))
 
     def _queue(self, op: _RecordOp) -> None:
         # Its place in the queue goes with it, so a retry can tell whether a later
@@ -603,7 +610,8 @@ class EgressRecordKeeper:
         # write has completed.
         self._settled = None
         if op.mode is None:
-            remove_egress_alert_record(self.path)
+            if remove_egress_alert_record(self.path) and op.on_removed is not None:
+                op.on_removed()
         else:
             self._write(op.mode, op.announced_at)
             self._settled = op.mode

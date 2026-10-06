@@ -3478,7 +3478,8 @@ def end_saved_egress_alert() -> notify.EgressRecordKeeper:
     the removal is queued here, on the keeper's thread, first thing in main() once
     the config is loaded, before the UI server, the wire tailer and run_controller's
     apply_nft_init, any of which can abort the start, since a record an aborted
-    start left would be adopted by a later run. No record is the usual case; a
+    start left would be adopted by a later run. No record is the usual case, and a
+    debug line; a record removed, at whichever attempt, is one line at info; a
     removal the disk refuses is a warning, and startup goes on. A run that keeps
     the record never calls this: its record is its detector's to adopt, and one
     left without a clean close in this boot is distrusted there (see
@@ -3486,11 +3487,18 @@ def end_saved_egress_alert() -> notify.EgressRecordKeeper:
     removal from its seed to its end leaves an earlier mark standing, the accepted
     residual)."""
     path = notify.EGRESS_ALERT_PATH
-    logging.info("egress alert: this run does not keep the record, so a saved alert in "
-                 "%s, if any, is ended", path)
+    logging.debug("egress alert: this run does not keep the record, so a saved alert in "
+                  "%s, if any, is ended", path)
+
+    def ended() -> None:
+        # On the keeper's thread, once a record has been removed: the one line at
+        # info, and only then, since no record is the usual case.
+        logging.info("egress alert: this run does not keep the record, so the saved "
+                     "alert in %s has ended", path)
+
     keeper = notify.EgressRecordKeeper(path, lambda: 0)
     keeper.start()
-    keeper.remove()
+    keeper.remove(on_removed=ended)
     return keeper
 
 

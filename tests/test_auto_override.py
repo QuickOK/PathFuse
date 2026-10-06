@@ -1595,6 +1595,49 @@ def test_a_run_that_does_not_keep_the_record_makes_a_last_attempt_at_shutdown(
         "the cancelled retry's timer thread did not end"
 
 
+def _clean_up_lines(caplog, level):
+    """What the clean-up of a saved alert logged at `level`."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == level and "does not keep the record" in r.getMessage()]
+
+
+@pytest.mark.parametrize("run", ["notifications-off", "switch-off"])
+def test_the_clean_up_is_news_only_once_it_has_ended_a_saved_alert(
+        tmp_path, monkeypatch, caplog, run):
+    # rv-pr24g-r1 (journal noise): round 6 had end_saved_egress_alert() say at info, at
+    # every start of a non-keeping run, that a saved alert "if any, is ended". As before
+    # round 6, the info line says the saved alert has ended only once a record has been
+    # removed, at the keeper's first attempt or a later one, main()'s last attempt at the
+    # close included; a start that finds no record is a debug line. (The check-off run is
+    # left out: its detector's seed ends the saved alert too, so which keeper's removal
+    # finds the record is a race between the two, and the alert ends either way.)
+    caplog.set_level(logging.DEBUG)
+    record = tmp_path / "egress_alert.json"
+    notifications, observe = _unkept_run(run)
+    ended = (f"egress alert: this run does not keep the record, so the saved alert in "
+             f"{record} has ended")
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                           observe=observe, pages=[])
+    assert _clean_up_lines(caplog, logging.INFO) == []            # no record: no news
+    assert len(_clean_up_lines(caplog, logging.DEBUG)) == 1
+    caplog.clear()
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                           observe=observe, pages=[])
+    assert not record.exists()
+    assert _clean_up_lines(caplog, logging.INFO) == [ended]       # removed: the news, once
+    caplog.clear()
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (5.0, 5.0, 5.0))
+    record.write_text(json.dumps({"selected": "relay_backbone", "announced_at": 1.0}))
+    calls = _refusing_remove(monkeypatch, record, refusals=1)
+    keepers = _clean_up_keepers_made(monkeypatch)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking"] * 2, notifications,
+                           observe=observe, pages=[],
+                           before_stop=_clean_up_attempted(keepers))
+    assert not record.exists() and calls == ["remove", "remove"]
+    assert _clean_up_lines(caplog, logging.INFO) == [ended]       # at the last attempt: the news
+
+
 @pytest.mark.parametrize("run", _UNKEPT)
 def test_a_start_that_aborts_still_makes_the_clean_ups_last_attempt(tmp_path, monkeypatch, run):
     # rv-pr24g-r1: the clean-up keeper is closed on every way out of main(), an aborted
