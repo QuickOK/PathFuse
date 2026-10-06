@@ -390,6 +390,34 @@ def test_notifier_takes_a_new_page_while_an_on_sent_runs(tmp_path):
     assert took < 2.0, f"notify() waited {took:.2f} s for an on_sent"
 
 
+def test_notifier_stop_says_whether_its_worker_ended(tmp_path, monkeypatch):
+    # run_controller closes the egress record keeper once stop() returns, and a page
+    # spool-notify takes after that is not recorded. So stop() says whether the worker
+    # ended in time: True for one with nothing to send, which ends at once, or one never
+    # started; False while a send outlives the timeout. Here spool-notify hangs, and the
+    # Notifier's own timeout on it (shortened) is what ends the send.
+    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 1.0)
+    sending = tmp_path / "sending"
+    script = tmp_path / "hung-spool-notify"
+    script.write_text(f'#!/bin/sh\ntouch "{sending}"\nexec sleep 30\n')
+    script.chmod(0o755)
+    assert notify.Notifier("pathfusetest", command=str(script)).stop() is True
+    idle = notify.Notifier("pathfusetest", command=str(script))
+    idle.start()
+    assert idle.stop(timeout=5.0) is True
+    assert idle._thread is not None and not idle._thread.is_alive()
+    n = notify.Notifier("pathfusetest", command=str(script))
+    n.start()
+    n.notify(ev(kind="started", title="start", message="hello"))
+    assert wait_for(sending.exists)            # the worker is inside the send
+    start = time.monotonic()
+    assert n.stop(timeout=0.2) is False
+    assert 0.15 <= time.monotonic() - start < 1.0   # it waited its timeout, no longer
+    assert n._thread is not None and n._thread.is_alive()
+    n._thread.join(5)                          # the send times out, and the worker ends
+    assert n.stop() is True
+
+
 # -- EventDetector tests ------------------------------------------------
 
 

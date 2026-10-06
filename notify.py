@@ -13,7 +13,10 @@ worker thread. Delivery reliability (spool + redeliver when the uplink is
 down) is spool-notify's job, not ours. The egress alert record works the same
 way: after the first observation, EventDetector.observe() only queues record
 operations, and the EgressRecordKeeper's thread does every write, removal and
-fsync of it, so a disk that stalls never holds up the control loop.
+fsync of it, so a disk that stalls never holds up the control loop. An
+operation still queued when the process ends (a crash, a power loss, or a page
+spool-notify takes after the keeper has closed) is lost, and costs at most one
+repeated page at the next start, never a missed one.
 """
 import functools
 import json
@@ -167,9 +170,10 @@ class Notifier:
     Once spool-notify has accepted a page (exit 0), the worker runs the page's
     on_sent, if it has one. A page that fails, or never reaches spool-notify
     (dropped from a full buffer, or still buffered when the process ends; stop()
-    waits only so long), never runs it. An on_sent that raises is logged, and the
-    worker carries on with the next page. A kind's pages are handed over, and
-    their on_sents run, in the order the pages were made."""
+    waits only so long, and says whether the worker ended in time), never runs
+    it. An on_sent that raises is logged, and the worker carries on with the next
+    page. A kind's pages are handed over, and their on_sents run, in the order
+    the pages were made."""
 
     BUFFER_MAX = 50
     SUBPROCESS_TIMEOUT_S = 30.0
@@ -190,12 +194,19 @@ class Notifier:
                                         daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0):
+    def stop(self, timeout: float = 5.0) -> bool:
+        """Have the worker send what it holds and end, waiting at most `timeout`
+        seconds for it. True once the worker thread has ended, or was never started;
+        False while it is still sending. A page spool-notify takes after a False runs
+        its on_sent after the caller has moved on: run_controller closes the egress
+        record keeper next, so that page's record change is lost."""
         with self._cond:
             self._stopping = True
             self._cond.notify()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
 
     def notify(self, ev: Event):
         with self._cond:
@@ -346,7 +357,9 @@ class EgressRecordKeeper:
     meets half a record and a power loss leaves the old record or the new one. A
     removal fsyncs the directory too. The record only spares the operator a
     repeated page, so every failure is a warning, and the thread carries on with
-    the next operation."""
+    the next operation. For the same reason an operation lost at process end,
+    still queued, or queued once close() has ended the thread, costs at most one
+    repeated page at the next start, never a missed one."""
 
     def __init__(self, path: str, generation: Callable[[], int]):
         self.path = path
@@ -577,10 +590,11 @@ class EventDetector:
     def close(self, timeout: float = 5.0) -> bool:
         """Run the record operations queued so far, waiting at most `timeout`
         seconds, then stop the record keeper's thread. For shutdown, once the
-        Notifier has stopped: its stop() sends the pages it still holds, and their
-        on_sents queue operations of their own. True when the keeper finished in
-        time, or when there is no record to keep. An operation queued after this
-        never runs, as if the process had ended."""
+        Notifier has stopped, or its stop() has given up on a send: its stop()
+        sends the pages it still holds, and their on_sents queue operations of
+        their own. True when the keeper finished in time, or when there is no
+        record to keep. An operation queued after this never runs, as if the
+        process had ended."""
         return self._keeper is None or self._keeper.close(timeout)
 
     def _seed(self, obs):

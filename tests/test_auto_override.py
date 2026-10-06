@@ -1068,14 +1068,16 @@ def test_controller_starts_the_observer_and_pages_through_the_detector(tmp_path,
                     "checked_at": 2.0, "error": None}
 
     class StubNotifier:
+        SUBPROCESS_TIMEOUT_S = _REAL_NOTIFIER.SUBPROCESS_TIMEOUT_S   # run_controller's shutdown bound
+
         def __init__(self, topic, **kw):
             pass
 
         def start(self):
             pass
 
-        def stop(self):
-            pass
+        def stop(self, timeout=None):
+            return True
 
         def notify(self, ev):
             pages.append(ev)
@@ -1160,6 +1162,27 @@ def _detectors_made(monkeypatch):
     return made
 
 
+def _notifiers_made(monkeypatch):
+    """The Notifiers made from here on, run_controller's among them, in a list.
+    _run_egress_controller re-points notify.Notifier at the real class, so this wraps
+    the class's __init__ rather than replacing the name."""
+    made: list = []
+    real_init = notify.Notifier.__init__
+
+    def init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        made.append(self)
+
+    monkeypatch.setattr(notify.Notifier, "__init__", init)
+    return made
+
+
+def _shutdown_warnings(caplog):
+    """The warnings run_controller logged about its shutdown."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "shutdown" in r.getMessage()]
+
+
 def _keeping(command=notify.DEFAULT_COMMAND, record=True):
     """Notifications with every page sent at once, that keep the egress alert record
     (at notify.EGRESS_ALERT_PATH) unless `record` is False."""
@@ -1197,14 +1220,16 @@ def _run_egress_controller(tmp_path, monkeypatch, statuses, notifications, *,
                     "checked_at": 2.0, "error": None}
 
     class AcceptingNotifier:
+        SUBPROCESS_TIMEOUT_S = _REAL_NOTIFIER.SUBPROCESS_TIMEOUT_S   # run_controller's shutdown bound
+
         def __init__(self, topic, **kw):
             pass
 
         def start(self):
             pass
 
-        def stop(self):
-            pass
+        def stop(self, timeout=None):
+            return True
 
         def notify(self, ev):
             taken.append(ev.title)
@@ -1418,3 +1443,97 @@ def test_a_controller_run_closes_the_detector_after_its_notifier_sent_everything
                            notify.NotifyCfg(topic="t", min_interval_s=0, command=str(slow)))
     assert _egress_pages(_handed(log)) == [_RESTORED]
     assert not record.exists()
+
+
+def test_a_page_spool_notify_takes_after_stop_gave_up_still_settles_the_record(
+        tmp_path, monkeypatch):
+    # Greptile P1 on PR #24, round 3. stop() joins the worker only so long, and one
+    # spool-notify run may take SUBPROCESS_TIMEOUT_S, so a page could be accepted after
+    # stop() returned. Its on_sent then queued the record change behind the keeper's
+    # exit marker, where it never ran, and the next start paged the fallback again. Here
+    # stop()'s own timeout gives up after 0.2 s, as 5 s does against a 30 s send, and
+    # spool-notify takes 0.6 s a page: run_controller must ask for longer, a send in
+    # flight and some, which costs an idle worker nothing.
+    record = tmp_path / "egress_alert.json"
+    log = tmp_path / "slow-spool-notify.log"
+    slow = tmp_path / "slow-spool-notify"
+    slow.write_text(f'#!/bin/sh\nsleep 0.6\nprintf "%s\\n" "$1" >> "{log}"\nexit 0\n',
+                    encoding="utf-8")
+    slow.chmod(0o755)
+    real_stop = notify.Notifier.stop
+    monkeypatch.setattr(notify.Notifier, "stop",
+                        lambda self, timeout=0.2: real_stop(self, timeout))
+    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 1.0)   # a 6 s bound, not 35
+    notifiers = _notifiers_made(monkeypatch)
+    detectors = _detectors_made(monkeypatch)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=str(slow)))
+    [n] = notifiers
+    [d] = detectors
+    assert n._thread is not None
+    n._thread.join(10)                       # the worker finishes its sends after the run
+    assert not n._thread.is_alive()
+    assert _egress_pages(_handed(log)) == [_FALLBACK]   # spool-notify took the page
+    assert d._keeper is not None and not d._keeper._thread.is_alive()   # the keeper closed
+    # The page the operator received last was the fallback, so the record must name it:
+    # a restart otherwise pages the same fallback again.
+    assert record.exists(), "the accepted fallback page's record change never ran"
+    assert json.loads(record.read_text())["selected"] == "relay_backbone"
+
+
+def test_a_controller_run_waits_for_a_send_in_flight_before_it_closes_the_keeper(
+        tmp_path, monkeypatch, caplog):
+    # One spool-notify run may take SUBPROCESS_TIMEOUT_S, and the shutdown flush can
+    # send several summaries, so run_controller gives stop() that long and five seconds
+    # more, and only then closes the record keeper. An idle worker ends at once, so the
+    # bound costs the normal case nothing, and that case ends without a warning.
+    monkeypatch.setattr(notify.Notifier, "SUBPROCESS_TIMEOUT_S", 0.25)
+    timeouts: list = []
+    real_stop = notify.Notifier.stop
+
+    def stop(self, timeout=5.0):
+        timeouts.append(timeout)
+        return real_stop(self, timeout)
+
+    monkeypatch.setattr(notify.Notifier, "stop", stop)
+    script, log = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
+    assert timeouts == [0.25 + 5.0]
+    assert _egress_pages(_handed(log)) == [_FALLBACK]
+    assert _shutdown_warnings(caplog) == []
+
+
+def test_a_controller_run_warns_when_its_notifier_is_still_sending_at_shutdown(
+        tmp_path, monkeypatch, caplog):
+    # When stop() gives up on a send, a page spool-notify takes from then on runs its
+    # on_sent too late to be recorded. The keeper closes all the same, since a record
+    # change lost that way costs one repeated page and never a missed one, and the run
+    # says so, once.
+    real_stop = notify.Notifier.stop
+    monkeypatch.setattr(notify.Notifier, "stop",
+                        lambda self, timeout=5.0: real_stop(self, timeout) and False)
+    detectors = _detectors_made(monkeypatch)
+    script, _log = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
+    [d] = detectors
+    assert d._keeper is not None and not d._keeper._thread.is_alive()   # closed anyway
+    warned = _shutdown_warnings(caplog)
+    assert len(warned) == 1, warned
+    assert "still sending" in warned[0] and "not recorded" in warned[0], warned
+
+
+def test_a_controller_run_warns_when_its_record_keeper_did_not_finish_at_shutdown(
+        tmp_path, monkeypatch, caplog):
+    # close() gives up on a disk that never recovers, and the operations it left unrun
+    # are gone with the process: the run says so, instead of returning without a line.
+    real_close = notify.EventDetector.close
+    monkeypatch.setattr(notify.EventDetector, "close",
+                        lambda self, timeout=5.0: real_close(self, timeout) and False)
+    script, _log = _spool_notify(tmp_path, "spool-notify", 0)
+    _run_egress_controller(tmp_path, monkeypatch, ["checking", "pending", "mismatch"],
+                           notify.NotifyCfg(topic="t", min_interval_s=0, command=script))
+    warned = _shutdown_warnings(caplog)
+    assert len(warned) == 1, warned
+    assert "record keeper" in warned[0] and "did not finish" in warned[0], warned

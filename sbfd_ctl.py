@@ -4153,12 +4153,24 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         stop_event.wait(max(0.0, tick - elapsed))
 
     if notifier is not None:
-        notifier.stop()
+        # The worker may be inside one spool-notify run, which can take up to
+        # SUBPROCESS_TIMEOUT_S, and the shutdown flush can send several summaries.
+        # An idle worker ends at once, so the bound only matters while a send is in
+        # flight, and it must outlast one: the record keeper closes next.
+        if not notifier.stop(timeout=notify.Notifier.SUBPROCESS_TIMEOUT_S + 5.0):
+            logging.warning("notify: the worker is still sending at shutdown; a page "
+                            "spool-notify takes from now on is not recorded, so a "
+                            "restart may page it again")
     # Only after the Notifier: its stop() sends the pages it still holds, and their
     # on_sents queue egress record operations. close() runs those, waiting a bounded
-    # time for the disk.
+    # time for the disk. A page taken after stop() gave up queues its change too late,
+    # behind the keeper's exit: it fails toward a repeated page, never a missed one.
     if detector is not None:
-        detector.close()
+        if not detector.close():
+            logging.warning("egress alert: the record keeper did not finish at "
+                            "shutdown; a record operation still queued did not run, "
+                            "so a restart may page a fallback again, or send a "
+                            "restore again")
     # The keep-alive pool is process-global; don't leave a relay socket behind
     # for whatever runs after this loop.
     close_relay_conns()
