@@ -370,7 +370,10 @@ def _finite(value, default=None):
     """`value` when it is a finite number (a bool is not one), else `default`."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
-    return value if math.isfinite(value) else default
+    try:
+        return value if math.isfinite(value) else default
+    except OverflowError:   # an int past float range: not a finite number either
+        return default
 
 
 def _boot_id() -> str:
@@ -1464,7 +1467,9 @@ class EventDetector:
             return None
         try:
             return _record_fields(raw)
-        except ValueError as e:
+        except (ValueError, TypeError, OverflowError) as e:
+            # Whatever a malformed record raises, it counts as absent: the seed runs on
+            # the controller's thread, and a record file must never stop a start.
             logging.warning("egress alert: the record %s %s, so it counts as absent",
                             path, e)
             return None

@@ -134,6 +134,8 @@ def test_a_kinds_events_go_out_in_the_order_they_came():
 
 import json
 import os
+import subprocess
+import sys
 import stat
 import time
 
@@ -3695,3 +3697,201 @@ def test_egress_alert_record_removal_is_made_durable(tmp_path, monkeypatch, endi
     assert not path.exists()
     at = events.index(("remove", str(path)))
     assert ("fsync", parent) in events[at + 1:], events   # the removal, after it
+
+
+# -- a malformed record never stops a start; the keeper's rule for a raised write; the --
+# -- mark without a kernel boot id; an earlier boot's mark is left as it is ------------
+
+
+_HUGE_INT = "1" + "0" * 400   # a JSON integer literal past float range: json gives an int
+
+
+def _write_record_with_an_integer_past_float_range(path, field):
+    rec = {"selected": "relay_backbone", "announced_at": 1.0,
+           "closed_at": 2.0, "boot_id": notify._boot_id()}
+    rec[field] = "__HUGE__"
+    path.write_text(json.dumps(rec).replace('"__HUGE__"', _HUGE_INT), encoding="utf-8")
+    assert _HUGE_INT in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("field, want", [
+    ("closed_at", ("relay_backbone", 1.0, None)),                 # no mark
+    ("announced_at", ("relay_backbone", 0.0, notify._boot_id())),  # reads as 0.0; the mark stands
+])
+def test_record_fields_treat_an_integer_past_float_range_as_not_finite(tmp_path, field, want):
+    # math.isfinite raises OverflowError on an int past float range; _finite must read
+    # that as "not a finite number", like any other value it does not accept.
+    path = tmp_path / "egress_alert.json"
+    _write_record_with_an_integer_past_float_range(path, field)
+    assert notify._record_fields(path.read_bytes()) == want
+
+
+@pytest.mark.parametrize("field, pages", [
+    ("closed_at", [FALLBACK]),   # unmarked: distrusted, so the confirmed mismatch pages
+    ("announced_at", []),        # marked, this boot: trusted, paged before the restart
+])
+def test_a_record_with_an_integer_past_float_range_seeds_without_raising(tmp_path, field, pages):
+    # The seed reads the record on the controller's thread: whatever a malformed record
+    # raises must count as "absent" (or as a malformed field), never stop the start.
+    path = tmp_path / "egress_alert.json"
+    _write_record_with_an_integer_past_float_range(path, field)
+    d = notify.EventDetector(egress_alert_path=str(path))
+    try:
+        assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+        assert d.observe(obs(egress=_eg("pending"))) == []
+        assert _titles(d.observe(obs(egress=_eg("mismatch")))) == pages
+    finally:
+        assert d.close()
+
+
+def test_egress_a_removals_retry_is_dropped_once_a_later_write_has_raised(
+        tmp_path, monkeypatch, caplog):
+    # The keeper's rule (its docstring): a retry is dropped once a later operation has
+    # run, or raised, since the record follows the later one. The suite pinned the ran
+    # half and the stale no-op; not the raised half, so a keeper that advances _last_seq
+    # only for an operation that ran passed every test.
+    #
+    # The case: a fallback paged and recorded; its restore paged, and the restore's
+    # removal refused; then a new fallback on the same mode paged, and its write refused
+    # too, for the rest of the run. The write raised after the removal failed, so the
+    # removal's retry is dropped: the removal is never tried again, at the close
+    # included, and the record the first page left stands, unmarked (the close marks
+    # nothing, since no write of this run completed), naming the mode of the fallback
+    # the operator was last paged about. The next run adopts it as distrusted, and its
+    # confirmed match pages the restore. Were the removal tried again instead, with the
+    # write still refused, no record would be left for a fallback the operator was paged
+    # about, and the next run would send no restore for it: a missed page, the direction
+    # the record must never fail in.
+    monkeypatch.setattr(notify, "_RECORD_RETRY_DELAYS_S", (1.0,))
+    caplog.set_level(logging.DEBUG)
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    d.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert d.drain() and path.exists()
+    first = json.loads(path.read_text(encoding="utf-8"))
+
+    # From here the disk refuses: the record's removal once, and every write of it (the
+    # rename over it) for the rest of the run.
+    refusing, calls = [True], []
+    real_remove, real_replace = os.remove, os.replace
+
+    def refuse():
+        raise OSError(errno.EROFS, "Read-only file system", str(path))
+
+    def remove(p, *a, **kw):
+        if os.fspath(p) == str(path):
+            calls.append("remove")
+            if refusing[0] and calls.count("remove") == 1:
+                refuse()
+        return real_remove(p, *a, **kw)
+
+    def replace(src, dst, *a, **kw):
+        if os.fspath(dst) == str(path):
+            calls.append("replace")
+            if refusing[0]:
+                refuse()
+        return real_replace(src, dst, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", remove)
+    monkeypatch.setattr(os, "unlink", remove)
+    monkeypatch.setattr(os, "replace", replace)
+
+    assert _sent(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert wait_for(lambda: calls == ["remove"])          # refused; its retry is due in 1 s
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert wait_for(lambda: calls[:2] == ["remove", "replace"])   # refused after it
+
+    def dropped():
+        return [r for r in caplog.records if r.thread == _keeper_thread(d).ident
+                and "dropped" in r.getMessage()]
+
+    assert wait_for(dropped), "the removal's retry was not dropped once the write had raised"
+    assert d.close()
+    assert calls.count("remove") == 1, calls              # not tried again, not at the close either
+    assert path.exists(), "the record of the fallback the operator was paged about is gone"
+    assert json.loads(path.read_text(encoding="utf-8")) == first   # as the first page left it
+
+    # The next run, its disk working again: the alert stands, distrusted, and the match
+    # pages the restore the operator is owed.
+    refusing[0] = False
+    d2 = notify.EventDetector(egress_alert_path=str(path))
+    d2.observe(obs(egress=_eg_checking("relay_backbone")))
+    assert _sent(d2.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+    assert d2.close()
+    assert not path.exists()
+
+
+_TREE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_NO_BOOT_ID_CHILD = r'''
+import json, sys
+tree, tests, no_boot_id, path, phase = sys.argv[1:6]
+sys.path[:0] = [tree, tests]
+import notify
+import test_notify as T
+notify._BOOT_ID_PATH = no_boot_id            # the kernel gives none here
+d = notify.EventDetector(egress_alert_path=path)
+if phase == "first":
+    pages = T._sent(d.observe(T.obs(egress=T._eg_checking("relay_backbone"))))
+    pages += T._sent(d.observe(T.obs(egress=T._eg("mismatch"))))
+    assert d.close()                           # the clean close: the mark, with the stand-in id
+else:
+    pages = T._sent(d.observe(T.obs(egress=T._eg_checking("relay_backbone"))))   # adopted
+    pages += T._sent(d.observe(T.obs(egress=T._eg("pending"))))
+    pages += T._sent(d.observe(T.obs(egress=T._eg("mismatch"))))
+    assert d.close()
+print(json.dumps({"pages": pages, "boot_id": notify._boot_id()}))
+'''
+
+
+def _no_boot_id_process(phase, tmp_path, path):
+    r = subprocess.run([sys.executable, "-c", _NO_BOOT_ID_CHILD, _TREE,
+                        os.path.join(_TREE, "tests"), str(tmp_path / "no-boot-id"),
+                        str(path), phase],
+                       capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_where_the_kernel_gives_no_boot_id_the_mark_does_not_outlive_the_process(tmp_path):
+    # Where there is no kernel boot id, the stand-in is this process's own, so no mark is
+    # trusted across a restart there: pinned across two processes, since within one the
+    # stand-in is stable and a constant stand-in would pass.
+    path = tmp_path / "egress_alert.json"
+    first = _no_boot_id_process("first", tmp_path, path)
+    assert first["pages"] == [FALLBACK]
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["boot_id"] == first["boot_id"], "the mark carries the process's stand-in id"
+    second = _no_boot_id_process("second", tmp_path, path)      # a service restart
+    assert second["boot_id"] != first["boot_id"], "the stand-in id must be the process's own"
+    assert second["pages"] == [FALLBACK], \
+        "the stand-in outlived the process: a restart without a kernel boot id trusted the mark"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["selected"] == "relay_backbone" and "closed_at" in record
+    assert record["boot_id"] == second["boot_id"], \
+        "the second process's clean close re-marks the record with its own stand-in id"
+
+
+def test_egress_an_earlier_boots_mark_is_adopted_without_a_write(tmp_path, monkeypatch):
+    # A mark of another boot is handled exactly like an unmarked record, and nothing is
+    # written for either: a distrusted record is left as it is.
+    path = tmp_path / "egress_alert.json"
+    _write_record(path, "relay_backbone", boot="an-earlier-boot")   # marked, in another boot
+    before = path.read_bytes()
+    replaced: list = []
+    real_replace = os.replace
+
+    def replace(src, dst, *a, **kw):
+        replaced.append(os.fspath(dst))
+        return real_replace(src, dst, *a, **kw)
+
+    monkeypatch.setattr(os, "replace", replace)
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []   # adopted, distrusted
+    assert d.drain()
+    assert replaced == [] and path.read_bytes() == before, \
+        "an earlier boot's mark was rewritten at adoption: a distrusted record is left as it is"
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]   # and its fallback pages
+    assert d.close()
