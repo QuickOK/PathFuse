@@ -10,7 +10,7 @@ not list must have none. Fixing errors only lowers the counts: afterwards run
 `scripts/typecheck.py --update-baseline` to record the new floor. A comment or
 decorator that lowers checking fails the gate before either checker runs, since the
 ratchet alone would pass the drop: a pyright mode below strict, a `# type: ignore`
-before the file's first statement, a line of mypy settings, or `@no_type_check`.
+before the file's first statement, a line of mypy settings, or a use of `no_type_check`.
 
 Exit 0 when every file is at or under its baseline, 1 when one is above it or a
 comment or decorator lowers checking,
@@ -207,17 +207,23 @@ def _first_statement_line(tree: ast.Module) -> int | None:
     return first.lineno
 
 
-def _no_type_check_decorators(tree: ast.Module, text: str) -> dict[int, str]:
-    """`@no_type_check` or `@<module>.no_type_check` on any def or class, by line: on a
-    function it switches both checkers off for all of it."""
+def _no_type_check_uses(tree: ast.Module, text: str) -> dict[int, str]:
+    """Each use of `no_type_check` in code, by line: as a decorator (`@` and the
+    expression), as any other expression, or as an import that renames it. On a
+    function it switches both checkers off for all of it, and any other use can make an
+    alias that does the same."""
+    decorators = {id(d) for node in ast.walk(tree)
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                  for d in node.decorator_list}
     found: dict[int, str] = {}
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            for d in node.decorator_list:
-                name = d.attr if isinstance(d, ast.Attribute) else \
-                    d.id if isinstance(d, ast.Name) else None
-                if name == "no_type_check":
-                    found[d.lineno] = "@" + (ast.get_source_segment(text, d) or name)
+        if isinstance(node, ast.alias):
+            if node.name == "no_type_check" and node.asname:
+                found.setdefault(node.lineno, ast.get_source_segment(text, node) or node.name)
+        elif isinstance(node, ast.Name) and node.id == "no_type_check" \
+                or isinstance(node, ast.Attribute) and node.attr == "no_type_check":
+            segment = ast.get_source_segment(text, node) or "no_type_check"
+            found.setdefault(node.lineno, ("@" if id(node) in decorators else "") + segment)
     return found
 
 
@@ -225,15 +231,16 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
     """`file:line: what` for each comment or decorator that lowers checking where the
     ratchet cannot see it: a pyright mode below strict (see _sets_lower_mode), wherever
     it stands; a `# type: ignore` on a line before the file's first statement as mypy
-    measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and
-    `@no_type_check`. Python's tokenizer finds the comments, as pyright's does, so one
+    measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and a use of
+    `no_type_check`. Python's tokenizer finds the comments, as pyright's does, so one
     after code counts and text inside a string does not. mypy settings are found line by
     line, as mypy finds them, strings included. A file that cannot be read is skipped:
     the checkers report it.
 
     ValueError, naming the file, when the gate cannot read one as the checkers do: it
-    declares an encoding other than UTF-8, as Python or as mypy reads the declaration
-    (pyright reads every file as UTF-8), or it does not decode, tokenize or parse."""
+    declares an encoding other than UTF-8 or ASCII, as Python or as mypy reads the
+    declaration (pyright reads every file as UTF-8), or a codec that is not a text
+    encoding, or it does not decode, tokenize or parse."""
     found: list[str] = []
     for f in files:
         try:
@@ -243,8 +250,10 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
             raw = (ROOT / f).read_bytes()
         except OSError:
             continue
-        except (SyntaxError, ValueError, LookupError) as e:   # a bad declaration, or bytes
-            raise ValueError(f"{f}: cannot check its comments: {e}") from None   # not in it
+        except (SyntaxError, ValueError, LookupError) as e:
+            # A bad declaration, a codec that is not a text encoding, or bytes it cannot
+            # decode.
+            raise ValueError(f"{f}: cannot check its comments: {e}") from None
         m = None if raw.startswith(codecs.BOM_UTF8) else MYPY_DECLARATION.match(raw)
         if m:
             declared.append(m.group(3).decode("ascii"))
@@ -271,8 +280,8 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
         for n, line in enumerate(text.split("\n"), 1):
             if MYPY_SETTINGS.match(line):
                 hits.setdefault(n, line.strip())
-        for n, decorator in _no_type_check_decorators(tree, text).items():
-            hits.setdefault(n, decorator)
+        for n, use in _no_type_check_uses(tree, text).items():
+            hits.setdefault(n, use)
         found += [f"{f}:{n}: {hits[n]}" for n in sorted(hits)]
     return found
 

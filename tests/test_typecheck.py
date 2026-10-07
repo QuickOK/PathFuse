@@ -582,6 +582,16 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
     # Neither checker honours it on a class; the gate refuses it anyway.
     "no-type-check-on-a-class": (b"from typing import no_type_check\n\n\n@no_type_check\n"
                                  b"class C: ...\n", 4, "@no_type_check"),
+    # Any other use can make an alias that switches the checkers off as the decorator does.
+    "no-type-check-imported-under-another-name": (
+        b"from typing import no_type_check as ntc\n\n\n@ntc\ndef f(x):\n    return x\n", 1,
+        "no_type_check as ntc"),
+    "no-type-check-from-typing-extensions-under-another-name": (
+        b"from typing_extensions import no_type_check as ntc\n", 1, "no_type_check as ntc"),
+    "no-type-check-assigned": (b"import typing\n\nntc = typing.no_type_check\n", 3,
+                               "typing.no_type_check"),
+    "no-type-check-called": (b"import typing\n\n\ndef f(x):\n    return x\n\n\n"
+                             b"f = typing.no_type_check(f)\n", 8, "typing.no_type_check"),
     "mypy-ignore-errors": (b"# mypy: ignore-errors\nx = 1\n", 1, "# mypy: ignore-errors"),
     "mypy-setting-after-code": (b"x = 1\n# mypy: no-check-untyped-defs\n", 2,
                                 "# mypy: no-check-untyped-defs"),
@@ -638,6 +648,8 @@ _NOT_LOWERING: dict[str, bytes] = {
     "another-decorator": (b"from functools import cache\n\n\n@cache\ndef f() -> int:\n"
                           b"    return 1\n"),
     "no-type-check-in-a-string": b'x = "@no_type_check"\n',
+    "no-type-check-imported-but-unused": b"from typing import no_type_check\n",
+    "another-decorator-imported-under-the-same-name": b"from functools import cache as ntc\n",
 }
 
 
@@ -686,6 +698,13 @@ _UNREADABLE: dict[str, bytes] = {
     "an-unknown-encoding-declared": b"# -*- coding: no-such-codec -*-\nx = 1\n",
     "utf-8-then-shift-jis-declared": b"# coding=utf-8 coding=shift_jis\nx = 1\n",
     "utf-8-then-an-unknown-codec-declared": b"# coding=utf-8 coding=no-such-codec\nx = 1\n",
+    "shift-jis-then-utf-8-declared": b"# coding=shift_jis coding=utf-8\nx = 1\n",
+    "latin-1-then-utf-8-modelines": (
+        b"# -*- coding: latin-1 -*- vim: set fileencoding=utf-8 :\nx = 1\n"),
+    "utf-8-then-shift-jis-after-a-shebang": (
+        b"#!/usr/bin/env python3\n# coding=utf-8 coding=shift_jis\nx = 1\n"),
+    "utf-8-then-latin-1-modelines-after-a-comment": (
+        b"# a comment\n# -*- coding: utf-8 -*- vim: set fileencoding=latin-1 :\nx = 1\n"),
     "utf-8-then-latin-1-declared": (
         b"# -*- coding: utf-8 -*- vim: set fileencoding=latin-1 :\nx = 1\n"),
     "a-transform-codec-declared": b"# -*- coding: rot13 -*-\nx = 1\n",
@@ -703,13 +722,17 @@ def test_mode_lowering_comments_raises_on_a_file_it_cannot_read_as_the_checkers_
         T.mode_lowering_comments(["a.py"])
 
 
+@pytest.mark.parametrize("source, named", [
+    (b"# -*- coding: latin-1 -*-\nx = 1\n", "iso8859-1"),
+    (b"# coding=latin-1 coding=shift_jis\nx = 1\n", "iso8859-1 and shift_jis"),  # Python, mypy
+], ids=["one-reading", "each-reading"])
 def test_mode_lowering_comments_says_which_encoding_a_file_declares(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: bytes, named: str) -> None:
     monkeypatch.setattr(T, "ROOT", tmp_path)
-    (tmp_path / "a.py").write_bytes(_UNREADABLE["latin-1-declared"])
+    (tmp_path / "a.py").write_bytes(source)
     with pytest.raises(ValueError) as e:
         T.mode_lowering_comments(["a.py"])
-    assert str(e.value) == ("a.py: cannot check its comments: it declares the iso8859-1 "
+    assert str(e.value) == (f"a.py: cannot check its comments: it declares the {named} "
                             "encoding, and pyright reads every file as UTF-8")
 
 
@@ -750,21 +773,26 @@ def test_no_comment_runs_a_file_below_strict_past_the_gate(
     assert sorted(k for k in lowered if k.startswith("type-ignore")) == []
 
 
-# Two of the same function, one under `@no_type_check`: lines 10-12 hold the other.
-_NO_TYPE_CHECK_TWINS = (b"from typing import no_type_check\n\n\n"
-                        b"@no_type_check\ndef silenced(x):\n    y: int = 'x'\n    return x\n\n\n"
-                        b"def checked(x):\n    y: int = 'x'\n    return x\n")
+def _twins(imported: bytes, decorator: bytes) -> bytes:
+    """Two of the same function, the first under `decorator`: lines 10-12 hold the other."""
+    return (imported + b"\n\n\n" + decorator + b"\ndef silenced(x):\n    y: int = 'x'\n"
+            b"    return x\n\n\ndef checked(x):\n    y: int = 'x'\n    return x\n")
 
 
 @pytest.mark.skipif(_PYRIGHT is None or shutil.which("mypy") is None,
                     reason="pyright (npm ci) or mypy is not installed")
-def test_no_type_check_switches_both_checkers_off_for_a_function(tmp_path: Path) -> None:
-    """Why the gate refuses `@no_type_check`: with the repo's configs, only the twin
-    without it has errors, in pyright and in mypy."""
+@pytest.mark.parametrize("imported, decorator", [
+    (b"from typing import no_type_check", b"@no_type_check"),
+    (b"from typing import no_type_check as ntc", b"@ntc"),
+], ids=["as-itself", "under-another-name"])
+def test_no_type_check_switches_both_checkers_off_for_a_function(
+        tmp_path: Path, imported: bytes, decorator: bytes) -> None:
+    """Why the gate refuses `no_type_check`, under any name: with the repo's configs,
+    only the twin without it has errors, in pyright and in mypy."""
     assert _PYRIGHT is not None
     shutil.copy(T.ROOT / "pyrightconfig.json", tmp_path / "pyrightconfig.json")
     shutil.copy(T.ROOT / "mypy.ini", tmp_path / "mypy.ini")
-    (tmp_path / "twins.py").write_bytes(_NO_TYPE_CHECK_TWINS)
+    (tmp_path / "twins.py").write_bytes(_twins(imported, decorator))
     r = subprocess.run([_PYRIGHT, "--outputjson", "twins.py"], cwd=tmp_path,
                        capture_output=True, text=True, timeout=300)
     assert r.returncode in (0, 1), r.stderr
@@ -828,14 +856,17 @@ _CLOSE = b"_ = '\"\"\"' # '\n"
 
 
 @pytest.mark.skipif(shutil.which("mypy") is None, reason="mypy is not installed")
+@pytest.mark.parametrize("before", [b"", b"#!/usr/bin/env python3\n"],
+                         ids=["first-line", "second-line"])
 def test_mypy_reads_the_last_declaration_on_a_line_where_python_reads_the_first(
-        tmp_path: Path) -> None:
+        tmp_path: Path, before: bytes) -> None:
     """Why the gate also reads the declaration as mypy does: under
-    `# coding=utf-8 coding=shift_jis` Python decodes UTF-8 and sees the code, while mypy
-    decodes shift_jis and reads the code as part of a string."""
+    `# coding=utf-8 coding=shift_jis`, on the first line or the second, Python decodes
+    UTF-8 and sees the code, while mypy decodes shift_jis and reads the code as part of
+    a string."""
     shutil.copy(T.ROOT / "mypy.ini", tmp_path / "mypy.ini")
-    two = b"# coding=utf-8 coding=shift_jis\n" + _OPEN + _MYPY_BODY + _CLOSE
-    one = b"# coding=utf-8\n" + _OPEN + _MYPY_BODY + _CLOSE
+    two = before + b"# coding=utf-8 coding=shift_jis\n" + _OPEN + _MYPY_BODY + _CLOSE
+    one = before + b"# coding=utf-8\n" + _OPEN + _MYPY_BODY + _CLOSE
     (tmp_path / "two.py").write_bytes(two)
     (tmp_path / "one.py").write_bytes(one)
     for source in (two, one):   # Python reads each as UTF-8, with the body as code
