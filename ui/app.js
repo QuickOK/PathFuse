@@ -291,6 +291,9 @@ function render(s){
     syncSub.textContent  = (s.relay_remote && s.relay_remote.error) ? "client-local only" : "no remote";
   }
 
+  /* KPI: Exit */
+  renderKpiExit(s);
+
   /* link sub */
   $("#links-sub").textContent = `${wans.length} wan${wans.length===1?"":"s"} · ${upCount} up`;
 
@@ -1600,6 +1603,45 @@ function renderEgressActual(s){
   }
   el.textContent = text;
   el.classList.toggle("warn", warn);
+}
+
+/* The same check as a KPI tile, so the wall layout (which hides the control
+   panel and the line above) shows the actual exit too. */
+function renderKpiExit(s){
+  const el  = $("#kpi-exit");
+  const val = $("#kpi-exit-val");
+  const sub = $("#kpi-exit-sub");
+  if (!el || !val || !sub) return;
+  const o = s.egress_observed;
+  let v, t, state = "";
+  if (!o){
+    v = "—"; t = "check off";
+  } else {
+    const at = o.since
+      ? new Date(o.since * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})
+      : "";
+    const observed = egressLabel(o.observed);
+    const selected = egressLabel(o.selected);
+    switch (o.status){
+      case "match":
+        v = observed; t = o.ip ? `matches · ${o.ip}` : "matches"; state = "ok"; break;
+      case "pending":
+        v = observed; t = `≠ selected ${selected} (rechecking)`; state = "degraded"; break;
+      case "mismatch":
+        v = observed; t = `≠ selected ${selected}` + (at ? ` since ${at}` : ""); state = "degraded"; break;
+      case "skipped":
+        v = "n/a"; t = "local direct"; break;
+      case "error":
+        v = "unknown"; t = "trace failed"; state = "degraded"; break;
+      case "failing":
+        v = "unknown"; t = "check failing" + (at ? ` since ${at}` : ""); state = "degraded"; break;
+      default:
+        v = "…"; t = "checking";
+    }
+  }
+  el.dataset.state = state;
+  val.textContent  = v;
+  sub.textContent  = t;
 }
 
 /* ---------- maintenance reboot ---------- */

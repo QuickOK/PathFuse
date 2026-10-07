@@ -175,7 +175,7 @@ body {
 /* ---------- KPI strip ---------- */
 .kpi-strip {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 1px;
   background: var(--border-subtle);
   border: 1px solid var(--border);
@@ -850,6 +850,7 @@ body[data-layout="wall"] .panel          { padding: 22px 26px; }
 @media (max-width: 760px) {
   .app { padding: 18px; }
   .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+  .kpi-strip .kpi:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .topbar { flex-wrap: wrap; }
   .topbar-meta { width: 100%; justify-content: space-between; gap: 14px; }
   .wan-meters { gap: 14px; }
