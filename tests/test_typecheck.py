@@ -465,7 +465,8 @@ def test_main_refuses_a_comment_that_runs_a_file_below_strict(
     assert T.main(argv) == 1
     out, err = capsys.readouterr()
     assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
-    assert err == ("TYPECHECK FAILED: these lines lower type checking (remove what they name):\n"
+    assert err == ("TYPECHECK FAILED: these lines can lower type checking "
+                   "(remove what they name):\n"
                    f"  a.py:2: # pyright: {mode}\n")
     assert not log.exists()                        # neither checker ran
     assert not (tmp_path / "baseline.json").exists()
@@ -482,7 +483,7 @@ def test_main_refuses_a_mode_comment_in_an_extensionless_script(
     (tmp_path / "deploy/tool").write_text("#!/usr/bin/env python3\n# pyright: basic\nx = 1\n")
     assert T.main([]) == 1
     assert capsys.readouterr().err == (
-        "TYPECHECK FAILED: these lines lower type checking (remove what they name):\n"
+        "TYPECHECK FAILED: these lines can lower type checking (remove what they name):\n"
         "  deploy/tool:2: # pyright: basic\n")
     assert not log.exists()                        # neither checker ran
 
@@ -548,6 +549,22 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
     # pyright keeps these two strict; the gate refuses them anyway.
     "beside-strict": (b"# pyright: strict, basic\n", 1, "# pyright: strict, basic"),
     "after-ignore": (b"# pyright: ignore, standard\n", 1, "# pyright: ignore, standard"),
+    # One rule set below an error for the whole file: off, or a warning or note, which
+    # the gate does not count.
+    "a-rule-off": (b"# pyright: reportUnknownMemberType=false\n", 1,
+                   "# pyright: reportUnknownMemberType=false"),
+    "rules-off": (b"# pyright: reportPrivateUsage=false, reportUnusedVariable=false\n", 1,
+                  "# pyright: reportPrivateUsage=false, reportUnusedVariable=false"),
+    "a-rule-to-none": (b"# pyright: reportUnknownVariableType=none\n", 1,
+                       "# pyright: reportUnknownVariableType=none"),
+    "a-rule-to-a-warning": (b"# pyright: reportUnknownArgumentType = warning\n", 1,
+                            "# pyright: reportUnknownArgumentType = warning"),
+    "a-rule-to-information": (b"# pyright: reportUnknownMemberType=information\n", 1,
+                              "# pyright: reportUnknownMemberType=information"),
+    "a-rule-off-after-code": (b"x = 1  # pyright: reportUnknownMemberType=false\n", 1,
+                              "# pyright: reportUnknownMemberType=false"),
+    "an-analysis-switched-off": (b"# pyright: analyzeUnannotatedFunctions=false\n", 1,
+                                 "# pyright: analyzeUnannotatedFunctions=false"),
     "type-ignore": (b"# type: ignore\nx = 1\n", 1, "# type: ignore"),
     "type-ignore-a-code": (b"# type: ignore[misc]\nx = 1\n", 1, "# type: ignore[misc]"),
     "type-ignore-no-spaces": (b"#type:ignore\nx = 1\n", 1, "#type:ignore"),
@@ -613,8 +630,8 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
 # What lowers no file's checking: other directives, line-level ignores, look-alikes.
 _NOT_LOWERING: dict[str, bytes] = {
     "strict": b"# pyright: strict\n",
-    "a-rule": b"# pyright: reportUnknownMemberType=false\n",
-    "rules": b"# pyright: reportPrivateUsage=false, reportUnusedVariable=false\n",
+    "a-rule-raised": b"# pyright: reportImplicitOverride=true\n",
+    "a-rule-raised-to-an-error": b"# pyright: reportMissingSuperCall=error\n",
     "a-mode-name-as-a-rule": b"# pyright: basic=true\n",
     "off": b"# pyright: off\n",                       # no such mode: an unknown rule
     "text-after-the-mode": b"# pyright: basic # why\n",  # the operand is "basic # why"

@@ -29,21 +29,23 @@ clean. When new code has to call a function that is not typed yet, type that fun
 silence that one line with `# pyright: ignore[<rule>]` and say why in a comment. After fixing
 errors, run `scripts/typecheck.py --update-baseline` to record the lower floor.
 
-The ratchet only stops counts rising, so the gate also refuses anything in a file that lowers its
+The ratchet only stops counts rising, so the gate also refuses these ways of lowering one file's
 checking, before either checker runs:
 - `# pyright: basic` or `# pyright: standard`, wherever pyright would read it: among other
   operands, or after code on the same line;
+- a `# pyright:` comment that sets a rule below an error for the whole file (`=false`, `=none`,
+  `=warning` or `=information`; the gate counts errors only);
 - a `# type: ignore` before the file's first statement, which mypy reads as silencing all of
   it;
 - a `# mypy:` line of settings: mypy's settings belong in `mypy.ini`;
 - `@no_type_check`, which switches both checkers off for a whole function, and any other use of
   `no_type_check` in code (an assignment, a call, an import that renames it), which could make an
-  alias that does the same. The gate goes by the name, so it refuses anything of your own called
-  `no_type_check` too: name it something else.
+  alias that does the same. The gate goes by the name, so it refuses any use of anything of your
+  own called `no_type_check` too: name it something else.
 
-A `# pyright:` comment that turns off a named rule for a whole file is allowed, because it names
-what it silences: say why beside it. pyright disregards `# type: ignore` (`enableTypeIgnoreComments`
-is off), so a line is silenced for pyright only by `# pyright: ignore[<rule>]`, and for mypy by
+To silence one line, write `# pyright: ignore[<rule>]` on it and say why beside it. pyright
+disregards `# type: ignore` (`enableTypeIgnoreComments` is off), so a line is silenced for pyright
+only by `# pyright: ignore[<rule>]`, and for mypy by
 `# type: ignore[<code>]`. Tests pin both config files, and refuse a tracked stub (`*.pyi`), which
 would change what the checkers see of a module in every file that imports it: a change to any of
 these is a deliberate one. pyright reads every file as UTF-8, so a file that declares an encoding

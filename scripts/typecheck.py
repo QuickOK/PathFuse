@@ -7,13 +7,14 @@ version the baseline was recorded with), else one on PATH, and the output names 
 one that ran. A file may not have more errors from either tool than
 scripts/typecheck-baseline.json records for it, and a file the baseline does
 not list must have none. Fixing errors only lowers the counts: afterwards run
-`scripts/typecheck.py --update-baseline` to record the new floor. Anything in a file
-that lowers its checking fails the gate before either checker runs, since the ratchet
-alone would pass the drop: a pyright mode below strict, a `# type: ignore` before the
-file's first statement, a line of mypy settings, or a use of `no_type_check`.
+`scripts/typecheck.py --update-baseline` to record the new floor. These ways of
+lowering one file's checking fail the gate before either checker runs, since the
+ratchet alone would pass the drop: a pyright mode below strict or a rule below an
+error, a `# type: ignore` before the file's first statement, a line of mypy settings,
+or a use of `no_type_check`.
 
-Exit 0 when every file is at or under its baseline, 1 when one is above it or
-something in a file lowers its checking,
+Exit 0 when every file is at or under its baseline, 1 when one is above it or a file
+lowers its checking in one of those ways,
 2 when there is no verdict to give: a checker is missing, crashes or hangs, git
 cannot list the files, a file cannot be read as the checkers read it, or the baseline
 is not the JSON --update-baseline writes.
@@ -42,6 +43,10 @@ MYPY_LINE = re.compile(r"^(?P<file>[^:]+):\d+(?::\d+)?: error:")
 # comment takes the file out of the strict mode pyrightconfig.json sets, and the
 # ratchet, which only stops counts rising, would pass the drop.
 LOWER_MODES = frozenset({"basic", "standard"})
+# The values a `# pyright:` comment can give one rule for its whole file that leave
+# fewer errors than strict reports: off (false, none), or below an error (warning,
+# information), since the gate counts errors only.
+LOWER_RULE_VALUES = frozenset({"false", "none", "warning", "information"})
 # What pyright trims from a comment and from each of its operands: JavaScript's trim,
 # which drops U+FEFF too. Python's whitespace covers the rest, and a few more.
 _TRIM = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "\ufeff"
@@ -181,17 +186,20 @@ def regressions(current: dict, baseline: dict) -> list[str]:
 
 def _sets_lower_mode(comment: str) -> bool:
     """Whether pyright reads `comment` (a comment token, `#` included) as setting its
-    file's mode below strict. As pyright 1.1.414 reads one: the text after `#`, trimmed,
-    starts with `pyright:`, and the rest splits on commas into operands, any one of
-    which, trimmed, can name the mode. pyright applies such a comment wherever it
-    stands, after code on the same line too (it only adds an error there). Beside
+    file's mode below strict, or one rule below an error for the whole file. As pyright
+    1.1.414 reads one: the text after `#`, trimmed, starts with `pyright:`, and the rest
+    splits on commas into operands. Any one, trimmed, can name the mode, or set a rule
+    as `<rule>=<value>` (the value trimmed too). pyright applies such a comment wherever
+    it stands, after code on the same line too (it only adds an error there). Beside
     `strict`, or after `ignore`, pyright disregards a lower mode; the gate refuses it
-    anyway."""
+    anyway. `# pyright: ignore[<rule>]` silences one line, not the file: it passes."""
     text = comment[1:].strip(_TRIM)
     if not text.startswith("pyright:"):
         return False
     operands = {op.strip(_TRIM) for op in text[len("pyright:"):].split(",")}
-    return not operands.isdisjoint(LOWER_MODES)
+    values = {value.strip(_TRIM) for _, eq, value in (op.partition("=") for op in operands)
+              if eq}
+    return not (operands.isdisjoint(LOWER_MODES) and values.isdisjoint(LOWER_RULE_VALUES))
 
 
 def _first_statement_line(tree: ast.Module) -> int | None:
@@ -228,14 +236,14 @@ def _no_type_check_uses(tree: ast.Module, text: str) -> dict[int, str]:
 
 
 def mode_lowering_comments(files: list[str]) -> list[str]:
-    """`file:line: what` for each thing in a file that lowers its checking where the
-    ratchet cannot see it: a pyright mode below strict (see _sets_lower_mode), wherever
-    it stands; a `# type: ignore` on a line before the file's first statement as mypy
-    measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and a use of
+    """`file:line: what` for each way a file lowers its checking where the ratchet cannot
+    see it: a pyright mode below strict, or a rule below an error (see _sets_lower_mode),
+    wherever it stands; a `# type: ignore` on a line before the file's first statement as
+    mypy measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and a use of
     `no_type_check`, matched by that name. Python's tokenizer finds the comments, as
-    pyright's does, so one
-    after code counts and text inside a string does not. mypy settings are found line by
-    line, as mypy finds them, strings included. A file that cannot be read is skipped:
+    pyright's does, so one after code counts and text inside a string does not. mypy
+    settings are found line by line, as mypy finds them, strings included. A file that
+    cannot be read is skipped:
     the checkers report it.
 
     ValueError, naming the file, when the gate cannot read one as the checkers do: it
@@ -316,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"typecheck: {e}", file=sys.stderr)
         return 2
     if lowered:
-        print("TYPECHECK FAILED: these lines lower type checking (remove what they name):",
+        print("TYPECHECK FAILED: these lines can lower type checking (remove what they name):",
               file=sys.stderr)
         for line in lowered:
             print(f"  {line}", file=sys.stderr)
