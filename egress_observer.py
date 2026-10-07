@@ -291,7 +291,7 @@ class EgressObserver:
 
     def snapshot(self) -> dict:
         """The tracker's snapshot, plus the check's cadence (`error_checks`,
-        `interval_s`): what a `failing` has gone without a check for, for a page."""
+        `interval_s`), which the failing page states as its threshold."""
         with self._lock:
             snap = self._tracker.snapshot()
         snap["error_checks"], snap["interval_s"] = self.cfg.error_checks, self.cfg.interval_s

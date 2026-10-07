@@ -1249,7 +1249,8 @@ def test_egress_none_is_ignored():
 #
 # A check that keeps failing says nothing about the exit, so it is paged on its own,
 # with its own kind, and leaves the fallback alert where it was. The observer's
-# snapshot carries the cadence (error_checks, interval_s) the page sizes itself from.
+# snapshot carries the cadence (error_checks, interval_s) that the failing page
+# states as its threshold.
 
 CHECK_FAILING, CHECK_WORKING = "🧭 Egress check failing", "🧭 Egress check working again"
 

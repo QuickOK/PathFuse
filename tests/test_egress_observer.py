@@ -345,7 +345,7 @@ def test_check_once_classifies():
 
 
 def test_observer_snapshot_carries_the_check_cadence():
-    # The detector sizes its "no exit check for N min" page from these two.
+    # The snapshot carries the cadence the failing page states as its threshold.
     cfg = E.ObserveCfg(url=URL, exits=RULES, interval_s=90.0, error_checks=4)
     o = E.EgressObserver(cfg, fetch=lambda url, iface, t: (None, "timeout"), clock=Clock())
     snap = o.snapshot()
