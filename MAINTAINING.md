@@ -33,14 +33,17 @@ The ratchet only stops counts rising, so the gate also refuses a comment that lo
 checking, before either checker runs:
 - `# pyright: basic` or `# pyright: standard`, wherever pyright would read it: among other
   operands, or after code on the same line;
-- a `# type: ignore` before the file's first line of code, which silences all of it for both
-  checkers;
+- a `# type: ignore` before the file's first statement, which mypy reads as silencing all of
+  it;
 - a `# mypy:` line of settings: mypy's settings belong in `mypy.ini`.
 
 A `# pyright:` comment that turns off a named rule for a whole file is allowed, because it names
 what it silences: say why beside it. pyright disregards `# type: ignore` (`enableTypeIgnoreComments`
 is off), so a line is silenced for pyright only by `# pyright: ignore[<rule>]`, and for mypy by
-`# type: ignore[<code>]`. Tests pin both config files, so a change to either is a deliberate one.
+`# type: ignore[<code>]`. Tests pin both config files, and refuse a tracked stub (`*.pyi`), which
+would change what the checkers see of a module in every file that imports it: a change to any of
+these is a deliberate one. pyright reads every file as UTF-8, so a file that declares another
+encoding gets no verdict (exit 2), as does one that does not tokenize or parse.
 
 pyright is the pinned one that `npm ci` installs in `node_modules/` (see Linting below for
 `npm ci`). Without it the gate falls back to a `pyright` on PATH, and its first line says which
@@ -51,8 +54,8 @@ records the counts as they are, higher ones included, so its diff should only lo
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
 so after upgrading either tool (pyright: its pin in `package.json`, then `npm install`), re-run
 `scripts/typecheck.py --update-baseline` and commit the new baseline in a commit of its own, with
-the versions named here updated. `tests/test_typecheck.py` asks the pinned pyright which comments
-run a file below strict, so its run after an upgrade re-checks the gate's rule against the new one.
+the versions named here updated. `tests/test_typecheck.py` asks pyright and mypy which comments
+lower a file's checking, so its run after upgrading either re-checks the gate's rule against it.
 
 ## Linting
 `scripts/preflight.sh` also runs `scripts/lint.py`: ShellCheck over every tracked shell script

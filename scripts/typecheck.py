@@ -10,18 +10,20 @@ not list must have none. Fixing errors only lowers the counts: afterwards run
 `scripts/typecheck.py --update-baseline` to record the new floor. A comment that
 lowers one file's checking fails the gate before either checker runs, since the
 ratchet alone would pass the drop: a pyright mode below strict, a `# type: ignore`
-before the file's first line of code, or a line of mypy settings.
+before the file's first statement, or a line of mypy settings.
 
 Exit 0 when every file is at or under its baseline, 1 when one is above it or a
 comment lowers a file's checking,
 2 when there is no verdict to give: a checker is missing, crashes or hangs, git
-cannot list the files, a file cannot be tokenized, or the baseline is not the JSON
---update-baseline writes.
+cannot list the files, a file cannot be read as the checkers read it, or the baseline
+is not the JSON --update-baseline writes.
 Each checker and git run with a time limit, so a hung tool cannot stall preflight.
 """
 from __future__ import annotations
 
 import argparse
+import ast
+import codecs
 import io
 import json
 import re
@@ -43,14 +45,11 @@ LOWER_MODES = frozenset({"basic", "standard"})
 # What pyright trims from a comment and from each of its operands: JavaScript's trim,
 # which drops U+FEFF too. Python's whitespace covers the rest, and a few more.
 _TRIM = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "\ufeff"
-# A `# type: ignore` before a file's first line of code silences all of the file, in
-# pyright and in mypy. pyright finds one after any `#` in a comment, mypy (through
-# Python's tokenizer) only at its start, each with or without spaces; this finds both.
+# A `# type: ignore` on a line before a file's first statement silences all of the file
+# in mypy, and in pyright were its type-ignore comments on. pyright finds one after any
+# `#` in a comment, mypy (through Python's tokenizer) only at its start, each with or
+# without spaces; this finds both.
 TYPE_IGNORE = re.compile(r"type:[\s\ufeff]*ignore")
-# The tokens that are not code: a `# type: ignore` among them, before the first token of
-# code, covers the whole file.
-NOT_CODE = frozenset({tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT,
-                      tokenize.DEDENT, tokenize.ENDMARKER})
 # mypy reads a line that starts `# mypy: ` as settings for its file (`ignore-errors`,
 # `no-check-untyped-defs`, ...), a line inside a string too. Settings belong in mypy.ini,
 # where a reviewer sees them, so the gate refuses every such line, however it is spaced.
@@ -188,35 +187,55 @@ def _sets_lower_mode(comment: str) -> bool:
     return not operands.isdisjoint(LOWER_MODES)
 
 
+def _first_statement_line(tree: ast.Module) -> int | None:
+    """The line mypy measures a whole-file `# type: ignore` against (get_lineno in its
+    fastparse): the first statement's, or for a decorated def or class its first
+    decorator expression's, which `@(` can put on a later line. None for no statement."""
+    if not tree.body:
+        return None
+    first = tree.body[0]
+    if isinstance(first, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+            and first.decorator_list:
+        return first.decorator_list[0].lineno
+    return first.lineno
+
+
 def mode_lowering_comments(files: list[str]) -> list[str]:
     """`file:line: comment` for each comment that lowers a file's checking where the
     ratchet cannot see it: a pyright mode below strict (see _sets_lower_mode), wherever
-    it stands; a `# type: ignore` before the file's first line of code (TYPE_IGNORE);
-    and a line of mypy settings (MYPY_SETTINGS). Python's tokenizer finds the comments,
-    as pyright's does, so one after code counts and text inside a string does not.
-    mypy settings are found line by line, as mypy finds them, strings included. A file
-    that cannot be read is skipped: the checkers report it.
+    it stands; a `# type: ignore` on a line before the file's first statement as mypy
+    measures it (TYPE_IGNORE); and a line of mypy settings (MYPY_SETTINGS). Python's
+    tokenizer finds the comments, as pyright's does, so one after code counts and text
+    inside a string does not. mypy settings are found line by line, as mypy finds them,
+    strings included. A file that cannot be read is skipped: the checkers report it.
 
-    ValueError, naming the file, when one cannot be tokenized: its comments cannot be
-    checked."""
+    ValueError, naming the file, when the gate cannot read one as the checkers do: it
+    declares an encoding other than UTF-8 (pyright reads every file as UTF-8, Python and
+    mypy by the declaration), or it does not decode, tokenize or parse."""
     found: list[str] = []
     for f in files:
         try:
             with tokenize.open(ROOT / f) as fh:
+                encoding = codecs.lookup(fh.encoding).name
                 text = fh.read()
-            tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
         except OSError:
             continue
-        except (SyntaxError, UnicodeDecodeError, tokenize.TokenError) as e:
-            raise ValueError(f"{f} cannot be tokenized, so its comments cannot be "
-                             f"checked: {e}") from None
+        except (SyntaxError, ValueError) as e:   # a bad declaration, or bytes it cannot decode
+            raise ValueError(f"{f}: cannot check its comments: {e}") from None
+        if encoding not in ("utf-8", "utf-8-sig"):
+            raise ValueError(f"{f}: cannot check its comments: it declares the {encoding} "
+                             f"encoding, and pyright reads every file as UTF-8")
+        try:
+            tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+            first = _first_statement_line(ast.parse(text, type_comments=True))
+        except (SyntaxError, ValueError, tokenize.TokenError) as e:
+            raise ValueError(f"{f}: cannot check its comments: {e}") from None
         hits: dict[int, str] = {}
-        header = True   # no token of code yet
         for t in tokens:
             if t.type == tokenize.COMMENT and (
-                    _sets_lower_mode(t.string) or header and TYPE_IGNORE.search(t.string)):
+                    _sets_lower_mode(t.string) or TYPE_IGNORE.search(t.string)
+                    and (first is None or t.start[0] < first)):
                 hits[t.start[0]] = t.string
-            header = header and t.type in NOT_CODE
         for n, line in enumerate(text.split("\n"), 1):
             if MYPY_SETTINGS.match(line):
                 hits.setdefault(n, line.strip())

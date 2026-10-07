@@ -424,6 +424,16 @@ def test_mypy_config_lowers_no_file() -> None:
         "scripts_are_modules": "True"}
 
 
+def test_no_tracked_stub_shadows_a_module() -> None:
+    """A stub (`*.pyi`, in typings/, pyright's stub path, or beside a module) changes
+    what the checkers see of a module in every file that imports it, and the gate
+    checks no stub, so one could hide errors in those files from the ratchet. Adding
+    one is a deliberate change here."""
+    r = subprocess.run(["git", "ls-files", "-z", "--", "*.pyi"], cwd=T.ROOT,
+                       capture_output=True, text=True, timeout=60, check=True)
+    assert r.stdout == ""
+
+
 def test_main_passes_over_a_pinned_pyright_that_is_not_executable(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str]) -> None:
@@ -485,16 +495,17 @@ def test_main_exits_2_when_a_file_cannot_be_tokenized(
     assert T.main(argv) == 2
     out, err = capsys.readouterr()
     assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
-    assert err.startswith(
-        "typecheck: a.py cannot be tokenized, so its comments cannot be checked: "), err
+    assert err.startswith("typecheck: a.py: cannot check its comments: "), err
     assert not log.exists()                        # neither checker ran
     assert not (tmp_path / "baseline.json").exists()
 
 
 # Comments that lower their file's checking, each with its line and the comment as the
 # gate reports it. pyright takes a mode from any operand, and from a comment after code;
-# it trims what JavaScript trims, U+FEFF included. A `# type: ignore` before the first
-# line of code silences the file; mypy reads settings from a `# mypy: ` line anywhere.
+# it trims what JavaScript trims, U+FEFF and the Unicode spaces included. mypy reads a
+# `# type: ignore` on a line before the first statement as silencing the file, and for a
+# decorated def or class that statement starts at its first decorator's expression;
+# mypy reads settings from a `# mypy: ` line anywhere.
 _LOWERING: dict[str, tuple[bytes, int, str]] = {
     "own-line": (b"# pyright: basic\n", 1, "# pyright: basic"),
     "no-spaces": (b"#pyright:standard\n", 1, "#pyright:standard"),
@@ -516,6 +527,21 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
     "cr": (b"x = 1\r# pyright: basic\r", 2, "# pyright: basic"),
     "last-line-unterminated": (b"x = 1\n# pyright: basic", 2, "# pyright: basic"),
     "after-a-form-feed": (b"\x0c# pyright: basic\n", 1, "# pyright: basic"),
+    "ideographic-space-before": ("x = 1\n#\u3000pyright: basic\n".encode(), 2,
+                                 "#\u3000pyright: basic"),
+    "ogham-space-before": ("x = 1\n#\u1680pyright: standard\n".encode(), 2,
+                           "#\u1680pyright: standard"),
+    "em-space-operand": ("x = 1\n# pyright:\u2003basic\n".encode(), 2, "# pyright:\u2003basic"),
+    "no-break-space-operand-after-a-rule": (
+        "x = 1\n# pyright: reportPrivateUsage=false,\u00a0standard\n".encode(), 2,
+        "# pyright: reportPrivateUsage=false,\u00a0standard"),
+    "zero-width-no-break-space-operand-after-a-rule": (
+        "x = 1\n# pyright: reportPrivateUsage=false,\ufeffbasic\n".encode(), 2,
+        "# pyright: reportPrivateUsage=false,\ufeffbasic"),
+    "narrow-no-break-space-after-the-mode": ("x = 1\n# pyright: basic\u202f\n".encode(), 2,
+                                             "# pyright: basic\u202f"),
+    "line-separator-after-the-mode": ("x = 1\n# pyright: standard\u2028\n".encode(), 2,
+                                      "# pyright: standard\u2028"),
     # pyright keeps these two strict; the gate refuses them anyway.
     "beside-strict": (b"# pyright: strict, basic\n", 1, "# pyright: strict, basic"),
     "after-ignore": (b"# pyright: ignore, standard\n", 1, "# pyright: ignore, standard"),
@@ -527,12 +553,26 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
     "type-ignore-after-another-comment": (b"# noqa # type: ignore\nx = 1\n", 1,
                                           "# noqa # type: ignore"),
     "type-ignore-in-an-empty-file": (b"# type: ignore\n", 1, "# type: ignore"),
+    "type-ignore-before-a-decorator-expression": (
+        b"@(  # type: ignore\n    staticmethod)\ndef first(): ...\n", 1, "# type: ignore"),
+    "type-ignore-on-its-own-line-in-a-decorator": (
+        b"@(\n    # type: ignore\n    staticmethod)\ndef first(): ...\n", 2, "# type: ignore"),
+    "type-ignore-before-a-class-decorator-expression": (
+        b"@(  # type: ignore[misc]\n    lambda c: c)\nclass First: ...\n", 1,
+        "# type: ignore[misc]"),
+    "type-ignore-before-a-walrus-decorator": (
+        b"@(  # type: ignore\n    d := staticmethod)\ndef first(): ...\n", 1, "# type: ignore"),
+    "type-ignore-in-nested-parentheses": (
+        b"@((  # type: ignore\n    lambda f: f))\ndef first(): ...\n", 1, "# type: ignore"),
     "mypy-ignore-errors": (b"# mypy: ignore-errors\nx = 1\n", 1, "# mypy: ignore-errors"),
     "mypy-setting-after-code": (b"x = 1\n# mypy: no-check-untyped-defs\n", 2,
                                 "# mypy: no-check-untyped-defs"),
     "mypy-setting-in-a-docstring": (b'"""Doc.\n# mypy: ignore-errors\n"""\n', 2,
                                     "# mypy: ignore-errors"),
-    # mypy reads neither of these two; the gate refuses them anyway.
+    "mypy-setting-after-a-byte-order-mark": ("\ufeff# mypy: ignore-errors\nx = 1\n".encode(), 1,
+                                             "# mypy: ignore-errors"),
+    # mypy does not read the first of these two, and the second silences one named code
+    # only; the gate refuses both, since mypy's settings belong in mypy.ini.
     "mypy-no-spaces": (b"#mypy:ignore-errors\n", 1, "#mypy:ignore-errors"),
     "mypy-one-code": (b"# mypy: disable-error-code=misc\n", 1,
                       "# mypy: disable-error-code=misc"),
@@ -561,6 +601,17 @@ _NOT_LOWERING: dict[str, bytes] = {
     "type-ignore-after-a-docstring": b'"""Doc."""\n# type: ignore\nx = 1\n',
     "mypy-in-a-string": b'x = "# mypy: ignore-errors"\n',
     "mypy-in-prose": b"# notes on mypy: none\n",
+    "type-ignore-on-the-decorator-line": b"@staticmethod  # type: ignore[misc]\ndef first(): ...\n",
+    "type-ignore-on-the-decorator-expression-line": (
+        b"@(\n    staticmethod  # type: ignore\n)\ndef first(): ...\n"),
+    "type-ignore-between-decorator-and-def": b"@(lambda f: f)\n# type: ignore\ndef first(): ...\n",
+    "type-ignore-in-a-second-decorator": (
+        b"@(lambda f: f)\n@(  # type: ignore\n    lambda f: f)\ndef first(): ...\n"),
+    "type-ignore-in-a-subscripted-decorator": (
+        b"@[\n    # type: ignore\n    lambda f: f][0]\ndef first(): ...\n"),
+    "type-ignore-inside-the-first-statement": b"x = print(  # type: ignore\n    1)\n",
+    "utf-8-declared": b"# -*- coding: utf-8 -*-\nx = 1\n",
+    "utf-8-declared-without-a-hyphen": b"# coding: UTF8\nx = 1\n",
 }
 
 
@@ -592,19 +643,40 @@ def test_mode_lowering_comments_lists_every_kind_in_line_order(
         "a.py:1: # mypy: ignore-errors", "a.py:2: # type: ignore", "a.py:3: # pyright: basic"]
 
 
-@pytest.mark.parametrize("source", [
-    b'x = """never closed\n',
-    b"if True:\n        x = 1\n    y = 2\n",   # a dedent to no enclosing level
-    b"x = '\xff'\n",                           # not UTF-8, in the encoding-cookie lines
-    b"x = 1\ny = 2\nz = '\xff'\n",             # not UTF-8, further down
-], ids=["unclosed-string", "bad-dedent", "not-utf-8-first-line", "not-utf-8-third-line"])
-def test_mode_lowering_comments_raises_on_a_file_it_cannot_tokenize(
+# Files the gate cannot read as the checkers do. pyright reads every file as UTF-8 and
+# Python and mypy by its declared encoding, so under another declaration the two can
+# see different comments: one might hide a mode the other applies.
+_UNREADABLE: dict[str, bytes] = {
+    "unclosed-string": b'x = """never closed\n',
+    "bad-dedent": b"if True:\n        x = 1\n    y = 2\n",
+    "does-not-parse": b"x = = 1\n",
+    "not-utf-8-first-line": b"x = '\xff'\n",
+    "not-utf-8-third-line": b"x = 1\ny = 2\nz = '\xff'\n",
+    "latin-1-declared": b"# -*- coding: latin-1 -*-\nx = 1\n",
+    "shift-jis-declared": b"# -*- coding: shift_jis -*-\nx = 1\n",
+    "declared-after-a-shebang": b"#!/usr/bin/env python3\n# coding: latin-1\nx = 1\n",
+    "declared-after-a-form-feed": b"\x0c# -*- coding: latin-1 -*-\nx = 1\n",
+    "an-unknown-encoding-declared": b"# -*- coding: no-such-codec -*-\nx = 1\n",
+}
+
+
+@pytest.mark.parametrize("source", list(_UNREADABLE.values()), ids=list(_UNREADABLE))
+def test_mode_lowering_comments_raises_on_a_file_it_cannot_read_as_the_checkers_do(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: bytes) -> None:
     monkeypatch.setattr(T, "ROOT", tmp_path)
     (tmp_path / "a.py").write_bytes(source)
-    with pytest.raises(ValueError,
-                       match=r"^a\.py cannot be tokenized, so its comments cannot be checked: "):
+    with pytest.raises(ValueError, match=r"^a\.py: cannot check its comments: "):
         T.mode_lowering_comments(["a.py"])
+
+
+def test_mode_lowering_comments_says_which_encoding_a_file_declares(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    (tmp_path / "a.py").write_bytes(_UNREADABLE["latin-1-declared"])
+    with pytest.raises(ValueError) as e:
+        T.mode_lowering_comments(["a.py"])
+    assert str(e.value) == ("a.py: cannot check its comments: it declares the iso8859-1 "
+                            "encoding, and pyright reads every file as UTF-8")
 
 
 # Four errors from three rules that strict reports and basic and standard do not: a
@@ -672,8 +744,11 @@ def test_no_comment_silences_a_file_for_mypy_past_the_gate(
         if m:
             codes.setdefault(m.group("file"), set()).add(m.group("code"))
     lowered = {k for k, name in names.items() if not _MYPY_BODY_CODES <= codes[name]}
-    # The probe tells them apart.
-    assert {"type-ignore", "mypy-ignore-errors", "mypy-setting-in-a-docstring"} <= lowered
+    # The probe tells them apart, and these rows are mypy's own behaviour.
+    assert {"type-ignore", "mypy-ignore-errors", "mypy-setting-in-a-docstring",
+            "mypy-setting-after-a-byte-order-mark", "type-ignore-before-a-decorator-expression",
+            "type-ignore-on-its-own-line-in-a-decorator",
+            "type-ignore-before-a-class-decorator-expression"} <= lowered
     assert "control" not in lowered
     monkeypatch.setattr(T, "ROOT", tmp_path)
     refused = {k for k, name in names.items() if T.mode_lowering_comments([name])}
