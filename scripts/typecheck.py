@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Type-check gate: pyright and mypy over every tracked Python file, against a baseline.
 
-pyright runs in the "basic" mode of pyrightconfig.json; mypy runs with mypy.ini
+pyright runs in the "strict" mode of pyrightconfig.json; mypy runs with mypy.ini
 (check_untyped_defs). The pyright is the one `npm ci` pins in node_modules/.bin/ (the
 version the baseline was recorded with), else one on PATH, and the output names the
 one that ran. A file may not have more errors from either tool than

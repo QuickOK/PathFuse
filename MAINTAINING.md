@@ -20,17 +20,25 @@ git config core.hooksPath scripts/hooks
 ```
 
 ## Type checking
-`scripts/preflight.sh` runs `scripts/typecheck.py`: pyright (basic mode, `pyrightconfig.json`) and
-mypy (`mypy.ini`, check_untyped_defs) over every tracked Python file. No file may have more errors
-than `scripts/typecheck-baseline.json` records, and a file it does not list must have none, so
-new code is held to zero. After fixing errors, run `scripts/typecheck.py --update-baseline` to
-lower the floor. Install once per machine: `sudo npm install -g pyright` and `sudo apt install mypy`.
+`scripts/preflight.sh` runs `scripts/typecheck.py`: pyright in strict mode (`pyrightconfig.json`)
+and mypy (`mypy.ini`, check_untyped_defs) over every tracked Python file. The gate is a per-file
+ratchet: no file may have more errors from either tool than `scripts/typecheck-baseline.json`
+records, and a file it does not list must have none. Strict counts an unannotated parameter or a
+value of unknown type as an error, so new and edited code must be typed, and a new file must be
+clean. When new code has to call a function that is not typed yet, type that function, or
+silence that one line with `# pyright: ignore[<rule>]` and say why in a comment. After fixing
+errors, run `scripts/typecheck.py --update-baseline` to record the lower floor.
+
+pyright is the pinned one that `npm ci` installs in `node_modules/` (see Linting below for
+`npm ci`). Without it the gate falls back to a `pyright` on PATH, and its first line says which
+one ran. Install mypy once per machine: `sudo apt install mypy`.
 
 The gate sees tracked files only, so `git add` a new file before running it. `--update-baseline`
 records the counts as they are, higher ones included, so its diff should only lower numbers. The
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
-so after upgrading either tool, re-run `scripts/typecheck.py --update-baseline` and commit the new
-baseline in a commit of its own, with the versions named here updated.
+so after upgrading either tool (pyright: its pin in `package.json`, then `npm install`), re-run
+`scripts/typecheck.py --update-baseline` and commit the new baseline in a commit of its own, with
+the versions named here updated.
 
 ## Linting
 `scripts/preflight.sh` also runs `scripts/lint.py`: ShellCheck over every tracked shell script

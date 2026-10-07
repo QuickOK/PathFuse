@@ -1,4 +1,4 @@
 {
-  "typeCheckingMode": "basic",
+  "typeCheckingMode": "strict",
   "exclude": ["**/__pycache__", ".venv", ".superpowers", "docs", "deploy/out"]
 }

@@ -1,127 +1,210 @@
 {
   "cell_telemetry.py": {
     "mypy": 7,
-    "pyright": 6
+    "pyright": 197
+  },
+  "deploy/relay/egress/relay-egress-deadman": {
+    "pyright": 48
+  },
+  "deploy/relay/egress/relay-egress-watchdog": {
+    "pyright": 439
+  },
+  "deploy/render.py": {
+    "pyright": 54
+  },
+  "egress_observer.py": {
+    "pyright": 108
   },
   "environ_ctl.py": {
     "mypy": 10,
-    "pyright": 11
+    "pyright": 331
   },
   "fec_control.py": {
-    "mypy": 1
+    "mypy": 1,
+    "pyright": 306
   },
   "fec_history.py": {
-    "mypy": 1
+    "mypy": 1,
+    "pyright": 40
   },
   "fec_report.py": {
     "mypy": 2,
-    "pyright": 5
+    "pyright": 111
   },
   "hotspot_watchdog.py": {
-    "pyright": 1
+    "pyright": 212
   },
   "location_fec.py": {
     "mypy": 3,
-    "pyright": 2
+    "pyright": 481
+  },
+  "maintenance_reboot.py": {
+    "pyright": 184
   },
   "netgear_api.py": {
-    "pyright": 1
+    "pyright": 86
   },
   "notify.py": {
-    "mypy": 14
+    "mypy": 14,
+    "pyright": 421
   },
   "sbfd.py": {
-    "mypy": 11,
-    "pyright": 3
+    "mypy": 6,
+    "pyright": 121
   },
   "sbfd_ctl.py": {
     "mypy": 22,
-    "pyright": 17
+    "pyright": 1426
+  },
+  "scripts/typecheck.py": {
+    "pyright": 26
+  },
+  "station_tracker.py": {
+    "pyright": 245
+  },
+  "tests/conftest.py": {
+    "pyright": 62
+  },
+  "tests/test_actuator.py": {
+    "pyright": 122
   },
   "tests/test_api.py": {
     "mypy": 15,
-    "pyright": 10
+    "pyright": 1256
   },
   "tests/test_auto_override.py": {
     "mypy": 25,
-    "pyright": 60
+    "pyright": 1300
   },
   "tests/test_cell_telemetry.py": {
-    "pyright": 4
+    "pyright": 244
+  },
+  "tests/test_client_state_reader.py": {
+    "pyright": 20
   },
   "tests/test_config.py": {
     "mypy": 43,
-    "pyright": 32
+    "pyright": 91
+  },
+  "tests/test_conftest_guard.py": {
+    "pyright": 14
+  },
+  "tests/test_decide.py": {
+    "pyright": 62
+  },
+  "tests/test_default_route.py": {
+    "pyright": 28
+  },
+  "tests/test_egress_observer.py": {
+    "pyright": 278
   },
   "tests/test_engarde_table.py": {
-    "mypy": 1
+    "mypy": 1,
+    "pyright": 88
   },
   "tests/test_environ.py": {
     "mypy": 8,
-    "pyright": 8
+    "pyright": 333
   },
   "tests/test_fec_config.py": {
     "mypy": 20,
-    "pyright": 18
+    "pyright": 49
+  },
+  "tests/test_fec_control.py": {
+    "pyright": 231
   },
   "tests/test_fec_decision_integration.py": {
-    "pyright": 1
+    "pyright": 194
   },
   "tests/test_fec_directions.py": {
-    "mypy": 1
+    "mypy": 1,
+    "pyright": 357
+  },
+  "tests/test_fec_history.py": {
+    "pyright": 19
   },
   "tests/test_fec_report.py": {
-    "pyright": 28
+    "pyright": 100
   },
   "tests/test_hotspot_watchdog.py": {
     "mypy": 6,
-    "pyright": 17
+    "pyright": 544
+  },
+  "tests/test_http_keepalive.py": {
+    "pyright": 80
   },
   "tests/test_location_fec.py": {
-    "pyright": 5
+    "pyright": 525
   },
   "tests/test_maintenance_reboot.py": {
     "mypy": 24,
-    "pyright": 3
+    "pyright": 1709
   },
   "tests/test_map_api.py": {
     "mypy": 2,
-    "pyright": 17
+    "pyright": 1056
   },
   "tests/test_notify.py": {
     "mypy": 1,
-    "pyright": 1
+    "pyright": 3025
+  },
+  "tests/test_ntfy_dispatch.py": {
+    "pyright": 35
+  },
+  "tests/test_relay_conn_pool.py": {
+    "pyright": 103
   },
   "tests/test_relay_egress_watchdog.py": {
     "mypy": 1,
-    "pyright": 1
+    "pyright": 1401
+  },
+  "tests/test_relay_fetcher.py": {
+    "pyright": 52
   },
   "tests/test_render.py": {
     "mypy": 3,
-    "pyright": 3
+    "pyright": 4
+  },
+  "tests/test_sbfd_config.py": {
+    "pyright": 29
   },
   "tests/test_sbfd_session.py": {
-    "pyright": 1
+    "pyright": 211
+  },
+  "tests/test_sbfd_state_listener.py": {
+    "pyright": 43
+  },
+  "tests/test_spool_notify.py": {
+    "pyright": 197
   },
   "tests/test_station_tracker.py": {
-    "pyright": 2
+    "pyright": 99
+  },
+  "tests/test_tile_store.py": {
+    "pyright": 146
+  },
+  "tests/test_typecheck.py": {
+    "pyright": 136
   },
   "tests/test_udpspeeder_fec.py": {
-    "pyright": 22
+    "pyright": 377
+  },
+  "tests/test_ui_static.py": {
+    "pyright": 3
   },
   "tile_store.py": {
     "mypy": 5,
-    "pyright": 8
+    "pyright": 219
   },
   "tools/simulate_dynamic.py": {
     "mypy": 3,
-    "pyright": 3
+    "pyright": 229
   },
   "udpspeeder_fec.py": {
-    "pyright": 4
+    "pyright": 350
   },
   "ui-preview.py": {
     "mypy": 2,
-    "pyright": 2
+    "pyright": 42
   }
 }
