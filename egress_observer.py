@@ -9,11 +9,11 @@ rules, and tracks whether the observed exit matches the selected mode.
 Config (`egress.observe` in the sbfd-ctl config; off while `url` is empty):
 
     {"url": "https://probe.example.net/trace", "iface": "wg0",
-     "interval_s": 120, "timeout_s": 8, "mismatch_checks": 2,
+     "interval_s": 120, "timeout_s": 8, "mismatch_checks": 2, "error_checks": 3,
      "exits": [{"mode": "relay_backbone", "field": "ip", "values": ["203.0.113.10"]}]}
 
 `exits` needs at least one rule. Bounds: interval_s 5..86400, timeout_s up to 120,
-mismatch_checks 1..100.
+mismatch_checks and error_checks 1..100.
 
 The first rule whose `field` value appears in `values` names the observed exit.
 A page that carries none of the rule fields (an HTTP error, a redirect, an empty
@@ -45,6 +45,7 @@ class ObserveCfg:
     interval_s: float = 120.0
     timeout_s: float = 8.0
     mismatch_checks: int = 2
+    error_checks: int = 3
     exits: tuple = ()
 
 
@@ -60,6 +61,14 @@ def _bounded(name: str, value, lo: float, hi: float, open_lo: bool = False) -> f
         raise ValueError(f"egress.observe.{name} must be within "
                          f"{'(' if open_lo else '['}{lo:g}, {hi:g}], got {value!r}")
     return f
+
+
+def _count(name: str, value) -> int:
+    """`value` when it is an integer within [1, 100] (a bool is not one); else ValueError."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+        raise ValueError(
+            f"egress.observe.{name} must be an integer within [1, 100], got {value!r}")
+    return value
 
 
 def parse_observe_cfg(raw, valid_modes) -> Optional[ObserveCfg]:
@@ -80,10 +89,8 @@ def parse_observe_cfg(raw, valid_modes) -> Optional[ObserveCfg]:
     iface = raw.get("iface", "wg0")
     if not isinstance(iface, str) or not iface:
         raise ValueError("egress.observe.iface must be an interface name")
-    checks = raw.get("mismatch_checks", 2)
-    if isinstance(checks, bool) or not isinstance(checks, int) or not 1 <= checks <= 100:
-        raise ValueError(
-            f"egress.observe.mismatch_checks must be an integer within [1, 100], got {checks!r}")
+    checks = _count("mismatch_checks", raw.get("mismatch_checks", 2))
+    error_checks = _count("error_checks", raw.get("error_checks", 3))
     interval_s = _bounded("interval_s", raw.get("interval_s", 120), 5, 86400)
     timeout_s = _bounded("timeout_s", raw.get("timeout_s", 8), 0, 120, open_lo=True)
     rules = []
@@ -105,7 +112,7 @@ def parse_observe_cfg(raw, valid_modes) -> Optional[ObserveCfg]:
         logging.warning("egress.observe: no exits rule names %s, so the check can never observe it "
                         "and reports a mismatch whenever it is selected", mode)
     return ObserveCfg(url=url, iface=iface, interval_s=interval_s, timeout_s=timeout_s,
-                      mismatch_checks=checks, exits=tuple(rules))
+                      mismatch_checks=checks, error_checks=error_checks, exits=tuple(rules))
 
 
 def parse_trace(body: Optional[str]) -> dict:
@@ -156,17 +163,23 @@ class ExitTracker:
 
     checking  no check yet since start, or since the selected mode changed
     skipped   the selected mode is local_direct (traffic never takes the relay)
-    error     the last fetch failed, or its page had none of the rule fields
-              (the mismatch count is kept)
+    error     the last fetch failed, or its page had none of the rule fields,
+              for fewer than `error_checks` checks in a row (the mismatch count is kept)
+    failing   that, for `error_checks` checks in a row (the mismatch count is still kept)
     match     the observed exit is the selected mode
     pending   mismatching, but for fewer than `mismatch_checks` checks in a row
     mismatch  mismatching for `mismatch_checks` checks in a row
+
+    A check that works (match, pending or mismatch), a `skipped` and a new selected
+    mode each reset the error count.
     """
 
-    def __init__(self, mismatch_checks: int, clock=time.time):
+    def __init__(self, mismatch_checks: int, clock=time.time, error_checks: int = 3):
         self.mismatch_checks = max(1, int(mismatch_checks))
+        self.error_checks = max(1, int(error_checks))
         self._clock = clock
         self._count = 0
+        self._errors = 0
         self.selected: Optional[str] = None
         self.observed: Optional[str] = None
         self.ip: Optional[str] = None
@@ -185,7 +198,7 @@ class ExitTracker:
         if mode == self.selected:
             return
         self.selected = mode
-        self._count = 0
+        self._count = self._errors = 0
         self.observed = self.ip = self.error = None
         self._set("checking", self._clock())
 
@@ -193,15 +206,17 @@ class ExitTracker:
         now = self._clock()
         self.checked_at = now
         if self.selected == "local_direct":
-            self._count = 0
+            self._count = self._errors = 0
             self.observed = self.ip = self.error = None
             self._set("skipped", now)
             return
         if error is not None:
             self.error = error
-            self._set("error", now)
+            self._errors += 1
+            self._set("failing" if self._errors >= self.error_checks else "error", now)
             return
         self.error = None
+        self._errors = 0
         self.observed = observed
         self.ip = ip[:_IP_MAX_CHARS] if ip is not None else None   # the page is not trusted to be short
         if observed == self.selected:
@@ -240,7 +255,8 @@ class EgressObserver:
         self._fetch = fetch
         self._lock = threading.Lock()
         self._kick = threading.Event()
-        self._tracker = ExitTracker(cfg.mismatch_checks, clock=clock)
+        self._tracker = ExitTracker(cfg.mismatch_checks, clock=clock,
+                                    error_checks=cfg.error_checks)
         self._thread: Optional[threading.Thread] = None
 
     def set_selected(self, mode: str) -> None:
@@ -274,8 +290,12 @@ class EgressObserver:
                 self._tracker.update(observed, ip, err)
 
     def snapshot(self) -> dict:
+        """The tracker's snapshot, plus the check's cadence (`error_checks`,
+        `interval_s`), which the failing page states as its threshold."""
         with self._lock:
-            return self._tracker.snapshot()
+            snap = self._tracker.snapshot()
+        snap["error_checks"], snap["interval_s"] = self.cfg.error_checks, self.cfg.interval_s
+        return snap
 
     def _run(self, stop: StopSignal) -> None:
         while not stop.is_set():

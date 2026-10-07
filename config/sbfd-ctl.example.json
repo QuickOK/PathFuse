@@ -36,6 +36,7 @@
       "interval_s": 120,
       "timeout_s": 8,
       "mismatch_checks": 2,
+      "error_checks": 3,
       "exits": [
         {
           "mode": "relay_vpn",

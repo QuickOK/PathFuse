@@ -330,8 +330,9 @@ class Observation:
     # or the published duplication block) so routine fringe ping-pong doesn't
     # misattribute a window-caused switch to "operator/policy" and page on it.
     handoff_active: bool = False
-    # The actual-exit check's snapshot (egress_observer.ExitTracker.snapshot()),
-    # or None when the check is off. Drives the egress fallback page.
+    # The actual-exit check's snapshot (egress_observer.EgressObserver.snapshot()),
+    # or None when the check is off. Drives the egress fallback page, and the page
+    # for a check that keeps failing (worded from its `error_checks` and `interval_s`).
     egress: Optional[dict] = None
 
 
@@ -822,7 +823,13 @@ class EventDetector:
     freed by hand within the boot (a remount), and a service restart after it,
     trust that mark still, so a new fallback that restart confirms stays silent.
     With egress_alert_path None the detector has no keeper and does no file I/O
-    at all, and a restart in the middle of a fallback pages it again."""
+    at all, and a restart in the middle of a fallback pages it again.
+
+    A check that keeps failing (`failing`: error_checks failed checks in a row)
+    says nothing about the exit, so it has an alert of its own, beside the
+    fallback alert and independent of it, paged once when the status reaches
+    `failing` and once when a check works again. That alert is in memory only:
+    a restart re-pages it once the failure is confirmed again, by design."""
 
     def __init__(self, relay_fail_threshold: int = 10,
                  wan_down_hold_s: float = 10.0, fec_alerts: bool = False,
@@ -878,6 +885,8 @@ class EventDetector:
         self._egress_gen = 0
         self._egress_selected: Optional[str] = None
         self._egress_skipped = False
+        # True while the exit check's failing has been announced (see _egress_check_events).
+        self._egress_check_failing = False
         self._egress_alert_path = egress_alert_path
         # Made at the seed when there is a path: it does the record's file I/O.
         self._keeper: Optional[EgressRecordKeeper] = None
@@ -1012,8 +1021,11 @@ class EventDetector:
         # any other. A `pending` is not yet a fallback, so it stays armed too.
         # A `skipped` ends the saved record, as it does on any later tick (see
         # _egress_events), so the record goes unread.
+        # A check already `failing` counts as announced, like anything else broken
+        # at startup: no page now, and the first check that works pages the recovery.
         status, selected = e.get("status"), e.get("selected")
         self._egress_selected, self._egress_skipped = selected, status == "skipped"
+        self._egress_check_failing = status == "failing"
         if status == "skipped":
             self._end_egress_alert()
             return
@@ -1288,28 +1300,76 @@ class EventDetector:
         queues the removal; a mode change or `skipped` ends it as any other.
 
         Each page carries the on_sent that settles the record once spool-notify
-        accepts it (see the class docstring); a silent end settles it itself."""
+        accepts it (see the class docstring); a silent end settles it itself.
+
+        The check's own alert (see _egress_check_events) is judged on the same tick,
+        first: a mismatch is a check that works, so its page follows the one that
+        says so."""
         self._distrust_if_unwritable()
         e = obs.egress
         if not e:
             return []
         status, selected = e.get("status"), e.get("selected")
         skipped = status == "skipped"
-        if selected != self._egress_selected or (skipped and not self._egress_skipped):
+        moved = selected != self._egress_selected
+        if moved or (skipped and not self._egress_skipped):
             self._end_egress_alert()
+        if moved:
+            # A `skipped` is a move too: the check never reports `failing` under
+            # local_direct, so the alert's mode is another, and the move ends it.
+            self._egress_check_failing = False
         self._egress_selected, self._egress_skipped = selected, skipped
+        evs = self._egress_check_events(e, status)
         if status == "mismatch" and (self._egress_alert_mode is None
                                      or self._egress_alert_unreliable):
             on_sent = self._raise_egress_alert(selected)
             ip = f" ({e['ip']})" if e.get("ip") else ""
-            return [Event("egress", "🧭 Egress fallback",
-                          f"selected {egress_label(selected)}, "
-                          f"actual {egress_label(e.get('observed'))}{ip}", "high",
-                          on_sent=on_sent)]
-        if status == "match" and self._egress_alert_mode is not None:
-            return [Event("egress", "🧭 Egress restored",
-                          f"actual exit matches {egress_label(selected)} again",
-                          "default", on_sent=self._restore_egress_alert())]
+            evs.append(Event("egress", "🧭 Egress fallback",
+                             f"selected {egress_label(selected)}, "
+                             f"actual {egress_label(e.get('observed'))}{ip}", "high",
+                             on_sent=on_sent))
+        elif status == "match" and self._egress_alert_mode is not None:
+            evs.append(Event("egress", "🧭 Egress restored",
+                             f"actual exit matches {egress_label(selected)} again",
+                             "default", on_sent=self._restore_egress_alert()))
+        return evs
+
+    def _egress_check_events(self, e: dict, status) -> list:
+        """Page once when the exit check has failed `error_checks` times in a row
+        (`failing`), and once when a check works again (match, pending or mismatch).
+        A failed check says nothing about the exit, so this alert stands beside the
+        fallback alert and neither touches the other: a `failing` under a standing
+        fallback is no restore, and a mismatch that ends this alert raises that one
+        as usual. `error` (not yet confirmed) and `checking` leave it as it is; a
+        change of the selected mode, which a `skipped` always is, ends it silently
+        (the caller does that, with the fallback alert's). It is kept in memory
+        only, with no record: a restart re-pages it once the failure is confirmed
+        again.
+
+        The failing page names the threshold that fired, error_checks failed
+        checks in a row, with the span they cover as a rounded hint from the
+        cadence the observer's snapshot carries: whole minutes from 60 s up,
+        whole seconds below, never "0"; without a usable cadence it names the
+        error alone."""
+        if status == "failing" and not self._egress_check_failing:
+            self._egress_check_failing = True
+            error = e.get("error") or "unknown error"
+            checks = _finite(e.get("error_checks"))
+            interval_s = _finite(e.get("interval_s"))
+            if checks is None or interval_s is None:
+                return [Event("egress_check", "🧭 Egress check failing",
+                              f"no exit check: {error}", "default")]
+            total_s = checks * interval_s
+            span = (f"{max(1, round(total_s / 60))} min" if total_s >= 60
+                    else f"{max(1, round(total_s))} s")
+            noun = "check" if checks == 1 else "checks"
+            return [Event("egress_check", "🧭 Egress check failing",
+                          f"{checks:g} failed {noun} in a row (about {span}): {error}",
+                          "default")]
+        if status in ("match", "pending", "mismatch") and self._egress_check_failing:
+            self._egress_check_failing = False
+            return [Event("egress_check", "🧭 Egress check working again",
+                          "the exit check succeeded again", "default")]
         return []
 
     # -- the egress alert record ------------------------------------------------

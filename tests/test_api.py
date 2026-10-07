@@ -2,7 +2,7 @@ import http.client
 import json
 import threading
 import urllib.request, urllib.error
-from pathlib import Path
+from pathlib import Path, PosixPath
 
 import pytest
 import sbfd_ctl as M
@@ -2289,3 +2289,31 @@ def test_client_egress_modes_match_the_relay_actuator():
     relay = importlib.util.module_from_spec(spec)
     loader.exec_module(relay)
     assert relay.VALID_DESIRED_MODES == M.VALID_EGRESS_MODES
+
+
+def test_root_serves_the_exit_kpi_tile(cfg, monkeypatch):
+    """`/` serves index.html with the Exit KPI tile: the wall layout hides the
+    control panel and the actual-exit line in it, so the KPI strip, visible in
+    both layouts, carries the actual exit too.
+
+    start_ui_server prefers /opt/sbfd-ctl/ui when it exists, which on a deployed
+    box would pin the installed copy instead of the repo's. The Path shim makes
+    that directory look absent for this test, and nothing else."""
+    class RepoUiPath(PosixPath):
+        def exists(self, *args, **kwargs):
+            if str(self) == "/opt/sbfd-ctl/ui":
+                return False
+            return super().exists(*args, **kwargs)
+    monkeypatch.setattr(M, "Path", RepoUiPath)
+    stop = threading.Event()
+    httpd = M.start_ui_server(cfg, stop)
+    try:
+        port = httpd.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
+            assert r.headers["Content-Type"].startswith("text/html")
+            body = r.read().decode()
+    finally:
+        stop.set()
+        httpd.shutdown()
+    for anchor in ('id="kpi-exit"', 'id="kpi-exit-val"', 'id="kpi-exit-sub"'):
+        assert anchor in body, anchor
