@@ -1606,7 +1606,9 @@ function renderEgressActual(s){
 }
 
 /* The same check as a KPI tile, so the wall layout (which hides the control
-   panel and the line above) shows the actual exit too. */
+   panel and the line above) shows the actual exit too. A sub-line names the
+   reason before the ip: .kpi-sub ellipsises on overflow, so a narrow tile
+   cuts the ip, never the reason, and the title keeps the whole line on hover. */
 function renderKpiExit(s){
   const el  = $("#kpi-exit");
   const val = $("#kpi-exit-val");
@@ -1626,9 +1628,9 @@ function renderKpiExit(s){
       case "match":
         v = observed; t = o.ip ? `matches · ${o.ip}` : "matches"; state = "ok"; break;
       case "pending":
-        v = observed; t = (o.ip ? `${o.ip} · ` : "") + `≠ selected ${selected} (rechecking)`; state = "degraded"; break;
+        v = observed; t = `≠ selected ${selected} (rechecking)` + (o.ip ? ` · ${o.ip}` : ""); state = "degraded"; break;
       case "mismatch":
-        v = observed; t = (o.ip ? `${o.ip} · ` : "") + `≠ selected ${selected}` + (at ? ` since ${at}` : ""); state = "degraded"; break;
+        v = observed; t = `≠ selected ${selected}` + (at ? ` since ${at}` : "") + (o.ip ? ` · ${o.ip}` : ""); state = "degraded"; break;
       case "skipped":
         v = "n/a"; t = "local direct"; break;
       case "error":
@@ -1642,6 +1644,7 @@ function renderKpiExit(s){
   el.dataset.state = state;
   val.textContent  = v;
   sub.textContent  = t;
+  sub.title        = t;
 }
 
 /* ---------- maintenance reboot ---------- */
