@@ -332,7 +332,7 @@ class Observation:
     handoff_active: bool = False
     # The actual-exit check's snapshot (egress_observer.EgressObserver.snapshot()),
     # or None when the check is off. Drives the egress fallback page, and the page
-    # for a check that keeps failing (sized from its `error_checks` and `interval_s`).
+    # for a check that keeps failing (worded from its `error_checks` and `interval_s`).
     egress: Optional[dict] = None
 
 
@@ -1346,18 +1346,25 @@ class EventDetector:
         only, with no record: a restart re-pages it once the failure is confirmed
         again.
 
-        The failing page says how long the exit has gone unchecked, error_checks
-        intervals, from the cadence the observer's snapshot carries; without a
-        usable cadence it names the error alone."""
+        The failing page names the threshold that fired, error_checks failed
+        checks in a row, with the span they cover as a rounded hint from the
+        cadence the observer's snapshot carries: whole minutes from 60 s up,
+        whole seconds below, never "0"; without a usable cadence it names the
+        error alone."""
         if status == "failing" and not self._egress_check_failing:
             self._egress_check_failing = True
             error = e.get("error") or "unknown error"
             checks = _finite(e.get("error_checks"))
             interval_s = _finite(e.get("interval_s"))
-            span = (f" for {round(checks * interval_s / 60)} min"
-                    if checks is not None and interval_s is not None else "")
+            if checks is None or interval_s is None:
+                return [Event("egress_check", "🧭 Egress check failing",
+                              f"no exit check: {error}", "default")]
+            total_s = checks * interval_s
+            span = (f"{max(1, round(total_s / 60))} min" if total_s >= 60
+                    else f"{max(1, round(total_s))} s")
             return [Event("egress_check", "🧭 Egress check failing",
-                          f"no exit check{span}: {error}", "default")]
+                          f"{checks:g} failed checks in a row (about {span}): {error}",
+                          "default")]
         if status in ("match", "pending", "mismatch") and self._egress_check_failing:
             self._egress_check_failing = False
             return [Event("egress_check", "🧭 Egress check working again",

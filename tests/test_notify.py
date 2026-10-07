@@ -3,6 +3,7 @@ import errno
 import gc
 import io
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -1269,7 +1270,7 @@ def test_egress_check_failing_pages_once_then_working_again():
     evs = d.observe(obs(egress=_eg_failing("timeout")))
     assert len(evs) == 1 and evs[0].kind == "egress_check" and evs[0].priority == "default"
     assert evs[0].title == CHECK_FAILING
-    assert evs[0].message == "no exit check for 6 min: timeout"
+    assert evs[0].message == "3 failed checks in a row (about 6 min): timeout"
     assert evs[0].on_sent is None
     assert d.observe(obs(egress=_eg_failing("curl rc=28"))) == []   # no repeat
     assert d.observe(obs(egress=_eg("error"))) == []             # nor on a plain error
@@ -1297,20 +1298,31 @@ def test_egress_check_any_successful_check_is_working_again(success, kinds_out):
 
 @pytest.mark.parametrize("egress, message", [
     pytest.param(_eg_failing("timeout", error_checks=2, interval_s=50.0),
-                 "no exit check for 2 min: timeout", id="rounded-up"),
+                 "2 failed checks in a row (about 2 min): timeout", id="rounded-up"),
     pytest.param(_eg_failing("timeout", error_checks=4, interval_s=20.0),
-                 "no exit check for 1 min: timeout", id="rounded-down"),
+                 "4 failed checks in a row (about 1 min): timeout", id="rounded-down"),
     pytest.param(_eg_failing("curl rc=7: Failed to connect", error_checks=2, interval_s=30),
-                 "no exit check for 1 min: curl rc=7: Failed to connect", id="int-interval"),
-    pytest.param(_eg_failing(None), "no exit check for 6 min: unknown error", id="no-error-text"),
+                 "2 failed checks in a row (about 1 min): curl rc=7: Failed to connect",
+                 id="int-interval"),
+    pytest.param(_eg_failing("timeout", error_checks=1, interval_s=5),
+                 "1 failed checks in a row (about 5 s): timeout", id="config-floors"),
+    pytest.param(_eg_failing("timeout", error_checks=1, interval_s=59.9),
+                 "1 failed checks in a row (about 60 s): timeout", id="just-under-a-minute"),
+    pytest.param(_eg_failing("timeout", error_checks=3, interval_s=0.1),
+                 "3 failed checks in a row (about 1 s): timeout", id="sub-second-floor"),
+    pytest.param(_eg_failing(None), "3 failed checks in a row (about 6 min): unknown error",
+                 id="no-error-text"),
     pytest.param(_eg_failing("", error_checks=3, interval_s=120.0),
-                 "no exit check for 6 min: unknown error", id="empty-error-text"),
+                 "3 failed checks in a row (about 6 min): unknown error", id="empty-error-text"),
 ])
-def test_egress_check_failing_message_names_the_span_and_the_error(egress, message):
+def test_egress_check_failing_message_names_the_threshold_and_the_error(egress, message):
+    # The count is the threshold that fired; the span is a rounded hint, in
+    # minutes from 60 s up and in seconds below, and never "0".
     d = notify.EventDetector()
     d.observe(obs(egress=_eg("checking")))
     evs = d.observe(obs(egress=egress))
     assert len(evs) == 1 and evs[0].message == message
+    assert not re.search(r"\b0 (min|s)\b", evs[0].message)
 
 
 @pytest.mark.parametrize("egress", [
@@ -1346,6 +1358,24 @@ def test_egress_check_anything_else_at_startup_leaves_the_page_armed(first):
     d = notify.EventDetector()
     assert d.observe(obs(egress=first)) == []                    # seed
     assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+
+
+@pytest.mark.parametrize("success", [
+    pytest.param(_eg("match", selected="relay_direct", observed="relay_direct"), id="match"),
+    pytest.param(_eg("pending", selected="relay_direct", observed="relay_vpn"), id="pending"),
+    pytest.param(_eg("mismatch", selected="relay_direct", observed="relay_vpn"), id="mismatch"),
+])
+def test_egress_check_a_mode_change_straight_to_a_working_check_is_silent(success):
+    # The observer reports `checking` after a mode change, but the detector may miss
+    # that tick: a check that works under the NEW mode is no recovery of the old
+    # mode's alert. The move ends that alert silently, so no "working again" page.
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    evs = d.observe(obs(egress=success))
+    assert [e for e in evs if e.kind == "egress_check"] == []
+    # Nothing stands under the new mode: a later failure there pages afresh.
+    assert _titles(d.observe(obs(egress=_eg_failing(selected="relay_direct")))) == [CHECK_FAILING]
 
 
 def test_egress_check_a_mode_change_ends_the_alert_silently():
