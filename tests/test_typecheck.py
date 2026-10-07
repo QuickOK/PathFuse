@@ -1,11 +1,14 @@
 """Tests for the type-check gate (scripts/typecheck.py)."""
+import ast
 import configparser
 import importlib.util
+import io
 import json
 import re
 import shutil
 import subprocess
 import sys
+import tokenize
 from collections import Counter
 from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
@@ -462,7 +465,7 @@ def test_main_refuses_a_comment_that_runs_a_file_below_strict(
     assert T.main(argv) == 1
     out, err = capsys.readouterr()
     assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
-    assert err == ("TYPECHECK FAILED: a comment lowers a file's type checking (remove it):\n"
+    assert err == ("TYPECHECK FAILED: a comment or decorator lowers type checking (remove it):\n"
                    f"  a.py:2: # pyright: {mode}\n")
     assert not log.exists()                        # neither checker ran
     assert not (tmp_path / "baseline.json").exists()
@@ -479,7 +482,7 @@ def test_main_refuses_a_mode_comment_in_an_extensionless_script(
     (tmp_path / "deploy/tool").write_text("#!/usr/bin/env python3\n# pyright: basic\nx = 1\n")
     assert T.main([]) == 1
     assert capsys.readouterr().err == (
-        "TYPECHECK FAILED: a comment lowers a file's type checking (remove it):\n"
+        "TYPECHECK FAILED: a comment or decorator lowers type checking (remove it):\n"
         "  deploy/tool:2: # pyright: basic\n")
     assert not log.exists()                        # neither checker ran
 
@@ -564,6 +567,21 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
         b"@(  # type: ignore\n    d := staticmethod)\ndef first(): ...\n", 1, "# type: ignore"),
     "type-ignore-in-nested-parentheses": (
         b"@((  # type: ignore\n    lambda f: f))\ndef first(): ...\n", 1, "# type: ignore"),
+    "type-ignore-before-an-async-def-decorator-expression": (
+        b"@(  # type: ignore\n    lambda f: f)\nasync def first() -> None: ...\n", 1,
+        "# type: ignore"),
+    "no-type-check": (b"from typing import no_type_check\n\n\n@no_type_check\ndef f(x):\n"
+                      b"    return x\n", 4, "@no_type_check"),
+    "typing-dot-no-type-check": (b"import typing\n\n\n@typing.no_type_check\ndef f(x):\n"
+                                 b"    return x\n", 4, "@typing.no_type_check"),
+    "no-type-check-on-an-async-def": (b"from typing import no_type_check\n\n\n@no_type_check\n"
+                                      b"async def f(x):\n    return x\n", 4, "@no_type_check"),
+    "no-type-check-on-a-method": (b"from typing import no_type_check\n\n\nclass C:\n"
+                                  b"    @no_type_check\n    def m(self, x):\n        return x\n",
+                                  5, "@no_type_check"),
+    # Neither checker honours it on a class; the gate refuses it anyway.
+    "no-type-check-on-a-class": (b"from typing import no_type_check\n\n\n@no_type_check\n"
+                                 b"class C: ...\n", 4, "@no_type_check"),
     "mypy-ignore-errors": (b"# mypy: ignore-errors\nx = 1\n", 1, "# mypy: ignore-errors"),
     "mypy-setting-after-code": (b"x = 1\n# mypy: no-check-untyped-defs\n", 2,
                                 "# mypy: no-check-untyped-defs"),
@@ -612,6 +630,14 @@ _NOT_LOWERING: dict[str, bytes] = {
     "type-ignore-inside-the-first-statement": b"x = print(  # type: ignore\n    1)\n",
     "utf-8-declared": b"# -*- coding: utf-8 -*-\nx = 1\n",
     "utf-8-declared-without-a-hyphen": b"# coding: UTF8\nx = 1\n",
+    "ascii-declared": b"# -*- coding: ascii -*-\nx = 1\n",
+    "type-ignore-on-a-decorated-class-s-first-decorator": (
+        b"@(lambda c: c)  # type: ignore[misc]\nclass First: ...\n"),
+    "type-ignore-on-a-decorated-async-def-s-first-decorator": (
+        b"@(lambda f: f)  # type: ignore[misc]\nasync def first() -> None: ...\n"),
+    "another-decorator": (b"from functools import cache\n\n\n@cache\ndef f() -> int:\n"
+                          b"    return 1\n"),
+    "no-type-check-in-a-string": b'x = "@no_type_check"\n',
 }
 
 
@@ -643,9 +669,10 @@ def test_mode_lowering_comments_lists_every_kind_in_line_order(
         "a.py:1: # mypy: ignore-errors", "a.py:2: # type: ignore", "a.py:3: # pyright: basic"]
 
 
-# Files the gate cannot read as the checkers do. pyright reads every file as UTF-8 and
-# Python and mypy by its declared encoding, so under another declaration the two can
-# see different comments: one might hide a mode the other applies.
+# Files the gate cannot read as the checkers do. pyright reads every file as UTF-8, and
+# Python and mypy by its declared encoding, so under another declaration they can see
+# different comments: one might hide a mode the other applies. mypy reads the
+# declaration with its own pattern, which takes the last one on a line.
 _UNREADABLE: dict[str, bytes] = {
     "unclosed-string": b'x = """never closed\n',
     "bad-dedent": b"if True:\n        x = 1\n    y = 2\n",
@@ -657,6 +684,13 @@ _UNREADABLE: dict[str, bytes] = {
     "declared-after-a-shebang": b"#!/usr/bin/env python3\n# coding: latin-1\nx = 1\n",
     "declared-after-a-form-feed": b"\x0c# -*- coding: latin-1 -*-\nx = 1\n",
     "an-unknown-encoding-declared": b"# -*- coding: no-such-codec -*-\nx = 1\n",
+    "utf-8-then-shift-jis-declared": b"# coding=utf-8 coding=shift_jis\nx = 1\n",
+    "utf-8-then-an-unknown-codec-declared": b"# coding=utf-8 coding=no-such-codec\nx = 1\n",
+    "utf-8-then-latin-1-declared": (
+        b"# -*- coding: utf-8 -*- vim: set fileencoding=latin-1 :\nx = 1\n"),
+    "a-transform-codec-declared": b"# -*- coding: rot13 -*-\nx = 1\n",
+    "hex-declared": b"# coding: hex\nx = 1\n",
+    "too-deep-to-parse": b"x = " + b"+".join([b"1"] * 10000) + b"\n",
 }
 
 
@@ -691,9 +725,9 @@ def test_no_comment_runs_a_file_below_strict_past_the_gate(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Asks the pyright the gate runs, with the repo's pyrightconfig.json, which of the
     forms above take a file out of strict: the gate must refuse each of them. A
-    `# type: ignore` before the first statement would silence the whole file, which
-    the config turns off, so those must leave the file in strict. An upgraded pyright
-    is re-checked here."""
+    `# type: ignore` before any code would silence the whole file in pyright, but the
+    config turns those comments off, so they must leave the file in strict. An
+    upgraded pyright is re-checked here."""
     assert _PYRIGHT is not None
     shutil.copy(T.ROOT / "pyrightconfig.json", tmp_path / "pyrightconfig.json")
     sources = {**{k: v[0] for k, v in _LOWERING.items()}, **_NOT_LOWERING, "control": b""}
@@ -714,6 +748,37 @@ def test_no_comment_runs_a_file_below_strict_past_the_gate(
     assert sorted(lowered - refused) == []
     # The config turns `# type: ignore` off for pyright, so not even those lower a file.
     assert sorted(k for k in lowered if k.startswith("type-ignore")) == []
+
+
+# Two of the same function, one under `@no_type_check`: lines 10-12 hold the other.
+_NO_TYPE_CHECK_TWINS = (b"from typing import no_type_check\n\n\n"
+                        b"@no_type_check\ndef silenced(x):\n    y: int = 'x'\n    return x\n\n\n"
+                        b"def checked(x):\n    y: int = 'x'\n    return x\n")
+
+
+@pytest.mark.skipif(_PYRIGHT is None or shutil.which("mypy") is None,
+                    reason="pyright (npm ci) or mypy is not installed")
+def test_no_type_check_switches_both_checkers_off_for_a_function(tmp_path: Path) -> None:
+    """Why the gate refuses `@no_type_check`: with the repo's configs, only the twin
+    without it has errors, in pyright and in mypy."""
+    assert _PYRIGHT is not None
+    shutil.copy(T.ROOT / "pyrightconfig.json", tmp_path / "pyrightconfig.json")
+    shutil.copy(T.ROOT / "mypy.ini", tmp_path / "mypy.ini")
+    (tmp_path / "twins.py").write_bytes(_NO_TYPE_CHECK_TWINS)
+    r = subprocess.run([_PYRIGHT, "--outputjson", "twins.py"], cwd=tmp_path,
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode in (0, 1), r.stderr
+    report: dict[str, Any] = json.loads(r.stdout)
+    pyright_lines = {int(d["range"]["start"]["line"]) + 1
+                     for d in report["generalDiagnostics"] if d["severity"] == "error"}
+    m = subprocess.run(["mypy", "--no-error-summary", "--python-executable", sys.executable,
+                        "twins.py"], cwd=tmp_path, capture_output=True, text=True, timeout=600)
+    assert m.returncode in (0, 1), m.stdout + m.stderr
+    mypy_lines = {int(x.group(1)) for x in map(re.compile(r"^twins\.py:(\d+)").match,
+                                                m.stdout.splitlines()) if x}
+    checked = set(range(10, 13))
+    assert pyright_lines and pyright_lines <= checked, pyright_lines
+    assert mypy_lines and mypy_lines <= checked, mypy_lines
 
 
 # Two mypy errors under mypy.ini: one in a typed function, and one in an untyped
@@ -753,3 +818,33 @@ def test_no_comment_silences_a_file_for_mypy_past_the_gate(
     monkeypatch.setattr(T, "ROOT", tmp_path)
     refused = {k for k, name in names.items() if T.mode_lowering_comments([name])}
     assert sorted(lowered - refused) == []
+
+
+# Under shift_jis the bytes C2 83 5C are two characters, the second swallowing the
+# backslash, so the string `_OPEN` starts does not end where it does in UTF-8: it runs
+# to `_CLOSE`.
+_OPEN = '_ = """\u0083\\\\"""\n'.encode()
+_CLOSE = b"_ = '\"\"\"' # '\n"
+
+
+@pytest.mark.skipif(shutil.which("mypy") is None, reason="mypy is not installed")
+def test_mypy_reads_the_last_declaration_on_a_line_where_python_reads_the_first(
+        tmp_path: Path) -> None:
+    """Why the gate also reads the declaration as mypy does: under
+    `# coding=utf-8 coding=shift_jis` Python decodes UTF-8 and sees the code, while mypy
+    decodes shift_jis and reads the code as part of a string."""
+    shutil.copy(T.ROOT / "mypy.ini", tmp_path / "mypy.ini")
+    two = b"# coding=utf-8 coding=shift_jis\n" + _OPEN + _MYPY_BODY + _CLOSE
+    one = b"# coding=utf-8\n" + _OPEN + _MYPY_BODY + _CLOSE
+    (tmp_path / "two.py").write_bytes(two)
+    (tmp_path / "one.py").write_bytes(one)
+    for source in (two, one):   # Python reads each as UTF-8, with the body as code
+        assert tokenize.detect_encoding(io.BytesIO(source).readline)[0] == "utf-8"
+        assert [n.name for n in ast.parse(source.decode()).body
+                if isinstance(n, ast.FunctionDef)] == ["typed", "untyped"]
+    r = subprocess.run(["mypy", "--no-error-summary", "--python-executable", sys.executable,
+                        "two.py", "one.py"], cwd=tmp_path, capture_output=True, text=True,
+                       timeout=600)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    files = [m.group("file") for m in map(_MYPY_ERROR.match, r.stdout.splitlines()) if m]
+    assert files == ["one.py", "one.py"]   # mypy read two.py's body as a string

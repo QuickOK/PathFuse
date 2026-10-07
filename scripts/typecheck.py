@@ -7,13 +7,13 @@ version the baseline was recorded with), else one on PATH, and the output names 
 one that ran. A file may not have more errors from either tool than
 scripts/typecheck-baseline.json records for it, and a file the baseline does
 not list must have none. Fixing errors only lowers the counts: afterwards run
-`scripts/typecheck.py --update-baseline` to record the new floor. A comment that
-lowers one file's checking fails the gate before either checker runs, since the
+`scripts/typecheck.py --update-baseline` to record the new floor. A comment or
+decorator that lowers checking fails the gate before either checker runs, since the
 ratchet alone would pass the drop: a pyright mode below strict, a `# type: ignore`
-before the file's first statement, or a line of mypy settings.
+before the file's first statement, a line of mypy settings, or `@no_type_check`.
 
 Exit 0 when every file is at or under its baseline, 1 when one is above it or a
-comment lowers a file's checking,
+comment or decorator lowers checking,
 2 when there is no verdict to give: a checker is missing, crashes or hangs, git
 cannot list the files, a file cannot be read as the checkers read it, or the baseline
 is not the JSON --update-baseline writes.
@@ -46,14 +46,21 @@ LOWER_MODES = frozenset({"basic", "standard"})
 # which drops U+FEFF too. Python's whitespace covers the rest, and a few more.
 _TRIM = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "\ufeff"
 # A `# type: ignore` on a line before a file's first statement silences all of the file
-# in mypy, and in pyright were its type-ignore comments on. pyright finds one after any
-# `#` in a comment, mypy (through Python's tokenizer) only at its start, each with or
-# without spaces; this finds both.
+# in mypy (pyright's whole-file form, before any code, is off with its type-ignore
+# comments). pyright finds one after any `#` in a comment, mypy (through Python's
+# tokenizer) only at its start, each with or without spaces; this finds both.
 TYPE_IGNORE = re.compile(r"type:[\s\ufeff]*ignore")
 # mypy reads a line that starts `# mypy: ` as settings for its file (`ignore-errors`,
 # `no-check-untyped-defs`, ...), a line inside a string too. Settings belong in mypy.ini,
 # where a reviewer sees them, so the gate refuses every such line, however it is spaced.
 MYPY_SETTINGS = re.compile(r"[ \t]*#[ \t]*mypy:")
+# mypy 1.15 reads a file's declared encoding with its own pattern (find_python_encoding),
+# which takes the last declaration on a line where Python takes the first, and reads
+# none after a byte-order mark.
+MYPY_DECLARATION = re.compile(rb"([ \t\v]*#.*(\r\n?|\n))??[ \t\v]*#.*coding[:=][ \t]*([-\w.]+)")
+# The declared encodings under which Python and mypy read the text pyright reads, which
+# is every file as UTF-8 (ASCII is UTF-8's subset: other bytes fail to decode).
+AS_PYRIGHT_READS = frozenset({"utf-8", "utf-8-sig", "ascii"})
 GIT_TIMEOUT_S = 60        # `git ls-files` takes well under a second
 CHECKER_TIMEOUT_S = 900   # each of pyright and mypy, over the whole repo with a cold cache
 
@@ -200,36 +207,61 @@ def _first_statement_line(tree: ast.Module) -> int | None:
     return first.lineno
 
 
+def _no_type_check_decorators(tree: ast.Module, text: str) -> dict[int, str]:
+    """`@no_type_check` or `@<module>.no_type_check` on any def or class, by line: on a
+    function it switches both checkers off for all of it."""
+    found: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for d in node.decorator_list:
+                name = d.attr if isinstance(d, ast.Attribute) else \
+                    d.id if isinstance(d, ast.Name) else None
+                if name == "no_type_check":
+                    found[d.lineno] = "@" + (ast.get_source_segment(text, d) or name)
+    return found
+
+
 def mode_lowering_comments(files: list[str]) -> list[str]:
-    """`file:line: comment` for each comment that lowers a file's checking where the
+    """`file:line: what` for each comment or decorator that lowers checking where the
     ratchet cannot see it: a pyright mode below strict (see _sets_lower_mode), wherever
     it stands; a `# type: ignore` on a line before the file's first statement as mypy
-    measures it (TYPE_IGNORE); and a line of mypy settings (MYPY_SETTINGS). Python's
-    tokenizer finds the comments, as pyright's does, so one after code counts and text
-    inside a string does not. mypy settings are found line by line, as mypy finds them,
-    strings included. A file that cannot be read is skipped: the checkers report it.
+    measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and
+    `@no_type_check`. Python's tokenizer finds the comments, as pyright's does, so one
+    after code counts and text inside a string does not. mypy settings are found line by
+    line, as mypy finds them, strings included. A file that cannot be read is skipped:
+    the checkers report it.
 
     ValueError, naming the file, when the gate cannot read one as the checkers do: it
-    declares an encoding other than UTF-8 (pyright reads every file as UTF-8, Python and
-    mypy by the declaration), or it does not decode, tokenize or parse."""
+    declares an encoding other than UTF-8, as Python or as mypy reads the declaration
+    (pyright reads every file as UTF-8), or it does not decode, tokenize or parse."""
     found: list[str] = []
     for f in files:
         try:
             with tokenize.open(ROOT / f) as fh:
-                encoding = codecs.lookup(fh.encoding).name
+                declared = [fh.encoding]
                 text = fh.read()
+            raw = (ROOT / f).read_bytes()
         except OSError:
             continue
-        except (SyntaxError, ValueError) as e:   # a bad declaration, or bytes it cannot decode
+        except (SyntaxError, ValueError, LookupError) as e:   # a bad declaration, or bytes
+            raise ValueError(f"{f}: cannot check its comments: {e}") from None   # not in it
+        m = None if raw.startswith(codecs.BOM_UTF8) else MYPY_DECLARATION.match(raw)
+        if m:
+            declared.append(m.group(3).decode("ascii"))
+        try:
+            other = sorted({codecs.lookup(e).name for e in declared} - AS_PYRIGHT_READS)
+        except LookupError as e:
             raise ValueError(f"{f}: cannot check its comments: {e}") from None
-        if encoding not in ("utf-8", "utf-8-sig"):
-            raise ValueError(f"{f}: cannot check its comments: it declares the {encoding} "
-                             f"encoding, and pyright reads every file as UTF-8")
+        if other:
+            raise ValueError(f"{f}: cannot check its comments: it declares the "
+                             f"{' and '.join(other)} encoding, and pyright reads every file "
+                             f"as UTF-8")
         try:
             tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
-            first = _first_statement_line(ast.parse(text, type_comments=True))
-        except (SyntaxError, ValueError, tokenize.TokenError) as e:
+            tree = ast.parse(text, filename=f, type_comments=True)
+        except (SyntaxError, ValueError, RecursionError, tokenize.TokenError) as e:
             raise ValueError(f"{f}: cannot check its comments: {e}") from None
+        first = _first_statement_line(tree)
         hits: dict[int, str] = {}
         for t in tokens:
             if t.type == tokenize.COMMENT and (
@@ -239,6 +271,8 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
         for n, line in enumerate(text.split("\n"), 1):
             if MYPY_SETTINGS.match(line):
                 hits.setdefault(n, line.strip())
+        for n, decorator in _no_type_check_decorators(tree, text).items():
+            hits.setdefault(n, decorator)
         found += [f"{f}:{n}: {hits[n]}" for n in sorted(hits)]
     return found
 
@@ -272,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"typecheck: {e}", file=sys.stderr)
         return 2
     if lowered:
-        print("TYPECHECK FAILED: a comment lowers a file's type checking (remove it):",
+        print("TYPECHECK FAILED: a comment or decorator lowers type checking (remove it):",
               file=sys.stderr)
         for line in lowered:
             print(f"  {line}", file=sys.stderr)
