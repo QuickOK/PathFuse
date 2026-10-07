@@ -1,7 +1,8 @@
-"""Tests for the lint gate (scripts/lint.py)."""
+"""Tests for the lint gate (scripts/lint.py) and the ESLint config it runs with."""
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ L = importlib.util.module_from_spec(_spec)
 _loader.exec_module(L)
 
 ESLINT: Path = L.ESLINT   # the pinned one in node_modules/, whatever ROOT a test sets
+REPO = Path(__file__).resolve().parent.parent   # this checkout, with eslint.config.mjs
 SC_FINDING = ("a.sh:3:1: warning: x appears unused. Verify use (or export if used "
               "externally). [SC2034]\n")
 ES_FINDING = ("\n/repo/ui/app.js\n  1:5  error  'x' is assigned a value but never used  "
@@ -275,6 +277,37 @@ def test_main_exits_2_when_git_cannot_be_run(
         "lint: git could not be run: [Errno 2] No such file or directory: 'git'\n")
 
 
+def _one_js_file() -> tuple[list[str], list[str]]:
+    return [], ["ui/app.js"]
+
+
+@pytest.mark.parametrize("tool", ["git", "eslint"])
+def test_main_exits_2_when_a_tool_cannot_be_executed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str], tool: str) -> None:
+    """A git on PATH with no execute bit raises PermissionError, and an eslint that is no
+    program at all (no #!, not a binary) raises OSError ENOEXEC: OSErrors that are not
+    FileNotFoundError. Each is one line naming the tool, exit 2, not a traceback."""
+    monkeypatch.setattr(L, "shutil", SimpleNamespace(which=_found))
+    if tool == "git":
+        git = tmp_path / "bin/git"
+        git.parent.mkdir()
+        git.write_text("#!/bin/sh\nexit 0\n")
+        git.chmod(0o644)   # no execute bit at all, so execve refuses it, root included
+        monkeypatch.setenv("PATH", str(git.parent))
+        want = "lint: git could not be run: [Errno 13] Permission denied: 'git'\n"
+    else:
+        eslint = tmp_path / "node_modules/.bin/eslint"
+        eslint.parent.mkdir(parents=True)
+        eslint.write_text("not a program\n")
+        eslint.chmod(0o755)
+        monkeypatch.setattr(L, "ESLINT", eslint)
+        monkeypatch.setattr(L, "lint_files", _one_js_file)   # shellcheck has nothing to run
+        want = f"lint: eslint could not be run: [Errno 8] Exec format error: '{eslint}'\n"
+    assert L.main([]) == 2
+    assert capsys.readouterr() == ("", want)
+
+
 def test_main_runs_the_tools_in_the_repo_root_end_to_end(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str]) -> None:
@@ -335,6 +368,52 @@ def test_eslint_report_from_the_real_tool_counts_a_warning(
         report = L.eslint_report(["clean.js", name])
         assert f"{tmp_path / name}\n  1:5  {level}  'unused' is assigned a value but never used" \
             in report, report
+
+
+# eslint.config.mjs itself: the pinned ESLint, run in the repo root as the gate runs it, on
+# probes read from stdin as if they sat at the given paths. Nothing else checks the config:
+# one that lost the recommended rules would let the gate pass any JavaScript at all.
+# ui/: Leaflet's L and the browser globals are known, ES2020's ?? parses, and the
+# recommended rules hold: an unused variable, an unused catch binding, an empty block.
+UI_PROBE = ('"use strict";\n'
+            'const map = L.map("m");\n'
+            'document.title = map.getContainer().id ?? localStorage.getItem("k");\n'
+            'const unused = 1;\n'
+            'try { sessionStorage.clear(); } catch (e) {}\n')
+# tests/js/: CommonJS under node, with node's globals.
+NODE_PROBE = ('const fs = require("fs");\n'
+              'module.exports = { fs, here: __dirname, argv: process.argv };\n')
+
+
+def _lint_stdin(path: str, source: str) -> list[tuple[str | None, str]]:
+    """(rule id, message) for each problem ESLint reports in `source` read as `path`."""
+    r = subprocess.run([str(ESLINT), "--format", "json", "--stdin", "--stdin-filename", path],
+                       cwd=REPO, input=source, capture_output=True, text=True, timeout=300)
+    assert r.returncode in (0, 1), r.stderr
+    results: list[dict[str, Any]] = json.loads(r.stdout)
+    assert len(results) == 1, r.stdout
+    messages: list[dict[str, Any]] = results[0]["messages"]
+    return [(m["ruleId"], m["message"]) for m in messages]
+
+
+@pytest.mark.skipif(not ESLINT.exists(), reason="eslint is not installed (npm ci)")
+@pytest.mark.parametrize("path, source, rules", [
+    ("ui/probe.js", UI_PROBE, ["no-empty", "no-unused-vars", "no-unused-vars"]),
+    ("tests/js/probe.js", NODE_PROBE, []),
+], ids=["ui", "tests-js"])
+def test_repo_eslint_config_applies_the_recommended_rules_with_each_area_s_globals(
+        path: str, source: str, rules: list[str]) -> None:
+    problems = _lint_stdin(path, source)
+    assert sorted(str(rule) for rule, _msg in problems) == rules, problems
+
+
+@pytest.mark.skipif(not ESLINT.exists(), reason="eslint is not installed (npm ci)")
+def test_repo_eslint_config_ignores_ui_vendor() -> None:
+    # Verbatim upstream releases. The gate never names them; the config keeps them out when
+    # ESLint runs another way (npx eslint ., an editor), and says so when one is named.
+    problems = _lint_stdin("ui/vendor/probe.js", "let unused = 1;\n")
+    assert len(problems) == 1 and problems[0][0] is None, problems
+    assert problems[0][1].startswith("File ignored because of a matching ignore pattern"), problems
 
 
 def test_preflight_runs_the_lint_gate() -> None:
