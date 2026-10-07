@@ -1,4 +1,5 @@
 {
-  "typeCheckingMode": "basic",
+  "typeCheckingMode": "strict",
+  "enableTypeIgnoreComments": false,
   "exclude": ["**/__pycache__", ".venv", ".superpowers", "docs", "deploy/out"]
 }

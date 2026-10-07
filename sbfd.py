@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # -- Protocol constants -------------------------------------------------------
 
@@ -371,6 +371,7 @@ def send_packet(sess: Session):
 # -- State file --------------------------------------------------------------
 
 def write_state_file(cfg: DaemonConfig, sessions: list):
+    global _state_publish_broken
     state_path = Path(cfg.state_file)
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,22 +419,23 @@ def write_state_file(cfg: DaemonConfig, sessions: list):
         return
     # A clean write after a failure: announce recovery once, so the log shows a
     # matched broken/recovered pair rather than an unexplained silence.
-    if write_state_file._broken:
+    if _state_publish_broken:
         logging.warning("state publishing recovered: writing %s again", state_path)
-        write_state_file._broken = False
+        _state_publish_broken = False
 
 
 # Tracks whether state publishing is currently failing, so the warnings above
 # fire on the broken->working edges only and never flood at the ~1/s write rate.
-write_state_file._broken = False
+_state_publish_broken = False
 
 
 def _warn_state_publish_broken(what: str, err: Exception):
     """Warn once on the transition into a state-publishing failure."""
-    if not write_state_file._broken:
+    global _state_publish_broken
+    if not _state_publish_broken:
         logging.warning("%s: %s — WAN state is not being published; readers "
                         "will see no fresh state until this recovers", what, err)
-        write_state_file._broken = True
+        _state_publish_broken = True
 
 # -- Optional HTTP /state listener --------------------------------------------
 
@@ -471,8 +473,8 @@ def start_state_listener(cfg: DaemonConfig):
         # pay ~40ms, measurably slower than the handshake it replaced.
         disable_nagle_algorithm = True
 
-        def log_message(self, fmt, *args):
-            logging.debug("state-http %s - %s", self.address_string(), fmt % args)
+        def log_message(self, format: str, *args: Any) -> None:
+            logging.debug("state-http %s - %s", self.address_string(), format % args)
 
         def do_GET(self):
             if self.path != "/state":

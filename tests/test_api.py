@@ -3,6 +3,7 @@ import json
 import threading
 import urllib.request, urllib.error
 from pathlib import Path, PosixPath
+from typing import Any
 
 import pytest
 import sbfd_ctl as M
@@ -1306,7 +1307,7 @@ def test_api_engarde_includes_wan_ifaces(cfg):
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *a):  # keep test output quiet
+        def log_message(self, format: str, *args: Any) -> None:  # keep test output quiet
             pass
 
     stub = HTTPServer(("127.0.0.1", 0), Stub)

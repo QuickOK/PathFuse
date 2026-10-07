@@ -19,4 +19,4 @@ else
   chk "udpspeeder-fec"     "systemctl is-active --quiet udpspeeder-fec"
 fi
 chk "wg0 has a peer"       "[ -n \"\$(wg show wg0 peers)\" ]"
-[ "$fail" = 0 ] && echo "ALL CHECKS PASSED" || { echo "SOME CHECKS FAILED"; exit 1; }
+if [ "$fail" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED"; exit 1; fi

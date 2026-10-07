@@ -20,7 +20,7 @@ const egressLabel = (m) => Object.prototype.hasOwnProperty.call(EGRESS_LABELS, m
       b.classList.toggle("active", active);
       b.setAttribute("aria-selected", active ? "true" : "false");
     });
-    try { localStorage.setItem("sbfd_layout", mode); } catch(e){}
+    try { localStorage.setItem("sbfd_layout", mode); } catch { /* storage blocked: applied but not remembered */ }
   };
   document.querySelectorAll("[data-layout-pick]").forEach(b => {
     b.addEventListener("click", () => apply(b.dataset.layoutPick));
@@ -31,7 +31,6 @@ const egressLabel = (m) => Object.prototype.hasOwnProperty.call(EGRESS_LABELS, m
 let lastApplyAt = 0;
 const dirtyFields = new Set();
 let lastState = null;
-let lastEngarde = null;
 
 const FORM_SELECTOR = 'input[name="mode"], input[name="policy"], input[name="egress_mode"], input[name="fec_mode"], #fec-fixed-ratio, #fec-fixed-custom, #fec-floor-ratio, #fec-floor-custom, input[name="environmental_enabled"], input[name="location_fec_enabled"], input[name="maintenance_enabled"], #maintenance-hour, #master-wan, #persist';
 
@@ -112,14 +111,6 @@ function fmtUptime(secs){
   if (d>0) return `${d}d ${pad(h)}:${pad(m)}:${pad(s)}`;
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
-function fmtBytes(n){
-  if (n == null) return "—";
-  if (n < 1024) return `${n} B`;
-  const u = ["KB","MB","GB","TB"];
-  let v = n/1024, i = 0;
-  while (v >= 1024 && i < u.length-1){ v/=1024; i++; }
-  return `${v.toFixed(v>=10?0:1)} ${u[i]}`;
-}
 
 /* ---------- live clock (browser-local time) + time-in-state ticker (250ms) ---------- */
 setInterval(() => {
@@ -177,7 +168,6 @@ async function fetchEngarde(){
     const r = await fetch("/api/engarde", {cache:"no-store"});
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const s = await r.json();
-    lastEngarde = s;
     renderConsist(s);
   } catch (e){
     renderConsist({ok:false, error:String(e)});
@@ -468,7 +458,7 @@ function renderWanList(s, wans, active, masterWan, dyn){
 
 function renderSignalDiagram(s, wans, active, masterWan){
   const eff = s.effective || {};
-  const W = 600, H = 260;
+  const H = 260;   // #signal-svg's viewBox is 600 x 260 (ui/index.html)
   const clientX = 96, sbfdX = 300, engX = 504;
   const yMid = H / 2;
   const yStep = wans.length > 1 ? Math.min(80, (H-60)/(wans.length+1)) : 0;
@@ -995,7 +985,7 @@ async function seedFecHistory(){
         par_waste_per_s: s.r2c.par_waste_per_s,
       });
     });
-  } catch (e) { /* endpoint absent (older controller): graph starts empty */ }
+  } catch { /* endpoint absent (older controller): graph starts empty */ }
   fecHistSeeded = true;
 }
 

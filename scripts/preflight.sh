@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # PathFuse preflight — run before pushing to the public repo. Blocks anything that would
-# break tests, fail to render, add type errors, or LEAK real infrastructure identifiers / secrets.
+# break tests, fail to render, add type errors or lint findings, or LEAK real infrastructure
+# identifiers / secrets.
 # Used directly (`scripts/preflight.sh`) and by the pre-push hook (scripts/hooks/pre-push).
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)" || exit 1   # repo root
@@ -15,6 +16,9 @@ echo "== deploy render --check =="
 
 echo "== types: pyright + mypy against scripts/typecheck-baseline.json =="
 "$PY" scripts/typecheck.py || fail=1
+
+echo "== lint: shellcheck + eslint =="
+"$PY" scripts/lint.py || fail=1
 
 echo "== gate: no deployment vocabulary =="
 # Scan TRACKED files only (skips .pytest_cache/.venv/out and other local cruft). Exclude the

@@ -22,6 +22,7 @@ import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1207,7 +1208,7 @@ def _serve_once(payload):
             self.end_headers()
             self.wfile.write(b)
 
-        def log_message(self, *a):
+        def log_message(self, format: str, *args: Any) -> None:
             pass
 
     srv = HTTPServer(("127.0.0.1", 0), H)

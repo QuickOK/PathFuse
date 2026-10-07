@@ -9,7 +9,7 @@ deployment consumes this repo via the deploy kit — it does not have its own di
 cd /path/to/PathFuse
 # ... edit code / templates / docs ...
 .venv/bin/python -m pytest -q          # (first time: python3 -m venv .venv && .venv/bin/pip install pytest)
-scripts/preflight.sh                    # tests + render check + types + sanitization + secret scan
+scripts/preflight.sh                    # tests + render check + types + lint + sanitization + secret scan
 git add -A && git commit -m "fix: ..."  # or feat: / docs: / refactor: / test:
 git push origin main
 ```
@@ -20,17 +20,66 @@ git config core.hooksPath scripts/hooks
 ```
 
 ## Type checking
-`scripts/preflight.sh` runs `scripts/typecheck.py`: pyright (basic mode, `pyrightconfig.json`) and
-mypy (`mypy.ini`, check_untyped_defs) over every tracked Python file. No file may have more errors
-than `scripts/typecheck-baseline.json` records, and a file it does not list must have none, so
-new code is held to zero. After fixing errors, run `scripts/typecheck.py --update-baseline` to
-lower the floor. Install once per machine: `sudo npm install -g pyright` and `sudo apt install mypy`.
+`scripts/preflight.sh` runs `scripts/typecheck.py`: pyright in strict mode (`pyrightconfig.json`)
+and mypy (`mypy.ini`, check_untyped_defs) over every tracked Python file. The gate is a per-file
+ratchet: no file may have more errors from either tool than `scripts/typecheck-baseline.json`
+records, and a file it does not list must have none. Strict counts an unannotated parameter or a
+value of unknown type as an error, so new and edited code must be typed, and a new file must be
+clean. When new code has to call a function that is not typed yet, type that function, or
+silence that one line with `# pyright: ignore[<rule>]` and say why in a comment. After fixing
+errors, run `scripts/typecheck.py --update-baseline` to record the lower floor.
+
+The ratchet only stops counts rising, so the gate also refuses these ways of lowering one file's
+checking, before either checker runs:
+- `# pyright: basic` or `# pyright: standard`, wherever pyright would read it: among other
+  operands, or after code on the same line;
+- a `# pyright:` comment that sets a rule below an error for the whole file (`=false`, `=none`,
+  `=warning` or `=information`; the gate counts errors only);
+- a `# type: ignore` before the file's first statement, which mypy reads as silencing all of
+  it;
+- a `# mypy:` line of settings: mypy's settings belong in `mypy.ini`;
+- `@no_type_check`, which switches both checkers off for a whole function, and any other use of
+  `no_type_check` in code (an assignment, a call, an import that renames it), which could make an
+  alias that does the same. The gate goes by the name, so it refuses any use of anything of your
+  own called `no_type_check` too: name it something else.
+
+To silence one line, write `# pyright: ignore[<rule>]` on it and say why beside it. pyright
+disregards `# type: ignore` (`enableTypeIgnoreComments` is off), so a line is silenced for pyright
+only by `# pyright: ignore[<rule>]`, and for mypy by
+`# type: ignore[<code>]`. Tests pin both config files, and refuse a tracked stub (`*.pyi`), which
+would change what the checkers see of a module in every file that imports it: a change to any of
+these is a deliberate one. pyright reads every file as UTF-8, so a file that declares an encoding
+other than UTF-8 or ASCII, as Python or as mypy reads the declaration, gets no verdict (exit 2), as
+does one that does not tokenize or parse.
+
+pyright is the pinned one that `npm ci` installs in `node_modules/` (see Linting below for
+`npm ci`). Without it the gate falls back to a `pyright` on PATH, and its first line says which
+one ran. Install mypy once per machine: `sudo apt install mypy`.
 
 The gate sees tracked files only, so `git add` a new file before running it. `--update-baseline`
 records the counts as they are, higher ones included, so its diff should only lower numbers. The
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
-so after upgrading either tool, re-run `scripts/typecheck.py --update-baseline` and commit the new
-baseline in a commit of its own, with the versions named here updated.
+so after upgrading either tool (pyright: its pin in `package.json`, then `npm install`), re-run
+`scripts/typecheck.py --update-baseline` and commit the new baseline in a commit of its own, with
+the versions named here updated. `tests/test_typecheck.py` asks pyright and mypy which comments
+lower a file's checking, so its run after upgrading either re-checks the gate's rule against it.
+
+## Linting
+`scripts/preflight.sh` also runs `scripts/lint.py`: ShellCheck over every tracked shell script
+(`*.sh`, plus extensionless files with a `sh` or `bash` shebang) and ESLint over the tracked
+JavaScript (`*.js` and `*.mjs`, but not `ui/vendor/`), configured by `eslint.config.mjs`:
+ESLint's recommended rules, no style rules. There is no baseline: any finding fails the gate,
+an ESLint warning included. Run it alone with `scripts/lint.py`; like the type gate it sees
+tracked files only, so `git add` a new script first.
+
+To install: `sudo apt install shellcheck` once per machine, and `npm ci` in the repo root once
+per clone (ESLint 10 needs Node 20.19+, 22.13+ or 24+). `npm ci` installs the versions pinned in
+`package.json` and `package-lock.json` into `node_modules/` (gitignored). The gate runs that
+ESLint only, never one on PATH: Debian's is too old to parse the `??` and `?.` the UI uses.
+
+When a finding is intended, silence that one line and say why in a comment: a
+`# shellcheck disable=SCxxxx` line directly above it, or
+`// eslint-disable-next-line <rule> -- <why>`.
 
 ## The rules the gate enforces (keep the repo public-safe)
 - **Generic vocabulary only.** No deployment-specific names (provider / ISP / host / hardware

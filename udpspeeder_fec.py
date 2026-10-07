@@ -15,6 +15,7 @@ import socket
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import fec_control
 import fec_report
@@ -215,8 +216,8 @@ def start_fec_http(listen, state, stop_event=None):
         # client sits on its delayed-ACK timer. See sbfd.py's state listener.
         disable_nagle_algorithm = True
 
-        def log_message(self, fmt, *args):
-            logging.debug("fec-http %s - %s", self.address_string(), fmt % args)
+        def log_message(self, format: str, *args: Any) -> None:
+            logging.debug("fec-http %s - %s", self.address_string(), format % args)
 
         def _json(self, code, obj):
             body = json.dumps(obj).encode()

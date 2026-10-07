@@ -57,7 +57,8 @@ spool() {
     # as an unprivileged user and reaches this dir via the spool-notify group.
     # On boxes without that group the dir is root:root, so this is 700-equivalent.
     chmod 770 "$SPOOL_DIR" 2>/dev/null
-    local f="${SPOOL_DIR}/$(date +%s)-$$-${RANDOM}.msg"
+    local f
+    f="${SPOOL_DIR}/$(date +%s)-$$-${RANDOM}.msg"
     if { printf 'TS=%s\n' "$(date +%s)"
          printf 'PRIORITY=%s\n' "$PRIORITY"
          printf 'TITLE=%s\n' "$TITLE"

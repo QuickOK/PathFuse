@@ -23,7 +23,7 @@ async function loadRadar() {
       L.tileLayer(j.host + f.path + "/256/{z}/{x}/{y}/2/1_1.png",
                   { opacity: 0, maxZoom: 17 }).addTo(map));
     radarFrame = 0;
-  } catch (e) { /* offline: no radar */ }
+  } catch { /* offline: no radar */ }
 }
 
 function stepRadar() {
@@ -84,7 +84,7 @@ function drawLocation(loc) {
           `${wan}: ${(v.ewma_loss || 0).toFixed(1)}% (${v.passes || 0} passes)`).join("  ")
           + (t.residual != null ? `  residual ${Number(t.residual).toFixed(1)}/s` : "");
         r.bindTooltip(tip);
-      } catch (e) { /* skip this tile, draw the rest */ }
+      } catch { /* skip this tile, draw the rest */ }
     });
     (loc.zones || []).forEach((z) => {
       try {
@@ -113,9 +113,9 @@ function drawLocation(loc) {
           L.DomEvent.stopPropagation(e);
           openEditor(z);
         });
-      } catch (e) { /* skip this zone, draw the rest */ }
+      } catch { /* skip this zone, draw the rest */ }
     });
-  } catch (e) {
+  } catch {
     locationLayer.clearLayers();
   }
 }
@@ -397,8 +397,8 @@ async function postZone(body) {
   // an unusable Content-Length or an oversized body with HTML, and parsing
   // that inside the try above showed the operator "save failed: SyntaxError"
   // while hiding the status that would have explained it.
-  let data = null;
-  try { data = await resp.json(); } catch (e) { data = null; }
+  let data;
+  try { data = await resp.json(); } catch { data = null; }
   if (!resp.ok || !data || !data.ok) {
     // Leave the panel open on a refusal: the operator has to see which field
     // the server rejected, with what they typed still in front of them.
@@ -426,7 +426,7 @@ async function tick() {
   let d;
   try {
     d = await (await fetch("/api/map")).json();
-  } catch (e) { return; }
+  } catch { return; }
   banner(d);
   drawStations(d.stations || [], d.predictions || []);
   drawEnviron(d.environ);
