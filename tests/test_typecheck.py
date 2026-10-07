@@ -465,7 +465,7 @@ def test_main_refuses_a_comment_that_runs_a_file_below_strict(
     assert T.main(argv) == 1
     out, err = capsys.readouterr()
     assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
-    assert err == ("TYPECHECK FAILED: a comment or decorator lowers type checking (remove it):\n"
+    assert err == ("TYPECHECK FAILED: these lines lower type checking (remove what they name):\n"
                    f"  a.py:2: # pyright: {mode}\n")
     assert not log.exists()                        # neither checker ran
     assert not (tmp_path / "baseline.json").exists()
@@ -482,7 +482,7 @@ def test_main_refuses_a_mode_comment_in_an_extensionless_script(
     (tmp_path / "deploy/tool").write_text("#!/usr/bin/env python3\n# pyright: basic\nx = 1\n")
     assert T.main([]) == 1
     assert capsys.readouterr().err == (
-        "TYPECHECK FAILED: a comment or decorator lowers type checking (remove it):\n"
+        "TYPECHECK FAILED: these lines lower type checking (remove what they name):\n"
         "  deploy/tool:2: # pyright: basic\n")
     assert not log.exists()                        # neither checker ran
 
@@ -590,6 +590,10 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
         b"from typing_extensions import no_type_check as ntc\n", 1, "no_type_check as ntc"),
     "no-type-check-assigned": (b"import typing\n\nntc = typing.no_type_check\n", 3,
                                "typing.no_type_check"),
+    "no-type-check-assigned-by-its-bare-name": (
+        b"from typing import no_type_check\n\nntc = no_type_check\n", 3, "no_type_check"),
+    "no-type-check-assigned-after-a-star-import": (
+        b"from typing import *\n\nntc = no_type_check\n", 3, "no_type_check"),
     "no-type-check-called": (b"import typing\n\n\ndef f(x):\n    return x\n\n\n"
                              b"f = typing.no_type_check(f)\n", 8, "typing.no_type_check"),
     "mypy-ignore-errors": (b"# mypy: ignore-errors\nx = 1\n", 1, "# mypy: ignore-errors"),
@@ -732,8 +736,9 @@ def test_mode_lowering_comments_says_which_encoding_a_file_declares(
     (tmp_path / "a.py").write_bytes(source)
     with pytest.raises(ValueError) as e:
         T.mode_lowering_comments(["a.py"])
+    plural = "s" if " and " in named else ""
     assert str(e.value) == (f"a.py: cannot check its comments: it declares the {named} "
-                            "encoding, and pyright reads every file as UTF-8")
+                            f"encoding{plural}, and pyright reads every file as UTF-8")
 
 
 # Four errors from three rules that strict reports and basic and standard do not: a

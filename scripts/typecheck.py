@@ -7,13 +7,13 @@ version the baseline was recorded with), else one on PATH, and the output names 
 one that ran. A file may not have more errors from either tool than
 scripts/typecheck-baseline.json records for it, and a file the baseline does
 not list must have none. Fixing errors only lowers the counts: afterwards run
-`scripts/typecheck.py --update-baseline` to record the new floor. A comment or
-decorator that lowers checking fails the gate before either checker runs, since the
-ratchet alone would pass the drop: a pyright mode below strict, a `# type: ignore`
-before the file's first statement, a line of mypy settings, or a use of `no_type_check`.
+`scripts/typecheck.py --update-baseline` to record the new floor. Anything in a file
+that lowers its checking fails the gate before either checker runs, since the ratchet
+alone would pass the drop: a pyright mode below strict, a `# type: ignore` before the
+file's first statement, a line of mypy settings, or a use of `no_type_check`.
 
-Exit 0 when every file is at or under its baseline, 1 when one is above it or a
-comment or decorator lowers checking,
+Exit 0 when every file is at or under its baseline, 1 when one is above it or
+something in a file lowers its checking,
 2 when there is no verdict to give: a checker is missing, crashes or hangs, git
 cannot list the files, a file cannot be read as the checkers read it, or the baseline
 is not the JSON --update-baseline writes.
@@ -220,19 +220,20 @@ def _no_type_check_uses(tree: ast.Module, text: str) -> dict[int, str]:
         if isinstance(node, ast.alias):
             if node.name == "no_type_check" and node.asname:
                 found.setdefault(node.lineno, ast.get_source_segment(text, node) or node.name)
-        elif isinstance(node, ast.Name) and node.id == "no_type_check" \
-                or isinstance(node, ast.Attribute) and node.attr == "no_type_check":
+        elif ((isinstance(node, ast.Name) and node.id == "no_type_check")
+              or (isinstance(node, ast.Attribute) and node.attr == "no_type_check")):
             segment = ast.get_source_segment(text, node) or "no_type_check"
             found.setdefault(node.lineno, ("@" if id(node) in decorators else "") + segment)
     return found
 
 
 def mode_lowering_comments(files: list[str]) -> list[str]:
-    """`file:line: what` for each comment or decorator that lowers checking where the
+    """`file:line: what` for each thing in a file that lowers its checking where the
     ratchet cannot see it: a pyright mode below strict (see _sets_lower_mode), wherever
     it stands; a `# type: ignore` on a line before the file's first statement as mypy
     measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and a use of
-    `no_type_check`. Python's tokenizer finds the comments, as pyright's does, so one
+    `no_type_check`, matched by that name. Python's tokenizer finds the comments, as
+    pyright's does, so one
     after code counts and text inside a string does not. mypy settings are found line by
     line, as mypy finds them, strings included. A file that cannot be read is skipped:
     the checkers report it.
@@ -263,8 +264,8 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
             raise ValueError(f"{f}: cannot check its comments: {e}") from None
         if other:
             raise ValueError(f"{f}: cannot check its comments: it declares the "
-                             f"{' and '.join(other)} encoding, and pyright reads every file "
-                             f"as UTF-8")
+                             f"{' and '.join(other)} encoding{'s' if len(other) > 1 else ''}, "
+                             f"and pyright reads every file as UTF-8")
         try:
             tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
             tree = ast.parse(text, filename=f, type_comments=True)
@@ -315,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"typecheck: {e}", file=sys.stderr)
         return 2
     if lowered:
-        print("TYPECHECK FAILED: a comment or decorator lowers type checking (remove it):",
+        print("TYPECHECK FAILED: these lines lower type checking (remove what they name):",
               file=sys.stderr)
         for line in lowered:
             print(f"  {line}", file=sys.stderr)
