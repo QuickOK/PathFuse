@@ -2783,6 +2783,15 @@ def test_the_readme_gives_the_units_timeout_and_the_slowest_ticks_sum():
             f"leaving {timeout - slowest} s") in text
 
 
+def test_the_readme_names_both_ways_a_tick_runs_extra_ip_commands():
+    """The timeouts paragraph names both cases that add an `ip` per item past the
+    slowest-tick sum: missing exemption routes, and duplicate preferred defaults
+    that plan_actions deletes before its replace."""
+    text = README.read_text()
+    assert ("or clears duplicate preferred defaults before its replace, runs one more "
+            "`ip` per missing prefix or cleared default") in text
+
+
 def test_the_readme_names_the_deadman_record():
     assert "`/run/relay-egress-watchdog/deadman.json`" in README.read_text()
 
