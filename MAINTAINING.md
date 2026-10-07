@@ -41,9 +41,9 @@ an ESLint warning included. Run it alone with `scripts/lint.py`; like the type g
 tracked files only, so `git add` a new script first.
 
 To install: `sudo apt install shellcheck` once per machine, and `npm ci` in the repo root once
-per clone (Node 20.19 or newer). `npm ci` installs the versions pinned in `package.json` and
-`package-lock.json` into `node_modules/` (gitignored). The gate runs that ESLint only, never one
-on PATH: Debian's is too old to parse the `??` and `?.` the UI uses.
+per clone (ESLint 10 needs Node 20.19+, 22.13+ or 24+). `npm ci` installs the versions pinned in
+`package.json` and `package-lock.json` into `node_modules/` (gitignored). The gate runs that
+ESLint only, never one on PATH: Debian's is too old to parse the `??` and `?.` the UI uses.
 
 When a finding is intended, silence that one line and say why in a comment: a
 `# shellcheck disable=SCxxxx` line directly above it, or
