@@ -37,7 +37,7 @@ def test_parse_observe_cfg_defaults_and_rules():
         {"mode": "relay_backbone", "field": "ip", "values": ["203.0.113.10"]}]}, MODES)
     assert c is not None
     assert c.url == "https://probe.example.net/trace" and c.iface == "wg0"
-    assert (c.interval_s, c.timeout_s, c.mismatch_checks) == (120.0, 8.0, 2)
+    assert (c.interval_s, c.timeout_s, c.mismatch_checks, c.error_checks) == (120.0, 8.0, 2, 3)
     assert c.exits == (E.ExitRule("relay_backbone", "ip", ("203.0.113.10",)),)
 
 
@@ -68,6 +68,11 @@ def test_parse_observe_cfg_off(raw):
     ({"url": "https://x", "exits": [RAW_RULE], "timeout_s": float("inf")}, "timeout_s"),
     ({"url": "https://x", "exits": [RAW_RULE], "timeout_s": "slow"}, "timeout_s"),
     ({"url": "https://x", "exits": [RAW_RULE], "mismatch_checks": 101}, "mismatch_checks"),
+    ({"url": "https://x", "exits": [RAW_RULE], "error_checks": 0}, "error_checks"),
+    ({"url": "https://x", "exits": [RAW_RULE], "error_checks": 101}, "error_checks"),
+    ({"url": "https://x", "exits": [RAW_RULE], "error_checks": "3"}, "error_checks"),
+    ({"url": "https://x", "exits": [RAW_RULE], "error_checks": 2.5}, "error_checks"),
+    ({"url": "https://x", "exits": [RAW_RULE], "error_checks": True}, "error_checks"),
     # a mode that is not a string is a ValueError, not a TypeError out of the set lookup
     ({"url": "https://x", "exits": [{"mode": ["relay_vpn"], "field": "ip", "values": ["1"]}]}, "mode"),
     ({"url": "https://x", "exits": [{"mode": {}, "field": "ip", "values": ["1"]}]}, "mode"),
@@ -79,7 +84,8 @@ def test_parse_observe_cfg_rejects(raw, match):
 
 @pytest.mark.parametrize("key, value", [
     ("interval_s", 5), ("interval_s", 86400), ("timeout_s", 0.5), ("timeout_s", 120),
-    ("mismatch_checks", 1), ("mismatch_checks", 100)])
+    ("mismatch_checks", 1), ("mismatch_checks", 100),
+    ("error_checks", 1), ("error_checks", 100)])
 def test_parse_observe_cfg_accepts_the_bounds(key, value):
     c = E.parse_observe_cfg({"url": "https://x", "exits": [RAW_RULE], key: value}, MODES)
     assert getattr(c, key) == value
@@ -184,6 +190,97 @@ def test_tracker_error_keeps_the_count():
     assert t.status == "mismatch"
 
 
+def _errors(t, n, error="timeout"):
+    for _ in range(n):
+        t.update(None, None, error)
+
+
+def test_tracker_errors_become_failing_at_the_threshold():
+    clk = Clock()
+    t = E.ExitTracker(2, clock=clk)                           # error_checks defaults to 3
+    t.select("relay_backbone")
+    t.update(None, None, "timeout")
+    assert t.status == "error" and t.error == "timeout"
+    clk.t += 120
+    t.update(None, None, "curl rc=28")
+    assert t.status == "error" and t.error == "curl rc=28"
+    clk.t += 120
+    t.update(None, None, "timeout")
+    assert t.status == "failing" and t.error == "timeout" and t.since == clk.t
+    clk.t += 120
+    t.update(None, None, "timeout")
+    assert t.status == "failing" and t.since == clk.t - 120   # still failing, since the third
+
+
+def test_tracker_error_checks_is_the_threshold():
+    t = E.ExitTracker(2, clock=Clock(), error_checks=2)
+    t.select("relay_backbone")
+    t.update(None, None, "timeout")
+    assert t.status == "error"
+    t.update(None, None, "timeout")
+    assert t.status == "failing"
+
+
+@pytest.mark.parametrize("observed, status", [
+    ("relay_backbone", "match"), ("relay_direct", "pending"), ("unknown", "pending")])
+def test_tracker_a_successful_check_resets_the_error_count(observed, status):
+    t = E.ExitTracker(5, clock=Clock(), error_checks=3)
+    t.select("relay_backbone")
+    _errors(t, 2)
+    t.update(observed, "198.51.100.20", None)
+    assert t.status == status and t.error is None
+    _errors(t, 2)
+    assert t.status == "error"                                  # two since the success, not four
+    _errors(t, 1)
+    assert t.status == "failing"
+
+
+def test_tracker_a_confirmed_mismatch_resets_the_error_count():
+    t = E.ExitTracker(1, clock=Clock(), error_checks=2)
+    t.select("relay_backbone")
+    _errors(t, 1)
+    t.update("relay_direct", "198.51.100.20", None)
+    assert t.status == "mismatch"
+    _errors(t, 1)
+    assert t.status == "error"
+
+
+def test_tracker_select_resets_the_error_count():
+    t = E.ExitTracker(2, clock=Clock(), error_checks=3)
+    t.select("relay_backbone")
+    _errors(t, 2)
+    t.select("relay_vpn")
+    assert t.status == "checking" and t.error is None
+    _errors(t, 2)
+    assert t.status == "error"
+    _errors(t, 1)
+    assert t.status == "failing"
+
+
+def test_tracker_skipped_resets_the_error_count():
+    # Leaving local_direct is a select(), which resets the count on its own, so the
+    # reset `skipped` makes is only visible on the counter itself.
+    t = E.ExitTracker(2, clock=Clock(), error_checks=3)
+    t.select("relay_backbone")
+    _errors(t, 2)
+    assert t._errors == 2
+    t.select("local_direct")
+    t._errors = 2                                               # as if select() had not reset it
+    t.update(None, None, None)
+    assert t.status == "skipped" and t._errors == 0
+
+
+def test_tracker_failing_keeps_the_mismatch_count():
+    t = E.ExitTracker(2, clock=Clock(), error_checks=1)
+    t.select("relay_backbone")
+    t.update("relay_direct", "198.51.100.20", None)
+    assert t.status == "pending"
+    _errors(t, 2)
+    assert t.status == "failing"
+    t.update("relay_direct", "198.51.100.20", None)
+    assert t.status == "mismatch"
+
+
 def test_tracker_local_direct_is_skipped():
     t = E.ExitTracker(1, clock=Clock())
     t.select("local_direct")
@@ -245,6 +342,39 @@ def test_check_once_classifies():
     snap = o.snapshot()
     assert calls == [("https://probe.example.net/trace", "wg0", 8.0)]
     assert (snap["status"], snap["observed"], snap["ip"]) == ("match", "relay_backbone", "203.0.113.10")
+
+
+def test_observer_snapshot_carries_the_check_cadence():
+    # The detector sizes its "no exit check for N min" page from these two.
+    cfg = E.ObserveCfg(url=URL, exits=RULES, interval_s=90.0, error_checks=4)
+    o = E.EgressObserver(cfg, fetch=lambda url, iface, t: (None, "timeout"), clock=Clock())
+    snap = o.snapshot()
+    assert (snap["error_checks"], snap["interval_s"]) == (4, 90.0)
+    assert snap["status"] == "checking"                        # the tracker's fields are all there
+
+
+def test_a_bare_observe_cfg_needs_three_errors_in_a_row():
+    # ObserveCfg's own default, for a cfg built without parse_observe_cfg.
+    cfg = E.ObserveCfg(url=URL, exits=RULES)
+    o = E.EgressObserver(cfg, fetch=lambda url, iface, t: (None, "timeout"), clock=Clock())
+    o.set_selected("relay_backbone")
+    seen = []
+    for _ in range(3):
+        o.check_once()
+        seen.append(o.snapshot()["status"])
+    assert seen == ["error", "error", "failing"]
+
+
+def test_check_once_errors_become_failing_after_error_checks():
+    cfg = E.ObserveCfg(url=URL, exits=RULES, error_checks=2)
+    o = E.EgressObserver(cfg, fetch=lambda url, iface, t: (None, "timeout"), clock=Clock())
+    o.set_selected("relay_backbone")
+    seen = []
+    for _ in range(3):
+        o.check_once()
+        seen.append(o.snapshot()["status"])
+    assert seen == ["error", "failing", "failing"]
+    assert o.snapshot()["error"] == "timeout"
 
 
 def test_check_once_skips_the_fetch_in_local_direct():

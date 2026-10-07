@@ -1244,6 +1244,189 @@ def test_egress_none_is_ignored():
     assert d.observe(obs()) == []
 
 
+# -- the exit check failing ------------------------------------------------------------
+#
+# A check that keeps failing says nothing about the exit, so it is paged on its own,
+# with its own kind, and leaves the fallback alert where it was. The observer's
+# snapshot carries the cadence (error_checks, interval_s) the page sizes itself from.
+
+CHECK_FAILING, CHECK_WORKING = "🧭 Egress check failing", "🧭 Egress check working again"
+
+
+def _eg_failing(error: Optional[str] = "timeout", selected: str = "relay_backbone",
+                error_checks: Any = 3, interval_s: Any = 120.0) -> dict:
+    # error_checks and interval_s are Any: some tests feed the page a cadence it
+    # cannot use (None, a string, a bool, NaN) and expect it to page without a span.
+    e = _eg("failing", selected=selected, observed=None, ip=None)
+    e.update(error=error, error_checks=error_checks, interval_s=interval_s)
+    return e
+
+
+def test_egress_check_failing_pages_once_then_working_again():
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=_eg("checking"))) == []          # seed
+    assert d.observe(obs(egress=_eg("error"))) == []             # not yet confirmed
+    evs = d.observe(obs(egress=_eg_failing("timeout")))
+    assert len(evs) == 1 and evs[0].kind == "egress_check" and evs[0].priority == "default"
+    assert evs[0].title == CHECK_FAILING
+    assert evs[0].message == "no exit check for 6 min: timeout"
+    assert evs[0].on_sent is None
+    assert d.observe(obs(egress=_eg_failing("curl rc=28"))) == []   # no repeat
+    assert d.observe(obs(egress=_eg("error"))) == []             # nor on a plain error
+    evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert len(evs) == 1 and evs[0].kind == "egress_check" and evs[0].priority == "default"
+    assert evs[0].title == CHECK_WORKING
+    assert evs[0].message == "the exit check succeeded again"
+    assert evs[0].on_sent is None
+    assert d.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []   # once
+
+
+@pytest.mark.parametrize("success, kinds_out", [
+    pytest.param(_eg("match", observed="relay_backbone"), ["egress_check"], id="match"),
+    pytest.param(_eg("pending"), ["egress_check"], id="pending"),
+    pytest.param(_eg("mismatch"), ["egress_check", "egress"], id="mismatch"),
+])
+def test_egress_check_any_successful_check_is_working_again(success, kinds_out):
+    # A mismatch is a check that worked, so it pages the fallback as well.
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    evs = d.observe(obs(egress=success))
+    assert kinds(evs) == kinds_out and evs[0].title == CHECK_WORKING
+
+
+@pytest.mark.parametrize("egress, message", [
+    pytest.param(_eg_failing("timeout", error_checks=2, interval_s=50.0),
+                 "no exit check for 2 min: timeout", id="rounded-up"),
+    pytest.param(_eg_failing("timeout", error_checks=4, interval_s=20.0),
+                 "no exit check for 1 min: timeout", id="rounded-down"),
+    pytest.param(_eg_failing("curl rc=7: Failed to connect", error_checks=2, interval_s=30),
+                 "no exit check for 1 min: curl rc=7: Failed to connect", id="int-interval"),
+    pytest.param(_eg_failing(None), "no exit check for 6 min: unknown error", id="no-error-text"),
+    pytest.param(_eg_failing("", error_checks=3, interval_s=120.0),
+                 "no exit check for 6 min: unknown error", id="empty-error-text"),
+])
+def test_egress_check_failing_message_names_the_span_and_the_error(egress, message):
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    evs = d.observe(obs(egress=egress))
+    assert len(evs) == 1 and evs[0].message == message
+
+
+@pytest.mark.parametrize("egress", [
+    pytest.param(_eg_failing(error_checks=None, interval_s=None), id="none"),
+    pytest.param(_eg_failing(error_checks="3", interval_s="120"), id="strings"),
+    pytest.param(_eg_failing(error_checks=3, interval_s=float("nan")), id="nan"),
+    pytest.param(_eg_failing(error_checks=True, interval_s=120.0), id="bool"),
+    pytest.param({**_eg("failing", observed=None, ip=None), "error": "timeout"}, id="absent"),
+])
+def test_egress_check_failing_without_a_cadence_still_pages(egress):
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    evs = d.observe(obs(egress=egress))
+    assert len(evs) == 1 and evs[0].title == CHECK_FAILING
+    assert evs[0].message == "no exit check: timeout"
+
+
+def test_egress_check_failing_at_startup_counts_as_announced():
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=_eg_failing())) == []           # seed
+    assert d.observe(obs(egress=_eg_failing())) == []           # announced already
+    evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert _titles(evs) == [CHECK_WORKING]                      # the recovery still reports
+
+
+@pytest.mark.parametrize("first", [
+    pytest.param(_eg("checking"), id="checking"),
+    pytest.param(_eg("error"), id="error"),
+    pytest.param(_eg("match", observed="relay_backbone"), id="match"),
+    pytest.param(_eg("skipped", selected="local_direct"), id="skipped"),
+])
+def test_egress_check_anything_else_at_startup_leaves_the_page_armed(first):
+    d = notify.EventDetector()
+    assert d.observe(obs(egress=first)) == []                    # seed
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+
+
+def test_egress_check_a_mode_change_ends_the_alert_silently():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert d.observe(obs(egress=_eg_checking("relay_direct"))) == []        # the mode changed
+    # The alert was about checks under relay Backbone, so a check that works under
+    # relay Direct is no recovery of it...
+    assert d.observe(obs(egress=_eg("match", selected="relay_direct", observed="relay_direct"))) == []
+    # ...and a failure under relay Direct is a new one.
+    assert _titles(d.observe(obs(egress=_eg_failing(selected="relay_direct")))) == [CHECK_FAILING]
+
+
+def test_egress_check_a_mode_change_straight_to_failing_pages_afresh():
+    # The observer reports `checking` after a change, but the detector may miss that
+    # tick: a `failing` under a new mode ends the old alert and pages its own.
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert _titles(d.observe(obs(egress=_eg_failing(selected="relay_vpn")))) == [CHECK_FAILING]
+
+
+def test_egress_check_skipped_ends_the_alert_silently():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert d.observe(obs(egress=_eg("skipped", selected="local_direct"))) == []
+    assert d.observe(obs(egress=_eg("skipped", selected="local_direct"))) == []
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert d.observe(obs(egress=_eg("match", observed="relay_backbone"))) == []   # nothing stood
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]     # re-armed
+
+
+@pytest.mark.parametrize("quiet", [
+    pytest.param(_eg("error"), id="error"),
+    pytest.param(_eg_checking("relay_backbone"), id="checking-same-mode"),
+])
+def test_egress_check_error_and_checking_leave_the_alert_standing(quiet):
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert d.observe(obs(egress=quiet)) == []
+    assert d.observe(obs(egress=_eg_failing())) == []           # still announced
+    assert _titles(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [CHECK_WORKING]
+
+
+def test_egress_check_failing_leaves_a_standing_fallback_alert_alone():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [FALLBACK]
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]   # not a restore
+    assert d.observe(obs(egress=_eg_failing())) == []
+    # The fallback alert stood throughout: the working check pages no second fallback.
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [CHECK_WORKING]
+    assert _titles(d.observe(obs(egress=_eg("match", observed="relay_backbone")))) == [RESTORED]
+
+
+def test_egress_check_a_fallback_leaves_a_standing_check_alert_where_it_is():
+    # The two alerts are independent: a mismatch ends the check alert only because it
+    # is a check that worked, and a later failing leaves the fallback alert standing.
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [CHECK_WORKING, FALLBACK]
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert d.observe(obs(egress=_eg_failing())) == []            # both stand: nothing to page
+    evs = d.observe(obs(egress=_eg("match", observed="relay_backbone")))
+    assert _titles(evs) == [CHECK_WORKING, RESTORED]
+
+
+def test_egress_check_a_mismatch_under_a_standing_check_alert_pages_both_once():
+    d = notify.EventDetector()
+    d.observe(obs(egress=_eg("checking")))
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [CHECK_WORKING, FALLBACK]
+    assert d.observe(obs(egress=_eg("mismatch"))) == []
+    assert _titles(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert _titles(d.observe(obs(egress=_eg("mismatch")))) == [CHECK_WORKING]
+
+
 # -- an egress alert across a restart -----------------------------------------------
 #
 # With egress_alert_path set, the detector records each fallback it announces and
@@ -1303,6 +1486,30 @@ def _sent(evs):
         if e.on_sent is not None:
             e.on_sent()
     return _titles(evs)
+
+
+def test_egress_check_pages_keep_no_record(tmp_path):
+    # The check alert lives in memory only: a restart re-pages once the failure is
+    # confirmed again, by design. Its pages neither write the record nor remove a
+    # fallback's.
+    path = tmp_path / "egress_alert.json"
+    d = notify.EventDetector(egress_alert_path=str(path))
+    assert d.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert _sent(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert d.drain() and not path.exists()
+    assert _sent(d.observe(obs(egress=_eg("mismatch")))) == [CHECK_WORKING, FALLBACK]
+    assert d.drain() and path.exists()
+    assert _sent(d.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]
+    assert _sent(d.observe(obs(egress=_eg("pending")))) == [CHECK_WORKING]
+    assert d.drain() and _record(path)["selected"] == "relay_backbone"
+    assert d.close()
+    after = notify.EventDetector(egress_alert_path=str(path))   # the restart
+    assert after.observe(obs(egress=_eg_checking("relay_backbone"))) == []
+    assert after.observe(obs(egress=_eg("error"))) == []
+    assert _sent(after.observe(obs(egress=_eg_failing()))) == [CHECK_FAILING]   # paged again
+    # the fallback was recorded, so the check that works pages no second one
+    assert _sent(after.observe(obs(egress=_eg("mismatch")))) == [CHECK_WORKING]
+    assert after.close()
 
 
 def test_egress_a_fallback_announced_before_a_restart_is_not_paged_again(tmp_path):

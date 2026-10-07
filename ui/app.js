@@ -1593,6 +1593,8 @@ function renderEgressActual(s){
       text = "actual: n/a (local direct)"; break;
     case "error":
       text = "actual: unknown (trace failed)"; warn = true; break;
+    case "failing":
+      text = "actual: unknown (check failing" + (at ? ` since ${at}` : "") + ")"; warn = true; break;
     default:
       text = "actual: checking…";
   }
