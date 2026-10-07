@@ -2,6 +2,7 @@ import json
 import pytest
 from pathlib import Path
 
+import egress_observer
 import sbfd_ctl
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -242,6 +243,16 @@ def test_shipped_example_config_keeps_the_egress_alert_record():
     raw = json.loads((ROOT / "config" / "sbfd-ctl.example.json").read_text())
     assert raw["notifications"].get("egress_alert_record") is True
     assert "egress_alert_path" not in raw["notifications"]
+
+
+def test_shipped_example_observe_block_parses_with_its_error_checks():
+    # The example ships with url "" (the check off), so load_config never reads its
+    # observe block: parse it here with a url, so a bad example value is caught.
+    raw = json.loads((ROOT / "config" / "sbfd-ctl.example.json").read_text())
+    observe = dict(raw["egress"]["observe"], url="https://probe.example.net/trace")
+    modes = {r["mode"] for r in observe["exits"]} | {"local_direct"}
+    cfg = egress_observer.parse_observe_cfg(observe, modes)
+    assert cfg is not None and (cfg.error_checks, cfg.mismatch_checks) == (3, 2)
 
 
 def test_load_config_notifications_full(tmp_path: Path):
