@@ -1626,9 +1626,9 @@ function renderKpiExit(s){
       case "match":
         v = observed; t = o.ip ? `matches · ${o.ip}` : "matches"; state = "ok"; break;
       case "pending":
-        v = observed; t = `≠ selected ${selected} (rechecking)`; state = "degraded"; break;
+        v = observed; t = (o.ip ? `${o.ip} · ` : "") + `≠ selected ${selected} (rechecking)`; state = "degraded"; break;
       case "mismatch":
-        v = observed; t = `≠ selected ${selected}` + (at ? ` since ${at}` : ""); state = "degraded"; break;
+        v = observed; t = (o.ip ? `${o.ip} · ` : "") + `≠ selected ${selected}` + (at ? ` since ${at}` : ""); state = "degraded"; break;
       case "skipped":
         v = "n/a"; t = "local direct"; break;
       case "error":
