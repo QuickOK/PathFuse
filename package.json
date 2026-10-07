@@ -1,0 +1,11 @@
+{
+  "name": "pathfuse-dev-tools",
+  "description": "Pinned development tools for PathFuse's preflight gates: ESLint for the UI's JavaScript and pyright for the type gate. Install with `npm ci`; nothing here ships to a node.",
+  "private": true,
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.12.0",
+    "globals": "17.13.0",
+    "pyright": "1.1.414"
+  }
+}

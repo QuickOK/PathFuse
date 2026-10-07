@@ -9,3 +9,4 @@ deploy/values.json
 deploy/out/
 docs/superpowers/
 *.pdf
+node_modules/
