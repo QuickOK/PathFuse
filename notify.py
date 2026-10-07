@@ -255,6 +255,7 @@ class Notifier:
                                else max(0.0, deadline - self._clock()))
                     self._cond.wait(timeout=timeout)
                 stopping = self._stopping and not self._buf
+                batch: list[Event] = []
                 if not stopping:
                     batch = list(self._buf)
                     self._buf.clear()

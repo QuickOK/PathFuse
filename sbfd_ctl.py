@@ -14,7 +14,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import fec_control
 import fec_history
 import fec_report
@@ -3157,8 +3157,8 @@ def start_ui_server(cfg: Config, stop_event: threading.Event, fec_hist=None):
         # slower than it was on HTTP/1.0. See sbfd.py's state listener.
         disable_nagle_algorithm = True
 
-        def log_message(self, fmt, *args):
-            logging.debug("ui %s - %s", self.address_string(), fmt % args)
+        def log_message(self, format: str, *args: Any) -> None:
+            logging.debug("ui %s - %s", self.address_string(), format % args)
 
         def _send_json(self, code: int, obj):
             body = _json.dumps(obj).encode()
@@ -3750,6 +3750,9 @@ def run_controller(cfg: Config, stop_event=None, wire_tracker=None, fec_hist=Non
         # ladder derived from the wrong one.
         fec_ladder = None
         fec_ladder_r2c = None
+        # The active profile's loss table, likewise None until it resolves
+        # below. The fec-at-max check reads it only when cfg.fec is set.
+        prof_table = None
         fec_location_level, fec_location_reason = 0, ""
         # Whether the floor changed the ratio this tick actually sends. With no
         # FEC config there is no ratio to change.
