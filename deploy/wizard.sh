@@ -39,7 +39,9 @@ run_manual(){
   plan_for "$role" "$tgt"
   # Remote steps send LOCAL absolute paths ($SCRIPTS/$HERE) verbatim over ssh, so the
   # remote must have this repo checked out at the same path with values.json present.
-  # Validate that precondition up front instead of failing opaquely mid-run.
+  # Validate that precondition up front instead of failing opaquely mid-run. The paths
+  # expand here, on the client side, on purpose: that is what SC2029 warns about.
+  # shellcheck disable=SC2029
   if [ -n "$tgt" ] && ! ssh "$tgt" "test -d '$SCRIPTS' && test -f '$HERE/values.json'"; then
     echo "ERROR: remote '$tgt' must have this repo checked out at the same path:" >&2
     echo "         $HERE   (with values.json present)." >&2
@@ -61,7 +63,9 @@ run_manual(){
     if [ -n "$tgt" ]; then
       a=$(ask "run on $tgt: $step  ? [y/N]")
       # $tgt is a single quoted argument to ssh (no local shell injection from the
-      # operator-typed target); $step is the fixed remote command string.
+      # operator-typed target); $step is the fixed remote command string, expanded
+      # here on purpose (SC2029 warns about exactly that).
+      # shellcheck disable=SC2029
       case "$a" in y|Y) ssh "$tgt" "$step";; *) echo "skipped";; esac
     else
       a=$(ask "run: $step  ? [y/N]")
