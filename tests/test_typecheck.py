@@ -720,7 +720,7 @@ def test_the_ignore_check_strips_what_node_trims() -> None:
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     trimmed: list[int] = json.loads(r.stdout)
-    assert sorted(map(ord, set(T._JS_TRIM))) == trimmed  # pyright: ignore[reportPrivateUsage]
+    assert sorted(map(ord, set(T._JS_TRIM))) == trimmed
 
 
 @pytest.mark.parametrize("source, line, comment", list(_LOWERING.values()), ids=list(_LOWERING))
