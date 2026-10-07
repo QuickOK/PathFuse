@@ -84,8 +84,10 @@ never forces master/backup). See [`environmental.md`](environmental.md).
   The relay enacts the mode with `deploy/relay/egress/relay-egress-watchdog`.
 - **Actual-exit check:** with `egress.observe` configured, `sbfd-ctl` fetches a `key=value` trace page
   through `wg0` every `interval_s`, classifies the exit with `exits` rules, and publishes
-  `egress_observed`. The UI shows it next to the egress buttons, and ntfy pages when the observed exit
-  disagrees with the selected mode for `mismatch_checks` checks in a row.
+  `egress_observed`. The UI shows it next to the egress buttons and as the Exit KPI tile (so the wall
+  layout, which hides the control panel, shows it too), and ntfy pages when the observed exit
+  disagrees with the selected mode for `mismatch_checks` checks in a row, or when the check itself
+  fails `error_checks` checks in a row.
 
 ## Adaptive FEC
 
