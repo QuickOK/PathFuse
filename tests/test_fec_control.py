@@ -8,8 +8,9 @@ import fec_control as F
 
 @pytest.fixture(autouse=True)
 def _temp_files_in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The helpers here make files with tempfile. Pointing it at this test's tmp_path
-    lets pytest remove them; in the system temp dir every run left its files."""
+    """Two tests here make FIFO directories with tempfile.mkdtemp. Pointing tempfile at
+    this test's tmp_path lets pytest remove them; in the system temp dir every run left
+    its own."""
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 

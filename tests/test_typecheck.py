@@ -664,6 +664,12 @@ _NOT_LOWERING: dict[str, bytes] = {
     "line-ignore": b"x = 1  # pyright: ignore[reportUnknownMemberType]\n",
     "line-ignore-whose-reason-names-a-value": (
         b"x = 1  # pyright: ignore[reportUnknownMemberType]  # debug=false\n"),
+    # pyright trims JavaScript's white space before it looks for `ignore`, so each of
+    # these is a line ignore, whatever follows it (CR and LF would end the comment).
+    **{f"ignore-after-javascript-space-u{ord(c):04x}": (
+        f"# pyright:{c}ignore, reportUnknownMemberType=false\n".encode())
+       for c in "\t\x0b\x0c \xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B)))
+       + "\u2028\u2029\u202f\u205f\u3000\ufeff"},
     "ignore-list": b"# pyright: ignore[reportPrivateUsage, reportUnusedVariable]\n",
     "in-a-string": b'x = "# pyright: basic"\n',
     "in-a-multiline-string": b'"""\n# pyright: basic\n"""\n',
@@ -700,6 +706,21 @@ _NOT_LOWERING: dict[str, bytes] = {
     "no-type-check-imported-but-unused": b"from typing import no_type_check\n",
     "another-decorator-imported-under-the-same-name": b"from functools import cache as ntc\n",
 }
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_ignore_check_strips_what_node_trims() -> None:
+    """_JS_TRIM is exactly the set of UTF-16 code units that the node pyright runs on
+    trims; all of JavaScript's white space is in the BMP."""
+    node = shutil.which("node")
+    assert node is not None
+    r = subprocess.run([node, "-e", "const o = []; for (let c = 0; c <= 0xFFFF; c++) "
+                        "if (String.fromCharCode(c).trim() === '') o.push(c); "
+                        "console.log(JSON.stringify(o))"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    trimmed: list[int] = json.loads(r.stdout)
+    assert sorted(map(ord, set(T._JS_TRIM))) == trimmed  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.parametrize("source, line, comment", list(_LOWERING.values()), ids=list(_LOWERING))
