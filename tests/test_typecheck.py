@@ -1,6 +1,8 @@
 """Tests for the type-check gate (scripts/typecheck.py)."""
+import configparser
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -398,13 +400,28 @@ def test_main_update_baseline_replaces_a_malformed_baseline(tmp_path, monkeypatc
     assert json.loads((tmp_path / "baseline.json").read_text()) == {"a.py": {"pyright": 2}}
 
 
-def test_pyright_runs_in_strict_mode() -> None:
-    """The baseline holds strict counts, and the ratchet only stops counts rising: a
-    lower mode would pass every file under it, so the mode itself is pinned here. So
-    is the setting that stops a `# type: ignore` at the top of a file silencing it."""
+def test_pyright_config_holds_only_strict_and_the_excludes() -> None:
+    """The baseline holds strict counts and the ratchet only stops counts rising, so
+    nothing in the config may lower a file: not the mode, not "ignore" (pyright still
+    counts an ignored file as analyzed, with no errors), not a rule set at the top level
+    or per execution environment. `# type: ignore` stays switched off. Excludes are
+    safe: the gate refuses a run that skips a file it names."""
     config = json.loads((T.ROOT / "pyrightconfig.json").read_text())
-    assert config.get("typeCheckingMode") == "strict"
-    assert config.get("enableTypeIgnoreComments") is False
+    rest = {k: v for k, v in config.items() if k != "exclude"}
+    assert rest == {"typeCheckingMode": "strict", "enableTypeIgnoreComments": False}
+
+
+def test_mypy_config_lowers_no_file() -> None:
+    """mypy.ini holds the settings the baseline's mypy counts were taken with, and no
+    section for one module: one could switch a file's errors off (`ignore_errors`), or
+    its untyped functions' checks, and the ratchet would pass the drop. Its exclude
+    is safe: mypy checks a file named on its command line whatever the exclude says."""
+    config = configparser.ConfigParser()
+    assert config.read(T.ROOT / "mypy.ini") == [str(T.ROOT / "mypy.ini")]
+    assert config.sections() == ["mypy"]
+    assert {k: v for k, v in config["mypy"].items() if k != "exclude"} == {
+        "check_untyped_defs": "True", "ignore_missing_imports": "True",
+        "scripts_are_modules": "True"}
 
 
 def test_main_passes_over_a_pinned_pyright_that_is_not_executable(
@@ -435,10 +452,26 @@ def test_main_refuses_a_comment_that_runs_a_file_below_strict(
     assert T.main(argv) == 1
     out, err = capsys.readouterr()
     assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
-    assert err == ("TYPECHECK FAILED: a comment runs a file below strict mode (remove it):\n"
+    assert err == ("TYPECHECK FAILED: a comment lowers a file's type checking (remove it):\n"
                    f"  a.py:2: # pyright: {mode}\n")
     assert not log.exists()                        # neither checker ran
     assert not (tmp_path / "baseline.json").exists()
+
+
+def test_main_refuses_a_mode_comment_in_an_extensionless_script(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """The gate type-checks the extensionless python scripts, so it reads them for the
+    comment too."""
+    log, _pinned, _path = _gate_over_one_file(tmp_path, monkeypatch, pinned=True, on_path=False)
+    monkeypatch.setattr(T, "python_files", lambda: ["deploy/tool"])
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy/tool").write_text("#!/usr/bin/env python3\n# pyright: basic\nx = 1\n")
+    assert T.main([]) == 1
+    assert capsys.readouterr().err == (
+        "TYPECHECK FAILED: a comment lowers a file's type checking (remove it):\n"
+        "  deploy/tool:2: # pyright: basic\n")
+    assert not log.exists()                        # neither checker ran
 
 
 @pytest.mark.parametrize("argv", [[], ["--update-baseline"]], ids=["check", "update-baseline"])
@@ -458,9 +491,10 @@ def test_main_exits_2_when_a_file_cannot_be_tokenized(
     assert not (tmp_path / "baseline.json").exists()
 
 
-# Comments pyright reads as setting their file's mode below strict, each with its line
-# and the comment as the gate reports it. pyright takes the mode from any operand, and
-# from a comment after code; it trims what JavaScript trims, U+FEFF included.
+# Comments that lower their file's checking, each with its line and the comment as the
+# gate reports it. pyright takes a mode from any operand, and from a comment after code;
+# it trims what JavaScript trims, U+FEFF included. A `# type: ignore` before the first
+# line of code silences the file; mypy reads settings from a `# mypy: ` line anywhere.
 _LOWERING: dict[str, tuple[bytes, int, str]] = {
     "own-line": (b"# pyright: basic\n", 1, "# pyright: basic"),
     "no-spaces": (b"#pyright:standard\n", 1, "#pyright:standard"),
@@ -485,9 +519,26 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
     # pyright keeps these two strict; the gate refuses them anyway.
     "beside-strict": (b"# pyright: strict, basic\n", 1, "# pyright: strict, basic"),
     "after-ignore": (b"# pyright: ignore, standard\n", 1, "# pyright: ignore, standard"),
+    "type-ignore": (b"# type: ignore\nx = 1\n", 1, "# type: ignore"),
+    "type-ignore-a-code": (b"# type: ignore[misc]\nx = 1\n", 1, "# type: ignore[misc]"),
+    "type-ignore-no-spaces": (b"#type:ignore\nx = 1\n", 1, "#type:ignore"),
+    "type-ignore-after-a-shebang": (b"#!/usr/bin/env python3\n# type: ignore\nx = 1\n", 2,
+                                    "# type: ignore"),
+    "type-ignore-after-another-comment": (b"# noqa # type: ignore\nx = 1\n", 1,
+                                          "# noqa # type: ignore"),
+    "type-ignore-in-an-empty-file": (b"# type: ignore\n", 1, "# type: ignore"),
+    "mypy-ignore-errors": (b"# mypy: ignore-errors\nx = 1\n", 1, "# mypy: ignore-errors"),
+    "mypy-setting-after-code": (b"x = 1\n# mypy: no-check-untyped-defs\n", 2,
+                                "# mypy: no-check-untyped-defs"),
+    "mypy-setting-in-a-docstring": (b'"""Doc.\n# mypy: ignore-errors\n"""\n', 2,
+                                    "# mypy: ignore-errors"),
+    # mypy reads neither of these two; the gate refuses them anyway.
+    "mypy-no-spaces": (b"#mypy:ignore-errors\n", 1, "#mypy:ignore-errors"),
+    "mypy-one-code": (b"# mypy: disable-error-code=misc\n", 1,
+                      "# mypy: disable-error-code=misc"),
 }
 
-# What pyright does not read as a lower mode: other directives, and look-alikes.
+# What lowers no file's checking: other directives, line-level ignores, look-alikes.
 _NOT_LOWERING: dict[str, bytes] = {
     "strict": b"# pyright: strict\n",
     "a-rule": b"# pyright: reportUnknownMemberType=false\n",
@@ -505,6 +556,11 @@ _NOT_LOWERING: dict[str, bytes] = {
     "capitalised": b"# Pyright: basic\n",
     "space-before-colon": b"# pyright : basic\n",
     "not-a-mode-name": b"#pyright:basics\n",
+    "type-ignore-on-a-line": b"x = 1  # type: ignore\n",
+    "type-ignore-a-code-on-a-later-line": b"x = 1\ny = 2  # type: ignore[misc]\n",
+    "type-ignore-after-a-docstring": b'"""Doc."""\n# type: ignore\nx = 1\n',
+    "mypy-in-a-string": b'x = "# mypy: ignore-errors"\n',
+    "mypy-in-prose": b"# notes on mypy: none\n",
 }
 
 
@@ -523,6 +579,17 @@ def test_mode_lowering_comments_passes_what_sets_no_lower_mode(
     monkeypatch.setattr(T, "ROOT", tmp_path)
     (tmp_path / "a.py").write_bytes(source)
     assert T.mode_lowering_comments(["a.py", "gone.py"]) == []   # an unreadable file is skipped
+
+
+def test_mode_lowering_comments_lists_every_kind_in_line_order(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """mypy settings are found line by line after the comments are tokenized; the
+    report still runs in line order, and lists each kind."""
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    (tmp_path / "a.py").write_bytes(b"# mypy: ignore-errors\n# type: ignore\n"
+                                    b"x = 1  # pyright: basic\n")
+    assert T.mode_lowering_comments(["a.py"]) == [
+        "a.py:1: # mypy: ignore-errors", "a.py:2: # type: ignore", "a.py:3: # pyright: basic"]
 
 
 @pytest.mark.parametrize("source", [
@@ -557,11 +624,7 @@ def test_no_comment_runs_a_file_below_strict_past_the_gate(
     is re-checked here."""
     assert _PYRIGHT is not None
     shutil.copy(T.ROOT / "pyrightconfig.json", tmp_path / "pyrightconfig.json")
-    sources = {**{k: v[0] for k, v in _LOWERING.items()}, **_NOT_LOWERING,
-               "control": b"",
-               "type-ignore": b"# type: ignore\n",
-               "type-ignore-a-code": b"# type: ignore[misc]\n",
-               "type-ignore-after-a-shebang": b"#!/usr/bin/env python3\n# type: ignore\n"}
+    sources = {**{k: v[0] for k, v in _LOWERING.items()}, **_NOT_LOWERING, "control": b""}
     names = {k: f"v{i}.py" for i, k in enumerate(sources)}
     for k, source in sources.items():
         (tmp_path / names[k]).write_bytes(source + b"\n" + _STRICT_ONLY)
@@ -574,6 +637,44 @@ def test_no_comment_runs_a_file_below_strict_past_the_gate(
         rules.setdefault(Path(str(d["file"])).name, set()).add(str(d.get("rule")))
     lowered = {k for k, name in names.items() if not rules[name] & _STRICT_ONLY_RULES}
     assert "own-line" in lowered and "control" not in lowered   # the probe tells them apart
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    refused = {k for k, name in names.items() if T.mode_lowering_comments([name])}
+    assert sorted(lowered - refused) == []
+    # The config turns `# type: ignore` off for pyright, so not even those lower a file.
+    assert sorted(k for k in lowered if k.startswith("type-ignore")) == []
+
+
+# Two mypy errors under mypy.ini: one in a typed function, and one in an untyped
+# function, which check_untyped_defs checks.
+_MYPY_BODY = (b"def typed() -> int:\n    return 'x'\n\n\n"
+              b"def untyped():\n    y: int = 'x'\n    return y\n")
+_MYPY_BODY_CODES = {"return-value", "assignment"}
+_MYPY_ERROR = re.compile(r"^(?P<file>[^:]+):\d+(?::\d+)?: error: .*\[(?P<code>[a-z-]+)\]$")
+
+
+@pytest.mark.skipif(shutil.which("mypy") is None, reason="mypy is not installed")
+def test_no_comment_silences_a_file_for_mypy_past_the_gate(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Asks mypy, with the repo's mypy.ini, which of the forms above silence one of a
+    file's errors: the gate must refuse each of them."""
+    shutil.copy(T.ROOT / "mypy.ini", tmp_path / "mypy.ini")
+    sources = {**{k: v[0] for k, v in _LOWERING.items()}, **_NOT_LOWERING, "control": b""}
+    names = {k: f"v{i}.py" for i, k in enumerate(sources)}
+    for k, source in sources.items():
+        (tmp_path / names[k]).write_bytes(source + b"\n" + _MYPY_BODY)
+    r = subprocess.run(["mypy", "--no-error-summary", "--python-executable", sys.executable,
+                        *names.values()], cwd=tmp_path, capture_output=True, text=True,
+                       timeout=600)
+    assert r.returncode in (0, 1), r.stdout + r.stderr
+    codes: dict[str, set[str]] = {name: set() for name in names.values()}
+    for line in r.stdout.splitlines():
+        m = _MYPY_ERROR.match(line)
+        if m:
+            codes.setdefault(m.group("file"), set()).add(m.group("code"))
+    lowered = {k for k, name in names.items() if not _MYPY_BODY_CODES <= codes[name]}
+    # The probe tells them apart.
+    assert {"type-ignore", "mypy-ignore-errors", "mypy-setting-in-a-docstring"} <= lowered
+    assert "control" not in lowered
     monkeypatch.setattr(T, "ROOT", tmp_path)
     refused = {k for k, name in names.items() if T.mode_lowering_comments([name])}
     assert sorted(lowered - refused) == []

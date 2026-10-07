@@ -53,7 +53,8 @@ def state_cfg(tmp_path: Path, caplog: pytest.LogCaptureFixture,
     test sees the log from there on."""
     caplog.set_level(logging.WARNING)
     # Restored when the test ends too, so no test leaves the module's flag behind.
-    monkeypatch.setattr(sbfd, "_state_publish_broken", sbfd._state_publish_broken)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(sbfd, "_state_publish_broken",
+                        sbfd._state_publish_broken)  # pyright: ignore[reportPrivateUsage]
     cfg = sbfd.DaemonConfig(state_file=str(tmp_path / "run" / "state.json"))
     _publish(cfg)
     caplog.clear()

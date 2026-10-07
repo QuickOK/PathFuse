@@ -29,12 +29,18 @@ clean. When new code has to call a function that is not typed yet, type that fun
 silence that one line with `# pyright: ignore[<rule>]` and say why in a comment. After fixing
 errors, run `scripts/typecheck.py --update-baseline` to record the lower floor.
 
-The ratchet only stops counts rising, so the gate also refuses a comment that runs a file below
-strict: `# pyright: basic` or `# pyright: standard`, wherever pyright would read it (among other
-operands, or after code on the same line). pyright disregards `# type: ignore`
-(`enableTypeIgnoreComments` is off), since one at the top of a file would silence all of it; a
-`# type: ignore[<code>]` line still silences mypy. A `# pyright:` comment that turns off a named
-rule for a whole file is allowed, because it names what it silences: say why beside it.
+The ratchet only stops counts rising, so the gate also refuses a comment that lowers one file's
+checking, before either checker runs:
+- `# pyright: basic` or `# pyright: standard`, wherever pyright would read it: among other
+  operands, or after code on the same line;
+- a `# type: ignore` before the file's first line of code, which silences all of it for both
+  checkers;
+- a `# mypy:` line of settings: mypy's settings belong in `mypy.ini`.
+
+A `# pyright:` comment that turns off a named rule for a whole file is allowed, because it names
+what it silences: say why beside it. pyright disregards `# type: ignore` (`enableTypeIgnoreComments`
+is off), so a line is silenced for pyright only by `# pyright: ignore[<rule>]`, and for mypy by
+`# type: ignore[<code>]`. Tests pin both config files, so a change to either is a deliberate one.
 
 pyright is the pinned one that `npm ci` installs in `node_modules/` (see Linting below for
 `npm ci`). Without it the gate falls back to a `pyright` on PATH, and its first line says which
