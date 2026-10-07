@@ -1362,8 +1362,9 @@ class EventDetector:
             total_s = checks * interval_s
             span = (f"{max(1, round(total_s / 60))} min" if total_s >= 60
                     else f"{max(1, round(total_s))} s")
+            noun = "check" if checks == 1 else "checks"
             return [Event("egress_check", "🧭 Egress check failing",
-                          f"{checks:g} failed checks in a row (about {span}): {error}",
+                          f"{checks:g} failed {noun} in a row (about {span}): {error}",
                           "default")]
         if status in ("match", "pending", "mismatch") and self._egress_check_failing:
             self._egress_check_failing = False

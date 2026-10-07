@@ -1305,9 +1305,9 @@ def test_egress_check_any_successful_check_is_working_again(success, kinds_out):
                  "2 failed checks in a row (about 1 min): curl rc=7: Failed to connect",
                  id="int-interval"),
     pytest.param(_eg_failing("timeout", error_checks=1, interval_s=5),
-                 "1 failed checks in a row (about 5 s): timeout", id="config-floors"),
+                 "1 failed check in a row (about 5 s): timeout", id="config-floors"),
     pytest.param(_eg_failing("timeout", error_checks=1, interval_s=59.9),
-                 "1 failed checks in a row (about 60 s): timeout", id="just-under-a-minute"),
+                 "1 failed check in a row (about 60 s): timeout", id="just-under-a-minute"),
     pytest.param(_eg_failing("timeout", error_checks=3, interval_s=0.1),
                  "3 failed checks in a row (about 1 s): timeout", id="sub-second-floor"),
     pytest.param(_eg_failing(None), "3 failed checks in a row (about 6 min): unknown error",
@@ -1316,8 +1316,9 @@ def test_egress_check_any_successful_check_is_working_again(success, kinds_out):
                  "3 failed checks in a row (about 6 min): unknown error", id="empty-error-text"),
 ])
 def test_egress_check_failing_message_names_the_threshold_and_the_error(egress, message):
-    # The count is the threshold that fired; the span is a rounded hint, in
-    # minutes from 60 s up and in seconds below, and never "0".
+    # The count is the threshold that fired, one "check" or several "checks"; the
+    # span is a rounded hint, in minutes from 60 s up and in seconds below, and
+    # never "0".
     d = notify.EventDetector()
     d.observe(obs(egress=_eg("checking")))
     evs = d.observe(obs(egress=egress))
