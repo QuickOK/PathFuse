@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 from importlib.machinery import SourceFileLoader
@@ -420,3 +421,41 @@ def test_preflight_runs_the_lint_gate() -> None:
     preflight = (Path(__file__).resolve().parent.parent / "scripts/preflight.sh").read_text()
     assert '\necho "== lint: shellcheck + eslint =="\n"$PY" scripts/lint.py || fail=1\n' \
         in preflight
+
+
+def test_package_json_pins_each_dev_tool_and_the_lockfile_installs_those_versions() -> None:
+    """A pin loosened to a range floats with the next `npm install`, and a lockfile out of
+    step with the pins installs another version: the type baseline's counts are the pinned
+    pyright's, so each dev tool is pinned to one exact version, and the lockfile matches."""
+    pkg: dict[str, Any] = json.loads((REPO / "package.json").read_text())
+    lock: dict[str, Any] = json.loads((REPO / "package-lock.json").read_text())
+    dev: dict[str, str] = pkg["devDependencies"]
+    assert pkg["private"] is True and "dependencies" not in pkg   # dev tools only, never published
+    assert [v for v in dev.values() if not re.fullmatch(r"\d+\.\d+\.\d+", v)] == [], dev
+    packages: dict[str, dict[str, Any]] = lock["packages"]
+    assert packages[""]["devDependencies"] == dev   # the lockfile was made from these pins
+    assert {name: packages[f"node_modules/{name}"]["version"] for name in dev} == dev
+
+
+@pytest.mark.skipif(not ESLINT.exists(), reason="eslint is not installed (npm ci)")
+@pytest.mark.parametrize("path, source, name", [
+    ("ui/probe.js", '"use strict";\nrequire("fs");\n', "require"),   # node's, not the browser's
+    ("tests/js/probe.js", "window.close();\n", "window"),            # the browser's, not node's
+], ids=["ui", "tests-js"])
+def test_repo_eslint_config_reports_a_name_the_area_does_not_define(
+        path: str, source: str, name: str) -> None:
+    """The negative control for the globals tests: with no-undef off, every name passes."""
+    assert _lint_stdin(path, source) == [("no-undef", f"'{name}' is not defined.")]
+
+
+@pytest.mark.skipif(not ESLINT.exists(), reason="eslint is not installed (npm ci)")
+@pytest.mark.parametrize("path, source, problems", [
+    ("ui/probe.js", "new (class { x = 1; })();\n", []),   # ES2022: a class field
+    ("ui/probe.js", 'import "x";\n',                       # a classic script, not a module
+     [(None, "Parsing error: 'import' and 'export' may appear only with 'sourceType: module'")]),
+    ("tests/js/probe.js", "return;\n", []),               # CommonJS: a top-level return
+], ids=["ui-es2022", "ui-script", "tests-js-commonjs"])
+def test_repo_eslint_config_parses_each_area_as_its_runtime_does(
+        path: str, source: str, problems: list[tuple[str | None, str]]) -> None:
+    """ui/ runs as ES2022 classic scripts in the browser, tests/js/ as CommonJS in node."""
+    assert _lint_stdin(path, source) == problems

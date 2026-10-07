@@ -396,3 +396,58 @@ def test_main_update_baseline_replaces_a_malformed_baseline(tmp_path, monkeypatc
     (tmp_path / "baseline.json").write_text('{"a.py": {"pyright": 2}')
     assert T.main(["--update-baseline"]) == 0
     assert json.loads((tmp_path / "baseline.json").read_text()) == {"a.py": {"pyright": 2}}
+
+
+def test_pyright_runs_in_strict_mode() -> None:
+    """The baseline holds strict counts, and the ratchet only stops counts rising: a
+    lower mode would pass every file under it, so the mode itself is pinned here."""
+    config = json.loads((T.ROOT / "pyrightconfig.json").read_text())
+    assert config.get("typeCheckingMode") == "strict"
+
+
+def test_main_passes_over_a_pinned_pyright_that_is_not_executable(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """The pinned pyright is taken only when it is there and executable; one that is
+    there but cannot run is passed over for the one on PATH, and the output says so."""
+    log, pinned_pyright, path_pyright = _gate_over_one_file(tmp_path, monkeypatch,
+                                                            pinned=True, on_path=True)
+    pinned_pyright.chmod(0o644)   # there, but running it would fail with EACCES
+    assert T.main([]) == 0
+    assert log.read_text().splitlines() == [str(path_pyright), str(tmp_path / "bin/mypy")]
+    assert capsys.readouterr() == (
+        f"typecheck: pyright is {path_pyright} from PATH, not the pinned one (run `npm ci`)\n"
+        "TYPECHECK OK (1 files; 0 baseline errors left in 0 files)\n", "")
+
+
+@pytest.mark.parametrize("mode", ["basic", "standard", "off"])
+@pytest.mark.parametrize("argv", [[], ["--update-baseline"]], ids=["check", "update-baseline"])
+def test_main_refuses_a_comment_that_runs_a_file_below_strict(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str], mode: str, argv: list[str]) -> None:
+    """`# pyright: basic` (or standard, or off) takes one file out of strict, and the
+    ratchet passes the drop. The gate refuses it before the checkers run, and before a
+    baseline could record counts strict never saw."""
+    log, _pinned, _path = _gate_over_one_file(tmp_path, monkeypatch, pinned=True, on_path=False)
+    (tmp_path / "a.py").write_text(f'"""A module."""\n  # pyright: {mode}\nx = 1\n')
+    assert T.main(argv) == 1
+    out, err = capsys.readouterr()
+    assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
+    assert err == ("TYPECHECK FAILED: a comment runs a file below strict mode (remove it):\n"
+                   f"  a.py:2: # pyright: {mode}\n")
+    assert not log.exists()                        # neither checker ran
+    assert not (tmp_path / "baseline.json").exists()
+
+
+@pytest.mark.parametrize("text", [
+    "# pyright: strict\n",                                 # raises the mode, if anything
+    "# pyright: reportUnknownMemberType=false\n",          # one rule, not the mode
+    'x = "# pyright: basic"\n',                            # in a string on a code line
+    "x = 1  # pyright: ignore[reportUnknownMemberType]\n",  # a line-level ignore
+    "#pyright:basics\n",                                  # not a mode name
+], ids=["strict", "rule-toggle", "in-a-string", "line-ignore", "not-a-mode"])
+def test_mode_lowering_comments_finds_only_a_lowered_mode(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    (tmp_path / "a.py").write_text(text)
+    assert T.mode_lowering_comments(["a.py", "gone.py"]) == []   # an unreadable file is skipped

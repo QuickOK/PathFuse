@@ -44,13 +44,16 @@ def _publish(cfg: sbfd.DaemonConfig, times: int = 1) -> None:
 
 
 @pytest.fixture
-def state_cfg(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> sbfd.DaemonConfig:
+def state_cfg(tmp_path: Path, caplog: pytest.LogCaptureFixture,
+              monkeypatch: pytest.MonkeyPatch) -> sbfd.DaemonConfig:
     """A config whose state file is tmp_path/run/state.json, publishing known to work.
 
     The broken/working state belongs to the module, so an earlier test may have left
     it broken: a first good write resets it (announcing a recovery if so), and the
     test sees the log from there on."""
     caplog.set_level(logging.WARNING)
+    # Restored when the test ends too, so no test leaves the module's flag behind.
+    monkeypatch.setattr(sbfd, "_state_publish_broken", sbfd._state_publish_broken)  # pyright: ignore[reportPrivateUsage]
     cfg = sbfd.DaemonConfig(state_file=str(tmp_path / "run" / "state.json"))
     _publish(cfg)
     caplog.clear()

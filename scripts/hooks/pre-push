@@ -3,7 +3,9 @@
 # Runs scripts/preflight.sh and blocks the push if any of its checks fails:
 #   tests            the pytest suite
 #   render check     deploy/render.py --check
-#   types            pyright + mypy against scripts/typecheck-baseline.json (scripts/typecheck.py)
+#   types            pyright (strict) + mypy against scripts/typecheck-baseline.json
+#                    (scripts/typecheck.py)
+#   lint             ShellCheck + ESLint over the shell scripts and JavaScript (scripts/lint.py)
 #   vocabulary gate  no deployment-specific names in tracked files
 #   IP gate          every IP literal in tracked files is an RFC-reserved example
 #   secrets gate     no private-key material in tracked files

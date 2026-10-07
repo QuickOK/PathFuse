@@ -29,6 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "scripts/typecheck-baseline.json"
 PYRIGHT = "node_modules/.bin/pyright"   # under ROOT: the pinned one `npm ci` installs
 MYPY_LINE = re.compile(r"^(?P<file>[^:]+):\d+(?::\d+)?: error:")
+# A comment of its own on a line that sets a file's pyright mode below the strict one
+# pyrightconfig.json sets: it would take that file out of strict while the ratchet,
+# which only stops counts rising, passes the drop.
+MODE_LOWERING = re.compile(r"^[ \t]*#[ \t]*pyright:[ \t]*(basic|standard|off)\b", re.MULTILINE)
 GIT_TIMEOUT_S = 60        # `git ls-files` takes well under a second
 CHECKER_TIMEOUT_S = 900   # each of pyright and mypy, over the whole repo with a cold cache
 
@@ -147,6 +151,22 @@ def regressions(current: dict, baseline: dict) -> list[str]:
     return out
 
 
+def mode_lowering_comments(files: list[str]) -> list[str]:
+    """`file:line: comment` for each comment that sets a file's pyright mode below
+    strict (see MODE_LOWERING). A file that cannot be read is skipped: the checkers
+    report it."""
+    found: list[str] = []
+    for f in files:
+        try:
+            text = (ROOT / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in MODE_LOWERING.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            found.append(f"{f}:{line}: {m.group(0).strip()}")
+    return found
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="pyright + mypy gate against a per-file baseline")
     ap.add_argument("--update-baseline", action="store_true",
@@ -169,6 +189,19 @@ def main(argv: list[str] | None = None) -> int:
         # does not read it, so a broken one cannot block that.
         baseline = {} if args.update_baseline else load_baseline(BASELINE)
         files, py = python_files(), _interpreter()
+    except (RuntimeError, ValueError) as e:
+        print(f"typecheck: {e}", file=sys.stderr)
+        return 2
+    # Before the checkers run, and before a baseline is re-recorded: a file run below
+    # strict would record, and then be held to, counts strict never saw.
+    lowered = mode_lowering_comments(files)
+    if lowered:
+        print("TYPECHECK FAILED: a comment runs a file below strict mode (remove it):",
+              file=sys.stderr)
+        for line in lowered:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    try:
         by_tool = {"pyright": pyright_counts(files, py, pyright),
                    "mypy": mypy_counts(files, py)}
     except (RuntimeError, ValueError) as e:
