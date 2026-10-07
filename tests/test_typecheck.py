@@ -574,6 +574,23 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
     "zero-width-no-break-space-after-the-equals": (
         "# pyright: reportUnknownMemberType=\ufefffalse\n".encode(), 1,
         "# pyright: reportUnknownMemberType=\ufefffalse"),
+    # pyright skips a comment as a line ignore only when `ignore` comes first, after
+    # what JavaScript's trim drops; otherwise it applies every operand to the file.
+    "a-rule-off-then-ignore": (b"# pyright: reportUnknownMemberType=false, ignore\n", 1,
+                               "# pyright: reportUnknownMemberType=false, ignore"),
+    "a-rule-off-then-ignore-without-a-space": (
+        b"# pyright: reportUnknownMemberType=false,ignore\n", 1,
+        "# pyright: reportUnknownMemberType=false,ignore"),
+    "a-rule-off-then-a-line-ignore": (
+        b"# pyright: reportUnknownMemberType=false, ignore[reportPrivateUsage]\n", 1,
+        "# pyright: reportUnknownMemberType=false, ignore[reportPrivateUsage]"),
+    "a-rule-off-then-ignore-after-code": (
+        b"x = 1  # pyright: reportUnknownMemberType=false, ignore\n", 1,
+        "# pyright: reportUnknownMemberType=false, ignore"),
+    **{f"ignore-after-python-only-space-u{ord(c):04x}": (
+        f"# pyright: {c}ignore, reportUnknownMemberType=false\n".encode(), 1,
+        f"# pyright: {c}ignore, reportUnknownMemberType=false")
+       for c in "\x1c\x1d\x1e\x1f\x85"},
     "type-ignore": (b"# type: ignore\nx = 1\n", 1, "# type: ignore"),
     "type-ignore-a-code": (b"# type: ignore[misc]\nx = 1\n", 1, "# type: ignore[misc]"),
     "type-ignore-no-spaces": (b"#type:ignore\nx = 1\n", 1, "#type:ignore"),

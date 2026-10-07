@@ -50,6 +50,10 @@ LOWER_RULE_VALUES = frozenset({"false", "none", "warning", "information"})
 # What pyright trims from a comment and from each of its operands: JavaScript's trim,
 # which drops U+FEFF too. Python's whitespace covers the rest, and a few more.
 _TRIM = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "\ufeff"
+# JavaScript's trim alone, without those few more: what pyright strips before it looks
+# for `ignore`. Stripping more there would pass as a line ignore a comment pyright
+# applies to the whole file.
+_JS_TRIM = "".join(c for c in _TRIM if c not in "\x1c\x1d\x1e\x1f\x85")
 # A `# type: ignore` on a line before a file's first statement silences all of the file
 # in mypy (pyright's whole-file form, before any code, is off with its type-ignore
 # comments). pyright finds one after any `#` in a comment, mypy (through Python's
@@ -201,7 +205,7 @@ def _lowers_checking(comment: str) -> bool:
     operands = {op.strip(_TRIM) for op in rest.split(",")}
     if not operands.isdisjoint(LOWER_MODES):
         return True
-    if rest.strip(_TRIM).startswith("ignore"):
+    if rest.strip(_JS_TRIM).startswith("ignore"):
         return False
     values = {value.strip(_TRIM) for _, eq, value in (op.partition("=") for op in operands)
               if eq}
@@ -288,8 +292,8 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
         hits: dict[int, str] = {}
         for t in tokens:
             if t.type == tokenize.COMMENT and (
-                    _lowers_checking(t.string) or TYPE_IGNORE.search(t.string)
-                    and (first is None or t.start[0] < first)):
+                    _lowers_checking(t.string)
+                    or (TYPE_IGNORE.search(t.string) and (first is None or t.start[0] < first))):
                 hits[t.start[0]] = t.string
         for n, line in enumerate(text.split("\n"), 1):
             if MYPY_SETTINGS.match(line):
