@@ -5,9 +5,11 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Callable
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, NoReturn
 
 import pytest
 
@@ -94,15 +96,17 @@ def _fake_run(monkeypatch, stdout, rc=1):
     return calls
 
 
-def test_pyright_counts_errors_per_repo_file(monkeypatch):
+def test_pyright_counts_errors_per_repo_file(monkeypatch: pytest.MonkeyPatch) -> None:
     diags = [{"file": str(T.ROOT / f), "severity": sev} for f, sev in [
         ("a.py", "error"), ("a.py", "error"), ("a.py", "warning"), ("tools/b.py", "error")]]
     calls = _fake_run(monkeypatch, json.dumps({"generalDiagnostics": diags,
                                                "summary": {"filesAnalyzed": 2}}))
-    assert T.pyright_counts(["a.py", "tools/b.py"], "/venv/python") == {"a.py": 2, "tools/b.py": 1}
-    # --outputjson makes the report parseable; cwd picks up pyrightconfig.json.
-    assert calls == [(["pyright", "--outputjson", "--pythonpath", "/venv/python",
-                       "a.py", "tools/b.py"], T.ROOT)]
+    assert T.pyright_counts(["a.py", "tools/b.py"], "/venv/python",
+                            "/repo/node_modules/.bin/pyright") == {"a.py": 2, "tools/b.py": 1}
+    # The pyright given runs; --outputjson makes its report parseable; cwd picks up
+    # pyrightconfig.json.
+    assert calls == [(["/repo/node_modules/.bin/pyright", "--outputjson", "--pythonpath",
+                       "/venv/python", "a.py", "tools/b.py"], T.ROOT)]
 
 
 def test_mypy_counts_errors_per_file_and_ignores_notes(monkeypatch):
@@ -117,16 +121,24 @@ def test_mypy_counts_errors_per_file_and_ignores_notes(monkeypatch):
 
 
 @pytest.mark.parametrize("tool", ["pyright", "mypy"])
-def test_counts_raise_when_the_checker_itself_fails(monkeypatch, tool):
+def test_counts_raise_when_the_checker_itself_fails(monkeypatch: pytest.MonkeyPatch,
+                                                    tool: str) -> None:
     # Exit 2 is a crash or a usage error. mypy's "Duplicate module" lines carry no line
     # number, so read as counts they would pass every file as clean.
     _fake_run(monkeypatch, 'x: error: Duplicate module named "__main__"\n', rc=2)
     with pytest.raises(RuntimeError, match=rf"{tool} failed \(rc=2\)"):
-        getattr(T, f"{tool}_counts")(["a.py"], "python3")
+        if tool == "pyright":
+            T.pyright_counts(["a.py"], "python3", "pyright")
+        else:
+            T.mypy_counts(["a.py"], "python3")
 
 
-@pytest.mark.skipif(shutil.which("pyright") is None, reason="pyright is not installed")
-def test_pyright_counts_refuses_a_run_that_skipped_a_named_file(tmp_path, monkeypatch):
+_PYRIGHT = T.pyright_binary()   # the one the gate runs in this repo; None when there is none
+
+
+@pytest.mark.skipif(_PYRIGHT is None, reason="pyright is not installed (npm ci)")
+def test_pyright_counts_refuses_a_run_that_skipped_a_named_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # pyright silently skips a file named on its command line when the file lies under
     # an `exclude` of pyrightconfig.json; that file must not pass as clean.
     (tmp_path / "pyrightconfig.json").write_text('{"exclude": ["docs"]}\n')
@@ -135,19 +147,27 @@ def test_pyright_counts_refuses_a_run_that_skipped_a_named_file(tmp_path, monkey
         (tmp_path / f).write_text('x: int = "not an int"\n')
     monkeypatch.setattr(T, "ROOT", tmp_path)
     with pytest.raises(RuntimeError, match="checked 1 of 2 files"):
-        T.pyright_counts(["docs/x.py", "top.py"], sys.executable)
+        T.pyright_counts(["docs/x.py", "top.py"], sys.executable, _PYRIGHT)
 
 
-def _stub_gate(monkeypatch, tmp_path, pyright, mypy, baseline=None,
-               files=("a.py", "b.py", "c.py")):
+def _stub_gate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pyright: dict[str, int],
+               mypy: dict[str, int], baseline: dict[str, dict[str, int]] | None = None,
+               files: tuple[str, ...] | None = ("a.py", "b.py", "c.py")) -> None:
     """main() over three files with canned counts and a baseline file in tmp_path.
 
     files=None keeps the real python_files(), and so the `git ls-files` it runs."""
     monkeypatch.setattr(T, "shutil", SimpleNamespace(which=lambda tool: f"/usr/bin/{tool}"))
     if files is not None:
         monkeypatch.setattr(T, "python_files", lambda: list(files))
-    monkeypatch.setattr(T, "pyright_counts", lambda files, py: Counter(pyright))
-    monkeypatch.setattr(T, "mypy_counts", lambda files, py: Counter(mypy))
+
+    def pyright_counts(_files: list[str], _py: str, _pyright: str) -> Counter[str]:
+        return Counter(pyright)
+
+    def mypy_counts(_files: list[str], _py: str) -> Counter[str]:
+        return Counter(mypy)
+
+    monkeypatch.setattr(T, "pyright_counts", pyright_counts)
+    monkeypatch.setattr(T, "mypy_counts", mypy_counts)
     monkeypatch.setattr(T, "BASELINE", tmp_path / "baseline.json")
     if baseline is not None:
         (tmp_path / "baseline.json").write_text(json.dumps(baseline))
@@ -178,8 +198,8 @@ def test_main_fails_above_the_baseline(tmp_path, monkeypatch, capsys, baseline):
     assert "TYPECHECK FAILED" in err and "  c.py: pyright 1 errors (baseline 0)" in err
 
 
-def _raise(exc):
-    def counts(files, py):
+def _raise(exc: Exception) -> Callable[..., NoReturn]:
+    def counts(*args: object) -> NoReturn:
         raise exc
     return counts
 
@@ -190,31 +210,102 @@ def _raise(exc):
     (None, _raise(RuntimeError("pyright failed (rc=3): bad config")), "pyright failed (rc=3)"),
     (None, _raise(ValueError("Expecting value")), "Expecting value"),
 ], ids=["no-pyright", "no-mypy", "crash", "bad-json"])
-def test_main_exits_2_when_a_checker_is_missing_or_crashes(tmp_path, monkeypatch, capsys,
-                                                         missing, pyright, msg):
+def test_main_exits_2_when_a_checker_is_missing_or_crashes(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        missing: str | None, pyright: Callable[..., NoReturn] | None, msg: str) -> None:
     _stub_gate(monkeypatch, tmp_path, pyright={}, mypy={})
-    monkeypatch.setattr(T, "shutil", SimpleNamespace(
-        which=lambda tool: None if tool == missing else f"/usr/bin/{tool}"))
+
+    def which(tool: str) -> str | None:   # the pinned pyright is "pyright" too
+        return None if Path(tool).name == missing else f"/usr/bin/{tool}"
+
+    monkeypatch.setattr(T, "shutil", SimpleNamespace(which=which))
     if pyright is not None:
         monkeypatch.setattr(T, "pyright_counts", pyright)
     assert T.main([]) == 2
     assert msg in capsys.readouterr().err
 
 
+_CLEAN = json.dumps({"generalDiagnostics": [], "summary": {"filesAnalyzed": 1}})
+
+
+def _stand_in(path: Path, log: Path, stdout: str = "") -> None:
+    """An executable at `path` that appends the path it was run as to `log`, then prints
+    `stdout` and exits 0."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\necho \"$0\" >> '{log}'\nprintf '%s' '{stdout}'\n")
+    path.chmod(0o755)
+
+
+def _gate_over_one_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                        pinned: bool, on_path: bool) -> tuple[Path, Path, Path]:
+    """main() in a repo at tmp_path over one clean file, with real processes: stand-ins
+    for the pinned pyright (when `pinned`), a pyright on PATH (when `on_path`) and mypy,
+    PATH holding only their bin/.
+
+    Returns the log each stand-in appends its path to when run, and the two pyrights'
+    paths."""
+    log, bin_dir = tmp_path / "ran", tmp_path / "bin"
+    pinned_pyright, path_pyright = tmp_path / "node_modules/.bin/pyright", bin_dir / "pyright"
+    for pyright, present in [(pinned_pyright, pinned), (path_pyright, on_path)]:
+        if present:
+            _stand_in(pyright, log, _CLEAN)
+    _stand_in(bin_dir / "mypy", log)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    monkeypatch.setattr(T, "BASELINE", tmp_path / "baseline.json")
+    monkeypatch.setattr(T, "python_files", lambda: ["a.py"])
+    return log, pinned_pyright, path_pyright
+
+
+@pytest.mark.parametrize("pinned, on_path", [(True, True), (True, False), (False, True)],
+                         ids=["pinned-and-path", "pinned-only", "path-only"])
+def test_main_runs_the_pinned_pyright_else_the_one_on_path_and_says_which(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        pinned: bool, on_path: bool) -> None:
+    """The pinned pyright (node_modules/.bin/, from `npm ci`) is the version the baseline
+    was recorded with, so it wins over one on PATH; that one is the fallback, and the
+    output names the one that ran."""
+    log, pinned_pyright, path_pyright = _gate_over_one_file(tmp_path, monkeypatch,
+                                                            pinned, on_path)
+    assert T.main([]) == 0
+    ran = pinned_pyright if pinned else path_pyright
+    assert log.read_text().splitlines() == [str(ran), str(tmp_path / "bin/mypy")]
+    says = ("typecheck: pyright is node_modules/.bin/pyright, the pinned one\n" if pinned else
+            f"typecheck: pyright is {path_pyright} from PATH, not the pinned one "
+            f"(run `npm ci`)\n")
+    assert capsys.readouterr() == (
+        says + "TYPECHECK OK (1 files; 0 baseline errors left in 0 files)\n", "")
+
+
+def test_main_exits_2_and_names_npm_ci_when_there_is_no_pyright(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
+    """Neither the pinned pyright nor one on PATH: no verdict, and nothing runs."""
+    log, _pinned, _path = _gate_over_one_file(tmp_path, monkeypatch,
+                                              pinned=False, on_path=False)
+    assert T.main([]) == 2
+    assert capsys.readouterr() == ("", "typecheck: pyright is not installed (run `npm ci` "
+                                       "in the repo root; see MAINTAINING.md)\n")
+    assert not log.exists()
+
+
 @pytest.mark.parametrize("tool", ["git", "pyright", "mypy"])
-def test_main_exits_2_and_names_a_tool_that_hangs(tmp_path, monkeypatch, capsys, tool):
+def test_main_exits_2_and_names_a_tool_that_hangs(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        tool: str) -> None:
     """Each tool runs with a time limit, so a hung one cannot stall preflight."""
     order, limit = ["git", "pyright", "mypy"], {"git": 60, "pyright": 900, "mypy": 900}
     (tmp_path / "a.py").write_text("")
-    limits = {}
+    limits: dict[str, float | None] = {}
 
-    def run(argv, **kw):
-        limits[argv[0]] = kw.get("timeout")
-        if argv[0] == tool:
+    def run(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        name = Path(argv[0]).name   # pyright runs by its path in node_modules/.bin/
+        limits[name] = kw.get("timeout")
+        if name == tool:
             raise subprocess.TimeoutExpired(argv, kw["timeout"])
         out = {"git": "a.py\0", "mypy": "",
                "pyright": json.dumps({"generalDiagnostics": [], "summary": {"filesAnalyzed": 1}})}
-        return subprocess.CompletedProcess(argv, 0, out[argv[0]], "")
+        return subprocess.CompletedProcess(argv, 0, out[name], "")
 
     monkeypatch.setattr(T, "ROOT", tmp_path)
     monkeypatch.setattr(T, "BASELINE", tmp_path / "baseline.json")   # main() reads it first
@@ -278,13 +369,15 @@ def test_main_exits_2_when_git_cannot_be_executed(tmp_path, monkeypatch, capsys)
     (b'{"a.py": {"pyright": -1}}', "is not a {file: {tool: error count}} map"),
 ], ids=["truncated", "not-utf8", "a-list", "row-a-number", "count-a-string", "count-a-bool",
         "count-negative"])
-def test_main_exits_2_on_a_malformed_baseline(tmp_path, monkeypatch, capsys, raw, problem):
+def test_main_exits_2_on_a_malformed_baseline(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+        raw: bytes, problem: str) -> None:
     """One line naming the file, not a traceback, and not a verdict from counts that are
     not counts. The baseline is read first, so a broken one costs no checker run."""
     _stub_gate(monkeypatch, tmp_path, pyright={}, mypy={})
-    ran = []
+    ran: list[list[str]] = []
 
-    def pyright_counts(files, py):
+    def pyright_counts(files: list[str], py: str, pyright: str) -> Counter[str]:
         ran.append(files)
         return Counter({"a.py": 2})
 

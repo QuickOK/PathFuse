@@ -2,7 +2,9 @@
 """Type-check gate: pyright and mypy over every tracked Python file, against a baseline.
 
 pyright runs in the "basic" mode of pyrightconfig.json; mypy runs with mypy.ini
-(check_untyped_defs). A file may not have more errors from either tool than
+(check_untyped_defs). The pyright is the one `npm ci` pins in node_modules/.bin/ (the
+version the baseline was recorded with), else one on PATH, and the output names the
+one that ran. A file may not have more errors from either tool than
 scripts/typecheck-baseline.json records for it, and a file the baseline does
 not list must have none. Fixing errors only lowers the counts: afterwards run
 `scripts/typecheck.py --update-baseline` to record the new floor.
@@ -25,6 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "scripts/typecheck-baseline.json"
+PYRIGHT = "node_modules/.bin/pyright"   # under ROOT: the pinned one `npm ci` installs
 MYPY_LINE = re.compile(r"^(?P<file>[^:]+):\d+(?::\d+)?: error:")
 GIT_TIMEOUT_S = 60        # `git ls-files` takes well under a second
 CHECKER_TIMEOUT_S = 900   # each of pyright and mypy, over the whole repo with a cold cache
@@ -35,12 +38,13 @@ def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
 
     RuntimeError, naming the tool, if it cannot be started or hangs.
     """
+    tool = Path(argv[0]).name
     try:
         return subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"{argv[0]} timed out after {timeout:g} s") from None
+        raise RuntimeError(f"{tool} timed out after {timeout:g} s") from None
     except OSError as e:   # not installed, or not executable
-        raise RuntimeError(f"{argv[0]} could not be run: {e}") from None
+        raise RuntimeError(f"{tool} could not be run: {e}") from None
 
 
 def python_files() -> list[str]:
@@ -72,8 +76,17 @@ def _interpreter() -> str:
     return str(venv) if venv.exists() else sys.executable
 
 
-def pyright_counts(files: list[str], py: str) -> Counter[str]:
-    r = _run(["pyright", "--outputjson", "--pythonpath", py, *files], CHECKER_TIMEOUT_S)
+def pyright_binary() -> str | None:
+    """The pyright to run: the pinned one in node_modules/.bin/ when it is there, else
+    one on PATH; None when there is neither."""
+    pinned = ROOT / PYRIGHT
+    if shutil.which(str(pinned)) is not None:   # there, and executable
+        return str(pinned)
+    return shutil.which("pyright")
+
+
+def pyright_counts(files: list[str], py: str, pyright: str) -> Counter[str]:
+    r = _run([pyright, "--outputjson", "--pythonpath", py, *files], CHECKER_TIMEOUT_S)
     if r.returncode not in (0, 1):
         raise RuntimeError(f"pyright failed (rc={r.returncode}): {r.stderr.strip()[:300]}")
     report = json.loads(r.stdout)
@@ -139,16 +152,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--update-baseline", action="store_true",
                     help="record the current per-file counts as the new baseline")
     args = ap.parse_args(argv)
-    for tool in ("pyright", "mypy"):
-        if shutil.which(tool) is None:
-            print(f"typecheck: {tool} is not installed (see MAINTAINING.md)", file=sys.stderr)
-            return 2
+    pyright = pyright_binary()
+    if pyright is None:
+        print("typecheck: pyright is not installed (run `npm ci` in the repo root; "
+              "see MAINTAINING.md)", file=sys.stderr)
+        return 2
+    if shutil.which("mypy") is None:
+        print("typecheck: mypy is not installed (see MAINTAINING.md)", file=sys.stderr)
+        return 2
+    if pyright == str(ROOT / PYRIGHT):
+        print(f"typecheck: pyright is {PYRIGHT}, the pinned one")
+    else:
+        print(f"typecheck: pyright is {pyright} from PATH, not the pinned one (run `npm ci`)")
     try:
         # Read first, so a broken baseline costs no run of the checkers. Re-recording
         # does not read it, so a broken one cannot block that.
         baseline = {} if args.update_baseline else load_baseline(BASELINE)
         files, py = python_files(), _interpreter()
-        by_tool = {"pyright": pyright_counts(files, py), "mypy": mypy_counts(files, py)}
+        by_tool = {"pyright": pyright_counts(files, py, pyright),
+                   "mypy": mypy_counts(files, py)}
     except (RuntimeError, ValueError) as e:
         print(f"typecheck: {e}", file=sys.stderr)
         return 2
