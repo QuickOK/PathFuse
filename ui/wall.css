@@ -841,8 +841,10 @@ body[data-layout="wall"] .kpi-value.mono { font-size: 28px; }
 body[data-layout="wall"] .wan-name       { font-size: 20px; }
 body[data-layout="wall"] .meter-val      { font-size: 22px; }
 body[data-layout="wall"] .panel          { padding: 22px 26px; }
-/* The Exit tile is the wall's only view of the actual exit: its sub-line wraps
-   there instead of ellipsising, so no wall width cuts the reason or the ip. */
+/* The Exit tile is the wall's only view of the actual exit: its value and its
+   sub-line wrap there instead of ellipsising, so no wall width cuts the exit's
+   name, the reason or the ip. */
+body[data-layout="wall"] #kpi-exit-val   { white-space: normal; overflow-wrap: anywhere; }
 body[data-layout="wall"] #kpi-exit-sub   { white-space: normal; overflow-wrap: anywhere; }
 
 /* ---------- responsive ---------- */

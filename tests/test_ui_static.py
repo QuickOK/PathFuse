@@ -2,6 +2,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 UI = Path(__file__).resolve().parent.parent / "ui"
 
 
@@ -17,12 +19,14 @@ def test_kpi_strip_has_a_column_per_tile():
     assert int(m.group(1)) == len(tiles)
 
 
-def test_the_wall_lets_the_exit_tiles_sub_line_wrap():
+@pytest.mark.parametrize("element", ["kpi-exit-val", "kpi-exit-sub"])
+def test_the_wall_lets_the_exit_tile_wrap(element):
     # The wall layout hides the control panel, so the Exit tile is its only view of the
-    # actual exit: at wall widths under ~1500 px an ellipsised sub-line would cut the end
-    # of the reason ("since 20:4…"), so in that layout the line wraps instead.
+    # actual exit: at wall widths under ~1460 px an ellipsis would cut the exit's name
+    # ("relay Back…") and, under ~1500 px, the end of the reason ("since 20:4…"), so in
+    # that layout the value and the sub-line wrap instead.
     css = (UI / "wall.css").read_text()
-    m = re.search(r'\nbody\[data-layout="wall"\] #kpi-exit-sub\s*\{([^}]*)\}', css)
-    assert m, "the wall layout no longer has a rule for the Exit tile's sub-line"
+    m = re.search(r'\nbody\[data-layout="wall"\] #' + element + r'\s*\{([^}]*)\}', css)
+    assert m, f"the wall layout no longer has a rule for #{element}"
     assert re.search(r"white-space:\s*normal", m.group(1)), m.group(1)
     assert re.search(r"overflow-wrap:\s*anywhere", m.group(1)), m.group(1)
