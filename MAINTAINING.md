@@ -9,7 +9,7 @@ deployment consumes this repo via the deploy kit — it does not have its own di
 cd /path/to/PathFuse
 # ... edit code / templates / docs ...
 .venv/bin/python -m pytest -q          # (first time: python3 -m venv .venv && .venv/bin/pip install pytest)
-scripts/preflight.sh                    # tests + render check + types + sanitization + secret scan
+scripts/preflight.sh                    # tests + render check + types + lint + sanitization + secret scan
 git add -A && git commit -m "fix: ..."  # or feat: / docs: / refactor: / test:
 git push origin main
 ```
@@ -31,6 +31,23 @@ records the counts as they are, higher ones included, so its diff should only lo
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
 so after upgrading either tool, re-run `scripts/typecheck.py --update-baseline` and commit the new
 baseline in a commit of its own, with the versions named here updated.
+
+## Linting
+`scripts/preflight.sh` also runs `scripts/lint.py`: ShellCheck over every tracked shell script
+(`*.sh`, plus extensionless files with a `sh` or `bash` shebang) and ESLint over the tracked
+JavaScript (`*.js` and `*.mjs`, but not `ui/vendor/`), configured by `eslint.config.mjs`:
+ESLint's recommended rules, no style rules. There is no baseline: any finding fails the gate,
+an ESLint warning included. Run it alone with `scripts/lint.py`; like the type gate it sees
+tracked files only, so `git add` a new script first.
+
+To install: `sudo apt install shellcheck` once per machine, and `npm ci` in the repo root once
+per clone (Node 20.19 or newer). `npm ci` installs the versions pinned in `package.json` and
+`package-lock.json` into `node_modules/` (gitignored). The gate runs that ESLint only, never one
+on PATH: Debian's is too old to parse the `??` and `?.` the UI uses.
+
+When a finding is intended, silence that one line and say why in a comment: a
+`# shellcheck disable=SCxxxx` line directly above it, or
+`// eslint-disable-next-line <rule> -- <why>`.
 
 ## The rules the gate enforces (keep the repo public-safe)
 - **Generic vocabulary only.** No deployment-specific names (provider / ISP / host / hardware
