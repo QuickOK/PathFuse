@@ -1309,6 +1309,8 @@ def test_egress_check_any_successful_check_is_working_again(success, kinds_out):
                  "1 failed check in a row (about 5 s): timeout", id="config-floors"),
     pytest.param(_eg_failing("timeout", error_checks=1, interval_s=59.9),
                  "1 failed check in a row (about 60 s): timeout", id="just-under-a-minute"),
+    pytest.param(_eg_failing("timeout", error_checks=1, interval_s=120.0),
+                 "1 failed check in a row (about 2 min): timeout", id="one-check-in-minutes"),
     pytest.param(_eg_failing("timeout", error_checks=3, interval_s=0.1),
                  "3 failed checks in a row (about 1 s): timeout", id="sub-second-floor"),
     pytest.param(_eg_failing(None), "3 failed checks in a row (about 6 min): unknown error",

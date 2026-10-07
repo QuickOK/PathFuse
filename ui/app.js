@@ -1607,8 +1607,9 @@ function renderEgressActual(s){
 
 /* The same check as a KPI tile, so the wall layout (which hides the control
    panel and the line above) shows the actual exit too. A sub-line names the
-   reason before the ip: .kpi-sub ellipsises on overflow, so a narrow tile
-   cuts the ip, never the reason, and the title keeps the whole line on hover. */
+   reason before the ip: in the ops layout .kpi-sub ellipsises on overflow, so
+   a narrow tile cuts the end of the line first, the ip before the reason, and
+   the title keeps the whole line on hover; in the wall layout the line wraps. */
 function renderKpiExit(s){
   const el  = $("#kpi-exit");
   const val = $("#kpi-exit-val");
