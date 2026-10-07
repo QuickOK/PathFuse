@@ -105,8 +105,9 @@ tile("match", snap("match", {observed: B}), "relay Backbone", `matches · ${IP}`
 tile("match, ip null", snap("match", {observed: B, ip: null}), "relay Backbone", "matches", "ok");
 
 // pending and mismatch name the reason first and the address last, so where the
-// tile is too narrow the ellipsis cuts the address, never the reason. Without an
-// address there is no separator and no placeholder.
+// ops tile is too narrow its ellipsis cuts the address before the reason (the wall
+// layout wraps the line instead). Without an address there is no separator and no
+// placeholder.
 const IPS = [["an ip", IP], ["ip null", null], ['ip ""', ""], ["ip undefined", undefined],
              ["no ip field", ABSENT]];
 const SINCES = [["since", SINCE], ["since null", null], ["no since field", ABSENT]];
