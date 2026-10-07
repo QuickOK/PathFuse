@@ -7,11 +7,14 @@ version the baseline was recorded with), else one on PATH, and the output names 
 one that ran. A file may not have more errors from either tool than
 scripts/typecheck-baseline.json records for it, and a file the baseline does
 not list must have none. Fixing errors only lowers the counts: afterwards run
-`scripts/typecheck.py --update-baseline` to record the new floor.
+`scripts/typecheck.py --update-baseline` to record the new floor. A comment that sets
+a file's pyright mode below strict fails the gate before either checker runs, since
+the ratchet alone would pass the drop.
 
 Exit 0 when every file is at or under its baseline, 1 when one is above it,
 2 when there is no verdict to give: a checker is missing, crashes or hangs, git
-cannot list the files, or the baseline is not the JSON --update-baseline writes.
+cannot list the files, a file cannot be tokenized, or the baseline is not the JSON
+--update-baseline writes.
 Each checker and git run with a time limit, so a hung tool cannot stall preflight.
 """
 from __future__ import annotations
@@ -22,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tokenize
 from collections import Counter
 from pathlib import Path
 
@@ -29,10 +33,13 @@ ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "scripts/typecheck-baseline.json"
 PYRIGHT = "node_modules/.bin/pyright"   # under ROOT: the pinned one `npm ci` installs
 MYPY_LINE = re.compile(r"^(?P<file>[^:]+):\d+(?::\d+)?: error:")
-# A comment of its own on a line that sets a file's pyright mode below the strict one
-# pyrightconfig.json sets: it would take that file out of strict while the ratchet,
-# which only stops counts rising, passes the drop.
-MODE_LOWERING = re.compile(r"^[ \t]*#[ \t]*pyright:[ \t]*(basic|standard|off)\b", re.MULTILINE)
+# The modes below strict that a `# pyright:` comment can set for its own file. Such a
+# comment takes the file out of the strict mode pyrightconfig.json sets, and the
+# ratchet, which only stops counts rising, would pass the drop.
+LOWER_MODES = frozenset({"basic", "standard"})
+# What pyright trims from a comment and from each of its operands: JavaScript's trim,
+# which drops U+FEFF too. Python's whitespace covers the rest, and a few more.
+_TRIM = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "\ufeff"
 GIT_TIMEOUT_S = 60        # `git ls-files` takes well under a second
 CHECKER_TIMEOUT_S = 900   # each of pyright and mypy, over the whole repo with a cold cache
 
@@ -151,19 +158,41 @@ def regressions(current: dict, baseline: dict) -> list[str]:
     return out
 
 
+def _sets_lower_mode(comment: str) -> bool:
+    """Whether pyright reads `comment` (a comment token, `#` included) as setting its
+    file's mode below strict. As pyright 1.1.414 reads one: the text after `#`, trimmed,
+    starts with `pyright:`, and the rest splits on commas into operands, any one of
+    which, trimmed, can name the mode. pyright applies such a comment wherever it
+    stands, after code on the same line too (it only adds an error there). Beside
+    `strict`, or after `ignore`, pyright disregards a lower mode; the gate refuses it
+    anyway."""
+    text = comment[1:].strip(_TRIM)
+    if not text.startswith("pyright:"):
+        return False
+    operands = {op.strip(_TRIM) for op in text[len("pyright:"):].split(",")}
+    return not operands.isdisjoint(LOWER_MODES)
+
+
 def mode_lowering_comments(files: list[str]) -> list[str]:
     """`file:line: comment` for each comment that sets a file's pyright mode below
-    strict (see MODE_LOWERING). A file that cannot be read is skipped: the checkers
-    report it."""
+    strict (see _sets_lower_mode). Python's tokenizer finds the comments, as pyright's
+    does, so one after code counts and text inside a string does not. A file that
+    cannot be read is skipped: the checkers report it.
+
+    ValueError, naming the file, when one cannot be tokenized: its comments cannot be
+    checked."""
     found: list[str] = []
     for f in files:
         try:
-            text = (ROOT / f).read_text(encoding="utf-8", errors="replace")
+            with tokenize.open(ROOT / f) as fh:
+                tokens = list(tokenize.generate_tokens(fh.readline))
         except OSError:
             continue
-        for m in MODE_LOWERING.finditer(text):
-            line = text.count("\n", 0, m.start()) + 1
-            found.append(f"{f}:{line}: {m.group(0).strip()}")
+        except (SyntaxError, UnicodeDecodeError, tokenize.TokenError) as e:
+            raise ValueError(f"{f} cannot be tokenized, so its comments cannot be "
+                             f"checked: {e}") from None
+        found += [f"{f}:{t.start[0]}: {t.string}" for t in tokens
+                  if t.type == tokenize.COMMENT and _sets_lower_mode(t.string)]
     return found
 
 
@@ -189,12 +218,12 @@ def main(argv: list[str] | None = None) -> int:
         # does not read it, so a broken one cannot block that.
         baseline = {} if args.update_baseline else load_baseline(BASELINE)
         files, py = python_files(), _interpreter()
+        # Before the checkers run, and before a baseline is re-recorded: a file run
+        # below strict would record, and then be held to, counts strict never saw.
+        lowered = mode_lowering_comments(files)
     except (RuntimeError, ValueError) as e:
         print(f"typecheck: {e}", file=sys.stderr)
         return 2
-    # Before the checkers run, and before a baseline is re-recorded: a file run below
-    # strict would record, and then be held to, counts strict never saw.
-    lowered = mode_lowering_comments(files)
     if lowered:
         print("TYPECHECK FAILED: a comment runs a file below strict mode (remove it):",
               file=sys.stderr)

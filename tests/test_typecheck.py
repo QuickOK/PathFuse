@@ -400,9 +400,11 @@ def test_main_update_baseline_replaces_a_malformed_baseline(tmp_path, monkeypatc
 
 def test_pyright_runs_in_strict_mode() -> None:
     """The baseline holds strict counts, and the ratchet only stops counts rising: a
-    lower mode would pass every file under it, so the mode itself is pinned here."""
+    lower mode would pass every file under it, so the mode itself is pinned here. So
+    is the setting that stops a `# type: ignore` at the top of a file silencing it."""
     config = json.loads((T.ROOT / "pyrightconfig.json").read_text())
     assert config.get("typeCheckingMode") == "strict"
+    assert config.get("enableTypeIgnoreComments") is False
 
 
 def test_main_passes_over_a_pinned_pyright_that_is_not_executable(
@@ -420,13 +422,13 @@ def test_main_passes_over_a_pinned_pyright_that_is_not_executable(
         "TYPECHECK OK (1 files; 0 baseline errors left in 0 files)\n", "")
 
 
-@pytest.mark.parametrize("mode", ["basic", "standard", "off"])
+@pytest.mark.parametrize("mode", ["basic", "standard"])
 @pytest.mark.parametrize("argv", [[], ["--update-baseline"]], ids=["check", "update-baseline"])
 def test_main_refuses_a_comment_that_runs_a_file_below_strict(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str], mode: str, argv: list[str]) -> None:
-    """`# pyright: basic` (or standard, or off) takes one file out of strict, and the
-    ratchet passes the drop. The gate refuses it before the checkers run, and before a
+    """`# pyright: basic` (or standard) takes one file out of strict, and the ratchet
+    passes the drop. The gate refuses it before the checkers run, and before a
     baseline could record counts strict never saw."""
     log, _pinned, _path = _gate_over_one_file(tmp_path, monkeypatch, pinned=True, on_path=False)
     (tmp_path / "a.py").write_text(f'"""A module."""\n  # pyright: {mode}\nx = 1\n')
@@ -439,15 +441,139 @@ def test_main_refuses_a_comment_that_runs_a_file_below_strict(
     assert not (tmp_path / "baseline.json").exists()
 
 
-@pytest.mark.parametrize("text", [
-    "# pyright: strict\n",                                 # raises the mode, if anything
-    "# pyright: reportUnknownMemberType=false\n",          # one rule, not the mode
-    'x = "# pyright: basic"\n',                            # in a string on a code line
-    "x = 1  # pyright: ignore[reportUnknownMemberType]\n",  # a line-level ignore
-    "#pyright:basics\n",                                  # not a mode name
-], ids=["strict", "rule-toggle", "in-a-string", "line-ignore", "not-a-mode"])
-def test_mode_lowering_comments_finds_only_a_lowered_mode(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+@pytest.mark.parametrize("argv", [[], ["--update-baseline"]], ids=["check", "update-baseline"])
+def test_main_exits_2_when_a_file_cannot_be_tokenized(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str], argv: list[str]) -> None:
+    """The gate cannot check the comments of a file the tokenizer cannot read, so it
+    has no verdict, and says so before the checkers run or a baseline is written."""
+    log, _pinned, _path = _gate_over_one_file(tmp_path, monkeypatch, pinned=True, on_path=False)
+    (tmp_path / "a.py").write_text('x = """never closed\n')
+    assert T.main(argv) == 2
+    out, err = capsys.readouterr()
+    assert out == "typecheck: pyright is node_modules/.bin/pyright, the pinned one\n"
+    assert err.startswith(
+        "typecheck: a.py cannot be tokenized, so its comments cannot be checked: "), err
+    assert not log.exists()                        # neither checker ran
+    assert not (tmp_path / "baseline.json").exists()
+
+
+# Comments pyright reads as setting their file's mode below strict, each with its line
+# and the comment as the gate reports it. pyright takes the mode from any operand, and
+# from a comment after code; it trims what JavaScript trims, U+FEFF included.
+_LOWERING: dict[str, tuple[bytes, int, str]] = {
+    "own-line": (b"# pyright: basic\n", 1, "# pyright: basic"),
+    "no-spaces": (b"#pyright:standard\n", 1, "#pyright:standard"),
+    "indented": (b"if True:\n    # pyright: basic\n    pass\n", 2, "# pyright: basic"),
+    "after-code": (b"x = 1  # pyright: basic\n", 1, "# pyright: basic"),
+    "after-code-in-a-def": (b"def f(x):\n    return x  # pyright: standard\n", 2,
+                            "# pyright: standard"),
+    "after-a-rule": (b"# pyright: reportUnknownVariableType=none, basic\n", 1,
+                     "# pyright: reportUnknownVariableType=none, basic"),
+    "before-a-rule": (b"# pyright: basic, reportPrivateUsage=false\n", 1,
+                      "# pyright: basic, reportPrivateUsage=false"),
+    "trailing-comma": (b"# pyright: basic,\n", 1, "# pyright: basic,"),
+    "tabs": (b"#\tpyright:\tbasic\n", 1, "#\tpyright:\tbasic"),
+    "no-break-space": ("#\u00a0pyright: basic\n".encode(), 1, "#\u00a0pyright: basic"),
+    "zero-width-no-break-space": ("#\ufeffpyright: basic\n".encode(), 1,
+                                  "#\ufeffpyright: basic"),
+    "after-a-byte-order-mark": ("\ufeff# pyright: basic\n".encode(), 1, "# pyright: basic"),
+    "crlf": (b"x = 1\r\n# pyright: basic\r\n", 2, "# pyright: basic"),
+    "cr": (b"x = 1\r# pyright: basic\r", 2, "# pyright: basic"),
+    "last-line-unterminated": (b"x = 1\n# pyright: basic", 2, "# pyright: basic"),
+    "after-a-form-feed": (b"\x0c# pyright: basic\n", 1, "# pyright: basic"),
+    # pyright keeps these two strict; the gate refuses them anyway.
+    "beside-strict": (b"# pyright: strict, basic\n", 1, "# pyright: strict, basic"),
+    "after-ignore": (b"# pyright: ignore, standard\n", 1, "# pyright: ignore, standard"),
+}
+
+# What pyright does not read as a lower mode: other directives, and look-alikes.
+_NOT_LOWERING: dict[str, bytes] = {
+    "strict": b"# pyright: strict\n",
+    "a-rule": b"# pyright: reportUnknownMemberType=false\n",
+    "rules": b"# pyright: reportPrivateUsage=false, reportUnusedVariable=false\n",
+    "a-mode-name-as-a-rule": b"# pyright: basic=true\n",
+    "off": b"# pyright: off\n",                       # no such mode: an unknown rule
+    "text-after-the-mode": b"# pyright: basic # why\n",  # the operand is "basic # why"
+    "line-ignore": b"x = 1  # pyright: ignore[reportUnknownMemberType]\n",
+    "ignore-list": b"# pyright: ignore[reportPrivateUsage, reportUnusedVariable]\n",
+    "in-a-string": b'x = "# pyright: basic"\n',
+    "in-a-multiline-string": b'"""\n# pyright: basic\n"""\n',
+    "prose": b"# notes on pyright: basic, standard\n",
+    "after-another-comment": b"# noqa # pyright: basic\n",
+    "doubled-hash": b"## pyright: basic\n",
+    "capitalised": b"# Pyright: basic\n",
+    "space-before-colon": b"# pyright : basic\n",
+    "not-a-mode-name": b"#pyright:basics\n",
+}
+
+
+@pytest.mark.parametrize("source, line, comment", list(_LOWERING.values()), ids=list(_LOWERING))
+def test_mode_lowering_comments_finds_a_lower_mode_wherever_pyright_reads_one(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        source: bytes, line: int, comment: str) -> None:
     monkeypatch.setattr(T, "ROOT", tmp_path)
-    (tmp_path / "a.py").write_text(text)
+    (tmp_path / "a.py").write_bytes(source)
+    assert T.mode_lowering_comments(["a.py"]) == [f"a.py:{line}: {comment}"]
+
+
+@pytest.mark.parametrize("source", list(_NOT_LOWERING.values()), ids=list(_NOT_LOWERING))
+def test_mode_lowering_comments_passes_what_sets_no_lower_mode(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: bytes) -> None:
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    (tmp_path / "a.py").write_bytes(source)
     assert T.mode_lowering_comments(["a.py", "gone.py"]) == []   # an unreadable file is skipped
+
+
+@pytest.mark.parametrize("source", [
+    b'x = """never closed\n',
+    b"if True:\n        x = 1\n    y = 2\n",   # a dedent to no enclosing level
+    b"x = '\xff'\n",                           # not UTF-8, in the encoding-cookie lines
+    b"x = 1\ny = 2\nz = '\xff'\n",             # not UTF-8, further down
+], ids=["unclosed-string", "bad-dedent", "not-utf-8-first-line", "not-utf-8-third-line"])
+def test_mode_lowering_comments_raises_on_a_file_it_cannot_tokenize(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: bytes) -> None:
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    (tmp_path / "a.py").write_bytes(source)
+    with pytest.raises(ValueError,
+                       match=r"^a\.py cannot be tokenized, so its comments cannot be checked: "):
+        T.mode_lowering_comments(["a.py"])
+
+
+# Four errors from three rules that strict reports and basic and standard do not: a
+# file with none of them left ran below strict.
+_STRICT_ONLY = b"def strict_only(x):\n    return x\n"
+_STRICT_ONLY_RULES = {"reportUnknownParameterType", "reportMissingParameterType",
+                      "reportUnknownVariableType"}
+
+
+@pytest.mark.skipif(_PYRIGHT is None, reason="pyright is not installed (npm ci)")
+def test_no_comment_runs_a_file_below_strict_past_the_gate(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Asks the pyright the gate runs, with the repo's pyrightconfig.json, which of the
+    forms above take a file out of strict: the gate must refuse each of them. A
+    `# type: ignore` before the first statement would silence the whole file, which
+    the config turns off, so those must leave the file in strict. An upgraded pyright
+    is re-checked here."""
+    assert _PYRIGHT is not None
+    shutil.copy(T.ROOT / "pyrightconfig.json", tmp_path / "pyrightconfig.json")
+    sources = {**{k: v[0] for k, v in _LOWERING.items()}, **_NOT_LOWERING,
+               "control": b"",
+               "type-ignore": b"# type: ignore\n",
+               "type-ignore-a-code": b"# type: ignore[misc]\n",
+               "type-ignore-after-a-shebang": b"#!/usr/bin/env python3\n# type: ignore\n"}
+    names = {k: f"v{i}.py" for i, k in enumerate(sources)}
+    for k, source in sources.items():
+        (tmp_path / names[k]).write_bytes(source + b"\n" + _STRICT_ONLY)
+    r = subprocess.run([_PYRIGHT, "--outputjson", *names.values()], cwd=tmp_path,
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode in (0, 1), r.stderr
+    report: dict[str, Any] = json.loads(r.stdout)
+    rules: dict[str, set[str]] = {name: set() for name in names.values()}
+    for d in report["generalDiagnostics"]:
+        rules.setdefault(Path(str(d["file"])).name, set()).add(str(d.get("rule")))
+    lowered = {k for k, name in names.items() if not rules[name] & _STRICT_ONLY_RULES}
+    assert "own-line" in lowered and "control" not in lowered   # the probe tells them apart
+    monkeypatch.setattr(T, "ROOT", tmp_path)
+    refused = {k for k, name in names.items() if T.mode_lowering_comments([name])}
+    assert sorted(lowered - refused) == []

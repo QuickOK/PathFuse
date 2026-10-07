@@ -29,6 +29,13 @@ clean. When new code has to call a function that is not typed yet, type that fun
 silence that one line with `# pyright: ignore[<rule>]` and say why in a comment. After fixing
 errors, run `scripts/typecheck.py --update-baseline` to record the lower floor.
 
+The ratchet only stops counts rising, so the gate also refuses a comment that runs a file below
+strict: `# pyright: basic` or `# pyright: standard`, wherever pyright would read it (among other
+operands, or after code on the same line). pyright disregards `# type: ignore`
+(`enableTypeIgnoreComments` is off), since one at the top of a file would silence all of it; a
+`# type: ignore[<code>]` line still silences mypy. A `# pyright:` comment that turns off a named
+rule for a whole file is allowed, because it names what it silences: say why beside it.
+
 pyright is the pinned one that `npm ci` installs in `node_modules/` (see Linting below for
 `npm ci`). Without it the gate falls back to a `pyright` on PATH, and its first line says which
 one ran. Install mypy once per machine: `sudo apt install mypy`.
@@ -38,7 +45,8 @@ records the counts as they are, higher ones included, so its diff should only lo
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
 so after upgrading either tool (pyright: its pin in `package.json`, then `npm install`), re-run
 `scripts/typecheck.py --update-baseline` and commit the new baseline in a commit of its own, with
-the versions named here updated.
+the versions named here updated. `tests/test_typecheck.py` asks the pinned pyright which comments
+run a file below strict, so its run after an upgrade re-checks the gate's rule against the new one.
 
 ## Linting
 `scripts/preflight.sh` also runs `scripts/lint.py`: ShellCheck over every tracked shell script
