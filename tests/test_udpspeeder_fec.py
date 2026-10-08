@@ -4,8 +4,17 @@ import os
 import tempfile
 import urllib.request, urllib.error
 
+from pathlib import Path
+
 import pytest
 import udpspeeder_fec as U
+
+
+@pytest.fixture(autouse=True)
+def _temp_files_in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The helpers here make files with tempfile. Pointing it at this test's tmp_path
+    lets pytest remove them; in the system temp dir every run left its files."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 
 def _state(sessions):

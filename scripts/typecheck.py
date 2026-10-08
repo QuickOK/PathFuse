@@ -50,6 +50,10 @@ LOWER_RULE_VALUES = frozenset({"false", "none", "warning", "information"})
 # What pyright trims from a comment and from each of its operands: JavaScript's trim,
 # which drops U+FEFF too. Python's whitespace covers the rest, and a few more.
 _TRIM = "".join(c for c in map(chr, range(0x3001)) if c.isspace()) + "\ufeff"
+# JavaScript's trim alone, without those few more: what pyright strips before it looks
+# for `ignore`. Stripping more there would pass as a line ignore a comment pyright
+# applies to the whole file.
+_JS_TRIM = "".join(c for c in _TRIM if c not in "\x1c\x1d\x1e\x1f\x85")
 # A `# type: ignore` on a line before a file's first statement silences all of the file
 # in mypy (pyright's whole-file form, before any code, is off with its type-ignore
 # comments). pyright finds one after any `#` in a comment, mypy (through Python's
@@ -184,7 +188,7 @@ def regressions(current: dict, baseline: dict) -> list[str]:
     return out
 
 
-def _sets_lower_mode(comment: str) -> bool:
+def _lowers_checking(comment: str) -> bool:
     """Whether pyright reads `comment` (a comment token, `#` included) as setting its
     file's mode below strict, or one rule below an error for the whole file. As pyright
     1.1.414 reads one: the text after `#`, trimmed, starts with `pyright:`, and the rest
@@ -192,14 +196,20 @@ def _sets_lower_mode(comment: str) -> bool:
     as `<rule>=<value>` (the value trimmed too). pyright applies such a comment wherever
     it stands, after code on the same line too (it only adds an error there). Beside
     `strict`, or after `ignore`, pyright disregards a lower mode; the gate refuses it
-    anyway. `# pyright: ignore[<rule>]` silences one line, not the file: it passes."""
+    anyway. pyright reads a comment whose operands start with `ignore` as silencing one
+    line only, so `# pyright: ignore[<rule>]` passes whatever its reason says."""
     text = comment[1:].strip(_TRIM)
     if not text.startswith("pyright:"):
         return False
-    operands = {op.strip(_TRIM) for op in text[len("pyright:"):].split(",")}
+    rest = text[len("pyright:"):]
+    operands = {op.strip(_TRIM) for op in rest.split(",")}
+    if not operands.isdisjoint(LOWER_MODES):
+        return True
+    if rest.strip(_JS_TRIM).startswith("ignore"):
+        return False
     values = {value.strip(_TRIM) for _, eq, value in (op.partition("=") for op in operands)
               if eq}
-    return not (operands.isdisjoint(LOWER_MODES) and values.isdisjoint(LOWER_RULE_VALUES))
+    return not values.isdisjoint(LOWER_RULE_VALUES)
 
 
 def _first_statement_line(tree: ast.Module) -> int | None:
@@ -237,14 +247,13 @@ def _no_type_check_uses(tree: ast.Module, text: str) -> dict[int, str]:
 
 def mode_lowering_comments(files: list[str]) -> list[str]:
     """`file:line: what` for each way a file lowers its checking where the ratchet cannot
-    see it: a pyright mode below strict, or a rule below an error (see _sets_lower_mode),
+    see it: a pyright mode below strict, or a rule below an error (see _lowers_checking),
     wherever it stands; a `# type: ignore` on a line before the file's first statement as
     mypy measures it (TYPE_IGNORE); a line of mypy settings (MYPY_SETTINGS); and a use of
     `no_type_check`, matched by that name. Python's tokenizer finds the comments, as
     pyright's does, so one after code counts and text inside a string does not. mypy
     settings are found line by line, as mypy finds them, strings included. A file that
-    cannot be read is skipped:
-    the checkers report it.
+    cannot be read is skipped: the checkers report it.
 
     ValueError, naming the file, when the gate cannot read one as the checkers do: it
     declares an encoding other than UTF-8 or ASCII, as Python or as mypy reads the
@@ -283,8 +292,8 @@ def mode_lowering_comments(files: list[str]) -> list[str]:
         hits: dict[int, str] = {}
         for t in tokens:
             if t.type == tokenize.COMMENT and (
-                    _sets_lower_mode(t.string) or TYPE_IGNORE.search(t.string)
-                    and (first is None or t.start[0] < first)):
+                    _lowers_checking(t.string)
+                    or (TYPE_IGNORE.search(t.string) and (first is None or t.start[0] < first))):
                 hits[t.start[0]] = t.string
         for n, line in enumerate(text.split("\n"), 1):
             if MYPY_SETTINGS.match(line):

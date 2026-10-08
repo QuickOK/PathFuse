@@ -565,6 +565,32 @@ _LOWERING: dict[str, tuple[bytes, int, str]] = {
                               "# pyright: reportUnknownMemberType=false"),
     "an-analysis-switched-off": (b"# pyright: analyzeUnannotatedFunctions=false\n", 1,
                                  "# pyright: analyzeUnannotatedFunctions=false"),
+    "a-rule-off-beside-one-raised": (
+        b"# pyright: reportUnknownMemberType=false, reportImplicitOverride=true\n", 1,
+        "# pyright: reportUnknownMemberType=false, reportImplicitOverride=true"),
+    "a-rule-raised-beside-one-off": (
+        b"# pyright: reportImplicitOverride=true, reportUnknownMemberType=false\n", 1,
+        "# pyright: reportImplicitOverride=true, reportUnknownMemberType=false"),
+    "zero-width-no-break-space-after-the-equals": (
+        "# pyright: reportUnknownMemberType=\ufefffalse\n".encode(), 1,
+        "# pyright: reportUnknownMemberType=\ufefffalse"),
+    # pyright skips a comment as a line ignore only when `ignore` comes first, after
+    # what JavaScript's trim drops; otherwise it applies every operand to the file.
+    "a-rule-off-then-ignore": (b"# pyright: reportUnknownMemberType=false, ignore\n", 1,
+                               "# pyright: reportUnknownMemberType=false, ignore"),
+    "a-rule-off-then-ignore-without-a-space": (
+        b"# pyright: reportUnknownMemberType=false,ignore\n", 1,
+        "# pyright: reportUnknownMemberType=false,ignore"),
+    "a-rule-off-then-a-line-ignore": (
+        b"# pyright: reportUnknownMemberType=false, ignore[reportPrivateUsage]\n", 1,
+        "# pyright: reportUnknownMemberType=false, ignore[reportPrivateUsage]"),
+    "a-rule-off-then-ignore-after-code": (
+        b"x = 1  # pyright: reportUnknownMemberType=false, ignore\n", 1,
+        "# pyright: reportUnknownMemberType=false, ignore"),
+    **{f"ignore-after-python-only-space-u{ord(c):04x}": (
+        f"# pyright: {c}ignore, reportUnknownMemberType=false\n".encode(), 1,
+        f"# pyright: {c}ignore, reportUnknownMemberType=false")
+       for c in "\x1c\x1d\x1e\x1f\x85"},
     "type-ignore": (b"# type: ignore\nx = 1\n", 1, "# type: ignore"),
     "type-ignore-a-code": (b"# type: ignore[misc]\nx = 1\n", 1, "# type: ignore[misc]"),
     "type-ignore-no-spaces": (b"#type:ignore\nx = 1\n", 1, "#type:ignore"),
@@ -636,6 +662,14 @@ _NOT_LOWERING: dict[str, bytes] = {
     "off": b"# pyright: off\n",                       # no such mode: an unknown rule
     "text-after-the-mode": b"# pyright: basic # why\n",  # the operand is "basic # why"
     "line-ignore": b"x = 1  # pyright: ignore[reportUnknownMemberType]\n",
+    "line-ignore-whose-reason-names-a-value": (
+        b"x = 1  # pyright: ignore[reportUnknownMemberType]  # debug=false\n"),
+    # pyright trims JavaScript's white space before it looks for `ignore`, so each of
+    # these is a line ignore, whatever follows it (CR and LF would end the comment).
+    **{f"ignore-after-javascript-space-u{ord(c):04x}": (
+        f"# pyright:{c}ignore, reportUnknownMemberType=false\n".encode())
+       for c in "\t\x0b\x0c \xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B)))
+       + "\u2028\u2029\u202f\u205f\u3000\ufeff"},
     "ignore-list": b"# pyright: ignore[reportPrivateUsage, reportUnusedVariable]\n",
     "in-a-string": b'x = "# pyright: basic"\n',
     "in-a-multiline-string": b'"""\n# pyright: basic\n"""\n',
@@ -674,8 +708,23 @@ _NOT_LOWERING: dict[str, bytes] = {
 }
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_ignore_check_strips_what_node_trims() -> None:
+    """_JS_TRIM is exactly the set of UTF-16 code units that the node pyright runs on
+    trims; all of JavaScript's white space is in the BMP."""
+    node = shutil.which("node")
+    assert node is not None
+    r = subprocess.run([node, "-e", "const o = []; for (let c = 0; c <= 0xFFFF; c++) "
+                        "if (String.fromCharCode(c).trim() === '') o.push(c); "
+                        "console.log(JSON.stringify(o))"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    trimmed: list[int] = json.loads(r.stdout)
+    assert sorted(map(ord, set(T._JS_TRIM))) == trimmed
+
+
 @pytest.mark.parametrize("source, line, comment", list(_LOWERING.values()), ids=list(_LOWERING))
-def test_mode_lowering_comments_finds_a_lower_mode_wherever_pyright_reads_one(
+def test_mode_lowering_comments_finds_each_lowering_wherever_it_stands(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         source: bytes, line: int, comment: str) -> None:
     monkeypatch.setattr(T, "ROOT", tmp_path)
@@ -684,7 +733,7 @@ def test_mode_lowering_comments_finds_a_lower_mode_wherever_pyright_reads_one(
 
 
 @pytest.mark.parametrize("source", list(_NOT_LOWERING.values()), ids=list(_NOT_LOWERING))
-def test_mode_lowering_comments_passes_what_sets_no_lower_mode(
+def test_mode_lowering_comments_passes_what_lowers_nothing(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: bytes) -> None:
     monkeypatch.setattr(T, "ROOT", tmp_path)
     (tmp_path / "a.py").write_bytes(source)
@@ -758,36 +807,45 @@ def test_mode_lowering_comments_says_which_encoding_a_file_declares(
                             f"encoding{plural}, and pyright reads every file as UTF-8")
 
 
-# Four errors from three rules that strict reports and basic and standard do not: a
-# file with none of them left ran below strict.
-_STRICT_ONLY = b"def strict_only(x):\n    return x\n"
-_STRICT_ONLY_RULES = {"reportUnknownParameterType", "reportMissingParameterType",
-                      "reportUnknownVariableType"}
+# Errors from several rules that strict reports as errors: a row lowers its file's
+# checking when it leaves any rule fewer errors than the control file has.
+_RULES_BODY = (b"def strict_only(x):\n    return x\n\n\n"
+               b"class _Base:\n    _hidden = 1\n\n\n"
+               b"def unknowns(x):\n    v = x.attr\n    print(v)\n    return v\n\n\n"
+               b"def unused() -> None:\n    w = 1\n\n\n"
+               b"leak = _Base._hidden\n")
 
 
 @pytest.mark.skipif(_PYRIGHT is None, reason="pyright is not installed (npm ci)")
-def test_no_comment_runs_a_file_below_strict_past_the_gate(
+def test_no_comment_lowers_a_file_past_the_gate(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Asks the pyright the gate runs, with the repo's pyrightconfig.json, which of the
-    forms above take a file out of strict: the gate must refuse each of them. A
-    `# type: ignore` before any code would silence the whole file in pyright, but the
-    config turns those comments off, so they must leave the file in strict. An
-    upgraded pyright is re-checked here."""
+    """Asks the pyright the gate runs, with the repo's pyrightconfig.json, which rows of
+    the tables above leave some rule fewer errors than the control does: a lower mode,
+    a rule set below an error, an analysis switched off. The gate must refuse each of
+    them. A `# type: ignore` before any code would silence the whole file in pyright,
+    but the config turns those comments off, so they must lower nothing. An upgraded
+    pyright is re-checked here."""
     assert _PYRIGHT is not None
     shutil.copy(T.ROOT / "pyrightconfig.json", tmp_path / "pyrightconfig.json")
     sources = {**{k: v[0] for k, v in _LOWERING.items()}, **_NOT_LOWERING, "control": b""}
     names = {k: f"v{i}.py" for i, k in enumerate(sources)}
     for k, source in sources.items():
-        (tmp_path / names[k]).write_bytes(source + b"\n" + _STRICT_ONLY)
+        (tmp_path / names[k]).write_bytes(source + b"\n" + _RULES_BODY)
     r = subprocess.run([_PYRIGHT, "--outputjson", *names.values()], cwd=tmp_path,
                        capture_output=True, text=True, timeout=300)
     assert r.returncode in (0, 1), r.stderr
     report: dict[str, Any] = json.loads(r.stdout)
-    rules: dict[str, set[str]] = {name: set() for name in names.values()}
+    errors: dict[str, Counter[str]] = {name: Counter() for name in names.values()}
     for d in report["generalDiagnostics"]:
-        rules.setdefault(Path(str(d["file"])).name, set()).add(str(d.get("rule")))
-    lowered = {k for k, name in names.items() if not rules[name] & _STRICT_ONLY_RULES}
-    assert "own-line" in lowered and "control" not in lowered   # the probe tells them apart
+        if d["severity"] == "error":
+            errors.setdefault(Path(str(d["file"])).name, Counter())[str(d.get("rule"))] += 1
+    control = errors[names["control"]]
+    lowered = {k for k, name in names.items()
+               if any(errors[name][rule] < n for rule, n in control.items())}
+    # The probe tells them apart: a lower mode, rules set below an error, an analysis off.
+    assert {"own-line", "a-rule-off", "rules-off", "a-rule-to-a-warning",
+            "an-analysis-switched-off"} <= lowered
+    assert "control" not in lowered
     monkeypatch.setattr(T, "ROOT", tmp_path)
     refused = {k for k, name in names.items() if T.mode_lowering_comments([name])}
     assert sorted(lowered - refused) == []

@@ -1,4 +1,17 @@
+import tempfile
+from pathlib import Path
+
+import pytest
+
 import fec_control as F
+
+
+@pytest.fixture(autouse=True)
+def _temp_files_in_tmp_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two tests here make FIFO directories with tempfile.mkdtemp. Pointing tempfile at
+    this test's tmp_path lets pytest remove them; in the system temp dir every run left
+    its own."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 
 def test_parse_ratio():
@@ -91,7 +104,7 @@ def test_ramp_down_held_until_hold_elapses():
     assert changed is True and rt3.current_level == 0 and rt3.last_change_ts == 120.0
 
 
-import os, tempfile
+import os
 
 
 def test_fifo_command():

@@ -61,8 +61,9 @@ records the counts as they are, higher ones included, so its diff should only lo
 baseline was recorded with pyright 1.1.414 and mypy 1.15.0. Other versions can count differently,
 so after upgrading either tool (pyright: its pin in `package.json`, then `npm install`), re-run
 `scripts/typecheck.py --update-baseline` and commit the new baseline in a commit of its own, with
-the versions named here updated. `tests/test_typecheck.py` asks pyright and mypy which comments
-lower a file's checking, so its run after upgrading either re-checks the gate's rule against it.
+the versions named here updated. `tests/test_typecheck.py` asks pyright and mypy which of the
+comments in its tables lower a file's checking, by each rule's count of errors, so its run after
+upgrading either re-checks the gate's rule against it.
 
 ## Linting
 `scripts/preflight.sh` also runs `scripts/lint.py`: ShellCheck over every tracked shell script
